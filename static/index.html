@@ -125,14 +125,19 @@ input[type=time]{border:1px solid var(--line);background:var(--card);border-radi
 <script>
 const S = {tab:'home', device:null, hours:24, filter:'all', search:'', sort:'n', open:new Set(),
            status:null, devices:[], activity:[], rules:null,
-           services:[], groups:[], ctl:{}, group:null, svcOpen:false, schedules:[], edit:null};
+           services:[], groups:[], ctl:{}, group:null, svcOpen:false, schedules:[], edit:null, cloud:null};
 const $ = id => document.getElementById(id);
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const num = n => Number(n || 0).toLocaleString();
 
+// Empty when opened directly on the Pi; set to "/pi/<id>" by the cloud relay so the
+// very same dashboard drives a remote Pi. The relay also needs a header it can check.
+const BASE = (window.QN_API_BASE || '').replace(/\/$/, '');
 async function api(path, body){
-  const r = await fetch(path, body === undefined ? {} :
-    {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)});
+  const opts = body === undefined ? {headers:{}} :
+    {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)};
+  opts.headers = Object.assign({'X-QuietNet': '1'}, opts.headers || {});
+  const r = await fetch(BASE + path, opts);
   const j = await r.json().catch(() => ({}));
   if(!r.ok) throw new Error(j.error || 'Something went wrong. Is QuietNet still running?');
   return j;
@@ -477,10 +482,29 @@ function viewRules(){
 }
 
 /* ---------- Set up a device ---------- */
+function cloudCard(){
+  const c = S.cloud || {};
+  if(!c.configured && !c.paired && c.state === undefined) return '';
+  if(c.paired){
+    const label = {online:'Connected', connecting:'Connecting…', off:'Off',
+                   error:'Problem — ' + (c.detail || 'trying again')}[c.state] || c.state;
+    return `<div class="card"><h2>Remote access${c.state === 'online' ? '<span class="badge blocked">On</span>' : ''}</h2>
+      <p>This QuietNet is linked to your online account. Status: <b>${esc(label)}</b>.</p>
+      <p class="muted small">Open your relay website and sign in to control this from anywhere — no router changes needed.</p>
+      <button class="btn" data-act="cloudforget">Unlink</button></div>`;
+  }
+  return `<div class="card"><h2>Remote access <span class="muted" style="font-weight:400">(optional)</span></h2>
+    <p class="muted small">Control this QuietNet from outside your home. On your relay website, sign in and choose
+      <b>Add a QuietNet</b>, then type the web address and pairing code it shows you here.</p>
+    <label class="fld">Relay web address<input type="text" id="clRelay" placeholder="your-relay.up.railway.app" value="${esc(c.relay || '')}"></label>
+    <label class="fld">Pairing code<input type="text" id="clCode" placeholder="ABCD-1234"></label>
+    <button class="btn primary" data-act="cloudpair">Link this QuietNet</button></div>`;
+}
 function viewSetup(){
   const ip = esc((S.status || {}).ip || '…');
   const step = (title, steps) => `<details><summary>${title}</summary><ol>${steps.map(s => `<li>${s}</li>`).join('')}</ol></details>`;
   return `
+  ${cloudCard()}
   <div class="card"><h2>How to point a device at QuietNet</h2>
     <p>Every device has a setting called <b>DNS</b>. Change it to this number and QuietNet can see and filter that device:</p>
     <div class="ipbox">${ip}</div>
@@ -528,6 +552,7 @@ async function refresh(hard){
     const ctl = scope => api('/api/controls?scope=' + encodeURIComponent(scope)).then(x => S.ctl[scope] = x);
     if(!S.services.length) jobs.push(api('/api/services').then(x => S.services = x));
     if(S.tab === 'schedules') jobs.push(api('/api/schedules').then(x => S.schedules = x));
+    if(S.tab === 'setup') jobs.push(api('/api/cloud').then(x => S.cloud = x).catch(() => {}));
     if(S.tab === 'home' || S.tab === 'groups' || S.tab === 'schedules')
       jobs.push(api('/api/devices').then(x => S.devices = x), api('/api/groups').then(x => S.groups = x));
     if(S.tab === 'home' && S.device) jobs.push(ctl('device:' + S.device));
@@ -629,6 +654,17 @@ const actions = {
   },
   async pause(){ await api('/api/pause', {minutes:10}).catch(oops); refresh(); },
   async resume(){ await api('/api/pause', {minutes:0}).catch(oops); refresh(); },
+  async cloudpair(){
+    const relay = $('clRelay').value.trim(), code = $('clCode').value.trim();
+    if(!relay || !code) return;
+    try{ await api('/api/cloud', {relay, code}); refresh(true); }catch(e){ oops(e); }
+  },
+  async cloudforget(){
+    const yes = await ask({title:'Unlink remote access?', ok:'Unlink', danger:true,
+      text:'You won\'t be able to reach this QuietNet from outside your home until you pair it again.'});
+    if(!yes) return;
+    await api('/api/cloud', {action:'forget'}).catch(oops); refresh(true);
+  },
   async getlist(){ await api('/api/update-list', {}).catch(oops); refresh(true); },
 };
 document.addEventListener('click', e => {

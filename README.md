@@ -60,6 +60,18 @@ When you turn on **Cut live connections** for a device (on that device's page), 
 - **It blocks by address.** If a blocked service shares an address with something else (big content networks sometimes do), that other thing can be affected too. Switching the enforcer off for the device removes all of this instantly.
 - Everyone on the network should know it's in use — it steers a device's traffic through the Pi.
 
+## Reach it from anywhere (optional)
+
+By default the dashboard only opens on your home network. If you want to check or change things while you're out, QuietNet comes with a small **relay** you host yourself (for example on [Railway](https://railway.app)).
+
+Because the Pi can't usually be reached from the internet directly, it works the other way around: the Pi makes an outgoing connection to your relay and holds it open, and your browser's requests travel down that line. **No router changes are needed.**
+
+1. Deploy the relay — see [`cloud/README.md`](cloud/README.md). You get a web address like `your-relay.up.railway.app`.
+2. Open it, create an account, and choose **Add a QuietNet** to get a pairing code.
+3. On the Pi's own dashboard, open **Set up a device → Remote access**, enter the relay address and the code.
+
+After that, sign in to the relay from anywhere to control your Pi. Only your account can reach it, and the relay never stores your history or rules — it just passes your requests through to the Pi while you're looking.
+
 ## Good to know
 
 - This computer has to be on and awake for the devices pointed at it to work.
@@ -79,7 +91,9 @@ QuietNet uses no third-party packages or libraries. Everything — the DNS filte
 | --- | --- |
 | `server.py` | The main program: DNS filter, rules, network scan and dashboard server |
 | `enforcer.py` | The live-connection enforcer (ARP + kernel firewall, Linux/Pi) |
-| `static/index.html` | The dashboard |
+| `cloud_agent.py` | The Pi's outbound link to the relay (for remote access) |
+| `cloud/` | The relay you host (e.g. on Railway) to reach your Pi from anywhere |
+| `static/index.html` | The dashboard (works locally and through the relay) |
 | `services.json` | The apps and services that can be blocked, and the addresses each one uses |
 | `junk_domains.txt` | The built-in advert and tracker list |
 | `Start QuietNet.command` | Double-click launcher for macOS |

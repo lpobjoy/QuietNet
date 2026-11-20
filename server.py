@@ -27,6 +27,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
 import enforcer
+import cloud_agent
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.environ.get("QUIETNET_DATA") or os.path.join(HERE, "data")   # where history and rules are kept
@@ -124,6 +125,7 @@ class State:
 
 S = State()
 ENF = None
+CA = None
 db = None
 db_lock = threading.RLock()
 log_q = queue.Queue()
@@ -991,6 +993,8 @@ class Web(BaseHTTPRequestHandler):
             self.send_json(api_groups())
         elif url.path == "/api/schedules":
             self.send_json(api_schedules())
+        elif url.path == "/api/cloud":
+            self.send_json(CA.status() if CA else {"configured": False, "paired": False, "state": "off"})
         elif url.path == "/api/enforcer":
             self.send_json(ENF.status() if ENF else {"available": False, "reason": "not started", "active": False})
         elif url.path == "/api/controls":
@@ -1036,6 +1040,14 @@ class Web(BaseHTTPRequestHandler):
                     return self.send_error(400)
                 set_service_block(scope, body["service"], bool(body.get("on")))
             return self.send_json({"ok": True})
+        if path == "/api/cloud":
+            if not CA:
+                return self.send_json({"error": "Remote access isn't available."}, 400)
+            if body.get("action") == "forget":
+                CA.forget()
+                return self.send_json({"ok": True})
+            err = CA.pair(body.get("relay", ""), body.get("code", ""))
+            return self.send_json({"error": err}, 400) if err else self.send_json({"ok": True})
         if path == "/api/enforce":
             ip = str(body.get("ip", ""))[:64]
             if not re.fullmatch(r"\d{1,3}(\.\d{1,3}){3}", ip):
@@ -1137,6 +1149,9 @@ def main():
     global ENF
     ENF = enforcer.Enforcer(S.local_ip, enforcement_plan, neighbours)
     ENF.start()
+    global CA
+    CA = cloud_agent.CloudAgent(args.web_port, DATA)
+    CA.start()
     if not ENF.available():
         print("  Live-connection enforcer: off (%s)" % ENF.reason)
     else:
@@ -1155,6 +1170,8 @@ def main():
     except KeyboardInterrupt:
         if ENF:
             ENF.stop()
+        if CA:
+            CA.stop()
         print("\nQuietNet stopped.")
 
 
