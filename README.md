@@ -14,6 +14,7 @@ See what every device in your home is talking to, block the adverts and trackers
 - **Internet on/off switch** for any device or group.
 - **Schedules** — block apps, services or all internet automatically at set times (bedtime, homework, school nights), per device, group or whole house.
 - **Kill switch** — one button stops all internet everywhere until you turn it back on.
+- **Cut live connections** (Raspberry Pi) — optionally stop a device even mid-stream, not just new connections. See below.
 - **Finds the devices on your network**, with their names and hardware addresses, so you can name and group them.
 - **Pause advert blocking for 10 minutes** when a website or app misbehaves.
 
@@ -47,6 +48,18 @@ Every device has a setting called DNS — the "phone book" it uses to find addre
 
 Rules are checked in this order: internet switched off → addresses you blocked or allowed yourself → blocked services → the advert list.
 
+## Cutting live connections (the enforcer)
+
+A normal block only stops a device *finding* an address. If a Disney+ stream is already playing, the device already has the connection open, so the block doesn't interrupt it until it next reconnects. The **enforcer** closes that gap.
+
+When you turn on **Cut live connections** for a device (on that device's page), QuietNet — running on the Raspberry Pi — tells that device "I am the router", so the device's traffic flows through the Pi. The Pi forwards everything as normal **except** packets heading for an address that's blocked for that device, which it drops. So a blocked Disney+ stream dies within seconds, bedtime and the kill switch become instant for that device, and everything else it does is untouched.
+
+- **Raspberry Pi / Linux only.** It uses the Pi's network directly, so it needs the container's `NET_RAW` and `NET_ADMIN` privileges (already set in `docker-compose.yml`) or to run as root. On a Mac it simply reports itself off, and ordinary DNS blocking still applies.
+- **Opt-in per device.** It only ever touches devices you switch it on for, and it restores the network cleanly when switched off or stopped.
+- **Works best when the device uses QuietNet for DNS** (the normal setup), because that's how QuietNet learns which addresses belong to Disney+, Fortnite and so on.
+- **It blocks by address.** If a blocked service shares an address with something else (big content networks sometimes do), that other thing can be affected too. Switching the enforcer off for the device removes all of this instantly.
+- Everyone on the network should know it's in use — it steers a device's traffic through the Pi.
+
 ## Good to know
 
 - This computer has to be on and awake for the devices pointed at it to work.
@@ -64,7 +77,8 @@ QuietNet uses no third-party packages or libraries. Everything — the DNS filte
 
 | File | What it is |
 | --- | --- |
-| `server.py` | The whole program: DNS filter, rules, network scan and dashboard server |
+| `server.py` | The main program: DNS filter, rules, network scan and dashboard server |
+| `enforcer.py` | The live-connection enforcer (ARP + kernel firewall, Linux/Pi) |
 | `static/index.html` | The dashboard |
 | `services.json` | The apps and services that can be blocked, and the addresses each one uses |
 | `junk_domains.txt` | The built-in advert and tracker list |

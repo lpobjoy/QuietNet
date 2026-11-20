@@ -2,8 +2,13 @@
 # It installs NOTHING from the internet: QuietNet uses only the Python standard library.
 FROM python:3.13-slim
 
+# The only system tool QuietNet needs: the kernel's own firewall, used by the
+# live-connection enforcer to drop blocked traffic. (No Python packages are installed.)
+RUN apt-get update && apt-get install -y --no-install-recommends nftables \
+    && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
-COPY server.py services.json junk_domains.txt ./
+COPY server.py enforcer.py services.json junk_domains.txt ./
 COPY static ./static
 
 # History and your rules live here. Mount a volume so they survive restarts.

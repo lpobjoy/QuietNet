@@ -5,6 +5,7 @@ touches your real history or rules, and never sends anything to the network.
 """
 import calendar
 import os
+import socket
 import struct
 import sys
 import tempfile
@@ -14,6 +15,7 @@ import unittest
 os.environ["QUIETNET_DATA"] = tempfile.mkdtemp(prefix="quietnet-test-")
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import server  # noqa: E402
+import enforcer  # noqa: E402
 
 KID, ADULT = "192.168.1.23", "192.168.1.40"
 
@@ -46,10 +48,12 @@ class Base(unittest.TestCase):
         if server.db is None:
             server.init_db()
             server.load_lists()
-        for table in ("blocked", "allowed", "groups", "device_group", "service_blocks", "internet_off", "schedules", "queries"):
+        for table in ("blocked", "allowed", "groups", "device_group", "service_blocks",
+                      "internet_off", "schedules", "queries", "enforced"):
             server.sql("DELETE FROM %s" % table, commit=True)
         server.init_db()
         server.S.junk_on, server.S.paused_until = True, 0
+        server.S.enforced, server.S.resolved = set(), {}
 
     def schedule(self, **kw):
         body = {"name": "Bedtime", "scope": "device:" + KID, "days": [0, 1, 2, 3, 4, 5, 6],
@@ -256,6 +260,67 @@ class Answers(Base):
     def test_when_the_internet_is_unreachable(self):
         resp = server.answer_query(query("www.bbc.co.uk"), KID, lambda data: None)
         self.assertEqual(resp[3] & 15, 2)                                    # "server failure"
+
+
+class EnforcerLogic(unittest.TestCase):
+    def test_arp_reply_frame_layout(self):
+        f = enforcer.build_arp_reply("192.168.1.254", "aa:bb:cc:dd:ee:ff", "192.168.1.23", "11:22:33:44:55:66")
+        self.assertEqual(f[0:6], bytes.fromhex("112233445566"))         # addressed to the victim
+        self.assertEqual(f[6:12], bytes.fromhex("aabbccddeeff"))        # from us (claimed sender)
+        self.assertEqual(f[12:14], b"\x08\x06")                         # ARP
+        self.assertEqual(f[20:22], b"\x00\x02")                         # opcode = reply
+        self.assertEqual(f[28:32], socket.inet_aton("192.168.1.254"))   # sender = the gateway's address
+        self.assertEqual(f[38:42], socket.inet_aton("192.168.1.23"))    # target = the victim
+
+    def test_bad_mac_is_rejected(self):
+        self.assertRaises(ValueError, enforcer.mac_to_bytes, "not-a-mac")
+
+    def test_nft_ruleset_surgical_vs_full_cut(self):
+        plan = {"192.168.1.23": {"off": False, "ips": {"1.2.3.4", "5.6.7.8"}},
+                "192.168.1.24": {"off": True, "ips": set()}}
+        text = enforcer.nft_ruleset(plan, "192.168.1.60")
+        self.assertIn("ip saddr 192.168.1.23 ip daddr { 1.2.3.4, 5.6.7.8 } drop", text)
+        self.assertIn("ip saddr 192.168.1.24 ip daddr != 192.168.1.60 drop", text)
+        self.assertIn("hook forward", text)
+
+    def test_nothing_blocked_means_no_drop_lines(self):
+        text = enforcer.nft_ruleset({"192.168.1.23": {"off": False, "ips": set()}}, "192.168.1.60")
+        self.assertNotIn("drop", text)
+
+    def test_iptables_rules(self):
+        cmds = enforcer.iptables_rules({"192.168.1.23": {"off": False, "ips": {"1.2.3.4"}}}, "192.168.1.60")
+        self.assertIn(["-A", "QUIETNET", "-s", "192.168.1.23", "-d", "1.2.3.4", "-j", "DROP"], cmds)
+
+
+class EnforcementPlan(Base):
+    def _answer(self, name, ip):
+        q = query(name)
+        head = q[:2] + b"\x81\x80\x00\x01\x00\x01\x00\x00\x00\x00"
+        return head + q[12:] + b"\xc0\x0c\x00\x01\x00\x01" + struct.pack(">IH", 300, 4) + socket.inet_aton(ip)
+
+    def test_resolved_ips_are_extracted(self):
+        self.assertEqual(server.answer_ips(self._answer("www.disneyplus.com", "203.0.113.5")), ["203.0.113.5"])
+
+    def test_plan_drops_a_blocked_services_addresses_for_the_enforced_device(self):
+        server.record_resolved("www.disneyplus.com", self._answer("www.disneyplus.com", "203.0.113.5"))
+        server.record_resolved("www.bbc.co.uk", self._answer("www.bbc.co.uk", "151.101.0.81"))
+        server.set_service_block("device:" + KID, "disneyplus", True)
+        server.S.enforced = {KID}
+        plan = server.enforcement_plan()
+        self.assertIn(KID, plan)
+        self.assertFalse(plan[KID]["off"])
+        self.assertIn("203.0.113.5", plan[KID]["ips"])       # Disney's address is dropped
+        self.assertNotIn("151.101.0.81", plan[KID]["ips"])   # the BBC's is not
+
+    def test_plan_is_full_cut_when_device_internet_is_off(self):
+        server.record_resolved("www.bbc.co.uk", self._answer("www.bbc.co.uk", "151.101.0.81"))
+        server.set_internet_off("device:" + KID, True)
+        server.S.enforced = {KID}
+        self.assertTrue(server.enforcement_plan()[KID]["off"])
+
+    def test_no_enforced_devices_means_empty_plan(self):
+        server.S.enforced = set()
+        self.assertEqual(server.enforcement_plan(), {})
 
 
 if __name__ == "__main__":

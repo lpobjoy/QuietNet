@@ -237,6 +237,7 @@ function viewHome(){
         ? `${num(d.n)} requests today · <b>${num(d.nb)} blocked</b> · active ${ago(d.last)}`
         : '<span class="muted">Not using QuietNet yet</span>'}</div>
       ${d.off ? '<span class="badge junk" style="margin:6px 0 0">Internet off</span>' : ''}
+      ${d.enforced ? '<span class="badge blocked" style="margin:6px 0 0">Live-enforced</span>' : ''}
       ${d.group ? `<span class="badge" style="margin:6px 0 0">${esc(groupName(d.group))}</span>` : ''}
     </button>`).join('');
   const scanning = st.scan && st.scan.state === 'scanning';
@@ -260,6 +261,20 @@ function viewHome(){
   ${cards ? `<div class="devices">${cards}</div>` : `<div class="card empty">
     <p><b>No devices yet.</b></p><p>QuietNet can only see devices that have been pointed at it.</p>
     <button class="btn primary" data-act="tab" data-tab="setup">Show me how to set up a device</button></div>`}`;
+}
+
+/* ---------- One device ---------- */
+function enforceCard(d){
+  const e = (S.status || {}).enforcer || {};
+  if(!d.last) return '';                       // device isn't using QuietNet yet, nothing to enforce
+  if(!e.available) return `<div class="card"><h2>Cut live connections</h2>
+    <p class="muted small">${esc(e.reason || "Not available on this computer.")}</p></div>`;
+  return `<div class="card"><div class="row">
+    <label class="switch"><input type="checkbox" id="enforceSwitch" ${d.enforced ? 'checked' : ''} aria-label="Cut live connections for this device"><span></span></label>
+    <div style="flex:1;min-width:200px"><h2>Cut live connections${d.enforced ? '<span class="badge junk">On</span>' : ''}</h2>
+    <div class="muted small">Normally a block only stops new connections. Turn this on and blocks, bedtimes and the kill switch
+      also stop things that are <b>already running</b> on this device (like a Disney+ video mid-stream). QuietNet steers this
+      device through itself and drops only what's blocked for it. Takes a few seconds to bite.</div></div></div></div>`;
 }
 
 /* ---------- One device ---------- */
@@ -317,6 +332,7 @@ function viewDevice(){
   ${d.last ? '' : `<div class="note"><b>This device isn't using QuietNet yet</b>, so nothing can be seen or blocked for it.
     <button class="btn link" data-act="tab" data-tab="setup">Show me how to set it up</button></div>`}
   ${controls('device:' + S.device, 'this device')}
+  ${enforceCard(d)}
   <h2>What it has been talking to</h2>
   <div class="controls">
     ${chip('all','Everything')}${chip('junk','Adverts &amp; suspicious')}${chip('blocked','Blocked')}
@@ -621,6 +637,7 @@ document.addEventListener('click', e => {
 });
 document.addEventListener('change', async e => {
   if(e.target.id === 'junkSwitch'){ await api('/api/junk-switch', {on:e.target.checked}).catch(oops); refresh(); }
+  if(e.target.id === 'enforceSwitch'){ await api('/api/enforce', {ip:S.device, on:e.target.checked}).catch(oops); refresh(true); }
   if(e.target.id === 'netSwitch'){ await api('/api/internet', {scope:e.target.dataset.scope, off:!e.target.checked}).catch(oops); refresh(true); }
   if(e.target.id === 'groupSel'){ await api('/api/device-group', {ip:S.device, group:e.target.value ? +e.target.value : null}).catch(oops); e.target.blur(); refresh(true); }
   if(e.target.classList.contains('member')){ await api('/api/device-group', {ip:e.target.dataset.ip, group:e.target.checked ? S.group : null}).catch(oops); refresh(true); }

@@ -26,6 +26,8 @@ from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
+import enforcer
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.environ.get("QUIETNET_DATA") or os.path.join(HERE, "data")   # where history and rules are kept
 STATIC = os.path.join(HERE, "static")
@@ -110,6 +112,8 @@ class State:
     dom2svc = {}            # address -> service id
     svc_blocks = {}         # scope -> set of blocked service ids
     off = set()             # scopes whose internet is switched off
+    enforced = set()        # device ips we actively enforce (cut live connections for)
+    resolved = {}           # domain -> {ip: last-seen} : the addresses we've handed out
     dev_group = {}          # device ip -> group id
     group_names = {}        # group id -> name
     schedules = []          # timed rules, e.g. bedtime (see load_schedules)
@@ -119,6 +123,7 @@ class State:
 
 
 S = State()
+ENF = None
 db = None
 db_lock = threading.RLock()
 log_q = queue.Queue()
@@ -153,6 +158,7 @@ def init_db():
         CREATE TABLE IF NOT EXISTS device_group(ip TEXT PRIMARY KEY, gid INTEGER);
         CREATE TABLE IF NOT EXISTS service_blocks(scope TEXT, service TEXT, PRIMARY KEY(scope, service));
         CREATE TABLE IF NOT EXISTS internet_off(scope TEXT PRIMARY KEY);
+        CREATE TABLE IF NOT EXISTS enforced(ip TEXT PRIMARY KEY);
     """)
     db.commit()
     S.blocked = {r[0] for r in sql("SELECT domain FROM blocked")}
@@ -160,6 +166,7 @@ def init_db():
     S.group_names = dict(sql("SELECT id, name FROM groups"))
     S.dev_group = dict(sql("SELECT ip, gid FROM device_group"))
     S.off = {r[0] for r in sql("SELECT scope FROM internet_off")}
+    S.enforced = {r[0] for r in sql("SELECT ip FROM enforced")}
     S.svc_blocks = {}
     for scope, service in sql("SELECT scope, service FROM service_blocks"):
         S.svc_blocks.setdefault(scope, set()).add(service)
@@ -423,6 +430,74 @@ def blocked_reply(data, qtype, qend):
     return reply(data, qend, 0, answer)
 
 
+def answer_ips(resp):
+    """Pull the IPv4/IPv6 addresses out of a DNS answer, so the enforcer knows
+    which addresses belong to a name. Best-effort: returns [] if it can't parse."""
+    out = []
+    try:
+        buf = memoryview(resp)
+        counts = [int.from_bytes(buf[i:i + 2], "big") for i in (4, 6, 8, 10)]
+
+        def skip_name(pos):
+            while True:
+                n = buf[pos]
+                if n == 0:
+                    return pos + 1
+                if n & 0xC0:
+                    return pos + 2
+                pos += 1 + n
+
+        pos = 12
+        for _ in range(counts[0]):
+            pos = skip_name(pos) + 4
+        for _ in range(counts[1]):
+            pos = skip_name(pos)
+            rtype = int.from_bytes(buf[pos:pos + 2], "big")
+            rdlen = int.from_bytes(buf[pos + 8:pos + 10], "big")
+            rdata = buf[pos + 10:pos + 10 + rdlen]
+            if rtype == 1 and rdlen == 4:
+                out.append(socket.inet_ntoa(bytes(rdata)))
+            elif rtype == 28 and rdlen == 16:
+                out.append(socket.inet_ntop(socket.AF_INET6, bytes(rdata)))
+            pos += 10 + rdlen
+    except (IndexError, ValueError, OSError):
+        return []
+    return out
+
+
+def record_resolved(domain, resp):
+    ips = answer_ips(resp)
+    if not ips:
+        return
+    now = time.time()
+    with db_lock:
+        m = S.resolved.setdefault(domain, {})
+        for ip in ips:
+            m[ip] = now
+        if len(S.resolved) > 4000:                     # keep memory bounded: drop the stalest names
+            for d in sorted(S.resolved, key=lambda d: max(S.resolved[d].values()))[:1000]:
+                S.resolved.pop(d, None)
+
+
+def enforcement_plan():
+    """What the enforcer should drop, per enforced device: reuses the normal rules.
+    {victim_ip: {"off": all-internet?, "ips": {addresses to drop}}}"""
+    if not S.enforced:
+        return {}
+    now = time.time()
+    plan = {}
+    for victim in S.enforced:
+        if internet_off_for(victim) or "all" in S.off:
+            plan[victim] = {"off": True, "ips": set()}
+            continue
+        ips = set()
+        for domain, ipmap in list(S.resolved.items()):
+            if decision(domain, victim)[0]:
+                ips.update(ip for ip, ts in ipmap.items() if now - ts < 6 * 3600 and ":" not in ip)
+        plan[victim] = {"off": False, "ips": ips}
+    return plan
+
+
 def cap_ttls(resp, limit=MAX_TTL):
     """Shorten how long a device may remember an answer.
 
@@ -514,6 +589,8 @@ def answer_query(data, client, forwarder):
     if blocked:
         return blocked_reply(data, qtype, qend)
     resp = forwarder(data)
+    if resp and loggable:
+        record_resolved(name, resp)
     return cap_ttls(resp) if resp else reply(data, qend, 2)
 
 
@@ -686,6 +763,7 @@ def api_status():
                       "state": S.list_state, "error": S.list_error},
         "today": {"total": total, "blocked": blocked},
         "scan": {"state": S.scan_state, "ts": S.scan_ts},
+        "enforcer": ENF.status() if ENF else {"available": False, "reason": "", "active": False},
     }
 
 
@@ -698,7 +776,8 @@ def api_devices():
         return out.setdefault(ip, {
             "ip": ip, "name": names.get(ip) or "", "hint": S.hints.get(ip, ""), "mac": "",
             "this_computer": ip == S.local_ip, "last": 0, "n": 0, "nb": 0, "on_network": 0,
-            "group": S.dev_group.get(ip), "off": internet_off_for(ip)})
+            "group": S.dev_group.get(ip), "off": internet_off_for(ip),
+            "enforced": ip in S.enforced})
 
     for ip, last, n, nb in sql("""SELECT client, MAX(ts), SUM(CASE WHEN ts>? THEN 1 ELSE 0 END),
                   SUM(CASE WHEN ts>? THEN blocked ELSE 0 END) FROM queries GROUP BY client""", (since, since)):
@@ -912,6 +991,8 @@ class Web(BaseHTTPRequestHandler):
             self.send_json(api_groups())
         elif url.path == "/api/schedules":
             self.send_json(api_schedules())
+        elif url.path == "/api/enforcer":
+            self.send_json(ENF.status() if ENF else {"available": False, "reason": "not started", "active": False})
         elif url.path == "/api/controls":
             scope = qs.get("scope", [""])[0]
             if not SCOPE.fullmatch(scope):
@@ -954,6 +1035,19 @@ class Web(BaseHTTPRequestHandler):
                 if body.get("service") not in S.svc_names:
                     return self.send_error(400)
                 set_service_block(scope, body["service"], bool(body.get("on")))
+            return self.send_json({"ok": True})
+        if path == "/api/enforce":
+            ip = str(body.get("ip", ""))[:64]
+            if not re.fullmatch(r"\d{1,3}(\.\d{1,3}){3}", ip):
+                return self.send_error(400)
+            with db_lock:
+                if body.get("on"):
+                    S.enforced.add(ip)
+                    db.execute("INSERT OR IGNORE INTO enforced VALUES(?)", (ip,))
+                else:
+                    S.enforced.discard(ip)
+                    db.execute("DELETE FROM enforced WHERE ip=?", (ip,))
+                db.commit()
             return self.send_json({"ok": True})
         if path == "/api/kill":             # the kill switch: stop the internet for every device
             set_internet_off("all", bool(body.get("on")))
@@ -1040,6 +1134,14 @@ def main():
     threading.Thread(target=hint_refresher, daemon=True).start()
     start_dns(args.dns_port)
 
+    global ENF
+    ENF = enforcer.Enforcer(S.local_ip, enforcement_plan, neighbours)
+    ENF.start()
+    if not ENF.available():
+        print("  Live-connection enforcer: off (%s)" % ENF.reason)
+    else:
+        print("  Live-connection enforcer: ready")
+
     web = ThreadingHTTPServer(("127.0.0.1", args.web_port), Web)
     url = "http://localhost:%d" % args.web_port
     print("\nQuietNet is running.")
@@ -1051,6 +1153,8 @@ def main():
     try:
         web.serve_forever()
     except KeyboardInterrupt:
+        if ENF:
+            ENF.stop()
         print("\nQuietNet stopped.")
 
 
