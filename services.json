@@ -1,0 +1,32 @@
+[
+  {"id": "fortnite", "name": "Fortnite / Epic Games", "cat": "Games", "domains": ["fortnite.com", "epicgames.com", "epicgames.dev", "epicgames.net"]},
+  {"id": "roblox", "name": "Roblox", "cat": "Games", "domains": ["roblox.com", "rbxcdn.com", "rbx.com"]},
+  {"id": "minecraft", "name": "Minecraft", "cat": "Games", "domains": ["minecraft.net", "mojang.com", "minecraftservices.com", "minecraft-services.net"]},
+  {"id": "steam", "name": "Steam", "cat": "Games", "domains": ["steampowered.com", "steamcommunity.com", "steamstatic.com", "steamcontent.com", "steamusercontent.com", "steamgames.com", "steamserver.net"]},
+  {"id": "playstation", "name": "PlayStation Network", "cat": "Games", "domains": ["playstation.com", "playstation.net", "sonyentertainmentnetwork.com"]},
+  {"id": "xbox", "name": "Xbox Live", "cat": "Games", "domains": ["xboxlive.com", "xbox.com", "xboxservices.com", "gamepass.com"]},
+  {"id": "nintendo", "name": "Nintendo", "cat": "Games", "domains": ["nintendo.net", "nintendo.com", "nintendo-europe.com", "nintendo.co.uk"]},
+  {"id": "ea", "name": "EA games (FC, Apex)", "cat": "Games", "domains": ["ea.com", "origin.com", "eac-cdn.com"]},
+  {"id": "cod", "name": "Call of Duty", "cat": "Games", "domains": ["callofduty.com", "activision.com", "demonware.net"]},
+
+  {"id": "youtube", "name": "YouTube", "cat": "Video", "domains": ["youtube.com", "youtu.be", "ytimg.com", "googlevideo.com", "youtube-nocookie.com", "youtubekids.com", "youtubei.googleapis.com", "youtube.googleapis.com"]},
+  {"id": "netflix", "name": "Netflix", "cat": "Video", "domains": ["netflix.com", "netflix.net", "nflxvideo.net", "nflximg.net", "nflximg.com", "nflxext.com", "nflxso.net"]},
+  {"id": "disneyplus", "name": "Disney+", "cat": "Video", "domains": ["disneyplus.com", "disney-plus.net", "dssott.com", "dssedge.com", "bamgrid.com", "disneystreaming.com"]},
+  {"id": "primevideo", "name": "Prime Video", "cat": "Video", "domains": ["primevideo.com", "amazonvideo.com", "aiv-cdn.net", "aiv-delivery.net", "pv-cdn.net"]},
+  {"id": "twitch", "name": "Twitch", "cat": "Video", "domains": ["twitch.tv", "ttvnw.net", "jtvnw.net", "twitchcdn.net"]},
+
+  {"id": "tiktok", "name": "TikTok", "cat": "Social", "domains": ["tiktok.com", "tiktokv.com", "tiktokv.us", "tiktokcdn.com", "tiktokcdn-us.com", "musical.ly", "byteoversea.com", "ibytedtos.com", "ibyteimg.com"]},
+  {"id": "instagram", "name": "Instagram", "cat": "Social", "domains": ["instagram.com", "cdninstagram.com", "ig.me"]},
+  {"id": "facebook", "name": "Facebook & Messenger", "cat": "Social", "domains": ["facebook.com", "fb.com", "fb.me", "fbcdn.net", "fbsbx.com", "facebook.net", "messenger.com"]},
+  {"id": "snapchat", "name": "Snapchat", "cat": "Social", "domains": ["snapchat.com", "sc-cdn.net", "sc-gw.com", "sc-static.net", "snap-dev.net", "snapkit.co"]},
+  {"id": "twitter", "name": "X / Twitter", "cat": "Social", "domains": ["twitter.com", "x.com", "twimg.com", "t.co"]},
+  {"id": "reddit", "name": "Reddit", "cat": "Social", "domains": ["reddit.com", "redd.it", "redditmedia.com", "redditstatic.com"]},
+  {"id": "pinterest", "name": "Pinterest", "cat": "Social", "domains": ["pinterest.com", "pinterest.co.uk", "pinimg.com"]},
+
+  {"id": "whatsapp", "name": "WhatsApp", "cat": "Chat", "domains": ["whatsapp.com", "whatsapp.net", "wa.me"]},
+  {"id": "discord", "name": "Discord", "cat": "Chat", "domains": ["discord.com", "discord.gg", "discordapp.com", "discordapp.net", "discord.media"]},
+  {"id": "telegram", "name": "Telegram", "cat": "Chat", "domains": ["telegram.org", "telegram.me", "t.me"]},
+  {"id": "chatgpt", "name": "ChatGPT", "cat": "Chat", "domains": ["openai.com", "chatgpt.com", "oaistatic.com", "oaiusercontent.com"]},
+
+  {"id": "spotify", "name": "Spotify", "cat": "Music", "domains": ["spotify.com", "scdn.co", "spotifycdn.com", "spotify.net"]}
+]

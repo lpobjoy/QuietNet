@@ -1,0 +1,522 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>QuietNet</title>
+<style>
+:root{
+  --bg:#f4f6f5; --card:#fff; --ink:#17231f; --muted:#5d6b66; --line:#dfe5e2;
+  --brand:#0f766e; --brand-ink:#fff; --brand-soft:#e0f2ef;
+  --red:#b42318; --red-soft:#fde8e6; --amber:#93540a; --amber-soft:#fdf0d5; --grey-soft:#edf0ef;
+}
+@media (prefers-color-scheme: dark){:root{
+  --bg:#111715; --card:#1b2421; --ink:#e8efec; --muted:#9aa9a3; --line:#2e3a36;
+  --brand:#2bb3a6; --brand-ink:#06211e; --brand-soft:#173530;
+  --red:#ff8a7d; --red-soft:#40201c; --amber:#f2c063; --amber-soft:#3a2d12; --grey-soft:#26302d;
+}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
+button,input,select{font:inherit;color:inherit}
+.wrap{max-width:920px;margin:0 auto;padding:0 16px 64px}
+header{display:flex;align-items:center;gap:12px;flex-wrap:wrap;padding:20px 0 12px}
+.logo{font-size:22px;font-weight:700;letter-spacing:-.01em;display:flex;align-items:center;gap:8px}
+.logo svg{width:28px;height:28px}
+.pill{padding:4px 12px;border-radius:999px;font-size:14px;font-weight:600;background:var(--brand-soft);color:var(--brand)}
+.pill.warn{background:var(--amber-soft);color:var(--amber)} .pill.bad{background:var(--red-soft);color:var(--red)}
+.spacer{flex:1}
+nav{display:flex;gap:4px;border-bottom:1px solid var(--line);margin-bottom:20px;overflow-x:auto}
+nav button{background:none;border:0;padding:10px 14px;font-weight:600;color:var(--muted);border-bottom:3px solid transparent;cursor:pointer;white-space:nowrap}
+nav button.on{color:var(--brand);border-color:var(--brand)}
+.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:18px;margin-bottom:16px}
+h1{font-size:24px;margin:0 0 4px;letter-spacing:-.01em} h2{font-size:18px;margin:0 0 6px} p{margin:0 0 10px}
+.muted{color:var(--muted)} .small{font-size:14px}
+.btn{border:1px solid var(--line);background:var(--card);border-radius:10px;padding:8px 14px;font-weight:600;cursor:pointer;white-space:nowrap}
+.btn:hover{border-color:var(--brand)}
+.btn.primary{background:var(--brand);border-color:var(--brand);color:var(--brand-ink)}
+.btn.danger{background:var(--red);border-color:var(--red);color:var(--card)}
+.btn.link{border:0;background:none;color:var(--brand);padding:4px 6px}
+:focus-visible{outline:3px solid var(--brand);outline-offset:2px}
+.banner{border-radius:12px;padding:14px 16px;margin-bottom:16px;background:var(--red-soft);color:var(--red)}
+.banner.warn{background:var(--amber-soft);color:var(--amber);display:flex;gap:12px;align-items:center;flex-wrap:wrap}
+.row{display:flex;gap:14px;align-items:center;flex-wrap:wrap}
+.stats{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-top:14px}
+.stat{background:var(--grey-soft);border-radius:10px;padding:12px}
+.stat b{display:block;font-size:24px;font-variant-numeric:tabular-nums}
+.switch{position:relative;width:52px;height:30px;flex:none}
+.switch input{opacity:0;width:100%;height:100%;margin:0;cursor:pointer;position:absolute;z-index:1}
+.switch span{position:absolute;inset:0;background:var(--line);border-radius:999px;transition:.15s}
+.switch span::after{content:"";position:absolute;width:24px;height:24px;left:3px;top:3px;background:#fff;border-radius:50%;transition:.15s}
+.switch input:checked+span{background:var(--brand)} .switch input:checked+span::after{left:25px}
+.switch input:focus-visible+span{outline:3px solid var(--brand);outline-offset:2px}
+.devices{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:12px}
+.device{text-align:left;cursor:pointer;margin:0;display:block;width:100%}
+.device:hover{border-color:var(--brand)}
+.device .name{font-weight:700;font-size:17px;overflow-wrap:anywhere}
+.controls{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin:14px 0}
+.chip{border:1px solid var(--line);background:var(--card);border-radius:999px;padding:6px 12px;font-size:14px;font-weight:600;cursor:pointer}
+.chip.on{background:var(--brand);border-color:var(--brand);color:var(--brand-ink)}
+input[type=search],input[type=text],select{border:1px solid var(--line);background:var(--card);border-radius:10px;padding:8px 12px;min-width:0}
+.item{border-top:1px solid var(--line);padding:12px 0}
+.item:first-child{border-top:0}
+.item .top{display:flex;gap:12px;align-items:center}
+.item .info{flex:1;min-width:0}
+.item .title{font-weight:650;overflow-wrap:anywhere}
+.badge{display:inline-block;font-size:12.5px;font-weight:700;padding:2px 8px;border-radius:999px;background:var(--grey-soft);color:var(--muted);margin-left:6px;vertical-align:1px;white-space:nowrap}
+.badge.junk{background:var(--red-soft);color:var(--red)} .badge.suspect{background:var(--amber-soft);color:var(--amber)}
+.badge.blocked{background:var(--brand-soft);color:var(--brand)}
+.hosts{margin:8px 0 0 14px;padding-left:12px;border-left:2px solid var(--line)}
+.hosts .item{padding:8px 0}
+.hosts .title{font-weight:500;font-family:ui-monospace,Menlo,monospace;font-size:14px}
+.expand{background:none;border:0;color:var(--brand);font-size:14px;font-weight:600;padding:2px 0;cursor:pointer}
+.empty{text-align:center;padding:28px 10px;color:var(--muted)}
+.ipbox{font:700 28px ui-monospace,Menlo,monospace;background:var(--brand-soft);color:var(--brand);padding:10px 18px;border-radius:12px;display:inline-block;margin:6px 0 10px;user-select:all}
+details{border-top:1px solid var(--line);padding:10px 0} details:first-of-type{border-top:0}
+summary{font-weight:650;cursor:pointer} details ol{margin:8px 0 4px;padding-left:22px} details li{margin:4px 0}
+.modal{position:fixed;inset:0;background:rgba(0,0,0,.45);display:flex;align-items:center;justify-content:center;padding:16px;z-index:10}
+.modal .card{max-width:440px;width:100%;margin:0}
+.modal input{width:100%;margin:6px 0 4px}
+.modal .row{justify-content:flex-end;margin-top:14px}
+.svcgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:8px;margin:6px 0 12px}
+.svc{display:flex;flex-direction:column;border:1px solid var(--line);background:var(--card);border-radius:10px;padding:8px 12px;cursor:pointer;text-align:left;font-weight:650;font-size:15px}
+.svc small{font-weight:600;color:var(--muted);font-size:12.5px}
+.svc:hover{border-color:var(--brand)}
+.svc.on{background:var(--red-soft);border-color:var(--red);color:var(--red)} .svc.on small{color:var(--red)}
+.svc:disabled{cursor:default}
+.cat{font-size:13px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.04em;margin-top:10px}
+label.check{display:flex;gap:10px;align-items:center;padding:9px 0;border-top:1px solid var(--line);cursor:pointer}
+label.check:first-of-type{border-top:0} label.check input{width:20px;height:20px;flex:none}
+.note{background:var(--amber-soft);color:var(--amber);border-radius:10px;padding:10px 14px;margin:12px 0}
+[hidden]{display:none!important}
+@media (max-width:560px){.stats{grid-template-columns:1fr}.item .top{flex-wrap:wrap}.item .info{flex-basis:100%}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div class="logo">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="color:var(--brand)"><path d="M12 3l8 3v6c0 4.5-3.2 8-8 9-4.8-1-8-4.5-8-9V6l8-3z"/><path d="M9 12l2 2 4-4"/></svg>
+      QuietNet
+    </div>
+    <span id="pill" class="pill">Starting…</span>
+    <span class="spacer"></span>
+    <button class="btn" id="pauseBtn" data-act="pause">Pause advert blocking for 10 minutes</button>
+  </header>
+  <nav>
+    <button data-act="tab" data-tab="home">Devices</button>
+    <button data-act="tab" data-tab="groups">Groups</button>
+    <button data-act="tab" data-tab="rules">Blocked list</button>
+    <button data-act="tab" data-tab="setup">Set up a device</button>
+  </nav>
+  <div id="banners"></div>
+  <main id="view"></main>
+</div>
+<div id="modal" class="modal" hidden></div>
+
+<script>
+const S = {tab:'home', device:null, hours:24, filter:'all', search:'', sort:'n', open:new Set(),
+           status:null, devices:[], activity:[], rules:null,
+           services:[], groups:[], ctl:{}, group:null, svcOpen:false};
+const $ = id => document.getElementById(id);
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const num = n => Number(n || 0).toLocaleString();
+
+async function api(path, body){
+  const r = await fetch(path, body === undefined ? {} :
+    {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)});
+  const j = await r.json().catch(() => ({}));
+  if(!r.ok) throw new Error(j.error || 'Something went wrong. Is QuietNet still running?');
+  return j;
+}
+function ago(ts){
+  if(!ts) return 'never';
+  const s = Date.now()/1000 - ts;
+  if(s < 60) return 'just now';
+  if(s < 3600) return Math.round(s/60) + ' min ago';
+  if(s < 86400) return Math.round(s/3600) + ' hr ago';
+  return Math.round(s/86400) + ' days ago';
+}
+function groupName(id){ return (S.groups.find(g => g.id === id) || {}).name || 'Group'; }
+function deviceName(d){
+  return d.name || (d.this_computer ? 'This computer' : (d.hint || 'Unnamed device'));
+}
+
+/* ---------- pop-up questions ---------- */
+function ask({title, text, input, ok='OK', danger=false, cancel='Cancel'}){
+  return new Promise(resolve => {
+    const m = $('modal');
+    m.innerHTML = `<div class="card" role="dialog" aria-modal="true" aria-label="${esc(title)}">
+      <h2>${esc(title)}</h2><p class="muted">${esc(text || '')}</p>
+      ${input !== undefined ? `<input type="text" id="mInput" maxlength="40" value="${esc(input)}">` : ''}
+      <div class="row">${cancel ? `<button class="btn" id="mNo">${esc(cancel)}</button>` : ''}
+      <button class="btn ${danger ? 'danger' : 'primary'}" id="mYes">${esc(ok)}</button></div></div>`;
+    m.hidden = false;
+    const done = v => { m.hidden = true; m.innerHTML = ''; resolve(v); };
+    $('mYes').onclick = () => done(input !== undefined ? $('mInput').value : true);
+    if(cancel) $('mNo').onclick = () => done(null);
+    m.onkeydown = e => { if(e.key === 'Escape') done(null); if(e.key === 'Enter') $('mYes').click(); };
+    (input !== undefined ? $('mInput') : $('mYes')).focus();
+  });
+}
+const oops = e => ask({title:'That didn\'t work', text:e.message, cancel:''});
+
+/* ---------- top of page ---------- */
+function renderChrome(){
+  const st = S.status;
+  document.querySelectorAll('nav button').forEach(b => b.classList.toggle('on', b.dataset.tab === S.tab));
+  if(!st) return;
+  const pill = $('pill'), pb = $('pauseBtn');
+  let banners = '';
+  if(!st.dns_ok){
+    pill.textContent = 'Not working'; pill.className = 'pill bad';
+    banners += `<div class="banner"><b>QuietNet couldn't start its filter.</b> Another program on this computer is
+      probably already using the same connection (port ${esc(st.dns_port)}). Close QuietNet, restart the computer and
+      try again. <span class="small">Technical detail: ${esc(st.dns_error)}</span></div>`;
+  } else if(st.paused_for > 0){
+    pill.textContent = 'Paused'; pill.className = 'pill warn';
+    banners += `<div class="banner warn"><span><b>Advert blocking is paused</b> for another
+      ${Math.ceil(st.paused_for/60)} min. Blocked services and switched-off devices stay blocked.</span>
+      <button class="btn" data-act="resume">Turn advert blocking back on now</button></div>`;
+  } else {
+    pill.textContent = 'Protecting your home'; pill.className = 'pill';
+  }
+  pb.hidden = st.paused_for > 0 || !st.dns_ok;
+  if($('banners').innerHTML !== banners) $('banners').innerHTML = banners;
+}
+
+/* ---------- internet switch + service blocking, for a device, a group or the whole house ---------- */
+function controls(scope, what){
+  const c = S.ctl[scope];
+  if(!c) return '';
+  const blocked = S.services.filter(v => c.services[v.id].on || c.services[v.id].from);
+  const cats = [...new Set(S.services.map(v => v.cat))];
+  const grid = !S.svcOpen ? '' : cats.map(cat => `<div class="cat">${esc(cat)}</div><div class="svcgrid">` +
+    S.services.filter(v => v.cat === cat).map(v => {
+      const x = c.services[v.id];
+      if(x.from && !x.on) return `<button class="svc on" disabled>${esc(v.name)}<small>Blocked for ${esc(x.from)}</small></button>`;
+      return `<button class="svc ${x.on ? 'on' : ''}" data-act="svc" data-scope="${esc(scope)}" data-s="${esc(v.id)}"
+        data-on="${x.on ? '' : '1'}" aria-pressed="${x.on}">${esc(v.name)}<small>${x.on ? 'Blocked — tap to allow' : 'Allowed'}</small></button>`;
+    }).join('') + '</div>').join('');
+  const isOff = c.off || c.off_from;
+  const net = scope === 'all' ? '' : `<div class="row" style="margin-bottom:16px">
+    <label class="switch"><input type="checkbox" id="netSwitch" data-scope="${esc(scope)}" ${c.off ? '' : 'checked'} aria-label="Internet for ${what}"><span></span></label>
+    <div style="flex:1;min-width:200px"><h2>Internet for ${what} is ${isOff ? 'OFF' : 'on'}</h2>
+    <div class="muted small">${c.off_from && !c.off ? 'Switched off for the ' + esc(c.off_from) + '.' : (c.off ? 'Switch back on to let ' + what + ' use the internet again.' : 'Switch this off to stop ' + what + ' reaching anything at all.')}</div></div></div>`;
+  return `<div class="card">${net}
+    <div class="row"><div style="flex:1;min-width:200px"><h2>Block apps and services for ${what}</h2>
+      <div class="muted small">${blocked.length ? 'Blocked: ' + blocked.map(v => esc(v.name)).join(', ') : 'Nothing blocked.'}</div></div>
+      <button class="btn" data-act="svctoggle">${S.svcOpen ? 'Done' : 'Choose services'}</button></div>${grid}</div>`;
+}
+
+/* ---------- Devices (home) ---------- */
+function viewHome(){
+  const st = S.status || {today:{}};
+  const pct = st.today.total ? Math.round(100 * st.today.blocked / st.today.total) : 0;
+  const cards = S.devices.map(d => `
+    <button class="card device" data-act="open" data-ip="${esc(d.ip)}">
+      <div class="name">${esc(deviceName(d))}</div>
+      <div class="muted small">${esc(d.ip)}${d.hint && d.name ? ' · ' + esc(d.hint) : ''}${d.mac ? ' · ' + esc(d.mac) : ''}</div>
+      <div class="small" style="margin-top:8px">${d.last
+        ? `${num(d.n)} requests today · <b>${num(d.nb)} blocked</b> · active ${ago(d.last)}`
+        : '<span class="muted">Not using QuietNet yet</span>'}</div>
+      ${d.off ? '<span class="badge junk" style="margin:6px 0 0">Internet off</span>' : ''}
+      ${d.group ? `<span class="badge" style="margin:6px 0 0">${esc(groupName(d.group))}</span>` : ''}
+    </button>`).join('');
+  const scanning = st.scan && st.scan.state === 'scanning';
+  return `
+  <div class="card">
+    <div class="row">
+      <label class="switch"><input type="checkbox" id="junkSwitch" ${st.junk_on ? 'checked' : ''} aria-label="Block known adverts and trackers automatically"><span></span></label>
+      <div style="flex:1;min-width:200px"><h2>Block known adverts and trackers automatically</h2>
+      <div class="muted small">QuietNet knows about ${num(st.junk_count)} junk addresses.
+        ${st.community && !st.community.installed ? '<button class="btn link" data-act="tab" data-tab="rules">Get the full list</button>' : ''}</div></div>
+    </div>
+    <div class="stats">
+      <div class="stat"><b>${num(st.today.total)}</b><span class="muted small">requests in the last 24 hours</span></div>
+      <div class="stat"><b>${num(st.today.blocked)}</b><span class="muted small">blocked</span></div>
+      <div class="stat"><b>${pct}%</b><span class="muted small">of traffic was junk</span></div>
+    </div>
+  </div>
+  <div class="row"><div style="flex:1;min-width:200px"><h2>Your devices</h2>
+    <p class="muted">Pick a device to see what it has been talking to, or to block things for it.</p></div>
+    <button class="btn" data-act="scan" ${scanning ? 'disabled' : ''}>${scanning ? 'Looking… (about 10 seconds)' : 'Find devices on my network'}</button></div>
+  ${cards ? `<div class="devices">${cards}</div>` : `<div class="card empty">
+    <p><b>No devices yet.</b></p><p>QuietNet can only see devices that have been pointed at it.</p>
+    <button class="btn primary" data-act="tab" data-tab="setup">Show me how to set up a device</button></div>`}`;
+}
+
+/* ---------- One device ---------- */
+function statusBadges(x){
+  let out = '';
+  if(x.v === 'junk') out += '<span class="badge junk">Advert / tracker</span>';
+  else if(x.v === 'suspect') out += '<span class="badge suspect">Possibly junk</span>';
+  if(x.b) out += `<span class="badge blocked">${x.why === 'you' ? 'Blocked by you' : x.why === 'service' ? 'Blocked · ' + esc(x.svc)
+    : x.why === 'off' ? 'Internet off' : 'Blocked automatically'}</span>`;
+  else if(x.some_blocked) out += '<span class="badge blocked">Partly blocked</span>';
+  else if(x.why === 'allowed') out += '<span class="badge">Allowed by you</span>';
+  return out;
+}
+function blockBtn(x, domain){
+  if(x.why === 'service' || x.why === 'off') return '';   // managed with the switches at the top of the page
+  return x.b
+    ? `<button class="btn" data-act="unblock" data-d="${esc(domain)}">Unblock</button>`
+    : `<button class="btn ${x.v === 'ok' ? '' : 'primary'}" data-act="block" data-d="${esc(domain)}" data-v="${x.v}">Block</button>`;
+}
+function activityList(){
+  const q = S.search.trim().toLowerCase();
+  let list = S.activity.filter(g => {
+    if(S.filter === 'junk' && !(g.v !== 'ok')) return false;
+    if(S.filter === 'blocked' && !(g.b || g.some_blocked)) return false;
+    if(q && !(g.base.includes(q) || g.owner.toLowerCase().includes(q) || g.hosts.some(h => h.d.includes(q)))) return false;
+    return true;
+  });
+  if(S.sort === 'last') list = [...list].sort((a,b) => b.last - a.last);
+  if(!S.activity.length) return `<div class="empty">Nothing recorded for this device in this time period.</div>`;
+  if(!list.length) return `<div class="empty">Nothing matches.</div>`;
+  return list.map(g => {
+    const open = S.open.has(g.base), many = g.hosts.length > 1 || g.hosts[0].d !== g.base;
+    const hosts = open ? `<div class="hosts">${g.hosts.map(h => `
+      <div class="item"><div class="top"><div class="info"><span class="title">${esc(h.d)}</span>${statusBadges(h)}
+        <div class="muted small">${h.n === 1 ? 'once' : num(h.n) + ' times'} · last ${ago(h.last)}</div></div>${blockBtn(h, h.d)}</div></div>`).join('')}</div>` : '';
+    return `<div class="item"><div class="top">
+      <div class="info"><span class="title">${esc(g.owner || g.base)}</span>${statusBadges(g)}
+        <div class="muted small">${g.owner ? esc(g.base) + ' · ' : ''}contacted ${g.n === 1 ? 'once' : num(g.n) + ' times'}${g.nb ? ' (' + num(g.nb) + ' blocked)' : ''} · last ${ago(g.last)}</div>
+        ${many ? `<button class="expand" data-act="expand" data-b="${esc(g.base)}" aria-expanded="${open}">${open ? 'Hide' : 'Show'} ${g.hosts.length} address${g.hosts.length > 1 ? 'es' : ''}</button>` : ''}
+      </div>${blockBtn(g, g.base)}</div>${hosts}</div>`;
+  }).join('');
+}
+function viewDevice(){
+  const d = S.devices.find(x => x.ip === S.device) || {ip:S.device, name:''};
+  const chip = (id, label) => `<button class="chip ${S.filter === id ? 'on' : ''}" data-act="filter" data-f="${id}">${label}</button>`;
+  return `
+  <button class="btn link" data-act="back">← All devices</button>
+  <div class="row" style="margin:6px 0 2px"><h1>${esc(deviceName(d))}</h1>
+    <button class="btn link" data-act="rename">Rename</button></div>
+  <div class="muted">${esc(d.ip)}${d.hint ? ' · ' + esc(d.hint) : ''}${d.mac ? ' · ' + esc(d.mac) : ''}</div>
+  <div class="row" style="margin:10px 0 14px"><label for="groupSel">Group:</label>
+    <select id="groupSel"><option value="">None</option>${S.groups.map(g =>
+      `<option value="${g.id}" ${d.group === g.id ? 'selected' : ''}>${esc(g.name)}</option>`).join('')}</select>
+    ${S.groups.length ? '' : '<button class="btn link" data-act="tab" data-tab="groups">Create a group</button>'}</div>
+  ${d.last ? '' : `<div class="note"><b>This device isn't using QuietNet yet</b>, so nothing can be seen or blocked for it.
+    <button class="btn link" data-act="tab" data-tab="setup">Show me how to set it up</button></div>`}
+  ${controls('device:' + S.device, 'this device')}
+  <h2>What it has been talking to</h2>
+  <div class="controls">
+    ${chip('all','Everything')}${chip('junk','Adverts &amp; suspicious')}${chip('blocked','Blocked')}
+    <span class="spacer"></span>
+    <select id="hours" aria-label="Time period">
+      <option value="1">Last hour</option><option value="24">Last 24 hours</option><option value="168">Last 7 days</option></select>
+    <select id="sort" aria-label="Sort by"><option value="n">Most contacted first</option><option value="last">Most recent first</option></select>
+    <input type="search" id="search" placeholder="Search…" aria-label="Search" value="${esc(S.search)}">
+  </div>
+  <div class="card" id="list">${activityList()}</div>
+  <p class="small muted">This list updates by itself every few seconds.
+    <button class="btn link" data-act="clear">Forget this device's history</button></p>`;
+}
+
+/* ---------- Groups ---------- */
+function viewGroups(){
+  const cards = S.groups.map(g => `
+    <button class="card device" data-act="opengroup" data-id="${g.id}">
+      <div class="name">${esc(g.name)}</div>
+      <div class="muted small">${g.members.length} device${g.members.length === 1 ? '' : 's'}</div>
+      <div class="small" style="margin-top:8px">${g.services} service${g.services === 1 ? '' : 's'} blocked</div>
+      ${g.off ? '<span class="badge junk" style="margin:6px 0 0">Internet off</span>' : ''}
+    </button>`).join('');
+  return `<div class="row"><div style="flex:1;min-width:200px"><h2>Groups</h2>
+    <p class="muted">Put devices together — for example "Kids" or "TVs" — and control them all at once.</p></div>
+    <button class="btn primary" data-act="newgroup">New group</button></div>
+    ${cards ? `<div class="devices">${cards}</div>` : '<div class="card empty">No groups yet.</div>'}`;
+}
+function viewGroup(){
+  const g = S.groups.find(x => x.id === S.group);
+  if(!g) return viewGroups();
+  const members = S.devices.map(d => `<label class="check">
+    <input type="checkbox" class="member" data-ip="${esc(d.ip)}" ${d.group === g.id ? 'checked' : ''}>
+    <span><b>${esc(deviceName(d))}</b> <span class="muted small">${esc(d.ip)}${d.group && d.group !== g.id ? ' · currently in ' + esc(groupName(d.group)) : ''}</span></span></label>`).join('');
+  return `<button class="btn link" data-act="groupback">← All groups</button>
+    <div class="row" style="margin:6px 0 12px"><h1>${esc(g.name)}</h1>
+      <button class="btn link" data-act="grouprename">Rename</button>
+      <button class="btn link" data-act="groupdelete">Delete group</button></div>
+    ${controls('group:' + g.id, 'this group')}
+    <div class="card"><h2>Devices in this group</h2>
+      ${members || '<div class="empty">No devices found yet. Press "Find devices on my network" on the Devices page.</div>'}</div>`;
+}
+
+/* ---------- Blocked list ---------- */
+function viewRules(){
+  const r = S.rules || {blocked:[], allowed:[]}, c = (S.status || {}).community || {};
+  const rows = (list, label) => list.length ? list.map(x => `
+    <div class="item"><div class="top"><div class="info"><span class="title">${esc(x.d)}</span>
+      <div class="muted small">${x.owner ? esc(x.owner) + ' · ' : ''}added ${ago(x.ts)}</div></div>
+      <button class="btn" data-act="forget" data-d="${esc(x.d)}">${label}</button></div></div>`).join('')
+    : '<div class="empty">Nothing here yet.</div>';
+  let listInfo = c.installed
+    ? `Installed: ${num(c.count)} junk addresses, last updated ${ago(c.updated)}.`
+    : 'Not downloaded yet. QuietNet is using its small built-in list.';
+  if(c.state === 'downloading') listInfo = 'Downloading… this takes a few seconds.';
+  if(c.state === 'error') listInfo = 'The download didn\'t work — check the internet connection and try again. (' + esc(c.error) + ')';
+  return `
+  ${controls('all', 'the whole house')}
+  <div class="card"><h2>Block an address yourself</h2>
+    <p class="muted small">Type a website or address, for example <i>ads.example.com</i>. Everything under it is blocked too.</p>
+    <div class="row"><input type="text" id="addBox" placeholder="example.com" style="flex:1" aria-label="Address to block">
+      <button class="btn primary" data-act="add">Block</button></div></div>
+  <div class="card"><h2>Blocked by you</h2>${rows(r.blocked, 'Unblock')}</div>
+  <div class="card"><h2>Always allowed</h2>
+    <p class="muted small">Addresses you unblocked even though they're on the junk list.</p>${rows(r.allowed, 'Remove')}</div>
+  <div class="card"><h2>The full junk list</h2>
+    <p class="muted small">A free list of well over 100,000 known advert and tracker addresses, kept up to date by volunteers
+      (the StevenBlack list). Downloading it makes automatic blocking far more thorough.</p>
+    <p class="small">${listInfo}</p>
+    <button class="btn ${c.installed ? '' : 'primary'}" data-act="getlist" ${c.state === 'downloading' ? 'disabled' : ''}>
+      ${c.installed ? 'Update the list' : 'Download the full list'}</button></div>`;
+}
+
+/* ---------- Set up a device ---------- */
+function viewSetup(){
+  const ip = esc((S.status || {}).ip || '…');
+  const step = (title, steps) => `<details><summary>${title}</summary><ol>${steps.map(s => `<li>${s}</li>`).join('')}</ol></details>`;
+  return `
+  <div class="card"><h2>How to point a device at QuietNet</h2>
+    <p>Every device has a setting called <b>DNS</b>. Change it to this number and QuietNet can see and filter that device:</p>
+    <div class="ipbox">${ip}</div>
+    <p class="muted small">To undo it at any time, set DNS back to <b>Automatic</b> on the device.</p>
+    ${step('iPhone or iPad', ['Open <b>Settings</b> → <b>Wi-Fi</b>.', 'Tap the ⓘ next to your home Wi-Fi.', 'Tap <b>Configure DNS</b> → <b>Manual</b>.', 'Delete any numbers already there, tap <b>Add Server</b> and type <b>' + ip + '</b>.', 'Tap <b>Save</b>.'])}
+    ${step('Android phone or tablet', ['Open <b>Settings</b> → <b>Network &amp; internet</b> → <b>Internet</b> (or <b>Wi-Fi</b>).', 'Tap the cog next to your home Wi-Fi, then the pencil / <b>Advanced</b>.', 'Change <b>IP settings</b> to <b>Static</b> and type <b>' + ip + '</b> in <b>DNS 1</b>. Leave the rest as it is.', 'Save. Also check <b>Settings → Network → Private DNS</b> is <b>Off</b>.'])}
+    ${step('Smart TV, streaming stick or games console', ['Open the TV\'s <b>Network</b> settings and choose your connection.', 'Look for <b>Advanced</b>, <b>Manual</b> or <b>DNS settings</b>.', 'Set <b>DNS</b> (or "Primary DNS") to <b>' + ip + '</b>. Leave everything else on automatic.'])}
+    ${step('Windows PC', ['Open <b>Settings</b> → <b>Network &amp; internet</b> → <b>Wi-Fi</b> → <b>Hardware properties</b>.', 'Next to <b>DNS server assignment</b> choose <b>Edit</b> → <b>Manual</b>.', 'Turn on <b>IPv4</b> and type <b>' + ip + '</b> as the <b>Preferred DNS</b>. Save.'])}
+    ${step('Mac', ['Open <b>System Settings</b> → <b>Network</b> → <b>Wi-Fi</b> → <b>Details…</b>', 'Choose <b>DNS</b>, press <b>+</b> and type <b>' + ip + '</b>.', 'Remove any other numbers in the list and press <b>OK</b>.'])}
+    ${step('The whole house at once (via your router)', ['Log in to your router (the address and password are usually on a sticker on it).', 'Find the <b>DHCP</b> or <b>LAN</b> settings and look for <b>DNS server</b>.', 'Set it to <b>' + ip + '</b> and save. Devices pick it up next time they reconnect to Wi-Fi.', '<b>Careful:</b> the internet will then seem broken for everyone whenever this computer is off or asleep.'])}
+  </div>
+  <div class="card"><h2>Good to know</h2>
+    <p><b>Keep this computer on.</b> Devices pointed at QuietNet need it running. If it's off or asleep, they won't be able to load anything.</p>
+    <p><b>Something stopped working?</b> Press <i>Pause advert blocking for 10 minutes</i> at the top. If that fixes it, look at the device's list for something recently blocked and unblock it.</p>
+    <p><b>What QuietNet can and can't see.</b> It sees <i>which addresses</i> a device contacts (like <i>ads.example.com</i>), not the pages, messages or passwords — those stay private. It can't remove adverts that come from the same address as the real content (YouTube adverts are the well-known example).</p>
+    <p><b>Blocking a service isn't instant.</b> A device can carry on for a few minutes until it next looks the address up. If an app still works after that, look in the device's list for what it's using and block that too.</p>
+    <p><b>Devices are recognised by their number</b> (like 192.168.1.23). If your router gives a device a new number, its name, group and blocks won't follow it — "reserving" the number in your router avoids that.</p>
+    <p><b>The number above can change</b> if your router hands this computer a new one. If devices suddenly stop working, come back here and check it. Your router can usually "reserve" the number so it stays put.</p>
+    <p class="muted small">Everyone in the house should know this is running — it records which services each device talks to. History is kept for 30 days on this computer only.</p>
+  </div>`;
+}
+
+/* ---------- drawing & refreshing ---------- */
+let lastView = '';
+function drawList(){ const h = activityList(), el = $('list'); if(el && el.dataset.h !== h){ el.innerHTML = h; el.dataset.h = h; } }
+function render(){
+  renderChrome();
+  const v = S.tab === 'rules' ? viewRules() : S.tab === 'setup' ? viewSetup()
+    : S.tab === 'groups' ? (S.group ? viewGroup() : viewGroups()) : S.device ? viewDevice() : viewHome();
+  if(v !== lastView){ $('view').innerHTML = v; lastView = v; }
+  if($('hours')){ $('hours').value = S.hours; $('sort').value = S.sort; }
+}
+function softRender(){
+  // Refresh without disturbing anything the person is typing into or reading.
+  renderChrome();
+  const a = document.activeElement;
+  if(a && (a.id === 'addBox' || a.tagName === 'SELECT')) return;
+  if(S.tab === 'home' && S.device && $('list')) drawList();
+  else if(S.tab !== 'setup' && !document.querySelector('details[open]')) render();
+}
+async function refresh(hard){
+  try{
+    const jobs = [api('/api/status').then(x => S.status = x)];
+    const ctl = scope => api('/api/controls?scope=' + encodeURIComponent(scope)).then(x => S.ctl[scope] = x);
+    if(!S.services.length) jobs.push(api('/api/services').then(x => S.services = x));
+    if(S.tab === 'home' || S.tab === 'groups')
+      jobs.push(api('/api/devices').then(x => S.devices = x), api('/api/groups').then(x => S.groups = x));
+    if(S.tab === 'home' && S.device) jobs.push(ctl('device:' + S.device));
+    if(S.tab === 'groups' && S.group) jobs.push(ctl('group:' + S.group));
+    if(S.tab === 'rules') jobs.push(ctl('all'));
+    if(S.tab === 'home' && S.device)
+      jobs.push(api(`/api/activity?ip=${encodeURIComponent(S.device)}&hours=${S.hours}`).then(x => S.activity = x));
+    if(S.tab === 'rules') jobs.push(api('/api/rules').then(x => S.rules = x));
+    await Promise.all(jobs);
+  }catch(e){
+    $('pill').textContent = 'Not running'; $('pill').className = 'pill bad';
+    return;
+  }
+  hard ? render() : softRender();
+}
+
+const actions = {
+  tab(d){ S.tab = d.tab; S.device = null; S.group = null; S.svcOpen = false; refresh(true); },
+  svctoggle(){ S.svcOpen = !S.svcOpen; render(); },
+  async svc(d){ await api('/api/service-block', {scope:d.scope, service:d.s, on:!!d.on}).catch(oops); refresh(true); },
+  async scan(){ await api('/api/scan', {}).catch(oops); refresh(true); },
+  opengroup(d){ S.group = +d.id; S.svcOpen = false; refresh(true); },
+  groupback(){ S.group = null; refresh(true); },
+  async newgroup(){
+    const name = await ask({title:'New group', text:'For example "Kids", "TVs" or "Guests".', input:'', ok:'Create'});
+    if(!name || !name.trim()) return;
+    try{ S.group = (await api('/api/group', {name})).id; }catch(e){ oops(e); }
+    refresh(true);
+  },
+  async grouprename(){
+    const name = await ask({title:'Rename group', input:groupName(S.group), ok:'Save'});
+    if(!name || !name.trim()) return;
+    await api('/api/group', {id:S.group, name}).catch(oops); refresh(true);
+  },
+  async groupdelete(){
+    const yes = await ask({title:'Delete this group?', ok:'Delete', danger:true,
+      text:'The devices stay, but anything blocked or switched off for the group is switched back on.'});
+    if(!yes) return;
+    await api('/api/group-delete', {id:S.group}).catch(oops); S.group = null; refresh(true);
+  },
+  open(d){ S.device = d.ip; S.activity = []; S.open.clear(); S.search = ''; S.filter = 'all'; S.svcOpen = false; refresh(true); },
+  back(){ S.device = null; refresh(true); },
+  filter(d){ S.filter = d.f; render(); },
+  expand(d){ S.open.has(d.b) ? S.open.delete(d.b) : S.open.add(d.b); drawList(); },
+  async block(d){
+    if(d.v === 'ok'){
+      const yes = await ask({title:`Block ${d.d}?`, ok:'Block it', danger:true,
+        text:'This doesn\'t look like an advert or tracker. Blocking it might stop an app or website from working. You can unblock it again at any time.'});
+      if(!yes) return;
+    }
+    await api('/api/block', {domain:d.d}).catch(oops); refresh();
+  },
+  async unblock(d){ await api('/api/unblock', {domain:d.d}).catch(oops); refresh(); },
+  async forget(d){ await api('/api/forget', {domain:d.d}).catch(oops); refresh(true); },
+  async add(){
+    const v = $('addBox').value;
+    if(!v.trim()) return;
+    try{ await api('/api/block', {domain:v}); $('addBox').value = ''; refresh(true); }catch(e){ oops(e); }
+  },
+  async rename(){
+    const d = S.devices.find(x => x.ip === S.device) || {};
+    const name = await ask({title:'Name this device', text:'For example "Living room TV" or "Sam\'s iPad".', input:d.name || '', ok:'Save'});
+    if(name === null) return;
+    await api('/api/device-name', {ip:S.device, name}).catch(oops); refresh(true);
+  },
+  async clear(){
+    const yes = await ask({title:'Forget this device\'s history?', ok:'Forget it', danger:true,
+      text:'The list of what this device has contacted will be wiped. Your blocked list is not affected.'});
+    if(!yes) return;
+    await api('/api/clear-history', {ip:S.device}).catch(oops); S.device = null; refresh(true);
+  },
+  async pause(){ await api('/api/pause', {minutes:10}).catch(oops); refresh(); },
+  async resume(){ await api('/api/pause', {minutes:0}).catch(oops); refresh(); },
+  async getlist(){ await api('/api/update-list', {}).catch(oops); refresh(true); },
+};
+document.addEventListener('click', e => {
+  const t = e.target.closest('[data-act]');
+  if(t && actions[t.dataset.act]) actions[t.dataset.act](t.dataset);
+});
+document.addEventListener('change', async e => {
+  if(e.target.id === 'junkSwitch'){ await api('/api/junk-switch', {on:e.target.checked}).catch(oops); refresh(); }
+  if(e.target.id === 'netSwitch'){ await api('/api/internet', {scope:e.target.dataset.scope, off:!e.target.checked}).catch(oops); refresh(true); }
+  if(e.target.id === 'groupSel'){ await api('/api/device-group', {ip:S.device, group:e.target.value ? +e.target.value : null}).catch(oops); e.target.blur(); refresh(true); }
+  if(e.target.classList.contains('member')){ await api('/api/device-group', {ip:e.target.dataset.ip, group:e.target.checked ? S.group : null}).catch(oops); refresh(true); }
+  if(e.target.id === 'hours'){ S.hours = +e.target.value; refresh(); }
+  if(e.target.id === 'sort'){ S.sort = e.target.value; drawList(); }
+});
+document.addEventListener('input', e => {
+  if(e.target.id === 'search'){ S.search = e.target.value; drawList(); }
+});
+document.addEventListener('keydown', e => { if(e.key === 'Enter' && e.target.id === 'addBox') actions.add(); });
+
+refresh(true);
+setInterval(() => { if($('modal').hidden) refresh(); }, 4000);
+</script>
+</body>
+</html>

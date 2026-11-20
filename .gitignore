@@ -1,0 +1,5 @@
+# Your household's history, blocked list and downloaded lists stay on your computer.
+data/
+__pycache__/
+*.pyc
+.DS_Store
