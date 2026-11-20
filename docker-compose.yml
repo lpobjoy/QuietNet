@@ -1,0 +1,20 @@
+# Start QuietNet on a Raspberry Pi (or any Linux box) with:  docker compose up -d
+#
+# host networking is required: QuietNet has to see the real home network to know
+# which device is which, answer DNS on port 53, and (later) enforce blocks on the LAN.
+services:
+  quietnet:
+    build: .
+    container_name: quietnet
+    network_mode: host
+    restart: unless-stopped
+    volumes:
+      - quietnet-data:/data
+    # NET_ADMIN + NET_RAW are needed for the network scan and the live-connection
+    # enforcer. They only grant access to this machine's own network.
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+
+volumes:
+  quietnet-data:

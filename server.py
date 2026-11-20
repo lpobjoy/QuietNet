@@ -27,12 +27,14 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-DATA = os.path.join(HERE, "data")
+DATA = os.environ.get("QUIETNET_DATA") or os.path.join(HERE, "data")   # where history and rules are kept
 STATIC = os.path.join(HERE, "static")
 COMMUNITY_FILE = os.path.join(DATA, "community_list.txt")
 COMMUNITY_URL = "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts"
 UPSTREAMS = [("1.1.1.1", 53), ("8.8.8.8", 53)]
 KEEP_DAYS = 30
+MAX_TTL = 120   # seconds a device may remember an answer, so new blocks and schedules bite within ~2 minutes
+CLOCK = re.compile(r"([01]\d|2[0-3]):[0-5]\d")
 VALID_NAME = re.compile(r"[a-z0-9_-]+(\.[a-z0-9_-]+)+")
 IGNORED_ENDINGS = (".arpa", ".local", ".lan", ".home", ".internal")
 # The system's own tool for listing network neighbours. Look in the usual places
@@ -110,6 +112,8 @@ class State:
     off = set()             # scopes whose internet is switched off
     dev_group = {}          # device ip -> group id
     group_names = {}        # group id -> name
+    schedules = []          # timed rules, e.g. bedtime (see load_schedules)
+    sched_cache = (0.0, [])  # (when worked out, schedules in force at that moment)
     scan_state = "idle"     # idle | scanning
     scan_ts = 0.0
 
@@ -143,6 +147,8 @@ def init_db():
         CREATE TABLE IF NOT EXISTS devices(ip TEXT PRIMARY KEY, name TEXT);
         CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT);
         CREATE TABLE IF NOT EXISTS groups(id INTEGER PRIMARY KEY, name TEXT);
+        CREATE TABLE IF NOT EXISTS schedules(id INTEGER PRIMARY KEY, name TEXT, scope TEXT, days TEXT,
+            t_from TEXT, t_to TEXT, off INTEGER, services TEXT, enabled INTEGER);
         CREATE TABLE IF NOT EXISTS seen(ip TEXT PRIMARY KEY, mac TEXT, host TEXT, ts REAL);
         CREATE TABLE IF NOT EXISTS device_group(ip TEXT PRIMARY KEY, gid INTEGER);
         CREATE TABLE IF NOT EXISTS service_blocks(scope TEXT, service TEXT, PRIMARY KEY(scope, service));
@@ -157,6 +163,7 @@ def init_db():
     S.svc_blocks = {}
     for scope, service in sql("SELECT scope, service FROM service_blocks"):
         S.svc_blocks.setdefault(scope, set()).add(service)
+    load_schedules()
     S.junk_on = get_setting("junk_on", "1") == "1"
     S.paused_until = float(get_setting("paused_until", "0"))
 
@@ -213,6 +220,38 @@ def is_junk(domain):
     return any(s in S.junk_builtin or s in S.junk_community for s in suffixes(domain))
 
 
+def load_schedules():
+    S.schedules = [
+        {"id": r[0], "name": r[1], "scope": r[2], "days": [int(c) for c in r[3]], "start": r[4], "end": r[5],
+         "off": bool(r[6]), "services": json.loads(r[7]), "enabled": bool(r[8])}
+        for r in sql("SELECT id,name,scope,days,t_from,t_to,off,services,enabled FROM schedules ORDER BY id")]
+    S.sched_cache = (0.0, [])
+
+
+def clock_minutes(hhmm):
+    return int(hhmm[:2]) * 60 + int(hhmm[3:])
+
+
+def schedule_in_force(x, now=None):
+    """Is this schedule's time window open right now (by this computer's clock)?"""
+    t = time.localtime(now)
+    mins, day = t.tm_hour * 60 + t.tm_min, t.tm_wday      # Monday is day 0
+    start, end = clock_minutes(x["start"]), clock_minutes(x["end"])
+    if start < end:
+        return day in x["days"] and start <= mins < end
+    # Overnight, e.g. 21:00 to 07:00: the evening belongs to today, the early morning to yesterday's schedule.
+    return (day in x["days"] and mins >= start) or ((day - 1) % 7 in x["days"] and mins < end)
+
+
+def active_schedules():
+    stamp, active = S.sched_cache
+    now = time.time()
+    if now - stamp > 5:
+        active = [x for x in S.schedules if x["enabled"] and schedule_in_force(x, now)]
+        S.sched_cache = (now, active)
+    return active
+
+
 def scopes_for(client):
     """Every set of rules that applies to a device: the whole house, itself, and its group."""
     out = ["all"]
@@ -221,6 +260,11 @@ def scopes_for(client):
         if client in S.dev_group:
             out.append("group:%d" % S.dev_group[client])
     return out
+
+
+def internet_off_for(client):
+    scopes = scopes_for(client)
+    return any(sc in S.off for sc in scopes) or any(x["off"] for x in active_schedules() if x["scope"] in scopes)
 
 
 def scope_label(scope):
@@ -232,25 +276,35 @@ def scope_label(scope):
 
 
 def decision(domain, client=None, paused=False):
-    """Returns (blocked?, why, detail). why is 'off', 'you', 'allowed', 'service', 'list' or None.
+    """Returns (blocked?, why, detail).
 
+    why is 'kill', 'off', 'schedule', 'you', 'allowed', 'service', 'list' or None.
     'paused' only pauses advert blocking and your own address blocks -
-    blocked services and switched-off devices stay blocked."""
+    the kill switch, schedules, blocked services and switched-off devices stay in force."""
+    if "all" in S.off:
+        return True, "kill", ""
     scopes = scopes_for(client)
     if any(sc in S.off for sc in scopes):
         return True, "off", ""
+    timed = [x for x in active_schedules() if x["scope"] in scopes]
+    for x in timed:
+        if x["off"]:
+            return True, "schedule", x["name"]
     names = suffixes(domain)
     for s in names:
-        if s in S.blocked:
-            if paused:
-                break
+        if s in S.blocked and not paused:
             return True, "you", ""
         if s in S.allowed:
             return False, "allowed", ""
     for s in names:
         svc = S.dom2svc.get(s)
-        if svc and any(svc in S.svc_blocks.get(sc, ()) for sc in scopes):
+        if not svc:
+            continue
+        if any(svc in S.svc_blocks.get(sc, ()) for sc in scopes):
             return True, "service", S.svc_names[svc]
+        for x in timed:
+            if svc in x["services"]:
+                return True, "schedule", x["name"]
     if not paused and S.junk_on and is_junk(domain):
         return True, "list", ""
     return False, None, ""
@@ -293,7 +347,7 @@ def unblock(domain):
     with db_lock:
         S.blocked.discard(domain)
         db.execute("DELETE FROM blocked WHERE domain=?", (domain,))
-        if decision(domain)[0]:  # still blocked by the list or a wider block: make an exception
+        if decision(domain)[1] == "list":  # the advert list still blocks it: keep it allowed from now on
             S.allowed.add(domain)
             db.execute("INSERT OR REPLACE INTO allowed VALUES(?,?)", (domain, time.time()))
         db.commit()
@@ -369,6 +423,46 @@ def blocked_reply(data, qtype, qend):
     return reply(data, qend, 0, answer)
 
 
+def cap_ttls(resp, limit=MAX_TTL):
+    """Shorten how long a device may remember an answer.
+
+    Without this a device can keep using an address for hours after it has been
+    blocked, which would make bedtime schedules and the kill switch very slow to bite."""
+    try:
+        buf = bytearray(resp)
+        counts = [int.from_bytes(buf[i:i + 2], "big") for i in (4, 6, 8, 10)]
+
+        def skip_name(pos):
+            while True:
+                n = buf[pos]
+                if n == 0:
+                    return pos + 1
+                if n & 0xC0 == 0xC0:          # a compression pointer ends the name
+                    return pos + 2
+                if n & 0xC0:                  # reserved label type: this isn't a name we understand
+                    raise ValueError("reserved label byte")
+                pos += 1 + n
+
+        pos = 12
+        for _ in range(counts[0]):
+            pos = skip_name(pos) + 4
+        for _ in range(sum(counts[1:])):
+            pos = skip_name(pos)
+            if pos + 10 > len(buf):
+                raise ValueError("record header runs off the end")
+            rtype = int.from_bytes(buf[pos:pos + 2], "big")
+            if rtype != 41 and int.from_bytes(buf[pos + 4:pos + 8], "big") > limit:   # 41 = settings record, not an answer
+                buf[pos + 4:pos + 8] = limit.to_bytes(4, "big")
+            pos += 10 + int.from_bytes(buf[pos + 8:pos + 10], "big")
+        # Only trust the rewrite if every record lined up and we landed exactly at the end.
+        # Anything else means we misread the packet, so hand back the untouched original.
+        if pos != len(buf):
+            return resp
+        return bytes(buf)
+    except (IndexError, ValueError):
+        return resp
+
+
 def forward_udp(data):
     for up in UPSTREAMS:
         try:
@@ -419,7 +513,8 @@ def answer_query(data, client, forwarder):
         log_q.put((time.time(), client, name, 1 if blocked else 0))
     if blocked:
         return blocked_reply(data, qtype, qend)
-    return forwarder(data) or reply(data, qend, 2)
+    resp = forwarder(data)
+    return cap_ttls(resp) if resp else reply(data, qend, 2)
 
 
 def udp_server(sock):
@@ -485,15 +580,44 @@ def find_local_ip():
         return "127.0.0.1"
 
 
+def neighbours():
+    """Which devices this computer currently knows about: {ip: mac}.
+
+    Reads the operating system's own neighbour table. On Linux (e.g. a Raspberry Pi)
+    that's /proc/net/arp - no extra tools needed, so it works in a plain container.
+    On macOS it reads the built-in `arp` command."""
+    out = {}
+    if os.path.exists("/proc/net/arp"):
+        try:
+            with open("/proc/net/arp") as f:
+                for line in f.readlines()[1:]:
+                    cols = line.split()
+                    if len(cols) >= 4 and re.fullmatch(r"[0-9a-f:]{17}", cols[3]) and cols[3] != "00:00:00:00:00:00":
+                        out[cols[0]] = cols[3]
+        except OSError:
+            pass
+        return out
+    try:
+        text = subprocess.run([ARP, "-an"], capture_output=True, text=True, timeout=20).stdout
+        for line in text.splitlines():
+            m = re.search(r"\((\d+\.\d+\.\d+\.\d+)\) at ([0-9a-fA-F:]{11,17})", line)
+            if m:
+                mac = ":".join(part.zfill(2) for part in m.group(2).lower().split(":"))
+                if mac != "ff:ff:ff:ff:ff:ff":
+                    out[m.group(1)] = mac
+    except (OSError, ValueError):
+        pass
+    return out
+
+
 def hint_refresher():
     while True:
         try:
-            out = subprocess.run([ARP, "-a"], capture_output=True, text=True, timeout=20).stdout
             hints = {}
-            for line in out.splitlines():
-                m = re.match(r"(\S+) \((\d+\.\d+\.\d+\.\d+)\)", line)
-                if m and m.group(1) != "?":
-                    hints[m.group(2)] = m.group(1).split(".")[0]
+            for ip, mac in neighbours().items():
+                name = reverse_name(ip)
+                if name:
+                    hints[ip] = name
             S.hints = hints
         except Exception:
             pass
@@ -523,15 +647,8 @@ def scan_network():
                     except OSError:
                         pass
                 time.sleep(1.2)
-        out = subprocess.run([ARP, "-an"], capture_output=True, text=True, timeout=20).stdout
-        found = {}
-        for line in out.splitlines():
-            m = re.search(r"\((\d+\.\d+\.\d+\.\d+)\) at ([0-9a-fA-F:]{11,17})", line)
-            if not m or not m.group(1).startswith(prefix) or m.group(1).endswith(".255"):
-                continue
-            mac = ":".join(part.zfill(2) for part in m.group(2).lower().split(":"))
-            if mac != "ff:ff:ff:ff:ff:ff":
-                found[m.group(1)] = mac
+        found = {ip: mac for ip, mac in neighbours().items()
+                 if ip.startswith(prefix) and not ip.endswith(".255")}
         found.setdefault(S.local_ip, "")
         pool = ThreadPoolExecutor(max_workers=32)
         jobs = {ip: pool.submit(reverse_name, ip) for ip in found}
@@ -562,6 +679,7 @@ def api_status():
     return {
         "ip": S.local_ip, "dns_ok": S.dns_error is None, "dns_error": S.dns_error, "dns_port": S.dns_port,
         "paused_for": max(0, int(S.paused_until - now)), "junk_on": S.junk_on,
+        "kill": "all" in S.off, "clock": time.strftime("%H:%M"),
         "junk_count": len(S.junk_builtin | S.junk_community),
         "community": {"installed": bool(S.junk_community), "count": len(S.junk_community),
                       "updated": os.path.getmtime(COMMUNITY_FILE) if os.path.exists(COMMUNITY_FILE) else None,
@@ -580,7 +698,7 @@ def api_devices():
         return out.setdefault(ip, {
             "ip": ip, "name": names.get(ip) or "", "hint": S.hints.get(ip, ""), "mac": "",
             "this_computer": ip == S.local_ip, "last": 0, "n": 0, "nb": 0, "on_network": 0,
-            "group": S.dev_group.get(ip), "off": any(sc in S.off for sc in scopes_for(ip))})
+            "group": S.dev_group.get(ip), "off": internet_off_for(ip)})
 
     for ip, last, n, nb in sql("""SELECT client, MAX(ts), SUM(CASE WHEN ts>? THEN 1 ELSE 0 END),
                   SUM(CASE WHEN ts>? THEN blocked ELSE 0 END) FROM queries GROUP BY client""", (since, since)):
@@ -635,19 +753,70 @@ def api_groups():
 
 
 def api_controls(scope):
-    """What is switched off / blocked for one device, one group, or the whole house."""
+    """What is switched off / blocked for one device, one group, or the whole house, and why."""
     inherited = []
     if scope != "all":
         inherited.append("all")
     if scope.startswith("device:") and scope[7:] in S.dev_group:
         inherited.append("group:%d" % S.dev_group[scope[7:]])
     own = S.svc_blocks.get(scope, ())
+    timed = [x for x in active_schedules() if x["scope"] == scope or x["scope"] in inherited]
     services = {}
     for v in S.services:
         via = next((sc for sc in inherited if v["id"] in S.svc_blocks.get(sc, ())), None)
-        services[v["id"]] = {"on": v["id"] in own, "from": scope_label(via) if via else ""}
+        why = "for the " + scope_label(via) if via else ""
+        if not why:
+            sch = next((x for x in timed if not x["off"] and v["id"] in x["services"]), None)
+            if sch:
+                why = 'by the "%s" schedule' % sch["name"]
+        services[v["id"]] = {"on": v["id"] in own, "from": why}
+    off_from = ""
     off_via = next((sc for sc in inherited if sc in S.off), None)
-    return {"off": scope in S.off, "off_from": scope_label(off_via) if off_via else "", "services": services}
+    sch = next((x for x in timed if x["off"]), None)
+    if "all" in S.off:
+        off_from = "by the kill switch"
+    elif off_via:
+        off_from = "for the " + scope_label(off_via)
+    elif sch:
+        off_from = 'by the "%s" schedule' % sch["name"]
+    return {"off": scope in S.off and scope != "all", "off_from": off_from, "services": services}
+
+
+def api_schedules():
+    return [dict(x, active=x["enabled"] and schedule_in_force(x)) for x in S.schedules]
+
+
+def save_schedule(body):
+    """Create or change a schedule. Returns an error message, or None when saved."""
+    name = str(body.get("name", "")).strip()[:40] or "Schedule"
+    scope = str(body.get("scope", ""))
+    days = body.get("days")
+    start, end = str(body.get("start", "")), str(body.get("end", ""))
+    off = bool(body.get("off"))
+    raw_services = body.get("services")
+    services = [v for v in raw_services if v in S.svc_names] if (not off and isinstance(raw_services, list)) else []
+    if not SCOPE.fullmatch(scope) or (scope.startswith("group:") and int(scope[6:]) not in S.group_names):
+        return "Please choose who the schedule is for."
+    # A day must be a whole number 0-6. Guard against bool (True == 1) and float (1.0 == 1), which pass a naive range test.
+    if (not isinstance(days, list) or not days
+            or any(not isinstance(d, int) or isinstance(d, bool) or d not in range(7) for d in days)):
+        return "Please choose at least one day."
+    if not CLOCK.fullmatch(start) or not CLOCK.fullmatch(end):
+        return "Please fill in both times."
+    if start == end:
+        return "The start and end times can't be the same."
+    if not off and not services:
+        return "Please choose what to block."
+    row = (name, scope, "".join(str(d) for d in sorted(set(days))), start, end, int(off), json.dumps(services))
+    with db_lock:
+        if any(x["id"] == body.get("id") for x in S.schedules):
+            db.execute("UPDATE schedules SET name=?,scope=?,days=?,t_from=?,t_to=?,off=?,services=? WHERE id=?",
+                       row + (body["id"],))
+        else:
+            db.execute("INSERT INTO schedules(name,scope,days,t_from,t_to,off,services,enabled) VALUES(?,?,?,?,?,?,?,1)", row)
+        db.commit()
+        load_schedules()
+    return None
 
 
 def set_service_block(scope, service, on):
@@ -683,7 +852,9 @@ def delete_group(gid):
         db.execute("DELETE FROM device_group WHERE gid=?", (gid,))
         db.execute("DELETE FROM service_blocks WHERE scope=?", (scope,))
         db.execute("DELETE FROM internet_off WHERE scope=?", (scope,))
+        db.execute("DELETE FROM schedules WHERE scope=?", (scope,))
         db.commit()
+        load_schedules()
 
 
 # ------------------------------------------------------------------ dashboard web server
@@ -739,6 +910,8 @@ class Web(BaseHTTPRequestHandler):
             self.send_json([{"id": v["id"], "name": v["name"], "cat": v["cat"]} for v in S.services])
         elif url.path == "/api/groups":
             self.send_json(api_groups())
+        elif url.path == "/api/schedules":
+            self.send_json(api_schedules())
         elif url.path == "/api/controls":
             scope = qs.get("scope", [""])[0]
             if not SCOPE.fullmatch(scope):
@@ -781,6 +954,21 @@ class Web(BaseHTTPRequestHandler):
                 if body.get("service") not in S.svc_names:
                     return self.send_error(400)
                 set_service_block(scope, body["service"], bool(body.get("on")))
+            return self.send_json({"ok": True})
+        if path == "/api/kill":             # the kill switch: stop the internet for every device
+            set_internet_off("all", bool(body.get("on")))
+            return self.send_json({"ok": True})
+        if path == "/api/schedule":
+            error = save_schedule(body)
+            return self.send_json({"error": error}, 400) if error else self.send_json({"ok": True})
+        if path in ("/api/schedule-enable", "/api/schedule-delete"):
+            with db_lock:
+                if path.endswith("delete"):
+                    db.execute("DELETE FROM schedules WHERE id=?", (body.get("id"),))
+                else:
+                    db.execute("UPDATE schedules SET enabled=? WHERE id=?", (int(bool(body.get("on"))), body.get("id")))
+                db.commit()
+                load_schedules()
             return self.send_json({"ok": True})
         if path == "/api/group":            # create, or rename when an id is given
             name = str(body.get("name", "")).strip()[:40]

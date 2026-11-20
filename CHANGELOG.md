@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.3 — 2026-11-20
+- **Schedules:** block apps, services or all internet automatically at set times — bedtime, homework, school nights — per device, per group or house-wide. Overnight windows (e.g. 21:00–07:00) supported.
+- **Kill switch:** one button stops all internet for every device using QuietNet, until you turn it back on.
+- Blocks, schedules and the kill switch now bite on connections within ~2 minutes (answer lifetimes are shortened).
+- **Runs in a container** (`Dockerfile` + `docker-compose.yml`) for easy, portable setup on a Raspberry Pi or any Linux box.
+- Device scan now works on Linux by reading the kernel's neighbour table directly (no extra tools, works in a plain container).
+- Added an automated test suite (`tests/`), standard library only.
+- Fixes from a code review: malformed schedule data can no longer corrupt saved schedules; unblocking during a bedtime schedule no longer leaves a stray permanent allow; pausing still respects explicit allows; malformed DNS replies are passed through untouched.
+
 ## 0.2 — 2026-11-20
 - Block whole apps and services (Fortnite, Disney+, YouTube, TikTok and more) with one tap.
 - Rules per device, per group, or for the whole house.

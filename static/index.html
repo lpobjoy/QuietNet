@@ -87,6 +87,13 @@ summary{font-weight:650;cursor:pointer} details ol{margin:8px 0 4px;padding-left
 label.check{display:flex;gap:10px;align-items:center;padding:9px 0;border-top:1px solid var(--line);cursor:pointer}
 label.check:first-of-type{border-top:0} label.check input{width:20px;height:20px;flex:none}
 .note{background:var(--amber-soft);color:var(--amber);border-radius:10px;padding:10px 14px;margin:12px 0}
+.killbtn{border-color:var(--red);color:var(--red)}
+.banner.flex{display:flex;gap:12px;align-items:center;flex-wrap:wrap}
+.fld{display:block;font-weight:650;margin:0 0 16px}
+.fld input[type=text],.fld select,.fld input[type=time]{display:block;margin-top:6px;font-weight:400}
+.fld input[type=text]{width:100%;max-width:360px}
+input[type=time]{border:1px solid var(--line);background:var(--card);border-radius:10px;padding:8px 12px}
+.daychips{display:flex;gap:6px;flex-wrap:wrap;margin:6px 0}
 [hidden]{display:none!important}
 @media (max-width:560px){.stats{grid-template-columns:1fr}.item .top{flex-wrap:wrap}.item .info{flex-basis:100%}}
 </style>
@@ -100,11 +107,13 @@ label.check:first-of-type{border-top:0} label.check input{width:20px;height:20px
     </div>
     <span id="pill" class="pill">Starting…</span>
     <span class="spacer"></span>
+    <button class="btn killbtn" id="killBtn" data-act="kill">Kill switch</button>
     <button class="btn" id="pauseBtn" data-act="pause">Pause advert blocking for 10 minutes</button>
   </header>
   <nav>
     <button data-act="tab" data-tab="home">Devices</button>
     <button data-act="tab" data-tab="groups">Groups</button>
+    <button data-act="tab" data-tab="schedules">Schedules</button>
     <button data-act="tab" data-tab="rules">Blocked list</button>
     <button data-act="tab" data-tab="setup">Set up a device</button>
   </nav>
@@ -116,7 +125,7 @@ label.check:first-of-type{border-top:0} label.check input{width:20px;height:20px
 <script>
 const S = {tab:'home', device:null, hours:24, filter:'all', search:'', sort:'n', open:new Set(),
            status:null, devices:[], activity:[], rules:null,
-           services:[], groups:[], ctl:{}, group:null, svcOpen:false};
+           services:[], groups:[], ctl:{}, group:null, svcOpen:false, schedules:[], edit:null};
 const $ = id => document.getElementById(id);
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const num = n => Number(n || 0).toLocaleString();
@@ -172,6 +181,11 @@ function renderChrome(){
     banners += `<div class="banner"><b>QuietNet couldn't start its filter.</b> Another program on this computer is
       probably already using the same connection (port ${esc(st.dns_port)}). Close QuietNet, restart the computer and
       try again. <span class="small">Technical detail: ${esc(st.dns_error)}</span></div>`;
+  } else if(st.kill){
+    pill.textContent = 'Internet stopped'; pill.className = 'pill bad';
+    banners += `<div class="banner flex"><span><b>The kill switch is ON.</b> The internet is stopped for every device
+      that uses QuietNet, until you turn it back on.</span>
+      <button class="btn" data-act="unkill">Turn the internet back on</button></div>`;
   } else if(st.paused_for > 0){
     pill.textContent = 'Paused'; pill.className = 'pill warn';
     banners += `<div class="banner warn"><span><b>Advert blocking is paused</b> for another
@@ -180,7 +194,8 @@ function renderChrome(){
   } else {
     pill.textContent = 'Protecting your home'; pill.className = 'pill';
   }
-  pb.hidden = st.paused_for > 0 || !st.dns_ok;
+  pb.hidden = st.paused_for > 0 || !st.dns_ok || st.kill;
+  $('killBtn').hidden = st.kill || !st.dns_ok;
   if($('banners').innerHTML !== banners) $('banners').innerHTML = banners;
 }
 
@@ -193,7 +208,7 @@ function controls(scope, what){
   const grid = !S.svcOpen ? '' : cats.map(cat => `<div class="cat">${esc(cat)}</div><div class="svcgrid">` +
     S.services.filter(v => v.cat === cat).map(v => {
       const x = c.services[v.id];
-      if(x.from && !x.on) return `<button class="svc on" disabled>${esc(v.name)}<small>Blocked for ${esc(x.from)}</small></button>`;
+      if(x.from && !x.on) return `<button class="svc on" disabled>${esc(v.name)}<small>Blocked ${esc(x.from)}</small></button>`;
       return `<button class="svc ${x.on ? 'on' : ''}" data-act="svc" data-scope="${esc(scope)}" data-s="${esc(v.id)}"
         data-on="${x.on ? '' : '1'}" aria-pressed="${x.on}">${esc(v.name)}<small>${x.on ? 'Blocked — tap to allow' : 'Allowed'}</small></button>`;
     }).join('') + '</div>').join('');
@@ -201,11 +216,13 @@ function controls(scope, what){
   const net = scope === 'all' ? '' : `<div class="row" style="margin-bottom:16px">
     <label class="switch"><input type="checkbox" id="netSwitch" data-scope="${esc(scope)}" ${c.off ? '' : 'checked'} aria-label="Internet for ${what}"><span></span></label>
     <div style="flex:1;min-width:200px"><h2>Internet for ${what} is ${isOff ? 'OFF' : 'on'}</h2>
-    <div class="muted small">${c.off_from && !c.off ? 'Switched off for the ' + esc(c.off_from) + '.' : (c.off ? 'Switch back on to let ' + what + ' use the internet again.' : 'Switch this off to stop ' + what + ' reaching anything at all.')}</div></div></div>`;
+    <div class="muted small">${c.off_from && !c.off ? 'Switched off ' + esc(c.off_from) + '.' : (c.off ? 'Switch back on to let ' + what + ' use the internet again.' : 'Switch this off to stop ' + what + ' reaching anything at all.')}</div></div></div>`;
   return `<div class="card">${net}
     <div class="row"><div style="flex:1;min-width:200px"><h2>Block apps and services for ${what}</h2>
       <div class="muted small">${blocked.length ? 'Blocked: ' + blocked.map(v => esc(v.name)).join(', ') : 'Nothing blocked.'}</div></div>
-      <button class="btn" data-act="svctoggle">${S.svcOpen ? 'Done' : 'Choose services'}</button></div>${grid}</div>`;
+      <button class="btn" data-act="svctoggle">${S.svcOpen ? 'Done' : 'Choose services'}</button></div>${grid}
+    <p class="small" style="margin:12px 0 0">Want this to happen automatically, like at bedtime?
+      <button class="btn link" data-act="schednew" data-scope="${esc(scope)}">Set a schedule</button></p></div>`;
 }
 
 /* ---------- Devices (home) ---------- */
@@ -250,14 +267,14 @@ function statusBadges(x){
   let out = '';
   if(x.v === 'junk') out += '<span class="badge junk">Advert / tracker</span>';
   else if(x.v === 'suspect') out += '<span class="badge suspect">Possibly junk</span>';
-  if(x.b) out += `<span class="badge blocked">${x.why === 'you' ? 'Blocked by you' : x.why === 'service' ? 'Blocked · ' + esc(x.svc)
-    : x.why === 'off' ? 'Internet off' : 'Blocked automatically'}</span>`;
+  if(x.b) out += `<span class="badge blocked">${x.why === 'you' ? 'Blocked by you' : x.why === 'service' || x.why === 'schedule' ? 'Blocked · ' + esc(x.svc)
+    : x.why === 'off' ? 'Internet off' : x.why === 'kill' ? 'Kill switch' : 'Blocked automatically'}</span>`;
   else if(x.some_blocked) out += '<span class="badge blocked">Partly blocked</span>';
   else if(x.why === 'allowed') out += '<span class="badge">Allowed by you</span>';
   return out;
 }
 function blockBtn(x, domain){
-  if(x.why === 'service' || x.why === 'off') return '';   // managed with the switches at the top of the page
+  if(['service', 'off', 'schedule', 'kill'].includes(x.why)) return '';   // managed with the switches at the top of the page
   return x.b
     ? `<button class="btn" data-act="unblock" data-d="${esc(domain)}">Unblock</button>`
     : `<button class="btn ${x.v === 'ok' ? '' : 'primary'}" data-act="block" data-d="${esc(domain)}" data-v="${x.v}">Block</button>`;
@@ -343,6 +360,76 @@ function viewGroup(){
       ${members || '<div class="empty">No devices found yet. Press "Find devices on my network" on the Devices page.</div>'}</div>`;
 }
 
+/* ---------- Schedules ---------- */
+const DAYS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+const DAYSETS = {'Every day':[0,1,2,3,4,5,6], 'Monday to Friday':[0,1,2,3,4], 'Weekends':[5,6], 'School nights (Sun to Thu)':[0,1,2,3,6]};
+function daysText(days){
+  const key = [...days].sort().join('');
+  for(const [label, set] of Object.entries(DAYSETS)) if([...set].sort().join('') === key) return label;
+  return [...days].sort().map(d => DAYS[d]).join(', ');
+}
+function scopeText(scope){
+  if(scope === 'all') return 'Whole house';
+  if(scope.startsWith('group:')) return groupName(+scope.slice(6)) + ' group';
+  const d = S.devices.find(x => x.ip === scope.slice(7));
+  return d ? deviceName(d) + ' (' + d.ip + ')' : scope.slice(7);
+}
+function whatText(x){
+  return x.off ? 'All internet off'
+    : 'Blocks ' + x.services.map(id => (S.services.find(v => v.id === id) || {}).name || id).join(', ');
+}
+function viewSchedules(){
+  if(S.edit) return scheduleForm();
+  const cards = S.schedules.map(x => `<div class="card"><div class="row">
+    <label class="switch"><input type="checkbox" class="schedOn" data-id="${x.id}" ${x.enabled ? 'checked' : ''} aria-label="Use the ${esc(x.name)} schedule"><span></span></label>
+    <div style="flex:1;min-width:200px"><h2>${esc(x.name)}${x.active ? '<span class="badge junk">On right now</span>' : ''}${x.enabled ? '' : '<span class="badge">Not in use</span>'}</h2>
+      <div>${esc(scopeText(x.scope))} · ${esc(daysText(x.days))}, ${esc(x.start)} to ${esc(x.end)}${x.start > x.end ? ' next morning' : ''}</div>
+      <div class="muted small">${esc(whatText(x))}</div></div>
+    <button class="btn" data-act="schededit" data-id="${x.id}">Change</button>
+    <button class="btn link" data-act="scheddelete" data-id="${x.id}">Delete</button></div></div>`).join('');
+  return `<div class="row"><div style="flex:1;min-width:200px"><h2>Schedules</h2>
+    <p class="muted">Block things automatically at set times — bedtime, homework, school nights.
+      Times go by this computer's clock (it's ${esc((S.status || {}).clock || '')} now).</p></div>
+    <button class="btn primary" data-act="schednew" data-preset="bedtime">Add a bedtime</button>
+    <button class="btn" data-act="schednew">New schedule</button></div>
+    ${cards || '<div class="card empty">No schedules yet. "Add a bedtime" is a good place to start.</div>'}`;
+}
+function scheduleForm(){
+  const e = S.edit;
+  const opt = (v, label) => `<option value="${esc(v)}" ${e.scope === v ? 'selected' : ''}>${esc(label)}</option>`;
+  const cats = [...new Set(S.services.map(v => v.cat))];
+  const grid = e.off ? '' : cats.map(cat => `<div class="cat">${esc(cat)}</div><div class="svcgrid">` +
+    S.services.filter(v => v.cat === cat).map(v => {
+      const on = e.services.includes(v.id);
+      return `<button class="svc ${on ? 'on' : ''}" data-act="schedsvc" data-s="${esc(v.id)}" aria-pressed="${on}">${esc(v.name)}<small>${on ? 'Will be blocked' : 'Allowed'}</small></button>`;
+    }).join('') + '</div>').join('');
+  return `<button class="btn link" data-act="schedcancel">← All schedules</button>
+  <h1 style="margin:6px 0 14px">${e.id ? 'Change schedule' : 'New schedule'}</h1>
+  <div class="card">
+    <label class="fld">Name<input type="text" id="sName" maxlength="40" placeholder="Bedtime" value="${esc(e.name)}"></label>
+    <label class="fld">Who is it for?<select id="sScope">${opt('all', 'Whole house')}
+      ${S.groups.length ? `<optgroup label="Groups">${S.groups.map(g => opt('group:' + g.id, g.name + ' group')).join('')}</optgroup>` : ''}
+      ${S.devices.length ? `<optgroup label="Devices">${S.devices.map(d => opt('device:' + d.ip, deviceName(d) + ' (' + d.ip + ')')).join('')}</optgroup>` : ''}</select></label>
+    <div class="fld">Which days?
+      <div class="daychips">${DAYS.map((d, i) => `<button class="chip ${e.days.includes(i) ? 'on' : ''}" data-act="schedday" data-d="${i}" aria-pressed="${e.days.includes(i)}">${d}</button>`).join('')}</div>
+      <div class="small" style="font-weight:400">Quick picks: ${Object.keys(DAYSETS).map(k => `<button class="btn link" data-act="scheddays" data-k="${esc(k)}">${esc(k)}</button>`).join('')}</div></div>
+    <div class="row" style="align-items:flex-start">
+      <label class="fld">Starts at<input type="time" id="sStart" value="${esc(e.start)}"></label>
+      <label class="fld">Ends at<input type="time" id="sEnd" value="${esc(e.end)}"></label></div>
+    <p class="muted small" id="sHint" style="margin-top:-8px">${overnightHint(e)}</p>
+    <div class="fld">What should be blocked?
+      <label class="check" style="font-weight:400"><input type="radio" name="sWhat" value="off" ${e.off ? 'checked' : ''}> All internet</label>
+      <label class="check" style="font-weight:400"><input type="radio" name="sWhat" value="svc" ${e.off ? '' : 'checked'}> Only the apps and services I choose</label></div>
+    ${grid}
+    <div class="row" style="justify-content:flex-end;margin-top:8px">
+      <button class="btn" data-act="schedcancel">Cancel</button>
+      <button class="btn primary" data-act="schedsave">Save schedule</button></div>
+  </div>`;
+}
+function overnightHint(e){
+  return e.start && e.end && e.start > e.end ? `This runs overnight: from ${esc(e.start)} until ${esc(e.end)} the next morning.` : '';
+}
+
 /* ---------- Blocked list ---------- */
 function viewRules(){
   const r = S.rules || {blocked:[], allowed:[]}, c = (S.status || {}).community || {};
@@ -393,7 +480,7 @@ function viewSetup(){
     <p><b>Keep this computer on.</b> Devices pointed at QuietNet need it running. If it's off or asleep, they won't be able to load anything.</p>
     <p><b>Something stopped working?</b> Press <i>Pause advert blocking for 10 minutes</i> at the top. If that fixes it, look at the device's list for something recently blocked and unblock it.</p>
     <p><b>What QuietNet can and can't see.</b> It sees <i>which addresses</i> a device contacts (like <i>ads.example.com</i>), not the pages, messages or passwords — those stay private. It can't remove adverts that come from the same address as the real content (YouTube adverts are the well-known example).</p>
-    <p><b>Blocking a service isn't instant.</b> A device can carry on for a few minutes until it next looks the address up. If an app still works after that, look in the device's list for what it's using and block that too.</p>
+    <p><b>Blocks, schedules and the kill switch take a couple of minutes to bite.</b> They stop a device finding addresses, so something already playing — a video, a game in progress — can carry on for a short while. If an app still works long after, look in the device's list for what it's using and block that too.</p>
     <p><b>Devices are recognised by their number</b> (like 192.168.1.23). If your router gives a device a new number, its name, group and blocks won't follow it — "reserving" the number in your router avoids that.</p>
     <p><b>The number above can change</b> if your router hands this computer a new one. If devices suddenly stop working, come back here and check it. Your router can usually "reserve" the number so it stays put.</p>
     <p class="muted small">Everyone in the house should know this is running — it records which services each device talks to. History is kept for 30 days on this computer only.</p>
@@ -406,13 +493,14 @@ function drawList(){ const h = activityList(), el = $('list'); if(el && el.datas
 function render(){
   renderChrome();
   const v = S.tab === 'rules' ? viewRules() : S.tab === 'setup' ? viewSetup()
-    : S.tab === 'groups' ? (S.group ? viewGroup() : viewGroups()) : S.device ? viewDevice() : viewHome();
+    : S.tab === 'groups' ? (S.group ? viewGroup() : viewGroups()) : S.tab === 'schedules' ? viewSchedules() : S.device ? viewDevice() : viewHome();
   if(v !== lastView){ $('view').innerHTML = v; lastView = v; }
   if($('hours')){ $('hours').value = S.hours; $('sort').value = S.sort; }
 }
 function softRender(){
   // Refresh without disturbing anything the person is typing into or reading.
   renderChrome();
+  if(S.edit) return;                      // never redraw a form someone is filling in
   const a = document.activeElement;
   if(a && (a.id === 'addBox' || a.tagName === 'SELECT')) return;
   if(S.tab === 'home' && S.device && $('list')) drawList();
@@ -423,7 +511,8 @@ async function refresh(hard){
     const jobs = [api('/api/status').then(x => S.status = x)];
     const ctl = scope => api('/api/controls?scope=' + encodeURIComponent(scope)).then(x => S.ctl[scope] = x);
     if(!S.services.length) jobs.push(api('/api/services').then(x => S.services = x));
-    if(S.tab === 'home' || S.tab === 'groups')
+    if(S.tab === 'schedules') jobs.push(api('/api/schedules').then(x => S.schedules = x));
+    if(S.tab === 'home' || S.tab === 'groups' || S.tab === 'schedules')
       jobs.push(api('/api/devices').then(x => S.devices = x), api('/api/groups').then(x => S.groups = x));
     if(S.tab === 'home' && S.device) jobs.push(ctl('device:' + S.device));
     if(S.tab === 'groups' && S.group) jobs.push(ctl('group:' + S.group));
@@ -440,7 +529,35 @@ async function refresh(hard){
 }
 
 const actions = {
-  tab(d){ S.tab = d.tab; S.device = null; S.group = null; S.svcOpen = false; refresh(true); },
+  tab(d){ S.tab = d.tab; S.device = null; S.group = null; S.svcOpen = false; S.edit = null; refresh(true); },
+  async kill(){
+    const yes = await ask({title:'Stop all internet now?', ok:'Stop the internet', danger:true,
+      text:'Every device that uses QuietNet will lose its internet until you turn it back on from this dashboard. It can take a couple of minutes to bite.'});
+    if(!yes) return;
+    await api('/api/kill', {on:true}).catch(oops); refresh(true);
+  },
+  async unkill(){ await api('/api/kill', {on:false}).catch(oops); refresh(true); },
+  schednew(d){
+    const bedtime = d.preset === 'bedtime';
+    S.edit = {name: bedtime ? 'Bedtime' : '', scope: d.scope || (bedtime && S.groups[0] ? 'group:' + S.groups[0].id : 'all'),
+              days: bedtime || d.scope ? [0,1,2,3,4,5,6] : [0,1,2,3,4], start: bedtime || d.scope ? '21:00' : '16:00',
+              end: bedtime || d.scope ? '07:00' : '18:00', off: bedtime || !!d.scope, services: []};
+    S.tab = 'schedules'; S.device = null; S.group = null; refresh(true);
+  },
+  schededit(d){ S.edit = JSON.parse(JSON.stringify(S.schedules.find(x => x.id === +d.id))); render(); },
+  schedcancel(){ S.edit = null; refresh(true); },
+  schedday(d){ const i = +d.d, e = S.edit; e.days = e.days.includes(i) ? e.days.filter(x => x !== i) : [...e.days, i]; render(); },
+  scheddays(d){ S.edit.days = [...DAYSETS[d.k]]; render(); },
+  schedsvc(d){ const e = S.edit; e.services = e.services.includes(d.s) ? e.services.filter(x => x !== d.s) : [...e.services, d.s]; render(); },
+  async schedsave(){
+    try{ await api('/api/schedule', S.edit); S.edit = null; refresh(true); }catch(e){ oops(e); }
+  },
+  async scheddelete(d){
+    const x = S.schedules.find(v => v.id === +d.id) || {};
+    const yes = await ask({title:`Delete the "${x.name}" schedule?`, ok:'Delete', danger:true, text:'It will stop blocking straight away.'});
+    if(!yes) return;
+    await api('/api/schedule-delete', {id:+d.id}).catch(oops); refresh(true);
+  },
   svctoggle(){ S.svcOpen = !S.svcOpen; render(); },
   async svc(d){ await api('/api/service-block', {scope:d.scope, service:d.s, on:!!d.on}).catch(oops); refresh(true); },
   async scan(){ await api('/api/scan', {}).catch(oops); refresh(true); },
@@ -507,10 +624,21 @@ document.addEventListener('change', async e => {
   if(e.target.id === 'netSwitch'){ await api('/api/internet', {scope:e.target.dataset.scope, off:!e.target.checked}).catch(oops); refresh(true); }
   if(e.target.id === 'groupSel'){ await api('/api/device-group', {ip:S.device, group:e.target.value ? +e.target.value : null}).catch(oops); e.target.blur(); refresh(true); }
   if(e.target.classList.contains('member')){ await api('/api/device-group', {ip:e.target.dataset.ip, group:e.target.checked ? S.group : null}).catch(oops); refresh(true); }
+  if(e.target.classList.contains('schedOn')){ await api('/api/schedule-enable', {id:+e.target.dataset.id, on:e.target.checked}).catch(oops); refresh(true); }
+  if(S.edit){
+    if(e.target.id === 'sScope') S.edit.scope = e.target.value;
+    if(e.target.name === 'sWhat'){ S.edit.off = e.target.value === 'off'; render(); }
+  }
   if(e.target.id === 'hours'){ S.hours = +e.target.value; refresh(); }
   if(e.target.id === 'sort'){ S.sort = e.target.value; drawList(); }
 });
 document.addEventListener('input', e => {
+  if(S.edit){
+    if(e.target.id === 'sName') S.edit.name = e.target.value;
+    if(e.target.id === 'sStart') S.edit.start = e.target.value;
+    if(e.target.id === 'sEnd') S.edit.end = e.target.value;
+    if(e.target.type === 'time') $('sHint').innerHTML = overnightHint(S.edit);
+  }
   if(e.target.id === 'search'){ S.search = e.target.value; drawList(); }
 });
 document.addEventListener('keydown', e => { if(e.key === 'Enter' && e.target.id === 'addBox') actions.add(); });

@@ -12,14 +12,24 @@ See what every device in your home is talking to, block the adverts and trackers
 - **Blocks whole apps and services** — Fortnite, Roblox, YouTube, Netflix, Disney+, TikTok, Snapchat, Discord and more.
 - **Rules for one device, a group, or the whole house** — make a "Kids" or "TVs" group and control them together.
 - **Internet on/off switch** for any device or group.
+- **Schedules** — block apps, services or all internet automatically at set times (bedtime, homework, school nights), per device, group or whole house.
+- **Kill switch** — one button stops all internet everywhere until you turn it back on.
 - **Finds the devices on your network**, with their names and hardware addresses, so you can name and group them.
 - **Pause advert blocking for 10 minutes** when a website or app misbehaves.
 
 ## Start it
 
-Double-click **Start QuietNet.command**. A window opens (leave it open) and the dashboard appears in your browser at <http://localhost:8377>.
+**On a Mac (for trying it out):** double-click **Start QuietNet.command**. A window opens (leave it open) and the dashboard appears at <http://localhost:8377>. The first time, macOS may ask whether Python can accept incoming connections, or find devices on your local network — choose **Allow** for both.
 
-The first time, macOS may ask whether Python can accept incoming connections, or whether Terminal can find devices on your local network — choose **Allow** for both.
+**On a Raspberry Pi or any Linux box (for leaving it running):** with Docker installed, run:
+
+```bash
+docker compose up -d
+```
+
+QuietNet then runs all the time and restarts with the machine. It installs nothing from the internet — the container is just Python and QuietNet's own code. The dashboard is at `http://<the-pi's-address>:8377`. Host networking is used so QuietNet can see the home network and answer DNS on port 53.
+
+> Running it on an always-on box like a Raspberry Pi is the intended setup: it works for every device in the house without touching your router, and it doesn't depend on your Mac being awake.
 
 ## Use it
 
@@ -59,6 +69,8 @@ QuietNet uses no third-party packages or libraries. Everything — the DNS filte
 | `services.json` | The apps and services that can be blocked, and the addresses each one uses |
 | `junk_domains.txt` | The built-in advert and tracker list |
 | `Start QuietNet.command` | Double-click launcher for macOS |
+| `Dockerfile`, `docker-compose.yml` | Run it in a container on a Pi or any Linux box |
+| `tests/` | Automated checks for the rules engine (standard library only) |
 | `data/` | Created when it runs: history, your rules, downloaded list (never uploaded) |
 
 Options for advanced use: `python3 server.py --dns-port 53 --web-port 8377 --no-browser`.
