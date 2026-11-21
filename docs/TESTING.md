@@ -52,7 +52,7 @@ There are none at present. When a fault is found that cannot be fixed straight a
 
 ## Automatic runs
 
-`.github/workflows/tests.yml` runs the suite on every push to `main` and every pull request, on Python 3.9 (what Apple supplies on a Mac) and 3.13 (what the containers use).
+`.github/workflows/tests.yml` runs the suite on every push to `main` and every pull request, on Linux with Python 3.13 (what the containers use) and on macOS with the Python that Apple supplies (what the Mac launcher prefers).
 
 ## Writing more
 

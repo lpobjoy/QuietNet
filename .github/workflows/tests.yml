@@ -1,5 +1,8 @@
-# Runs the test suite on every push and pull request, on the oldest and newest Python
-# QuietNet is expected to run on. Nothing is installed: the tests need only Python itself.
+# Runs the test suite on every push to main and every pull request, in the two places
+# QuietNet is expected to run:
+#   - Linux with Python 3.13, which is what the containers use;
+#   - macOS with the Python that Apple supplies (3.9), which is what "Start QuietNet.command" prefers.
+# Nothing is installed: the tests need only Python itself.
 name: tests
 on:
   push:
@@ -8,16 +11,22 @@ on:
 permissions:
   contents: read
 jobs:
-  tests:
+  linux:
+    name: Linux, Python 3.13
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        python: ["3.9", "3.13"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: ${{ matrix.python }}
+          python-version: "3.13"
       - name: Run the tests
         run: python -m unittest discover tests
+  mac:
+    name: macOS, Apple's Python
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Show which Python this is
+        run: /usr/bin/python3 --version
+      - name: Run the tests
+        run: /usr/bin/python3 -m unittest discover tests
