@@ -4,36 +4,6 @@ Found in a review of version 0.5 on 21 November 2026. Each entry says what is wr
 
 Entries marked **Tested** have a check in `tests/` that is currently an expected failure. It will start passing when the issue is fixed, and the test run will then say so.
 
-## Stops QuietNet working
-
-### 1. The Pi container stops at start-up — Tested
-
-`server.py` imports `cloud_agent`, but `Dockerfile` copies only `server.py` and `enforcer.py`. `docker compose up` therefore fails with `ModuleNotFoundError: No module named 'cloud_agent'`. This arrived with version 0.5.
-
-**Fix:** add `cloud_agent.py` to the `COPY` line in `Dockerfile`.
-**Test:** `test_packaging.Containers.test_the_pi_container_includes_every_program_file_the_server_imports`
-
-### 2. The dashboard cannot be opened on a Pi with no screen
-
-The dashboard listens on `127.0.0.1` and refuses any request not addressed to `localhost`. The README says to open `http://<the-pi's-address>:8377`, which is refused. On a Pi with no screen and keyboard there is then no way to reach the dashboard, and so no way to enter a pairing code for remote access. The environment variables `QUIETNET_CLOUD` and `QUIETNET_PAIR` would work, but `docker-compose.yml` does not pass them in.
-
-The README also says, under "Good to know", that the dashboard opens only on the computer QuietNet runs on. The two statements contradict each other.
-
-**Fix, one of:**
-- Pass `QUIETNET_CLOUD` and `QUIETNET_PAIR` through in `docker-compose.yml` and make the relay the documented way in. This keeps the dashboard closed to the home network.
-- Or add a setting to listen on the home network, with a password. Without a password, anyone in the house could change the rules.
-
-### 3. The enforcer does not clean up when QuietNet stops
-
-Two faults with the same result:
-
-- On Ctrl-C, `main()` asks the enforcer to stop and then returns. The enforcer runs in a background thread that the program does not wait for, so the program exits before `_teardown()` runs.
-- Under Docker, `docker stop` sends a different signal (SIGTERM), which the program does not handle. Docker waits ten seconds and then ends it by force.
-
-Left behind on the host: the `quietnet` firewall table, packet forwarding switched on, and redirects switched off. Steered devices recover on their own within a minute or so, when they next ask where the router is.
-
-**Fix:** handle SIGTERM the same way as Ctrl-C, and have `Enforcer.stop()` wait for the thread to finish (`join`) before `main()` returns.
-
 ## Needs testing on a real Pi
 
 ### 4. With Docker installed, an enforced device may lose all internet
@@ -107,6 +77,23 @@ The status summary counts today's lookups by time, but the only index on the his
 - `enforcement_plan()` reads the set of enforced devices while a dashboard request may be changing it. The enforcer catches the resulting error and tries again two seconds later.
 - The README and the comment at the top of `server.py` say blocked lookups are answered "that doesn't exist". They are answered with the address `0.0.0.0`, which devices treat the same way.
 
-## Fixed in this branch
+## Fixed
+
+### ~~1. The Pi container stops at start-up~~
+
+`server.py` imports `cloud_agent`, but the `Dockerfile` did not copy `cloud_agent.py`, so `docker compose up` failed with `ModuleNotFoundError`. The file is now copied.
+**Test:** `test_packaging.Containers.test_the_pi_container_includes_every_program_file_the_server_imports`
+
+### ~~2. The dashboard cannot be opened on a Pi with no screen~~
+
+The dashboard answers on `localhost` only, but the README said to open it at the Pi's network address, and `docker-compose.yml` gave no way to pair a Pi with a relay without the dashboard. The dashboard stays closed to the home network, which is the safer choice: opening it would let anyone in the house change the rules unless a password were added. In its place, `docker-compose.yml` now passes `QUIETNET_CLOUD` and `QUIETNET_PAIR` through, and the README describes the two ways in: the relay, or an SSH tunnel.
+**Tests:** `test_packaging.Containers.test_compose_lets_a_pi_with_no_screen_be_paired`, `test_packaging.Readme.test_the_readme_does_not_send_people_to_an_address_that_is_refused`
+
+### ~~3. The enforcer does not clean up when QuietNet stops~~
+
+On Ctrl-C the program exited before the enforcer's clean-up ran, and `docker stop` was not handled at all, so the firewall table and kernel settings were left behind. `Enforcer.stop()` now waits for the clean-up to finish, the program treats `docker stop` the same as Ctrl-C, and the container is given 20 seconds to stop.
+**Tests:** `test_enforcer.Teardown.test_stop_waits_until_the_network_has_been_restored`, `test_shutdown`
+
+### Other
 
 - The relay's documentation said passwords were hashed with scrypt. The code uses PBKDF2-SHA256. The wording in `cloud/README.md` and the comment at the top of `cloud/relay.py` now match the code.

@@ -1,8 +1,11 @@
 # Changelog
 
 ## Unreleased
+- **Fixed: the Pi container did not start.** The `Dockerfile` left out `cloud_agent.py`, which 0.5 began to need.
+- **Fixed: no way in on a Pi with no screen.** The dashboard only opens on the Pi itself, but the README pointed to the Pi's network address. `docker-compose.yml` now accepts `QUIETNET_CLOUD` and `QUIETNET_PAIR` so the Pi can be paired with a relay at start-up, and the README describes this and the SSH tunnel alternative.
+- **Fixed: the enforcer left its changes behind on shutdown.** Stopping QuietNet (Ctrl-C or `docker stop`) now waits while the enforcer hands devices back to the router, removes its firewall table and restores the kernel settings.
 - **Documentation** in `docs/`: how QuietNet works, an API reference, a testing guide, and a list of known issues from a review of 0.5.
-- **Tests** for the parts that had none: the DNS packet handling, the dashboard API, the enforcer's behaviour, the relay, the Pi's link to the relay, and the packaging. 262 tests in all, up from 37.
+- **Tests** for the parts that had none: the DNS packet handling, the dashboard API, the enforcer's behaviour, the relay, the Pi's link to the relay, and the packaging. 269 tests in all, up from 37.
 - Corrected the relay's description of password storage: it uses PBKDF2, not scrypt.
 
 ## 0.5 — 2026-11-20

@@ -148,6 +148,7 @@ class Enforcer:
         self._active = False
         self._stop = threading.Event()
         self._lock = threading.RLock()
+        self._thread = None
 
     # -- availability -------------------------------------------------------
 
@@ -175,7 +176,8 @@ class Enforcer:
         if not self.available():
             self.log("Enforcer off: " + self.reason)
             return
-        threading.Thread(target=self._run, daemon=True).start()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
 
     def _open_socket(self):
         s = socket.socket(AF_PACKET, socket.SOCK_RAW, socket.htons(ETH_ARP))
@@ -252,8 +254,14 @@ class Enforcer:
 
     # -- stop and restore ---------------------------------------------------
 
-    def stop(self):
+    def stop(self, wait=15):
+        """Ask the enforcer to stop, and wait (up to `wait` seconds) until it has handed every
+        device back to the router and removed its firewall rules. Without the wait, the program
+        could exit first and leave those behind."""
         self._stop.set()
+        t = self._thread
+        if t and t.is_alive() and t is not threading.current_thread():
+            t.join(wait)
 
     def _teardown(self):
         with self._lock:

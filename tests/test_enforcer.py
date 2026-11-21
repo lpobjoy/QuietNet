@@ -196,6 +196,23 @@ class Teardown(EnforcerCase):
         self.assertFalse(self.e.status()["active"])
         self.assertEqual(self.log[-1], "Enforcer stopped; network restored.")
 
+    def test_stop_waits_until_the_network_has_been_restored(self):
+        # stop() must not return while devices are still pointed at us, or the program
+        # could exit first and leave the firewall table and kernel settings behind.
+        self.plan = {KID: {"off": True, "ips": set()}}
+        self.e._open_socket = lambda: self.sock
+        self.e.start()
+        self.assertTrue(self.e._thread.is_alive())
+        self.e.stop()
+        self.assertFalse(self.e._thread.is_alive())
+        self.assertEqual(self.log[-1], "Enforcer stopped; network restored.")
+        self.assertIn((["nft", "delete", "table", "inet", "quietnet"], None), self.commands)
+        self.assertTrue(self.sock.closed)
+
+    def test_stop_before_start_is_harmless(self):
+        self.e.stop()
+        self.assertEqual(self.commands, [])
+
     def test_iptables_teardown_removes_its_chain(self):
         self.e.backend = "iptables"
         self.e._teardown()

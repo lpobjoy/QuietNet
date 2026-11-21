@@ -11,9 +11,9 @@ python3 -m unittest discover tests
 Nothing needs installing. The run takes about twelve seconds and ends with a line such as:
 
 ```
-Ran 262 tests in 11.4s
+Ran 269 tests in 11.6s
 
-OK (expected failures=2)
+OK (expected failures=1)
 ```
 
 To run one file, or one test:
@@ -28,7 +28,8 @@ python3 -m unittest tests.test_relay.Relaying.test_another_account_cannot_reach_
 ## What the tests are safe to do
 
 - They use throwaway data folders. Your real history and rules are never read or changed.
-- They contact nothing outside the computer. Where the code would reach the internet, a stand-in on the same computer answers.
+- They contact nothing outside the computer. Where the code would reach the internet, a stand-in on the same computer answers. One exception: `test_shutdown.py` starts the real program for a moment, and at start-up it asks the local network for the names of nearby devices.
+- `test_shutdown.py` is skipped (the run reports `skipped=2`) on a Linux machine with admin rights and a firewall tool, because there the real enforcer could start. Run the tests as an ordinary user to include it.
 - They need no admin rights. The enforcer's raw socket, firewall command and kernel settings are replaced with stand-ins that record what they were asked to do.
 - Web servers are started on spare ports chosen by the operating system, so they do not clash with a running QuietNet.
 
@@ -39,18 +40,18 @@ python3 -m unittest tests.test_relay.Relaying.test_another_account_cannot_reach_
 | `test_quietnet.py` | 37 | The rules engine: adverts, your own blocks and allows, services, groups, pause, the kill switch, schedules (including overnight and week-wrap), answer lifetimes, and the enforcer's plan and rule text |
 | `test_dns.py` | 41 | Reading questions and refusing malformed ones; blocked answers for each record type; pulling addresses out of answers; what is recorded and what is not; the address helpers; the community list download; and the real filter running over UDP and TCP against a stand-in upstream |
 | `test_dashboard_api.py` | 53 | Every dashboard API call over real HTTP: the `Host` and JSON guards, blocking, switches, groups, schedules, devices, activity, history, enforcement and remote access settings, and that changes survive a restart |
-| `test_enforcer.py` | 29 | What the enforcer sends and to whom; that it never touches this computer or devices not chosen; firewall reloads only on change; kernel settings switched and restored; teardown; when it reports itself unavailable; reading the routing table |
+| `test_enforcer.py` | 31 | What the enforcer sends and to whom; that it never touches this computer or devices not chosen; firewall reloads only on change; kernel settings switched and restored; teardown, and that stopping waits for it; when it reports itself unavailable; reading the routing table |
 | `test_relay.py` | 52 | Password records; session cookies and tampering; the bridge between browser and Pi; sign-up, login and sign-out; pairing codes; that one account cannot reach another's Pi; the forged-request guard; offline and timeout answers; the remote dashboard page |
 | `test_cloud_agent.py` | 21 | Pairing and saving the token; set-up from environment variables; running a relayed request against the local dashboard; the polling loop; what happens when the relay unpairs the Pi, fails or cannot be reached |
-| `test_packaging.py` | 29 | Standard library only; the containers include what the programs import; `services.json` and `junk_domains.txt` are well formed with no overlaps; the dashboard calls only API addresses the server has; the README lists every file |
+| `test_packaging.py` | 32 | Standard library only; the containers include what the programs import; the compose file passes the pairing settings; `services.json` and `junk_domains.txt` are well formed with no overlaps; the dashboard calls only API addresses the server has; the README lists every file |
+| `test_shutdown.py` | 2 | Starts the whole program and stops it with Ctrl-C and with the signal `docker stop` sends; checks it exits cleanly |
 
 ## Expected failures
 
-Two tests describe behaviour that is wrong today. They are marked as expected failures so the run stays green, and each points to its entry in [Known issues](KNOWN_ISSUES.md).
+One test describes behaviour that is wrong today. It is marked as an expected failure so the run stays green, and it points to its entry in [Known issues](KNOWN_ISSUES.md).
 
 | Test | Issue |
 | --- | --- |
-| `test_packaging.Containers.test_the_pi_container_includes_every_program_file_the_server_imports` | 1: the Pi container is missing `cloud_agent.py` |
 | `test_dashboard_api.BlockingAddresses.test_a_domain_that_is_not_text_is_refused_politely` | 9: a number sent as an address drops the connection |
 
 When an issue is fixed, its test starts passing and the run reports "unexpected success". Remove the `@unittest.expectedFailure` line above that test.

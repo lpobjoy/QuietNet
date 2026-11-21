@@ -108,7 +108,7 @@ Every two seconds it asks `server.enforcement_plan()` what to do, then:
 
 Only the outgoing direction passes through the Pi. Replies travel from the router to the device directly.
 
-When the last device is released, the kernel settings are put back. On shutdown, `_teardown()` tells every device the router's real hardware address five times, removes the firewall table and restores the settings. See [Known issues](KNOWN_ISSUES.md) 3: at present the program exits before this finishes.
+When the last device is released, the kernel settings are put back. On shutdown, `_teardown()` tells every device the router's real hardware address five times, removes the firewall table and restores the settings. The program waits for this to finish before it exits, both on Ctrl-C and on `docker stop`.
 
 Limits: it works on IPv4 only; it blocks by address, so two services sharing an address are both affected; and it relies on the device using QuietNet for DNS, since that is how QuietNet learns which addresses belong to which name.
 

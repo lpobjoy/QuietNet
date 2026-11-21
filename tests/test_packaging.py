@@ -70,11 +70,9 @@ class StandardLibraryOnly(unittest.TestCase):
 
 
 class Containers(unittest.TestCase):
-    @unittest.expectedFailure
     def test_the_pi_container_includes_every_program_file_the_server_imports(self):
-        # KNOWN ISSUE 1 (docs/KNOWN_ISSUES.md): server.py imports cloud_agent, but the Dockerfile
-        # does not copy cloud_agent.py, so the container stops at start-up. When the Dockerfile is
-        # fixed this check will start passing; remove the expectedFailure line above at that point.
+        # A file the server imports but the Dockerfile leaves out stops the container at start-up
+        # (this happened to cloud_agent.py in 0.5).
         needed = {m + ".py" for m in imports_of("server.py") & LOCAL_MODULES}
         self.assertEqual(needed - copied_into("Dockerfile"), set())
 
@@ -102,6 +100,16 @@ class Containers(unittest.TestCase):
         compose = read("docker-compose.yml")
         for needed in ("network_mode: host", "NET_ADMIN", "NET_RAW", "/data", "restart: unless-stopped"):
             self.assertIn(needed, compose)
+
+    def test_compose_lets_a_pi_with_no_screen_be_paired(self):
+        # The dashboard only opens on the Pi itself, so these two settings are the way in.
+        compose = read("docker-compose.yml")
+        self.assertIn("QUIETNET_CLOUD=${QUIETNET_CLOUD:-}", compose)
+        self.assertIn("QUIETNET_PAIR=${QUIETNET_PAIR:-}", compose)
+
+    def test_compose_allows_time_for_the_enforcer_to_restore_the_network(self):
+        grace = int(re.search(r"stop_grace_period: (\d+)s", read("docker-compose.yml")).group(1))
+        self.assertGreater(grace, 15)          # longer than Enforcer.stop() is prepared to wait
 
     def test_every_copied_path_exists(self):
         for dockerfile in ("Dockerfile", os.path.join("cloud", "Dockerfile")):
@@ -205,6 +213,11 @@ class DashboardContract(unittest.TestCase):
 
 
 class Readme(unittest.TestCase):
+    def test_the_readme_does_not_send_people_to_an_address_that_is_refused(self):
+        # The dashboard answers on localhost only (see test_dashboard_api.Guards).
+        self.assertNotIn("address>:8377`", read("README.md"))
+        self.assertIn("http://localhost:8377", read("README.md"))
+
     def test_every_top_level_file_is_listed_in_the_readme(self):
         readme = read("README.md")
         for name in ("server.py", "enforcer.py", "cloud_agent.py", "services.json", "junk_domains.txt",

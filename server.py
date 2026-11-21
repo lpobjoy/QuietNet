@@ -14,6 +14,7 @@ import json
 import os
 import queue
 import re
+import signal
 import socket
 import socketserver
 import sqlite3
@@ -1132,6 +1133,12 @@ class Web(BaseHTTPRequestHandler):
         self.send_error(404)
 
 
+def _stop_requested(signum, frame):
+    """`docker stop` and a system shutdown ask politely with SIGTERM. Treat it like Ctrl-C,
+    so the enforcer gets to restore the network before the program exits."""
+    raise KeyboardInterrupt
+
+
 def main():
     ap = argparse.ArgumentParser(description="QuietNet home advert and tracker blocker")
     ap.add_argument("--dns-port", type=int, default=53)
@@ -1165,14 +1172,18 @@ def main():
     print("\nLeave this window open. Close it to stop QuietNet.\n")
     if not args.no_browser:
         threading.Timer(0.5, webbrowser.open, (url,)).start()
+    signal.signal(signal.SIGTERM, _stop_requested)
     try:
         web.serve_forever()
     except KeyboardInterrupt:
+        pass
+    finally:
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)     # a second request must not interrupt the clean-up
         if ENF:
-            ENF.stop()
+            ENF.stop()                                    # waits until the network is restored
         if CA:
             CA.stop()
-        print("\nQuietNet stopped.")
+        print("\nQuietNet stopped.", flush=True)
 
 
 if __name__ == "__main__":
