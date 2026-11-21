@@ -98,12 +98,23 @@ QuietNet uses no third-party packages or libraries. Everything — the DNS filte
 | `junk_domains.txt` | The built-in advert and tracker list |
 | `Start QuietNet.command` | Double-click launcher for macOS |
 | `Dockerfile`, `docker-compose.yml` | Run it in a container on a Pi or any Linux box |
-| `tests/` | Automated checks for the rules engine (standard library only) |
+| `tests/` | Automated checks for every part: rules, DNS, dashboard API, enforcer, relay and remote link (standard library only) |
+| `docs/` | How it works, the API, how to test it, and known issues |
 | `data/` | Created when it runs: history, your rules, downloaded list (never uploaded) |
 
 Options for advanced use: `python3 server.py --dns-port 53 --web-port 8377 --no-browser`.
 
 See [CHANGELOG.md](CHANGELOG.md) for what changed in each version.
+
+## Documentation
+
+- [How QuietNet works](docs/ARCHITECTURE.md) — the parts, what happens to a lookup, the order rules are checked in, the enforcer, remote access, the security model, and what is stored.
+- [API reference](docs/API.md) — every call the dashboard and the relay accept.
+- [Testing](docs/TESTING.md) — how to run the tests and what they cover.
+- [Known issues](docs/KNOWN_ISSUES.md) — faults and gaps found in review, with suggested fixes.
+- [Hosting the relay](cloud/README.md)
+
+Run the tests with `python3 -m unittest discover tests`.
 
 ## Licence
 

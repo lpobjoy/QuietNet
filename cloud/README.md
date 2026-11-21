@@ -26,6 +26,6 @@ Then pair a local Pi agent against `http://localhost:8080`.
 
 ## What it stores
 
-Your account (email + a scrypt-hashed password) and the list of your Pis. It never
+Your account (email + a PBKDF2-hashed password) and the list of your Pis. It never
 stores browsing history or rules — those stay on the Pi and only pass through while
 you're looking at them.

@@ -1,0 +1,86 @@
+# Testing
+
+## Running the tests
+
+From the repository folder:
+
+```bash
+python3 -m unittest discover tests
+```
+
+Nothing needs installing. The run takes about twelve seconds and ends with a line such as:
+
+```
+Ran 262 tests in 11.4s
+
+OK (expected failures=2)
+```
+
+To run one file, or one test:
+
+```bash
+python3 -m unittest tests/test_relay.py
+python3 -m unittest tests.test_relay.Relaying.test_another_account_cannot_reach_your_pi
+```
+
+`pytest tests` also works if you have it.
+
+## What the tests are safe to do
+
+- They use throwaway data folders. Your real history and rules are never read or changed.
+- They contact nothing outside the computer. Where the code would reach the internet, a stand-in on the same computer answers.
+- They need no admin rights. The enforcer's raw socket, firewall command and kernel settings are replaced with stand-ins that record what they were asked to do.
+- Web servers are started on spare ports chosen by the operating system, so they do not clash with a running QuietNet.
+
+## What each file covers
+
+| File | Tests | Covers |
+| --- | --- | --- |
+| `test_quietnet.py` | 37 | The rules engine: adverts, your own blocks and allows, services, groups, pause, the kill switch, schedules (including overnight and week-wrap), answer lifetimes, and the enforcer's plan and rule text |
+| `test_dns.py` | 41 | Reading questions and refusing malformed ones; blocked answers for each record type; pulling addresses out of answers; what is recorded and what is not; the address helpers; the community list download; and the real filter running over UDP and TCP against a stand-in upstream |
+| `test_dashboard_api.py` | 53 | Every dashboard API call over real HTTP: the `Host` and JSON guards, blocking, switches, groups, schedules, devices, activity, history, enforcement and remote access settings, and that changes survive a restart |
+| `test_enforcer.py` | 29 | What the enforcer sends and to whom; that it never touches this computer or devices not chosen; firewall reloads only on change; kernel settings switched and restored; teardown; when it reports itself unavailable; reading the routing table |
+| `test_relay.py` | 52 | Password records; session cookies and tampering; the bridge between browser and Pi; sign-up, login and sign-out; pairing codes; that one account cannot reach another's Pi; the forged-request guard; offline and timeout answers; the remote dashboard page |
+| `test_cloud_agent.py` | 21 | Pairing and saving the token; set-up from environment variables; running a relayed request against the local dashboard; the polling loop; what happens when the relay unpairs the Pi, fails or cannot be reached |
+| `test_packaging.py` | 29 | Standard library only; the containers include what the programs import; `services.json` and `junk_domains.txt` are well formed with no overlaps; the dashboard calls only API addresses the server has; the README lists every file |
+
+## Expected failures
+
+Two tests describe behaviour that is wrong today. They are marked as expected failures so the run stays green, and each points to its entry in [Known issues](KNOWN_ISSUES.md).
+
+| Test | Issue |
+| --- | --- |
+| `test_packaging.Containers.test_the_pi_container_includes_every_program_file_the_server_imports` | 1: the Pi container is missing `cloud_agent.py` |
+| `test_dashboard_api.BlockingAddresses.test_a_domain_that_is_not_text_is_refused_politely` | 9: a number sent as an address drops the connection |
+
+When an issue is fixed, its test starts passing and the run reports "unexpected success". Remove the `@unittest.expectedFailure` line above that test.
+
+## Writing more
+
+The existing files share a few helpers, all in `test_quietnet.py`:
+
+- `Base`: a test class whose `setUp` empties the rule tables and reloads the rules, so each test starts clean.
+- `query(name, qtype)`: builds a DNS question packet.
+- `fake_answer(data)`: the reply a real upstream would give, with a one-day lifetime.
+- `is_blocked(name, client)`: asks the filter and reports whether the answer was the block address.
+- `at(day, "HH:MM")`: a moment on a given weekday, for schedule tests.
+
+Conventions: one behaviour per test; the test name states the behaviour in plain words; a comment explains any check whose reason is not obvious from the name.
+
+## Not covered
+
+These need a real network or a real host, and are not tested automatically:
+
+- The enforcer on a real Pi: that steering works, that non-blocked traffic still flows, and how it behaves alongside Docker's firewall rules (issue 4).
+- The network scan (`scan_network`) and host-name lookups, which depend on the devices present.
+- The dashboard page in a browser. Its API calls are checked against the server, but its behaviour is not.
+- Building and starting the containers.
+- The relay under load, or with many Pis.
+
+A short manual check after changing the enforcer or the containers:
+
+1. `docker compose up -d` on the Pi; confirm `docker logs quietnet` shows "QuietNet is running".
+2. Point one device at the Pi for DNS and confirm it appears on the Devices page.
+3. Block a service for that device and confirm a new connection fails.
+4. Turn on "Cut live connections", start a stream, block its service, and confirm the stream stops within a few seconds while other sites still load.
+5. `docker stop quietnet`, then confirm the device still has internet and `nft list tables` on the Pi shows no `quietnet` table.

@@ -11,7 +11,7 @@ changes, and only you can reach your Pi.
 This is meant to run on a host like Railway, which provides the public HTTPS
 address. It uses only the Python standard library - nothing is installed.
 
-What it keeps: your account (email + a scrypt-hashed password) and a list of your
+What it keeps: your account (email + a PBKDF2-hashed password) and a list of your
 Pis. It never stores your browsing history or rules - those stay on the Pi.
 """
 import base64
