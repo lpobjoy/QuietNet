@@ -12,6 +12,8 @@ Listens on `127.0.0.1:8377`.
 
 - The `Host` header must be `localhost` or `127.0.0.1` (a port is allowed). Anything else gets `403`.
 - `POST` requests must have `Content-Type: application/json` (otherwise `415`) and a JSON body (unreadable JSON gets `400`).
+- A body larger than 64 KB gets `413`. A body that is JSON but not an object gets `400`.
+- Every answer carries `X-Frame-Options: DENY`, `Content-Security-Policy: frame-ancestors 'none'`, `X-Content-Type-Options: nosniff` and `Referrer-Policy: no-referrer`.
 - Successful changes return `{"ok": true}` unless noted. Refusals with a message return `400` and `{"error": "…"}`. Refusals of badly formed input return a bare `400`.
 
 A **scope** is `all`, `group:<id>` or `device:<ip>`.
@@ -94,7 +96,7 @@ A **scope** is `all`, `group:<id>` or `device:<ip>`.
 | `POST /api/group-delete` | `{"id"}` | Also deletes the group's rules and schedules |
 | `POST /api/device-group` | `{"ip", "group"}` | An unknown or missing group removes the device from its group |
 | `POST /api/device-name` | `{"ip", "name"}` | Name cut to 40 characters |
-| `POST /api/enforce` | `{"ip", "on"}` | "Cut live connections" for one device. IPv4 text only |
+| `POST /api/enforce` | `{"ip", "on"}` | "Cut live connections" for one device. Must be a real IPv4 address, as text |
 | `POST /api/cloud` | `{"relay", "code"}` or `{"action": "forget"}` | Pair with a relay, or unpair |
 | `POST /api/scan` | `{}` | Starts a network scan in the background |
 | `POST /api/update-list` | `{}` | Starts the community list download in the background |
@@ -113,16 +115,27 @@ Schedule body:
 
 Listens on `$PORT` (default 8080). HTTPS is expected to be provided by the host.
 
+Every answer carries the same four protective headers as the dashboard API, plus `Cache-Control: no-store`. Bodies over 64 KB are not read: a form counts as empty, and a relayed call gets `413`.
+
+Wrong guesses are limited. When a limit is reached the answer is `429` with "Too many attempts. Please wait a few minutes and try again."
+
+| What | Limit |
+| --- | --- |
+| Wrong passwords for one email | 5 in 15 minutes |
+| Wrong passwords across all emails | 60 in 5 minutes |
+| Wrong pairing codes, overall | 20 in 10 minutes |
+| New accounts, overall | 10 an hour |
+
 ### Website (browser, session cookie)
 
 | Request | Does |
 | --- | --- |
 | `GET /healthz` | `{"ok": true}` |
 | `GET /login`, `GET /signup` | The forms |
-| `POST /signup` | Form fields `email`, `password` (8 characters or more). Signs in and redirects to `/` |
+| `POST /signup` | Form fields `email`, `password` (8 characters or more). Signs in and redirects to `/`. `403` when sign-up is switched off (`QUIETNET_SIGNUP`) |
 | `POST /login` | Form fields `email`, `password` |
 | `GET` or `POST /logout` | Clears the cookie |
-| `GET /` | Your QuietNets, with pairing codes for those not yet paired |
+| `GET /` | Your QuietNets, with pairing codes for those not yet paired. A code older than 15 minutes is replaced when this page is opened |
 | `POST /pis/new` | Form field `name`. Creates a QuietNet and a pairing code |
 | `POST /pis/<id>/delete` | Removes one of your QuietNets. Its Pi is locked out at once |
 | `GET /pi/<id>/` | The dashboard page, set to call this Pi |
@@ -138,6 +151,8 @@ Relayed calls can fail in these ways:
 | `404` | Not signed in, not your Pi, or not an `/api/` path |
 | `503` | The Pi is not paired, or has not been heard from for 40 seconds |
 | `504` | The Pi did not answer within 30 seconds |
+| `413` | The request body is over 64 KB |
+| `502` | The Pi answered with a status outside 200–599 |
 
 Any other status and body are the Pi's own.
 
@@ -145,7 +160,7 @@ Any other status and body are the Pi's own.
 
 | Request | Body or header | Returns |
 | --- | --- | --- |
-| `POST /agent/pair` | `{"code"}` | `{"ok", "id", "token"}`, or `400` with `{"error"}`. A code works once |
+| `POST /agent/pair` | `{"code"}` | `{"ok", "id", "token"}`, or `400` with `{"error"}`. A code works once and for 15 minutes. `429` after too many wrong codes |
 | `GET /agent/poll` | Header `X-QuietNet-Token` | Waits up to 25 seconds. `{}` if nothing to do, or `{"id", "method", "path", "body"?}`. `401` if the token is not recognised |
 | `POST /agent/respond` | Header `X-QuietNet-Token`; `{"id", "status", "body"}` | `{"ok": true}` |
 

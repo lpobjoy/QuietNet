@@ -158,6 +158,22 @@ class Setup(AgentCase):
         self.assertTrue(again.status()["paired"])
         self.assertEqual(again.status()["relay"], self.relay_url)
 
+    @unittest.skipIf(os.name == "nt", "file permissions work differently on Windows")
+    def test_the_saved_token_is_readable_only_by_its_owner(self):
+        a = self.agent()
+        a.pair(self.relay_url, PretendRelay.good_code)
+        path = os.path.join(self.data, "cloud.json")
+        self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+
+    @unittest.skipIf(os.name == "nt", "file permissions work differently on Windows")
+    def test_a_file_left_open_by_an_older_version_is_tightened(self):
+        path = os.path.join(self.data, "cloud.json")
+        with open(path, "w") as f:
+            f.write("{}")
+        os.chmod(path, 0o644)
+        self.agent().pair(self.relay_url, PretendRelay.good_code)
+        self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+
     def test_a_trailing_slash_on_the_relay_address_is_dropped(self):
         a = self.agent()
         self.assertIsNone(a.pair(self.relay_url + "/", PretendRelay.good_code))

@@ -111,6 +111,7 @@ QuietNet uses no third-party packages or libraries. Everything — the DNS filte
 | `Dockerfile`, `docker-compose.yml` | Run it in a container on a Pi or any Linux box |
 | `tests/` | Automated checks for every part: rules, DNS, dashboard API, enforcer, relay and remote link (standard library only) |
 | `docs/` | How it works, the API, how to test it, and known issues |
+| `AGENTS.md` | Rules for anyone, person or AI agent, changing the code |
 | `data/` | Created when it runs: history, your rules, downloaded list (never uploaded) |
 
 Options for advanced use: `python3 server.py --dns-port 53 --web-port 8377 --no-browser`.
@@ -124,6 +125,7 @@ See [CHANGELOG.md](CHANGELOG.md) for what changed in each version.
 - [Testing](docs/TESTING.md) — how to run the tests and what they cover.
 - [Known issues](docs/KNOWN_ISSUES.md) — faults and gaps found in review, with suggested fixes.
 - [Hosting the relay](cloud/README.md)
+- [Guide for agents](AGENTS.md) — what must stay true when changing the code.
 
 Run the tests with `python3 -m unittest discover tests`.
 

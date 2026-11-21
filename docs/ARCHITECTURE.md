@@ -2,7 +2,7 @@
 
 This document explains how QuietNet is built, for someone who wants to change it or check what it does. The [README](../README.md) covers installing and using it.
 
-Related documents: [API reference](API.md) · [Testing](TESTING.md) · [Known issues](KNOWN_ISSUES.md)
+Related documents: [Guide for agents](../AGENTS.md) · [API reference](API.md) · [Testing](TESTING.md) · [Known issues](KNOWN_ISSUES.md)
 
 ## The parts
 
@@ -104,7 +104,7 @@ Every two seconds it asks `server.enforcement_plan()` what to do, then:
 
 1. **Steers the device.** It sends the device an ARP message saying "the router's address is at the Pi's hardware address". The device then sends its outgoing traffic to the Pi. The message is repeated every tick because devices forget it after a short while.
 2. **Forwards everything.** It turns on the kernel's packet forwarding so the Pi passes the traffic on to the real router, and turns off "redirect" messages, which would tell the device to go straight to the router again.
-3. **Drops what is blocked.** It loads a small firewall table (`nft`, or `iptables` if `nft` is missing). For a device whose internet is off, it drops everything not addressed to the Pi itself. Otherwise it drops only the addresses that QuietNet handed out, in the last six hours, for names currently blocked for that device.
+3. **Drops what is blocked.** It loads a small firewall table (`nft`, or `iptables` if `nft` is missing). Each load deletes the previous table and defines the new one as a single step, because loading a table that already exists would add to it and leave old rules behind. For a device whose internet is off, it drops everything not addressed to the Pi itself. Otherwise it drops only the addresses that QuietNet handed out, in the last six hours, for names currently blocked for that device.
 
 Only the outgoing direction passes through the Pi. Replies travel from the router to the device directly.
 
@@ -132,7 +132,7 @@ sequenceDiagram
   A->>R: GET /agent/poll with token, waits again
 ```
 
-**Pairing.** On the relay website you create a QuietNet and get a code such as `A1B2-C3D4`. You enter the code and the relay's address on the Pi's dashboard (or set `QUIETNET_CLOUD` and `QUIETNET_PAIR`). The Pi sends the code to `/agent/pair` and gets back a 48-character token, which it saves in `data/cloud.json`. The code is then cleared and cannot be used again.
+**Pairing.** On the relay website you create a QuietNet and get a code such as `A1B2-C3D4`, valid for 15 minutes. Opening the page after that issues a fresh one. You enter the code and the relay's address on the Pi's dashboard (or set `QUIETNET_CLOUD` and `QUIETNET_PAIR`). The Pi sends the code to `/agent/pair` and gets back a 48-character token, which it saves in `data/cloud.json`. The code is then cleared and cannot be used again.
 
 **The bridge.** `Bridge` in `relay.py` keeps a queue of waiting calls per Pi. A browser request is queued and its thread waits up to 30 seconds for the answer. The Pi handles one call at a time. A Pi not heard from for 40 seconds is treated as offline. If the relay ever answers a poll with 401, the Pi discards its token and must be paired again.
 
@@ -143,12 +143,17 @@ sequenceDiagram
 | Threat | Defence | Where |
 | --- | --- | --- |
 | A web page you visit tries to call the local dashboard | The dashboard listens on `127.0.0.1` only and refuses any request whose `Host` is not `localhost` or `127.0.0.1` | `Web.local_only` |
+| Another website shows the dashboard inside itself and tricks someone into clicking | Both servers send `X-Frame-Options: DENY` and `frame-ancestors 'none'` on every answer | `Web.end_headers`, `Relay.end_headers` |
 | A web page posts a forged form to the local dashboard | Changes must be sent as JSON, which a cross-site form cannot do without permission the server never gives | `Web.do_POST` |
 | A web page makes your signed-in browser call the relay | Relayed API calls need an `X-QuietNet: 1` header that another site cannot add; the cookie is `SameSite=Lax` and `HttpOnly` | `Relay.pi_request`, `set_cookie` |
 | Someone else's account reaches your Pi | Every `/pi/<id>/…` request checks the Pi belongs to the signed-in user | `Relay.my_pi` |
 | A stolen or edited session cookie | The cookie is `user.expiry.signature`, signed with a secret kept in the relay's database; it lasts 14 days | `make_session`, `read_session` |
-| A hostile value reaching the firewall | `/api/enforce` accepts only dotted IPv4 text; addresses to drop come from parsed DNS answers | `Web.do_POST`, `answer_ips` |
-| Text injected into the dashboard | The page escapes every value it inserts with `esc()`; the relay escapes Pi names | `static/index.html`, `relay.py` |
+| A hostile value reaching the firewall | `/api/enforce` accepts only a real IPv4 address; addresses to drop come from parsed DNS answers | `Web.handle_post`, `answer_ips` |
+| Text injected into the dashboard | The page escapes every value it inserts, ids and counts included, with `esc()` or `num()`; the relay escapes Pi names | `static/index.html`, `relay.py` |
+| Guessing passwords or pairing codes | Wrong guesses are counted and capped, per account and overall; pairing codes last 15 minutes; an unknown email takes as long to refuse as a wrong password | `Throttle`, `Relay.do_login`, `Relay.agent_pair` |
+| A forged DNS answer | The filter accepts an answer only from the server it asked, with the matching id | `forward_udp` |
+| Very large requests | Bodies over 64 KB are refused unread | `MAX_BODY` in both servers |
+| Other accounts on the same machine reading history or tokens | The data folders and `cloud.json` are readable by their owner only | `init_db`, `CloudAgent._save` |
 
 Two things to keep in mind:
 
@@ -171,7 +176,7 @@ Tables in `quietnet.db`:
 
 | Table | Holds |
 | --- | --- |
-| `queries` | Every lookup: time, device address, name, blocked or not. Pruned to 30 days, hourly |
+| `queries` | Every lookup: time, device address, name, blocked or not. Pruned to 30 days, hourly. Two indexes: by device then time (the device page), and by time (today's totals) |
 | `blocked`, `allowed` | Your own address rules |
 | `service_blocks` | (scope, service) pairs |
 | `internet_off` | Scopes whose internet is off. The scope `all` is the kill switch |
@@ -186,7 +191,7 @@ Rules are also held in memory (the `State` object) and reloaded from the databas
 
 ### On the relay: `relay.db`
 
-`users` (email, password record), `pis` (id, owner, name, token, pairing code, last seen), `meta` (the signing secret).
+`users` (email, password record), `pis` (id, owner, name, token, pairing code and when it was issued, last seen), `meta` (the signing secret).
 
 ## Background work
 
@@ -215,6 +220,7 @@ Command line, `server.py`: `--dns-port` (default 53), `--web-port` (default 8377
 | `PORT` | `relay.py` | Port to listen on. Default 8080 |
 | `QUIETNET_RELAY_DATA` | `relay.py` | Folder for `relay.db`. Default: `data/` beside the program |
 | `QUIETNET_STATIC` | `relay.py` | Path to the dashboard page, if not in the usual place |
+| `QUIETNET_SIGNUP` | `relay.py` | Who may create an account: `open` (default), `first` (only while there are no accounts) or `closed` |
 
 Fixed values worth knowing, all near the top of their files:
 
@@ -228,6 +234,10 @@ Fixed values worth knowing, all near the top of their files:
 | Browser wait for the Pi | `CALL_TIMEOUT` = 30 s | `relay.py` |
 | Pi poll wait | `POLL_TIMEOUT` = 25 s | `relay.py` |
 | Pi counted offline after | `OFFLINE_AFTER` = 40 s | `relay.py` |
+| Pairing code lifetime | `PAIR_CODE_MINUTES` = 15 | `relay.py` |
+| Wrong passwords before a wait | `LOGIN_LIMIT_PER_EMAIL` = 5 in 15 minutes | `relay.py` |
+| Wrong pairing codes before a wait | `PAIR_LIMIT_OVERALL` = 20 in 10 minutes | `relay.py` |
+| Largest request body | `MAX_BODY` = 64 KB | `server.py`, `relay.py` |
 
 ## Adding a blockable service
 

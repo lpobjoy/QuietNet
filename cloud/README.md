@@ -12,9 +12,10 @@ It uses only the Python standard library.
 3. Railway reads `railway.json` and builds `cloud/Dockerfile`. No settings needed —
    it provides the public HTTPS address and the `PORT`.
 4. Add a **Volume** mounted at `/data` so accounts survive redeploys.
-5. Open the Railway URL, create your account, and choose **Add a QuietNet** to get a
+5. Add the variable `QUIETNET_SIGNUP=first`. Only the first account can then be created, which should be yours. Without it, anyone who finds the address can make an account (they still cannot see your Pi).
+6. Open the Railway URL, create your account, and choose **Add a QuietNet** to get a
    pairing code. Enter that code (and the Railway URL) on the Pi's own QuietNet page
-   under **Remote access**.
+   under **Remote access**. The code works once and for 15 minutes; reload the page for a new one.
 
 ## Run locally (for development)
 

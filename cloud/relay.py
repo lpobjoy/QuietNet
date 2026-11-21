@@ -28,16 +28,45 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
+# MAP OF THIS FILE:
+#   settings              timeouts, limits, who may sign up
+#   storage               relay.db: users, pis, and the secret that signs session cookies
+#   passwords & sessions  PBKDF2 password records; signed "user.expiry.signature" cookies
+#   limits on guessing    Throttle: caps wrong passwords and wrong pairing codes
+#   the relay bridge      Bridge: hands a browser's request to the right Pi and waits for its answer
+#   small HTML pages      the page layout
+#   web server            Relay: accounts, pairing, the Pi-side calls, and browser -> Pi relaying
+#
+# THREADS: one per request (ThreadingHTTPServer). A Pi's poll and a browser's relayed call are both
+# threads that sleep inside Bridge until the other arrives. All shared state is in Bridge, Throttle
+# and the database, each guarded by its own lock.
+#
+# Fuller explanation: docs/ARCHITECTURE.md (Remote access, Security model). Every call: docs/API.md.
+
 DATA = os.environ.get("QUIETNET_RELAY_DATA") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 PORT = int(os.environ.get("PORT", "8080"))
 SESSION_HOURS = 24 * 14
 CALL_TIMEOUT = 30          # how long a browser request waits for the Pi to answer
 POLL_TIMEOUT = 25          # how long the Pi's long-poll waits before returning empty
 OFFLINE_AFTER = 40         # a Pi not seen for this many seconds is treated as offline
+MAX_BODY = 64 * 1024       # the largest request body the relay will read; real ones are a few hundred bytes
+PAIR_CODE_MINUTES = 15     # how long a pairing code stays valid after it is shown
+# Who may create an account, set with the QUIETNET_SIGNUP environment variable:
+#   open   - anyone who finds the address (the default)
+#   first  - only while no account exists yet, i.e. the person who set the relay up
+#   closed - nobody
+SIGNUP = os.environ.get("QUIETNET_SIGNUP", "open").strip().lower()
+# Limits on wrong guesses: (how many failures, within how many seconds). See Throttle below.
+LOGIN_LIMIT_PER_EMAIL = (5, 15 * 60)
+LOGIN_LIMIT_OVERALL = (60, 5 * 60)
+PAIR_LIMIT_OVERALL = (20, 10 * 60)
+SIGNUP_LIMIT_OVERALL = (10, 60 * 60)
 EMAIL_RE = re.compile(r"[^@\s]+@[^@\s]+\.[^@\s]+")
 
 
 def find_dashboard():
+    """Locate the dashboard page (static/index.html): from QUIETNET_STATIC, beside this
+    file (in the container), or one folder up (in the repository). None if not found."""
     here = os.path.dirname(os.path.abspath(__file__))
     for path in (os.environ.get("QUIETNET_STATIC", ""), os.path.join(here, "static", "index.html"),
                  os.path.join(here, "..", "static", "index.html")):
@@ -56,6 +85,8 @@ db_lock = threading.RLock()
 
 
 def sql(statement, args=(), commit=False, one=False):
+    """Run one SQL statement, holding the lock that guards the single shared connection.
+    one=True returns the first row (or None) in place of a list of rows."""
     with db_lock:
         cur = db.execute(statement, args)
         rows = cur.fetchall()
@@ -65,8 +96,14 @@ def sql(statement, args=(), commit=False, one=False):
 
 
 def init_db():
+    """Open (or create) relay.db, make sure the tables exist, and load or create the secret
+    used to sign session cookies. Deleting the 'secret' row signs everyone out."""
     global db, SECRET
     os.makedirs(DATA, exist_ok=True)
+    try:
+        os.chmod(DATA, 0o700)       # the folder holds accounts, Pi tokens and the signing secret: owner only
+    except OSError:
+        pass                        # e.g. a mounted volume that does not allow it; carry on
     db = sqlite3.connect(os.path.join(DATA, "relay.db"), check_same_thread=False)
     db.execute("PRAGMA journal_mode=WAL")
     db.executescript("""
@@ -75,6 +112,10 @@ def init_db():
             code TEXT, paired INTEGER, created REAL, last_seen REAL);
         CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
     """)
+    # Added after 0.5: when the current pairing code was issued, so that codes can expire.
+    # Databases made by 0.5 lack the column, so add it if it is missing.
+    if "code_ts" not in [row[1] for row in db.execute("PRAGMA table_info(pis)")]:
+        db.execute("ALTER TABLE pis ADD COLUMN code_ts REAL DEFAULT 0")
     db.commit()
     row = sql("SELECT value FROM meta WHERE key='secret'", one=True)
     if row:
@@ -90,12 +131,16 @@ PBKDF2_ROUNDS = 240000
 
 
 def hash_pw(password, salt=None, rounds=PBKDF2_ROUNDS):
+    """Turn a password into the record that is stored: 'pbkdf2$rounds$salt$key'.
+    A fresh random salt is used unless one is given (check_pw gives the stored one)."""
     salt = salt or secrets.token_bytes(16)
     dk = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, rounds)
     return "pbkdf2$%d$%s$%s" % (rounds, base64.b64encode(salt).decode(), base64.b64encode(dk).decode())
 
 
 def check_pw(password, stored):
+    """Does this password match the stored record? Re-derives the key with the record's own
+    salt and rounds and compares in constant time. A damaged record never matches."""
     try:
         _, rounds, salt_b64, _ = stored.split("$")
         return hmac.compare_digest(hash_pw(password, base64.b64decode(salt_b64), int(rounds)), stored)
@@ -104,6 +149,8 @@ def check_pw(password, stored):
 
 
 def make_session(user_id):
+    """A session cookie value for a user: 'user.expiry.signature'. The signature is an
+    HMAC over the first two parts, so neither can be altered without the relay's secret."""
     exp = str(int(time.time() + SESSION_HOURS * 3600))
     msg = "%d.%s" % (user_id, exp)
     sig = hmac.new(SECRET, msg.encode(), hashlib.sha256).hexdigest()[:32]
@@ -111,6 +158,7 @@ def make_session(user_id):
 
 
 def read_session(cookie):
+    """The user id a session cookie belongs to, or None if it is forged, altered or expired."""
     try:
         uid, exp, sig = cookie.split(".")
         msg = "%s.%s" % (uid, exp)
@@ -122,18 +170,97 @@ def read_session(cookie):
     return None
 
 
+# ------------------------------------------------------------------ limits on guessing
+
+class Throttle:
+    """Counts recent failures under a name, and says when there have been too many.
+
+    The relay sits on the public internet, where anyone can try passwords or pairing codes
+    all day. This keeps a short memory of failures (in memory only; it resets on restart)
+    so that guessing is cut off long before it could succeed.
+
+    Names used: "login:<email>" (per account), "login" (all accounts together, which also caps
+    the processor time spent checking passwords), "pair" and "signup" (overall).
+    The overall limits cannot be dodged by changing network address, because they do not
+    depend on the caller's address at all."""
+
+    def __init__(self):
+        """Starts with no failures recorded."""
+        self.lock = threading.Lock()
+        self.failures = {}      # name -> [time of each recent failure]
+
+    def blocked(self, name, limit):
+        """True if `name` has already failed `limit[0]` times within the last `limit[1]` seconds."""
+        most, window = limit
+        cutoff = time.time() - window
+        with self.lock:
+            recent = [t for t in self.failures.get(name, ()) if t > cutoff]
+            if recent:
+                self.failures[name] = recent
+            else:
+                self.failures.pop(name, None)
+            return len(recent) >= most
+
+    def fail(self, name):
+        """Record one failure under `name`."""
+        with self.lock:
+            if len(self.failures) > 10000:          # under a flood of made-up emails, forget the oldest half
+                for key in sorted(self.failures, key=lambda k: self.failures[k][-1])[:5000]:
+                    del self.failures[key]
+            self.failures.setdefault(name, []).append(time.time())
+
+    def clear(self, name):
+        """Forget the failures under `name` (after a successful login)."""
+        with self.lock:
+            self.failures.pop(name, None)
+
+
+throttle = Throttle()
+TOO_MANY = "Too many attempts. Please wait a few minutes and try again."
+
+
+def new_pair_code():
+    """A fresh pairing code, like 'A1B2-C3D4'."""
+    return "%s-%s" % (secrets.token_hex(2).upper(), secrets.token_hex(2).upper())
+
+
+def signup_allowed():
+    """Whether a new account may be created right now (see SIGNUP at the top of the file)."""
+    if SIGNUP == "closed":
+        return False
+    if SIGNUP == "first":
+        return sql("SELECT COUNT(*) FROM users", one=True)[0] == 0
+    return True
+
+
+# A real password record for a password nobody has. Checked when a login names an unknown email,
+# so that "no such account" takes as long to answer as "wrong password" and the two can't be told apart.
+_DUMMY_PW = None
+
+
+def dummy_check(password):
+    """Do the work of checking a password without any account to check it against."""
+    global _DUMMY_PW
+    if _DUMMY_PW is None:
+        _DUMMY_PW = hash_pw(secrets.token_hex(16))
+    check_pw(password, _DUMMY_PW)
+
+
 # ------------------------------------------------------------------ the relay bridge
 
 class Bridge:
     """Holds each Pi's open long-poll and shuttles calls/replies across it."""
 
     def __init__(self):
+        """Starts with no Pis and no calls waiting."""
         self.lock = threading.Lock()
         self.queues = {}      # pi_id -> [call, ...] waiting to be picked up by the Pi
         self.waiting = {}     # call_id -> {"event": Event, "resp": dict}
         self.cond = {}        # pi_id -> Condition, so the Pi's poll can sleep until work arrives
 
     def _cond(self, pi_id):
+        """The wake-up signal for one Pi's waiting poll, created on first use. It shares the
+        bridge's lock, so 'check the queue' and 'go to sleep' happen as one step and no call is missed."""
         with self.lock:
             return self.cond.setdefault(pi_id, threading.Condition(self.lock))
 
@@ -168,6 +295,8 @@ class Bridge:
                 cond.wait(remaining)
 
     def respond(self, call_id, resp):
+        """Pi side: deliver the answer to the browser request waiting on `call_id`. An answer
+        to a call that has already timed out (or never existed) is dropped."""
         with self.lock:
             slot = self.waiting.get(call_id)
             if slot:
@@ -198,34 +327,75 @@ a{{color:#0f766e}}</style></head><body><div class="wrap"><div class="brand">\U00
 
 
 def page(body):
+    """Wrap a fragment of HTML in the site's page layout."""
     return PAGE.format(body=body)
 
 
 # ------------------------------------------------------------------ web server
 
 class Relay(BaseHTTPRequestHandler):
+    """The relay's web server. Three kinds of caller:
+
+      browser, signed out - /login, /signup
+      browser, signed in  - /, /pis/..., and /pi/<id>/... which is passed through to that Pi
+      a Pi                - /agent/pair, /agent/poll, /agent/respond (token in a header)
+
+    Every handler that acts for a signed-in person starts by calling user() or my_pi(). Keep it so:
+    there is no other check between a request and someone's home network."""
     server_version = "QuietNet"
 
     def log_message(self, *a):
+        """Say nothing: the host keeps its own request log."""
         pass
+
+    def end_headers(self):
+        # Sent with every answer, including errors:
+        #  - the two frame lines stop another website showing these pages inside itself and
+        #    tricking a signed-in person into clicking buttons;
+        #  - nosniff stops a browser treating a Pi's JSON answer as a web page, whatever it contains;
+        #  - no-referrer keeps Pi ids out of links followed from here;
+        #  - no-store keeps pages showing your home's activity out of shared caches.
+        """Add the protective headers to every answer, then finish the headers as usual."""
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Content-Security-Policy", "frame-ancestors 'none'")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("Cache-Control", "no-store")
+        super().end_headers()
 
     # -- helpers --------------------------------------------------------
 
+    def read_body(self):
+        """The request body as bytes, or None if it is missing a sensible length or is too big."""
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            return None
+        if n < 0 or n > MAX_BODY:
+            return None
+        return self.rfile.read(n)
+
     def secure(self):
+        """Did this request reach the host over HTTPS? (The host handles HTTPS and tells us.)"""
         return self.headers.get("X-Forwarded-Proto", "http") == "https"
 
     def user(self):
+        """The signed-in user's id, read from the session cookie, or None."""
         cookie = self.headers.get("Cookie", "")
         m = re.search(r"qn_session=([^;]+)", cookie)
         return read_session(m.group(1)) if m else None
 
     def set_cookie(self, token):
+        """Queue a session cookie to go out with this answer. An empty token signs out.
+        HttpOnly keeps page scripts from reading it; SameSite=Lax keeps other sites from sending it
+        with their own form posts; Secure is added whenever the request came over HTTPS."""
         flags = "HttpOnly; SameSite=Lax; Path=/; Max-Age=%d" % (SESSION_HOURS * 3600)
         if self.secure():
             flags += "; Secure"
         self._cookie = "qn_session=%s; %s" % (token, flags)
 
     def send_html(self, body, code=200):
+        """Send a page (the fragment is wrapped in the site layout), with any queued cookie."""
         data = page(body).encode()
         self.send_response(code)
         self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -236,6 +406,7 @@ class Relay(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def send_json(self, obj, code=200):
+        """Send `obj` as a JSON answer with the given status."""
         data = json.dumps(obj).encode()
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
@@ -244,6 +415,7 @@ class Relay(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def redirect(self, to):
+        """Send the browser to another page, with any queued cookie."""
         self.send_response(303)
         self.send_header("Location", to)
         if getattr(self, "_cookie", None):
@@ -251,17 +423,22 @@ class Relay(BaseHTTPRequestHandler):
         self.end_headers()
 
     def body_json(self):
+        """The request body as a JSON object. Anything unreadable, oversized or not an
+        object counts as empty."""
         try:
-            n = int(self.headers.get("Content-Length") or 0)
-            return json.loads(self.rfile.read(n) or b"{}")
+            obj = json.loads(self.read_body() or b"{}")
         except (ValueError, TypeError):
             return {}
+        return obj if isinstance(obj, dict) else {}
 
     def body_form(self):
-        n = int(self.headers.get("Content-Length") or 0)
-        return {k: v[0] for k, v in parse_qs(self.rfile.read(n).decode("utf-8", "ignore")).items()}
+        """The request body as form fields (first value of each). Oversized counts as empty."""
+        raw = self.read_body() or b""
+        return {k: v[0] for k, v in parse_qs(raw.decode("utf-8", "ignore")).items()}
 
     def my_pi(self, pi_id):
+        """The row for Pi `pi_id` if the signed-in user owns it, otherwise None.
+        This is the check that keeps one account away from another's Pi."""
         uid = self.user()
         if not uid:
             return None
@@ -271,6 +448,7 @@ class Relay(BaseHTTPRequestHandler):
     # -- routing --------------------------------------------------------
 
     def do_GET(self):
+        """Route every GET to its handler."""
         url = urlparse(self.path)
         p = url.path
         if p == "/healthz":
@@ -279,6 +457,8 @@ class Relay(BaseHTTPRequestHandler):
             return self.agent_poll()
         if p.startswith("/pi/"):
             return self.pi_request("GET", p, url.query)
+        if p == "/signup" and not signup_allowed():
+            return self.send_html(self.auth_form("login", "New accounts are switched off on this relay."))
         if p in ("/login", "/signup"):
             return self.send_html(self.auth_form(p[1:]))
         if p == "/logout":
@@ -289,6 +469,7 @@ class Relay(BaseHTTPRequestHandler):
         self.send_error(404)
 
     def do_POST(self):
+        """Route every POST to its handler."""
         p = urlparse(self.path).path
         if p == "/agent/pair":
             return self.agent_pair()
@@ -312,10 +493,11 @@ class Relay(BaseHTTPRequestHandler):
     # -- accounts -------------------------------------------------------
 
     def auth_form(self, mode, error=""):
+        """The sign-in or sign-up form (`mode` is 'login' or 'signup'), with an optional error."""
         other = "signup" if mode == "login" else "login"
         title = "Sign in" if mode == "login" else "Create your account"
-        switch = ('New here? <a href="/signup">Create an account</a>' if mode == "login"
-                  else 'Already have an account? <a href="/login">Sign in</a>')
+        switch = ('Already have an account? <a href="/login">Sign in</a>' if mode != "login"
+                  else 'New here? <a href="/signup">Create an account</a>' if signup_allowed() else "")
         err = '<div class="err">%s</div>' % html.escape(error) if error else ""
         return """<div class="card"><h1>%s</h1><p class="muted">Reach your home QuietNet from anywhere.</p>%s
             <form method="post" action="/%s">
@@ -326,29 +508,50 @@ class Relay(BaseHTTPRequestHandler):
             title, err, mode, "current-password" if mode == "login" else "new-password", title, switch)
 
     def do_signup(self):
+        """Create an account and sign in, if sign-up is allowed and the details are acceptable."""
         f = self.body_form()
         email, pw = f.get("email", "").strip().lower(), f.get("password", "")
-        if not EMAIL_RE.fullmatch(email) or len(pw) < 8:
+        if not signup_allowed():
+            return self.send_html(self.auth_form("login", "New accounts are switched off on this relay."), 403)
+        if throttle.blocked("signup", SIGNUP_LIMIT_OVERALL):
+            return self.send_html(self.auth_form("signup", TOO_MANY), 429)
+        if not EMAIL_RE.fullmatch(email) or len(email) > 254 or len(pw) < 8:
             return self.send_html(self.auth_form("signup", "Enter a valid email and a password of at least 8 characters."))
         if sql("SELECT 1 FROM users WHERE email=?", (email,), one=True):
             return self.send_html(self.auth_form("signup", "That email already has an account."))
+        throttle.fail("signup")         # every new account counts towards the hourly limit
         sql("INSERT INTO users(email,pw,created) VALUES(?,?,?)", (email, hash_pw(pw), time.time()), commit=True)
         uid = sql("SELECT id FROM users WHERE email=?", (email,), one=True)[0]
         self.set_cookie(make_session(uid))
         self.redirect("/")
 
     def do_login(self):
+        """Check an email and password and sign in. Wrong guesses are counted, per account
+        and overall, and an unknown email is made to take as long as a wrong password."""
         f = self.body_form()
         email, pw = f.get("email", "").strip().lower(), f.get("password", "")
+        email = email[:254]
+        if throttle.blocked("login:" + email, LOGIN_LIMIT_PER_EMAIL) or throttle.blocked("login", LOGIN_LIMIT_OVERALL):
+            return self.send_html(self.auth_form("login", TOO_MANY), 429)
         row = sql("SELECT id,pw FROM users WHERE email=?", (email,), one=True)
-        if not row or not check_pw(pw, row[1]):
+        if row:
+            good = check_pw(pw, row[1])
+        else:
+            dummy_check(pw)             # spend the same time as a real check, so unknown emails can't be spotted
+            good = False
+        if not good:
+            throttle.fail("login:" + email)
+            throttle.fail("login")
             return self.send_html(self.auth_form("login", "Wrong email or password."))
+        throttle.clear("login:" + email)
         self.set_cookie(make_session(row[0]))
         self.redirect("/")
 
     # -- device list / pairing -----------------------------------------
 
     def home(self):
+        """The signed-in home page: your QuietNets, with a pairing code for each one not yet
+        paired. A code that has expired is replaced here, so the page never shows a dead one."""
         uid = self.user()
         if not uid:
             return self.redirect("/login")
@@ -357,11 +560,18 @@ class Relay(BaseHTTPRequestHandler):
         now = time.time()
         for pid, name, paired, seen in pis:
             if not paired:
-                code = sql("SELECT code FROM pis WHERE id=?", (pid,), one=True)[0]
+                code, code_ts = sql("SELECT code, code_ts FROM pis WHERE id=?", (pid,), one=True)
+                if now - (code_ts or 0) > PAIR_CODE_MINUTES * 60:
+                    # The old code has expired. Looking at this page is what issues a new one,
+                    # so the code on screen is always one that works.
+                    code = new_pair_code()
+                    sql("UPDATE pis SET code=?, code_ts=? WHERE id=? AND paired=0", (code, now, pid), commit=True)
                 rows += """<div class="card"><div class="row"><div><b>%s</b><div class="muted">Waiting to be paired</div></div>
                     <form method="post" action="/pis/%s/delete"><button class="btn" style="background:#b42318">Remove</button></form></div>
                     <p class="muted" style="margin-top:12px">On the Pi's own QuietNet page, open <b>Remote access</b>, enter this relay's
-                    web address and this code:</p><div class="code">%s</div></div>""" % (html.escape(name), pid, html.escape(code))
+                    web address and this code:</p><div class="code">%s</div>
+                    <p class="muted" style="margin-top:8px">The code works once and for %d minutes. Reload this page for a new one.</p></div>""" % (
+                    html.escape(name), pid, html.escape(code), PAIR_CODE_MINUTES)
             else:
                 online = seen and (now - seen) < OFFLINE_AFTER
                 rows += """<a class="dev" href="/pi/%s/"><span class="dot %s"></span>
@@ -374,17 +584,19 @@ class Relay(BaseHTTPRequestHandler):
             <button class="btn" type="submit">Create pairing code</button></form>""" % (rows or '<p class="muted">No QuietNets yet.</p>'))
 
     def new_pi(self):
+        """Create a QuietNet entry for the signed-in user, with a fresh pairing code."""
         uid = self.user()
         if not uid:
             return self.redirect("/login")
         name = (self.body_form().get("name", "").strip() or "My QuietNet")[:40]
         pid = secrets.token_hex(8)
-        code = "%s-%s" % (secrets.token_hex(2).upper(), secrets.token_hex(2).upper())
-        sql("INSERT INTO pis(id,user_id,name,token,code,paired,created,last_seen) VALUES(?,?,?,?,?,0,?,0)",
-            (pid, uid, name, "", code, time.time()), commit=True)
+        now = time.time()
+        sql("INSERT INTO pis(id,user_id,name,token,code,paired,created,last_seen,code_ts) VALUES(?,?,?,?,?,0,?,0,?)",
+            (pid, uid, name, "", new_pair_code(), now, now), commit=True)
         self.redirect("/")
 
     def delete_pi(self, pid):
+        """Remove one of the signed-in user's QuietNets. Its token stops working at once."""
         uid = self.user()
         if uid:
             sql("DELETE FROM pis WHERE id=? AND user_id=?", (pid, uid), commit=True)
@@ -393,23 +605,32 @@ class Relay(BaseHTTPRequestHandler):
     # -- the agent (Pi) side -------------------------------------------
 
     def agent_pair(self):
+        """A Pi presents a pairing code. If it is current and unused, mark the entry paired,
+        clear the code and hand back a new secret token. Wrong codes are counted and capped overall."""
         body = self.body_json()
         code = str(body.get("code", "")).strip().upper()
-        row = sql("SELECT id FROM pis WHERE code=? AND paired=0", (code,), one=True)
+        if throttle.blocked("pair", PAIR_LIMIT_OVERALL):
+            return self.send_json({"error": TOO_MANY}, 429)
+        row = code and sql("SELECT id FROM pis WHERE code=? AND paired=0 AND code_ts>?",
+                           (code, time.time() - PAIR_CODE_MINUTES * 60), one=True)
         if not row:
-            return self.send_json({"error": "That pairing code is wrong or already used."}, 400)
+            throttle.fail("pair")
+            return self.send_json({"error": "That pairing code is wrong, already used, or has expired."}, 400)
         token = secrets.token_hex(24)
         sql("UPDATE pis SET paired=1, token=?, code='', last_seen=? WHERE id=?",
             (token, time.time(), row[0]), commit=True)
         self.send_json({"ok": True, "id": row[0], "token": token})
 
     def agent(self):
+        """The Pi row matching the token in the request header, or None."""
         token = self.headers.get("X-QuietNet-Token", "")
         if not token:
             return None
         return sql("SELECT id FROM pis WHERE token=? AND paired=1", (token,), one=True)
 
     def agent_poll(self):
+        """A Pi asks for work. Notes that it is alive, then waits (up to POLL_TIMEOUT seconds)
+        for a browser request to pass down. An empty object means 'nothing yet, ask again'."""
         row = self.agent()
         if not row:
             return self.send_error(401)
@@ -418,17 +639,29 @@ class Relay(BaseHTTPRequestHandler):
         self.send_json(call or {})      # {} means "nothing to do"; a real call always carries an id
 
     def agent_respond(self):
+        """A Pi returns the answer to a call. Only ordinary status codes are passed on."""
         row = self.agent()
         if not row:
             return self.send_error(401)
         body = self.body_json()
-        bridge.respond(str(body.get("id", "")),
-                       {"status": int(body.get("status", 502)), "body": body.get("body", "")})
+        try:
+            status = int(body.get("status", 502))
+        except (TypeError, ValueError):
+            status = 502
+        if not 200 <= status <= 599:        # only ordinary answer codes are passed back to the browser
+            status = 502
+        text = body.get("body", "")
+        bridge.respond(str(body.get("id", "")), {"status": status, "body": text if isinstance(text, str) else ""})
         self.send_json({"ok": True})
 
     # -- browser -> Pi relay -------------------------------------------
 
     def pi_request(self, method, path, query):
+        """A signed-in browser's request for one of its Pis.
+
+        '/pi/<id>/' serves the dashboard page. '/pi/<id>/api/...' is passed to the Pi through the
+        bridge and the Pi's answer is returned. Checks, in order: the Pi is yours; the path is an API
+        path; the request carries the dashboard's own header; the Pi is online."""
         parts = path.split("/", 3)          # ['', 'pi', '<id>', 'rest...']
         if len(parts) < 3:
             return self.send_error(404)
@@ -450,7 +683,10 @@ class Relay(BaseHTTPRequestHandler):
 
         payload = {"method": method, "path": rest + (("?" + query) if query else "")}
         if method == "POST":
-            payload["body"] = self.rfile.read(int(self.headers.get("Content-Length") or 0)).decode("utf-8", "ignore")
+            raw = self.read_body()
+            if raw is None:
+                return self.send_error(413)
+            payload["body"] = raw.decode("utf-8", "ignore")
         resp = bridge.call(pid, payload)
         if resp is None:
             return self.send_json({"error": "Your QuietNet didn't answer in time."}, 504)
@@ -462,6 +698,8 @@ class Relay(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def serve_dashboard(self, pid, name):
+        """Send the dashboard page, with two additions: a script telling it to send its API
+        calls to '/pi/<id>/...', and a bar across the top with the Pi's name and a way back."""
         if not DASHBOARD:
             return self.send_error(500)
         with open(DASHBOARD, encoding="utf-8") as f:
@@ -482,6 +720,7 @@ class Relay(BaseHTTPRequestHandler):
 
 
 def main():
+    """Open the database and serve until stopped."""
     init_db()
     if not DASHBOARD:
         print("Warning: dashboard file not found; remote dashboard pages won't render.")

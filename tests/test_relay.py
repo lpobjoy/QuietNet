@@ -83,6 +83,12 @@ class RelayCase(unittest.TestCase):
         with relay.bridge.lock:
             relay.bridge.queues.clear()
             relay.bridge.waiting.clear()
+        relay.throttle.failures.clear()
+
+    def limit(self, name, value):
+        """Change one of the relay's limits for the length of a test."""
+        self.addCleanup(setattr, relay, name, getattr(relay, name))
+        setattr(relay, name, value)
 
     def signed_in(self, email="lewis@example.com"):
         b = Browser(self.port)
@@ -341,7 +347,7 @@ class Pairing(RelayCase):
         self.assertEqual(Browser(self.port).post("/agent/pair", data={"code": code})[0], 200)
         status, text, _ = Browser(self.port).post("/agent/pair", data={"code": code})
         self.assertEqual(status, 400)
-        self.assertIn("wrong or already used", json.loads(text)["error"])
+        self.assertIn("already used", json.loads(text)["error"])
 
     def test_wrong_and_empty_codes_are_refused(self):
         b = self.signed_in()
@@ -497,6 +503,249 @@ class Relaying(RelayCase):
         self.assertIn('window.QN_API_BASE="/pi/%s";' % pid, text)
         self.assertIn("Home &lt;Pi&gt; &mdash; remote", text)
         self.assertNotIn("Home <Pi>", text)
+
+
+# ------------------------------------------------------------------ hardening
+
+class Headers(RelayCase):
+    WANTED = {"X-Frame-Options": "DENY", "Content-Security-Policy": "frame-ancestors 'none'",
+              "X-Content-Type-Options": "nosniff", "Referrer-Policy": "no-referrer", "Cache-Control": "no-store"}
+
+    def check(self, r, where):
+        for name, value in self.WANTED.items():
+            self.assertEqual(r.getheader(name), value, "%s on %s" % (name, where))
+
+    def test_every_kind_of_answer_carries_the_protective_headers(self):
+        b = self.signed_in()
+        pid, token = self.paired_pi(b)
+        self.check(Browser(self.port).get("/login")[2], "a page")
+        self.check(Browser(self.port).get("/healthz")[2], "json")
+        self.check(Browser(self.port).get("/")[2], "a redirect")
+        self.check(Browser(self.port).get("/nope")[2], "an error")
+        self.check(b.get("/pi/%s/" % pid)[2], "the remote dashboard")
+        t, _ = self.pretend_pi(token)
+        self.check(b.get("/pi/%s/api/status" % pid, headers={"X-QuietNet": "1"})[2], "a relayed answer")
+        t.join(5)
+
+
+class Storage(RelayCase):
+    @unittest.skipIf(os.name == "nt", "file permissions work differently on Windows")
+    def test_the_data_folder_is_private_to_its_owner(self):
+        # It holds the accounts, every Pi's token and the secret that signs sessions.
+        self.assertEqual(os.stat(relay.DATA).st_mode & 0o777, 0o700)
+
+
+class ThrottleLogic(unittest.TestCase):
+    def test_blocks_only_after_the_limit_is_reached(self):
+        t = relay.Throttle()
+        for _ in range(3):
+            self.assertFalse(t.blocked("x", (3, 60)))
+            t.fail("x")
+        self.assertTrue(t.blocked("x", (3, 60)))
+        self.assertFalse(t.blocked("y", (3, 60)))             # other names are unaffected
+
+    def test_old_failures_stop_counting(self):
+        t = relay.Throttle()
+        t.failures["x"] = [time.time() - 120] * 5
+        self.assertFalse(t.blocked("x", (3, 60)))
+        self.assertEqual(t.failures, {})                      # and are tidied away
+
+    def test_clear_forgets_a_name(self):
+        t = relay.Throttle()
+        t.fail("x")
+        t.clear("x")
+        self.assertFalse(t.blocked("x", (1, 60)))
+
+    def test_memory_stays_bounded_under_a_flood_of_names(self):
+        t = relay.Throttle()
+        for i in range(10050):
+            t.fail("login:made-up-%d@example.com" % i)
+        self.assertLessEqual(len(t.failures), 10001)
+
+
+class GuessLimits(RelayCase):
+    def login(self, email="lewis@example.com", password="wrong password"):
+        return Browser(self.port).post("/login", form={"email": email, "password": password})
+
+    def test_repeated_wrong_passwords_lock_that_account_for_a_while(self):
+        self.signed_in()
+        for _ in range(relay.LOGIN_LIMIT_PER_EMAIL[0]):
+            self.assertEqual(self.login()[0], 200)
+        status, text, _ = self.login(password=PASSWORD)       # even the right password must now wait
+        self.assertEqual(status, 429)
+        self.assertIn("Too many attempts", text)
+
+    def test_one_accounts_lock_does_not_affect_another(self):
+        self.signed_in()
+        self.signed_in("hannah@example.com")
+        for _ in range(relay.LOGIN_LIMIT_PER_EMAIL[0]):
+            self.login()
+        self.assertEqual(self.login("hannah@example.com", PASSWORD)[0], 303)
+
+    def test_a_successful_login_wipes_the_slate(self):
+        self.signed_in()
+        for _ in range(relay.LOGIN_LIMIT_PER_EMAIL[0] - 1):
+            self.login()
+        self.assertEqual(self.login(password=PASSWORD)[0], 303)
+        for _ in range(relay.LOGIN_LIMIT_PER_EMAIL[0] - 1):
+            self.assertEqual(self.login()[0], 200)
+        self.assertEqual(self.login(password=PASSWORD)[0], 303)
+
+    def test_guessing_across_many_emails_is_capped_too(self):
+        self.signed_in()
+        self.limit("LOGIN_LIMIT_OVERALL", (4, 600))
+        for i in range(4):
+            self.login("nobody%d@example.com" % i)
+        self.assertEqual(self.login("someone-new@example.com")[0], 429)
+
+    def test_an_unknown_email_costs_the_same_work_as_a_wrong_password(self):
+        # If unknown emails were answered instantly, timing would reveal which emails have accounts.
+        self.signed_in()
+        real, calls = relay.check_pw, []
+        self.addCleanup(setattr, relay, "check_pw", real)
+        relay.check_pw = lambda password, stored: calls.append(1) or real(password, stored)
+        self.login("nobody@example.com")
+        self.assertEqual(len(calls), 1)
+
+    def test_wrong_pairing_codes_are_capped(self):
+        self.limit("PAIR_LIMIT_OVERALL", (3, 600))
+        b = self.signed_in()
+        b.post("/pis/new", form={"name": "Home Pi"})
+        code = relay.sql("SELECT code FROM pis", one=True)[0]
+        for i in range(3):
+            self.assertEqual(Browser(self.port).post("/agent/pair", data={"code": "0000-000%d" % i})[0], 400)
+        status, text, _ = Browser(self.port).post("/agent/pair", data={"code": code})
+        self.assertEqual(status, 429)
+        self.assertIn("Too many attempts", json.loads(text)["error"])
+        self.assertEqual(relay.sql("SELECT paired FROM pis", one=True)[0], 0)      # the real code was not used up
+
+    def test_new_accounts_are_capped_per_hour(self):
+        self.limit("SIGNUP_LIMIT_OVERALL", (2, 3600))
+        self.signed_in("a@example.com")
+        self.signed_in("b@example.com")
+        status, text, _ = Browser(self.port).post("/signup", form={"email": "c@example.com", "password": PASSWORD})
+        self.assertEqual(status, 429)
+        self.assertEqual(relay.sql("SELECT COUNT(*) FROM users", one=True)[0], 2)
+
+
+class PairingCodeExpiry(RelayCase):
+    def test_a_code_stops_working_after_fifteen_minutes(self):
+        b = self.signed_in()
+        b.post("/pis/new", form={"name": "Home Pi"})
+        code = relay.sql("SELECT code FROM pis", one=True)[0]
+        relay.sql("UPDATE pis SET code_ts=?", (time.time() - relay.PAIR_CODE_MINUTES * 60 - 5,), commit=True)
+        status, text, _ = Browser(self.port).post("/agent/pair", data={"code": code})
+        self.assertEqual(status, 400)
+        self.assertIn("expired", json.loads(text)["error"])
+
+    def test_opening_the_page_issues_a_fresh_code_that_works(self):
+        b = self.signed_in()
+        b.post("/pis/new", form={"name": "Home Pi"})
+        old = relay.sql("SELECT code FROM pis", one=True)[0]
+        relay.sql("UPDATE pis SET code_ts=0", commit=True)
+        page = b.get("/")[1]
+        new = relay.sql("SELECT code FROM pis", one=True)[0]
+        self.assertNotEqual(new, old)
+        self.assertIn(new, page)
+        self.assertIn("15 minutes", page)
+        self.assertEqual(Browser(self.port).post("/agent/pair", data={"code": old})[0], 400)
+        self.assertEqual(Browser(self.port).post("/agent/pair", data={"code": new})[0], 200)
+
+    def test_a_code_still_in_date_is_left_alone_when_the_page_is_reloaded(self):
+        b = self.signed_in()
+        b.post("/pis/new", form={"name": "Home Pi"})
+        code = relay.sql("SELECT code FROM pis", one=True)[0]
+        b.get("/")
+        b.get("/")
+        self.assertEqual(relay.sql("SELECT code FROM pis", one=True)[0], code)
+
+    def test_a_database_from_version_0_5_is_upgraded_in_place(self):
+        import sqlite3
+        folder = tempfile.mkdtemp(prefix="quietnet-relay-old-")
+        old = sqlite3.connect(os.path.join(folder, "relay.db"))
+        old.executescript("""
+            CREATE TABLE users(id INTEGER PRIMARY KEY, email TEXT UNIQUE, pw TEXT, created REAL);
+            CREATE TABLE pis(id TEXT PRIMARY KEY, user_id INTEGER, name TEXT, token TEXT,
+                code TEXT, paired INTEGER, created REAL, last_seen REAL);
+            CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT);
+            INSERT INTO pis VALUES('abc', 1, 'Home Pi', 'tok', '', 1, 1.0, 2.0);
+        """)
+        old.commit()
+        old.close()
+        keep = (relay.db, relay.SECRET, relay.DATA)
+        try:
+            relay.DATA = folder
+            relay.init_db()
+            self.assertEqual(relay.sql("SELECT id, token, paired, code_ts FROM pis"), [("abc", "tok", 1, 0)])
+            relay.init_db()                                   # starting a second time must not fail
+            relay.db.close()
+        finally:
+            relay.db, relay.SECRET, relay.DATA = keep
+
+
+class SignupSwitch(RelayCase):
+    def signup(self, email):
+        return Browser(self.port).post("/signup", form={"email": email, "password": PASSWORD})
+
+    def test_open_by_default(self):
+        self.assertEqual(relay.SIGNUP, "open")
+        self.assertIn("Create an account", Browser(self.port).get("/login")[1])
+
+    def test_closed_means_nobody_can_create_an_account(self):
+        self.limit("SIGNUP", "closed")
+        status, text, _ = self.signup("a@example.com")
+        self.assertEqual(status, 403)
+        self.assertIn("switched off", text)
+        self.assertEqual(relay.sql("SELECT COUNT(*) FROM users", one=True)[0], 0)
+        self.assertIn("switched off", Browser(self.port).get("/signup")[1])
+        self.assertNotIn("Create an account", Browser(self.port).get("/login")[1])
+
+    def test_first_lets_in_one_account_then_shuts_the_door(self):
+        self.limit("SIGNUP", "first")
+        self.assertEqual(self.signup("lewis@example.com")[0], 303)
+        self.assertEqual(self.signup("stranger@example.com")[0], 403)
+        self.assertEqual(relay.sql("SELECT email FROM users"), [("lewis@example.com",)])
+        self.assertNotIn("Create an account", Browser(self.port).get("/login")[1])
+
+    def test_existing_accounts_can_still_sign_in_when_sign_up_is_closed(self):
+        self.signed_in()
+        self.limit("SIGNUP", "closed")
+        status, _, _ = Browser(self.port).post("/login", form={"email": "lewis@example.com", "password": PASSWORD})
+        self.assertEqual(status, 303)
+
+
+class OversizedAndOddInput(RelayCase):
+    API = {"X-QuietNet": "1"}
+
+    def test_an_oversized_body_is_not_read_or_relayed(self):
+        b = self.signed_in()
+        pid, token = self.paired_pi(b)
+        big = {"domain": "x" * (relay.MAX_BODY + 1)}
+        self.assertEqual(b.post("/pi/%s/api/block" % pid, data=big, headers=self.API)[0], 413)
+        self.assertEqual(relay.bridge.queues.get(pid, []), [])
+
+    def test_an_oversized_form_is_treated_as_empty(self):
+        status, text, _ = Browser(self.port).post(
+            "/signup", form={"email": "a@example.com", "password": "p" * (relay.MAX_BODY + 1)})
+        self.assertIn("Enter a valid email", text)
+        self.assertEqual(relay.sql("SELECT COUNT(*) FROM users", one=True)[0], 0)
+
+    def test_json_that_is_not_an_object_is_treated_as_empty(self):
+        for data in ([1, 2], "text", 5):
+            self.assertEqual(Browser(self.port).post("/agent/pair", data=data)[0], 400)
+
+    def test_a_pi_cannot_make_the_relay_send_a_strange_status(self):
+        b = self.signed_in()
+        pid, token = self.paired_pi(b)
+        for odd in (99, 700, "abc", None):
+            t, _ = self.pretend_pi(token, status=odd)
+            self.assertEqual(b.get("/pi/%s/api/status" % pid, headers=self.API)[0], 502, odd)
+            t.join(5)
+
+    def test_an_overlong_email_is_refused(self):
+        email = "a" * 250 + "@example.com"
+        status, text, _ = Browser(self.port).post("/signup", form={"email": email, "password": PASSWORD})
+        self.assertIn("Enter a valid email", text)
 
 
 if __name__ == "__main__":

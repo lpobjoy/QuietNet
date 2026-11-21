@@ -69,6 +69,30 @@ class StandardLibraryOnly(unittest.TestCase):
         self.assertEqual(imports_of(os.path.join("cloud", "relay.py")) & LOCAL_MODULES, set())
 
 
+class Commenting(unittest.TestCase):
+    """The programs are meant to be readable by whoever (or whatever) picks them up next."""
+    PROGRAMS = StandardLibraryOnly.PROGRAMS
+
+    def test_every_function_and_class_explains_itself(self):
+        for path in self.PROGRAMS:
+            tree = ast.parse(read(path))
+            self.assertTrue(ast.get_docstring(tree), "%s needs an opening description" % path)
+            silent = [node.name for node in ast.walk(tree)
+                      if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and not ast.get_docstring(node)]
+            self.assertEqual(silent, [], "%s: add a docstring saying what these do and why" % path)
+
+    def test_the_dashboard_script_opens_with_its_notes_for_editors(self):
+        page = read("static", "index.html")
+        notes = page[page.index("<script>"):page.index("const S = {")]
+        for must in ("HOW IT IS ORGANISED", "esc()", "data-act", "QN_API_BASE"):
+            self.assertIn(must, notes)
+
+    def test_the_guide_for_agents_exists_and_names_the_test_command(self):
+        guide = read("AGENTS.md")
+        self.assertIn("python3 -m unittest discover tests", guide)
+        self.assertIn("AGENTS.md", read("CLAUDE.md"))
+
+
 class Containers(unittest.TestCase):
     def test_the_pi_container_includes_every_program_file_the_server_imports(self):
         # A file the server imports but the Dockerfile leaves out stops the container at start-up
@@ -207,6 +231,12 @@ class DashboardContract(unittest.TestCase):
         # relay.serve_dashboard does a plain text replace on these exact tags.
         self.assertEqual(self.page.count("<head>"), 1)
         self.assertEqual(self.page.count("<body>"), 1)
+
+    def test_ids_and_counts_from_the_server_are_escaped_too(self):
+        # Through the relay these come from a Pi the relay does not control, so even "numbers"
+        # must not be pasted into the page raw.
+        for raw in ('"${g.id}"', '"${x.id}"', '"${x.v}"', '"${x.on}"', "${g.services} service", "${g.members.length} device"):
+            self.assertNotIn(raw, self.page, raw)
 
     def test_the_page_loads_nothing_from_other_websites(self):
         self.assertEqual(re.findall(r"""(?:src|href)=["']https?://""", self.page), [])

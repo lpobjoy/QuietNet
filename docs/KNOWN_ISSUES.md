@@ -1,18 +1,24 @@
 # Known issues
 
-Found in a review of version 0.5 on 21 November 2026. Each entry says what is wrong, what it affects, and a suggested fix. The numbers are referred to from the tests and the other documents, so keep them stable; strike an entry through when it is fixed.
+Two reviews have been made: of version 0.5 on 21 November 2026, and a second, deeper pass the same day covering security, the software QuietNet depends on, and efficiency. This file lists what is still open, then what has been fixed.
 
-Entries marked **Tested** have a check in `tests/` that is currently an expected failure. It will start passing when the issue is fixed, and the test run will then say so.
+The numbers are referred to from tests and other documents. Keep them stable.
 
-## Needs testing on a real Pi
+## Open: needs testing on a real Pi
 
 ### 4. With Docker installed, an enforced device may lose all internet
 
 Docker sets the host's rule for forwarded traffic to "drop unless allowed". The enforcer's own table accepts forwarded traffic, but an accept in one table does not override a drop in another. A steered device's traffic would then be dropped by Docker's rule, cutting the device off completely where only the blocked addresses were meant to go.
 
-This could not be tested in the review. To check: enforce a device, block nothing for it, and see whether it can still browse.
+This could not be tested in review. To check: enforce a device, block nothing for it, and see whether it can still browse.
 
 **Fix if confirmed:** add an explicit accept for the home network's forwarded traffic in Docker's `DOCKER-USER` chain while the enforcer is active, and remove it on teardown.
+
+### 15. The firewall reload fix needs confirming on a Pi
+
+Issue 15 (below, under Fixed) was confirmed and fixed against the real `nft` tool in a test machine, but not with real devices. To check: enforce a device, switch its internet off, confirm it is cut off, switch it back on, and confirm it recovers within a few seconds without restarting QuietNet.
+
+## Open: design decisions for the owner
 
 ### 5. IPv4 only
 
@@ -23,77 +29,118 @@ The DNS filter listens on IPv4 addresses only, and the enforcer steers and drops
 
 **Fix:** listen for DNS on IPv6 as well. For the enforcer, either steer IPv6 too (neighbour advertisements in place of ARP) or state the limit on the device page.
 
-## Relay security
+### 6. Sign-up on the relay is open unless you close it
 
-### 6. Open sign-up, no limit on guesses, pairing codes that never expire
+Anyone who finds the relay's address can create an account. Accounts cannot see each other's Pis, so this exposes nothing, but it is an open door on a public server. A setting now exists to close it: `QUIETNET_SIGNUP=first` allows only the first account, and `closed` allows none. The default is still `open`, so that existing set-ups behave as before.
 
-- Anyone who finds the relay's address can create an account. Accounts are separate from each other, so this exposes nothing, but it is an open door on a public server.
-- There is no limit on login attempts or on pairing attempts.
-- A pairing code is eight characters from 0–9 and A–F (about four billion possibilities) and stays valid until used. A stranger who guessed one would pair their own machine as your Pi and could show you false information. They would not gain control of your real Pi.
-
-**Fix:** allow sign-up only while there are no accounts, or behind an invite code set as an environment variable. Limit attempts per address on `/login` and `/agent/pair`. Expire pairing codes after fifteen minutes.
-
-### 7. Smaller relay points
-
-- Signing out clears the cookie in the browser, but a copied cookie stays valid for its full 14 days. There is no way to end all sessions short of deleting the signing secret.
-- Pi tokens are stored as plain text in `relay.db`. Storing a hash would mean a leaked database could not be used to pose as a Pi.
-- Request bodies are read whole with no size limit.
-
-## Filtering gaps
+**Recommended:** set `QUIETNET_SIGNUP=first` on Railway. Consider making it the default.
 
 ### 8. Devices that bring their own phone book
 
-iCloud Private Relay, Android's Private DNS setting, and browsers with "secure DNS" switched on send lookups past QuietNet. The README mentions this briefly.
+iCloud Private Relay, Android's Private DNS setting, and browsers with "secure DNS" switched on send lookups past QuietNet.
 
 **Fix:** two widely used signals close most of it. Block `mask.icloud.com` and `mask-h2.icloud.com`, which makes Apple devices switch Private Relay off for that network. Answer "no such name" for `use-application-dns.net`, which makes Firefox use the network's DNS.
 
-## Robustness
+### 18. The local dashboard has no password
 
-### 9. Input of the wrong type drops the connection — Tested
+Anyone who can open `http://localhost:8377` on the QuietNet computer controls it: another account on the same machine, or anyone with an SSH login. This is by design for a single-owner home machine. It matters if the Pi is shared.
 
-Several dashboard API calls assume the type of a value and fail if it is something else. The server thread raises an error and the connection closes with no reply. Nothing is changed, so no harm follows, but the answer should be a clean `400`.
+### 19. Limits on guessing are simple by design
 
-- `/api/block`, `/api/unblock`, `/api/forget` with a `domain` that is a number
-- `/api/pause` with `minutes` that is not a number
+The relay's limits are kept in memory, so they reset when it restarts. The per-account limit (five wrong passwords in fifteen minutes) means a stranger who knows your email can keep you locked out by guessing wrongly on purpose. For a self-hosted relay with one owner this is a fair trade; a public service would want something finer.
 
-**Fix:** check the type before use in `clean_domain()` and the pause handler.
-**Test:** `test_dashboard_api.BlockingAddresses.test_a_domain_that_is_not_text_is_refused_politely`
+## Open: smaller security points
 
-### 10. An impossible address can stall the enforcer
+### 7. Relay
 
-`/api/enforce` accepts any four groups of one to three digits, so `999.999.999.999` is accepted. The firewall tool rejects a rule containing it, and because the whole table is loaded at once, no rule changes take effect until that entry is removed.
+- Signing out clears the cookie in the browser, but a copied cookie stays valid for its full 14 days. The only way to end every session is to delete the `secret` row in `relay.db`.
+- Pi tokens are stored as plain text in `relay.db`. Storing a hash would mean a leaked database could not be used to pose as a Pi. The data folder is now private to its owner, which narrows this.
+- The sign-in form carries no one-time token, so another site could sign a visitor in to the attacker's own account ("login forgery"). The visitor would see the attacker's QuietNets, not their own. Low risk.
+- The sign-up form says when an email already has an account. Low risk for a single-owner relay.
 
-**Fix:** validate with `ipaddress.IPv4Address` in place of the pattern.
+### 20. A relay address beginning `http://` is accepted
 
-### 11. History queries read the whole table
+The Pi will pair with a relay over plain HTTP if given such an address. Over the internet that would send the Pi's token unprotected. An address typed without a scheme gets `https://`, so this needs a deliberate `http://`. It is left in for running a relay on the same machine during development.
 
-The status summary counts today's lookups by time, but the only index on the history table starts with the device address, so the database reads every row. The devices list groups the entire table on every refresh. With 30 days of a household's lookups this will become slow, most noticeably through the relay.
+**Fix:** refuse `http://` unless the host is `localhost` or `127.0.0.1`.
 
-**Fix:** add an index on `queries(ts)`, and limit the devices query to recent history.
+### 21. Both containers run as the root user
+
+The Pi container needs network rights that are simplest to hold as root. The relay does not need them, but Railway mounts its storage volume owned by root, so an unprivileged relay could not write its database without extra set-up.
+
+## Open: efficiency
+
+### 22. Every allowed lookup goes to the internet
+
+QuietNet keeps no memory of answers. Because it also cuts every answer's lifetime to 120 seconds, devices ask again often, and each ask is a round trip to 1.1.1.1. On a busy home network that adds delay and traffic.
+
+**Fix:** keep answers in memory for their (shortened) lifetime, keyed by name and record type, and clear the memory whenever a rule changes.
+
+### 23. The remote dashboard is slower than it needs to be
+
+Each refresh of the dashboard makes three to six API calls. Through the relay each one is a separate round trip, and the Pi handles them one at a time: it asks the relay for work, does one call, answers, and asks again. On a slow link the page lags.
+
+**Fix:** let the Pi take several waiting calls per poll and answer them together, or add one combined "everything this tab needs" call.
+
+### 24. A flood of lookups queues without limit
+
+The UDP listener hands every lookup to a pool of 64 workers. If lookups arrive faster than they can be answered (a misbehaving device, or the upstream servers being unreachable), the waiting list grows without bound.
+
+**Fix:** drop new lookups when more than a few hundred are waiting. Devices retry on their own.
 
 ### 12. Minor
 
-- The community list download accepts the line `0.0.0.0 0.0.0.0` from the source file and stores `0.0.0.0` as a blocked name. Harmless.
-- `enforcement_plan()` reads the set of enforced devices while a dashboard request may be changing it. The enforcer catches the resulting error and tries again two seconds later.
 - The README and the comment at the top of `server.py` say blocked lookups are answered "that doesn't exist". They are answered with the address `0.0.0.0`, which devices treat the same way.
+- The enforcer drops addresses handed out in the last six hours. A service that moves to new addresses is covered as soon as the device looks them up through QuietNet.
+
+## Software QuietNet depends on
+
+QuietNet uses **no third-party Python packages**, so there is no package list to scan. A test (`test_packaging.StandardLibraryOnly`) keeps it that way. What it does depend on:
+
+| Dependency | Where | State on 21 November 2026 |
+| --- | --- | --- |
+| Python 3.13 | Both containers (`python:3.13-slim`) | In its security-fixes-only period, supported until October 2028. Latest is 3.13.18 (25 October 2026). The image tag follows the newest 3.13 release each time the container is rebuilt |
+| Debian packages, including `nftables` | Pi container | Installed fresh at build time |
+| Python 3.9 from Apple | macOS, via `Start QuietNet.command` | Python 3.9 is past the end of its upstream support. Apple maintains its own copy on its own timetable |
+| StevenBlack hosts list | Downloaded on request | Data only. Each line is checked before use and nothing in it is executed |
+
+The Python security fixes published during 2026 were checked against the modules QuietNet uses (`http.server`, `urllib`, `sqlite3`, `socket`, `ssl` as a client, `hashlib`, `hmac`, `json`, `subprocess`, `webbrowser`). Those found:
+
+- Fixes to `tarfile`, `zipfile`, `tempfile`, the XML parser and `mimetypes`: QuietNet does not use these.
+- A use-after-free in server-side TLS with certain callbacks: QuietNet never serves TLS itself. The host does that for the relay.
+- A memory denial-of-service in `http.client` (fixed in 3.13.11): the Pi's link to the relay uses this module, so the fix matters. Any image built since December 2025 has it.
+- Option injection in `webbrowser.open()` through a crafted address: QuietNet opens only its own fixed `localhost` address.
+- Removal of trust in a compromised certificate authority (3.13.18): applies to the Pi's HTTPS connections to the relay and to the list download. Rebuild to pick it up.
+
+**To do:** rebuild both containers so they carry 3.13.18. `.github/dependabot.yml` now asks GitHub to open a pull request whenever a newer base image appears. On a Mac, running QuietNet with a current Python from python.org is safer than Apple's 3.9, though the scan feature works best with Apple's (see the launcher's comment).
+
+This check used the published release notes. It is not a scan of the built image, which needs a tool such as `docker scout` or `trivy` run against the image itself.
 
 ## Fixed
 
-### ~~1. The Pi container stops at start-up~~
+### In the second review
 
-`server.py` imports `cloud_agent`, but the `Dockerfile` did not copy `cloud_agent.py`, so `docker compose up` failed with `ModuleNotFoundError`. The file is now copied.
-**Test:** `test_packaging.Containers.test_the_pi_container_includes_every_program_file_the_server_imports`
+| # | What was wrong | Fix |
+| --- | --- | --- |
+| 13 | **Another website could show the dashboard inside itself**, invisibly, and trick someone into clicking the kill switch or unblocking an address. The local dashboard has no login, so this worked against it directly | Both web servers now send headers on every answer that forbid being shown inside another page |
+| 14 | **Forged DNS answers were accepted from any sender** that guessed the port and a two-byte id | The filter now accepts an answer only from the server it asked |
+| 15 | **Enforcer rules piled up and never went away.** Loading the firewall table again added to the old rules. A device whose internet was switched off and then on again stayed cut off until QuietNet restarted | The rules text now deletes the old table before defining the new one, as a single step |
+| 16 | **Ids and counts were put into the dashboard page unescaped.** Through the relay these come from a Pi the relay does not control, so a hostile "Pi" could have run script in the owner's signed-in page | Every value is now escaped |
+| 17 | **The Pi's relay token and the history database were readable by other accounts** on the same machine | `cloud.json` is owner-only; both data folders are owner-only |
+| 6 | **No limit on password or pairing-code guesses; codes never expired; unknown emails answered faster than wrong passwords** | Wrong guesses are counted and capped; codes last 15 minutes and a fresh one is issued when the page is opened; unknown emails take as long as wrong passwords; sign-up can be closed |
+| 7 | **Request bodies were read whole, whatever their size**; a Pi could make the relay send any status code | Bodies over 64 KB are refused on both servers; only ordinary status codes are passed on |
+| 9 | **Input of the wrong type dropped the connection** with no answer | Clean `400` refusals throughout the dashboard API |
+| 10 | **An impossible address such as 999.999.999.999 could be enforced**, which stopped every firewall rule loading | The address must now be a real IPv4 address |
+| 11 | **History queries read the whole table** on every dashboard refresh | A second index, and the devices query split in two so each part is answered from an index. The database is also told not to force the disk after every write, which suits an SD card |
+| 12 | The community list stored `0.0.0.0` as a blocked name; the enforcer read a set while it could be changing | Both corrected |
 
-### ~~2. The dashboard cannot be opened on a Pi with no screen~~
+### In the first review
 
-The dashboard answers on `localhost` only, but the README said to open it at the Pi's network address, and `docker-compose.yml` gave no way to pair a Pi with a relay without the dashboard. The dashboard stays closed to the home network, which is the safer choice: opening it would let anyone in the house change the rules unless a password were added. In its place, `docker-compose.yml` now passes `QUIETNET_CLOUD` and `QUIETNET_PAIR` through, and the README describes the two ways in: the relay, or an SSH tunnel.
-**Tests:** `test_packaging.Containers.test_compose_lets_a_pi_with_no_screen_be_paired`, `test_packaging.Readme.test_the_readme_does_not_send_people_to_an_address_that_is_refused`
+| # | What was wrong | Fix |
+| --- | --- | --- |
+| 1 | The Pi container stopped at start-up: the `Dockerfile` left out `cloud_agent.py` | The file is copied |
+| 2 | No way in on a Pi with no screen: the dashboard answers on `localhost` only, but the README pointed to the Pi's network address | `docker-compose.yml` passes the pairing settings through; the README describes the relay and an SSH tunnel |
+| 3 | The enforcer left its firewall table and kernel settings behind on shutdown | Stopping waits for the clean-up; `docker stop` is handled like Ctrl-C |
+| | The relay's documentation said passwords used scrypt | It uses PBKDF2; the wording is corrected |
 
-### ~~3. The enforcer does not clean up when QuietNet stops~~
-
-On Ctrl-C the program exited before the enforcer's clean-up ran, and `docker stop` was not handled at all, so the firewall table and kernel settings were left behind. `Enforcer.stop()` now waits for the clean-up to finish, the program treats `docker stop` the same as Ctrl-C, and the container is given 20 seconds to stop.
-**Tests:** `test_enforcer.Teardown.test_stop_waits_until_the_network_has_been_restored`, `test_shutdown`
-
-### Other
-
-- The relay's documentation said passwords were hashed with scrypt. The code uses PBKDF2-SHA256. The wording in `cloud/README.md` and the comment at the top of `cloud/relay.py` now match the code.
+Every fix has a test. `docs/TESTING.md` says which file covers which part.

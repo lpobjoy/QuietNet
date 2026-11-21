@@ -107,6 +107,18 @@ class Ticking(EnforcerCase):
         self.assertIn("ip saddr %s ip daddr { 203.0.113.5 } drop" % KID, self.loaded_rules()[0])
         self.assertIn("policy accept", self.loaded_rules()[0])
 
+    def test_each_load_replaces_the_old_rules_rather_than_adding_to_them(self):
+        # Loading a table that already exists adds to it. If the text did not delete the old table
+        # first, a device switched back on would stay cut off, because its old "drop everything"
+        # rule would still be in the kernel. (Confirmed against the real nft tool on 21/11/26.)
+        self.plan = {KID: {"off": True, "ips": set()}}
+        self.e._tick()
+        self.plan = {KID: {"off": False, "ips": set()}}
+        self.e._tick()
+        for text in self.loaded_rules():
+            self.assertTrue(text.startswith("table inet quietnet\ndelete table inet quietnet\ntable inet quietnet {"), text)
+        self.assertNotIn("drop", self.loaded_rules()[-1])
+
     def test_the_firewall_is_only_reloaded_when_the_plan_changes(self):
         self.plan = {KID: {"off": False, "ips": {"203.0.113.5"}}}
         for _ in range(3):

@@ -100,6 +100,57 @@ class Guards(Api):
         self.assertEqual(self.post("/api/kill", raw="{not json")[0], 400)
         self.assertNotIn("all", server.S.off)
 
+    def test_every_answer_carries_the_protective_headers(self):
+        # Without the frame headers, another website could show this dashboard inside itself,
+        # invisibly, and trick someone into clicking the kill switch.
+        wanted = {"X-Frame-Options": "DENY", "Content-Security-Policy": "frame-ancestors 'none'",
+                  "X-Content-Type-Options": "nosniff", "Referrer-Policy": "no-referrer"}
+        for method, path, host in (("GET", "/", "localhost"), ("GET", "/api/status", "localhost"),
+                                   ("GET", "/api/nope", "localhost"), ("GET", "/api/status", "evil.example"),
+                                   ("POST", "/api/kill", "localhost")):
+            conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+            conn.request(method, path, headers={"Host": host})
+            r = conn.getresponse()
+            r.read()
+            conn.close()
+            for name, value in wanted.items():
+                self.assertEqual(r.getheader(name), value, "%s on %s %s (%d)" % (name, method, path, r.status))
+
+    def test_an_oversized_body_is_refused_unread(self):
+        status, _ = self.post("/api/block", {"domain": "x" * (server.MAX_BODY + 1)})
+        self.assertEqual(status, 413)
+        self.assertEqual(server.S.blocked, set())
+
+    def test_a_nonsense_length_is_refused(self):
+        for length in ("-1", "lots"):
+            conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+            conn.putrequest("POST", "/api/kill", skip_host=True)
+            for name, value in (("Host", "localhost"), ("Content-Type", "application/json"), ("Content-Length", length)):
+                conn.putheader(name, value)
+            conn.endheaders()
+            status = conn.getresponse().status
+            conn.close()
+            self.assertIn(status, (400, 413), length)
+        self.assertNotIn("all", server.S.off)
+
+    def test_json_that_is_not_an_object_is_refused(self):
+        for raw in ("[1, 2]", '"text"', "5", "null"):
+            self.assertEqual(self.post("/api/kill", raw=raw)[0], 400, raw)
+        self.assertNotIn("all", server.S.off)
+
+    def test_values_of_the_wrong_kind_get_a_clean_refusal(self):
+        # Each of these used to make the server drop the connection with no answer.
+        for path, body in (("/api/group", {"name": "Kids", "id": [1]}),
+                           ("/api/group-delete", {"id": {"a": 1}}),
+                           ("/api/device-group", {"ip": "192.168.1.23", "group": [1]}),
+                           ("/api/schedule-delete", {"id": {"a": 1}}),
+                           ("/api/schedule-enable", {"id": [1], "on": True}),
+                           ("/api/pause", {"minutes": "soon"}), ("/api/pause", {"minutes": [10]}),
+                           ("/api/pause", {"minutes": "nan"})):
+            status, _ = self.post(path, body)
+            self.assertEqual(status, 400, (path, body))
+        self.assertEqual(server.S.paused_until, 0)
+
     def test_unknown_addresses_are_not_found(self):
         self.assertEqual(self.get("/api/nope")[0], 404)
         self.assertEqual(self.post("/api/nope")[0], 404)
@@ -126,16 +177,12 @@ class BlockingAddresses(Api):
             self.assertEqual(out, {"error": "That doesn't look like a web address."})
         self.assertEqual(server.S.blocked, set())
 
-    @unittest.expectedFailure
     def test_a_domain_that_is_not_text_is_refused_politely(self):
-        # KNOWN ISSUE 9 (docs/KNOWN_ISSUES.md): a number where the address should be makes the
-        # server drop the connection instead of answering 400. Nothing is changed, so it is
-        # harmless, but it should be a clean refusal. Remove expectedFailure once fixed.
-        try:
-            status, _ = self.post("/api/block", {"domain": 42})
-        except (http.client.HTTPException, OSError):
-            status = None
-        self.assertEqual(status, 400)
+        # These used to make the server drop the connection with no answer at all.
+        for path in ("/api/block", "/api/unblock", "/api/forget"):
+            for domain in (42, 4.2, True, ["example.com"], {"d": "example.com"}):
+                self.assertEqual(self.post(path, {"domain": domain})[0], 400, (path, domain))
+        self.assertEqual((server.S.blocked, server.S.allowed), (set(), set()))
 
     def test_the_rules_page_lists_blocks_and_allows_with_owners(self):
         self.ok("/api/block", {"domain": "tiktok.com"})
@@ -157,6 +204,11 @@ class BlockingAddresses(Api):
         self.ok("/api/forget", {"domain": "doubleclick.net"})
         self.assertEqual((server.S.blocked, server.S.allowed), (set(), set()))
         self.assertTrue(is_blocked("ads.doubleclick.net", KID))         # back to the advert list's verdict
+
+    @unittest.skipIf(os.name == "nt", "file permissions work differently on Windows")
+    def test_the_data_folder_is_private_to_its_owner(self):
+        # It holds the household's browsing history.
+        self.assertEqual(os.stat(server.DATA).st_mode & 0o777, 0o700)
 
     def test_rules_survive_a_restart(self):
         self.ok("/api/block", {"domain": "example.com"})
@@ -424,6 +476,22 @@ class Devices(Api):
         self.ok("/api/clear-history", {})
         self.assertEqual(self.get("/api/devices")[1], [])
 
+    def test_history_questions_are_answered_from_an_index(self):
+        # With 30 days of a household's lookups, a question that reads every row makes the dashboard
+        # crawl. Ask the database how it would answer each one and check it names an index.
+        def plan(statement, args):
+            return " | ".join(row[-1] for row in server.sql("EXPLAIN QUERY PLAN " + statement, args))
+        today = plan("SELECT COUNT(*), COALESCE(SUM(blocked),0) FROM queries WHERE ts>?", (0,))
+        self.assertIn("COVERING INDEX q_ts", today)
+        counts = plan("""SELECT client, COUNT(*), COALESCE(SUM(blocked), 0) FROM queries INDEXED BY q_ts
+                         WHERE ts>? GROUP BY client""", (0,))
+        self.assertIn("COVERING INDEX q_ts", counts)
+        last = plan("SELECT client, MAX(ts) FROM queries GROUP BY client", ())
+        self.assertIn("COVERING INDEX q_client_ts", last)
+        activity = plan("SELECT domain, COUNT(*), MAX(ts), SUM(blocked) FROM queries WHERE client=? AND ts>? GROUP BY domain",
+                        (KID, 0))
+        self.assertIn("INDEX q_client_ts (client=? AND ts>?)", activity)
+
     def test_the_status_summary_counts_today(self):
         self.log(KID, "www.bbc.co.uk")
         self.log(KID, "ads.doubleclick.net", blocked=1)
@@ -448,7 +516,7 @@ class EnforceAndCloud(Api):
     def test_only_a_plain_ipv4_address_can_be_enforced(self):
         # This value ends up inside a firewall rule, so nothing else may get through.
         for ip in ("", "not-an-ip", "192.168.1", "192.168.1.23/24", "192.168.1.23 drop", "fe80::1",
-                   "192.168.1.23\n192.168.1.24", None):
+                   "192.168.1.23\n192.168.1.24", None, "999.999.999.999", "192.168.1.256", 3232235799, ["192.168.1.23"]):
             self.assertEqual(self.post("/api/enforce", {"ip": ip, "on": True})[0], 400, ip)
         self.assertEqual(server.S.enforced, set())
 

@@ -245,7 +245,7 @@ class CommunityList(Base):
             server.update_community_list()
 
     def test_a_good_download_is_installed_and_saved(self):
-        lines = ["# comment", "127.0.0.1 localhost", "0.0.0.0 Bad_Host!", "::1 ip6-localhost"]
+        lines = ["# comment", "127.0.0.1 localhost", "0.0.0.0 0.0.0.0", "0.0.0.0 Bad_Host!", "::1 ip6-localhost"]
         lines += ["0.0.0.0 tracker%d.example.net" % i for i in range(1200)]
         self.download("\n".join(lines))
         self.assertEqual(server.S.list_state, "idle")
@@ -267,6 +267,71 @@ class CommunityList(Base):
         self.download(error=OSError("no internet"))
         self.assertEqual((server.S.list_state, server.S.list_error), ("error", "no internet"))
         self.assertEqual(server.S.junk_community, {"kept.example.net"})
+
+
+class Forwarding(unittest.TestCase):
+    def test_an_answer_from_anyone_but_the_server_we_asked_is_ignored(self):
+        # A pretend upstream that, on each question, first has a stranger send a forged answer
+        # (right id, wrong address) and only then sends the real one. The forgery must lose.
+        upstream = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        upstream.bind(("127.0.0.1", 0))
+        stranger = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        stranger.bind(("127.0.0.1", 0))
+        self.addCleanup(upstream.close)
+        self.addCleanup(stranger.close)
+
+        def serve():
+            try:
+                data, addr = upstream.recvfrom(4096)
+            except OSError:
+                return
+            forged = fake_answer(data)[:-4] + bytes([6, 6, 6, 6])
+            stranger.sendto(forged, addr)
+            upstream.sendto(fake_answer(data), addr)
+
+        threading.Thread(target=serve, daemon=True).start()
+        with mock.patch.object(server, "UPSTREAMS", [upstream.getsockname()]):
+            resp = server.forward_udp(query("www.bbc.co.uk"))
+        self.assertEqual(resp[-4:], bytes([93, 184, 216, 34]))
+
+    def test_an_answer_with_the_wrong_id_is_ignored(self):
+        upstream = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        upstream.bind(("127.0.0.1", 0))
+        self.addCleanup(upstream.close)
+
+        def serve():
+            try:
+                data, addr = upstream.recvfrom(4096)
+            except OSError:
+                return
+            upstream.sendto(b"\x00\x00" + fake_answer(data)[2:-4] + bytes([6, 6, 6, 6]), addr)
+            upstream.sendto(fake_answer(data), addr)
+
+        threading.Thread(target=serve, daemon=True).start()
+        with mock.patch.object(server, "UPSTREAMS", [upstream.getsockname()]):
+            resp = server.forward_udp(query("www.bbc.co.uk"))
+        self.assertEqual(resp[-4:], bytes([93, 184, 216, 34]))
+
+    def test_the_spare_server_is_used_when_the_first_is_silent(self):
+        silent = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        silent.bind(("127.0.0.1", 0))
+        dead_port = silent.getsockname()
+        silent.close()                                           # nothing listens here now
+        spare = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        spare.bind(("127.0.0.1", 0))
+        self.addCleanup(spare.close)
+
+        def serve():
+            try:
+                data, addr = spare.recvfrom(4096)
+            except OSError:
+                return
+            spare.sendto(fake_answer(data), addr)
+
+        threading.Thread(target=serve, daemon=True).start()
+        with mock.patch.object(server, "UPSTREAMS", [dead_port, spare.getsockname()]):
+            resp = server.forward_udp(query("www.bbc.co.uk"))
+        self.assertEqual(resp[-4:], bytes([93, 184, 216, 34]))
 
 
 class LiveFilter(Base):

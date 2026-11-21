@@ -8,12 +8,12 @@ From the repository folder:
 python3 -m unittest discover tests
 ```
 
-Nothing needs installing. The run takes about twelve seconds and ends with a line such as:
+Nothing needs installing. The run takes about sixteen seconds and ends with a line such as:
 
 ```
-Ran 269 tests in 11.6s
+Ran 312 tests in 16.5s
 
-OK (expected failures=1)
+OK
 ```
 
 To run one file, or one test:
@@ -38,23 +38,21 @@ python3 -m unittest tests.test_relay.Relaying.test_another_account_cannot_reach_
 | File | Tests | Covers |
 | --- | --- | --- |
 | `test_quietnet.py` | 37 | The rules engine: adverts, your own blocks and allows, services, groups, pause, the kill switch, schedules (including overnight and week-wrap), answer lifetimes, and the enforcer's plan and rule text |
-| `test_dns.py` | 41 | Reading questions and refusing malformed ones; blocked answers for each record type; pulling addresses out of answers; what is recorded and what is not; the address helpers; the community list download; and the real filter running over UDP and TCP against a stand-in upstream |
-| `test_dashboard_api.py` | 53 | Every dashboard API call over real HTTP: the `Host` and JSON guards, blocking, switches, groups, schedules, devices, activity, history, enforcement and remote access settings, and that changes survive a restart |
-| `test_enforcer.py` | 31 | What the enforcer sends and to whom; that it never touches this computer or devices not chosen; firewall reloads only on change; kernel settings switched and restored; teardown, and that stopping waits for it; when it reports itself unavailable; reading the routing table |
-| `test_relay.py` | 52 | Password records; session cookies and tampering; the bridge between browser and Pi; sign-up, login and sign-out; pairing codes; that one account cannot reach another's Pi; the forged-request guard; offline and timeout answers; the remote dashboard page |
-| `test_cloud_agent.py` | 21 | Pairing and saving the token; set-up from environment variables; running a relayed request against the local dashboard; the polling loop; what happens when the relay unpairs the Pi, fails or cannot be reached |
-| `test_packaging.py` | 32 | Standard library only; the containers include what the programs import; the compose file passes the pairing settings; `services.json` and `junk_domains.txt` are well formed with no overlaps; the dashboard calls only API addresses the server has; the README lists every file |
+| `test_dns.py` | 44 | Reading questions and refusing malformed ones; blocked answers for each record type; pulling addresses out of answers; what is recorded and what is not; the address helpers; the community list download; that forged answers are ignored; and the real filter running over UDP and TCP against a stand-in upstream |
+| `test_dashboard_api.py` | 60 | Every dashboard API call over real HTTP: the `Host` and JSON guards, blocking, switches, groups, schedules, devices, activity, history, enforcement and remote access settings; the protective headers, size limits and wrong-type input; that history questions use an index; and that changes survive a restart |
+| `test_enforcer.py` | 32 | What the enforcer sends and to whom; that it never touches this computer or devices not chosen; firewall reloads only on change, and each reload replaces the old rules; kernel settings switched and restored; teardown, and that stopping waits for it; when it reports itself unavailable; reading the routing table |
+| `test_relay.py` | 78 | Password records; session cookies and tampering; the bridge between browser and Pi; sign-up, login and sign-out; pairing codes; that one account cannot reach another's Pi; the forged-request guard; offline and timeout answers; the remote dashboard page; limits on wrong guesses; pairing code expiry; closing sign-up; upgrading a 0.5 database |
+| `test_cloud_agent.py` | 23 | Pairing and saving the token, readable by its owner only; set-up from environment variables; running a relayed request against the local dashboard; the polling loop; what happens when the relay unpairs the Pi, fails or cannot be reached |
+| `test_packaging.py` | 36 | Standard library only; the containers include what the programs import; the compose file passes the pairing settings; `services.json` and `junk_domains.txt` are well formed with no overlaps; the dashboard calls only API addresses the server has; the README lists every file; every function and class has a docstring |
 | `test_shutdown.py` | 2 | Starts the whole program and stops it with Ctrl-C and with the signal `docker stop` sends; checks it exits cleanly |
 
 ## Expected failures
 
-One test describes behaviour that is wrong today. It is marked as an expected failure so the run stays green, and it points to its entry in [Known issues](KNOWN_ISSUES.md).
+There are none at present. When a fault is found that cannot be fixed straight away, write the test for the correct behaviour, mark it `@unittest.expectedFailure`, and point it at an entry in [Known issues](KNOWN_ISSUES.md). The run stays green, and reports "unexpected success" once the fault is fixed, which is the cue to remove the mark.
 
-| Test | Issue |
-| --- | --- |
-| `test_dashboard_api.BlockingAddresses.test_a_domain_that_is_not_text_is_refused_politely` | 9: a number sent as an address drops the connection |
+## Automatic runs
 
-When an issue is fixed, its test starts passing and the run reports "unexpected success". Remove the `@unittest.expectedFailure` line above that test.
+`.github/workflows/tests.yml` runs the suite on every push to `main` and every pull request, on Python 3.9 (what Apple supplies on a Mac) and 3.13 (what the containers use).
 
 ## Writing more
 
@@ -72,7 +70,7 @@ Conventions: one behaviour per test; the test name states the behaviour in plain
 
 These need a real network or a real host, and are not tested automatically:
 
-- The enforcer on a real Pi: that steering works, that non-blocked traffic still flows, and how it behaves alongside Docker's firewall rules (issue 4).
+- The enforcer on a real Pi: that steering works, that non-blocked traffic still flows, that a device switched off and on again recovers (issue 15), and how it behaves alongside Docker's firewall rules (issue 4).
 - The network scan (`scan_network`) and host-name lookups, which depend on the devices present.
 - The dashboard page in a browser. Its API calls are checked against the server, but its behaviour is not.
 - Building and starting the containers.
@@ -83,5 +81,5 @@ A short manual check after changing the enforcer or the containers:
 1. `docker compose up -d` on the Pi; confirm `docker logs quietnet` shows "QuietNet is running".
 2. Point one device at the Pi for DNS and confirm it appears on the Devices page.
 3. Block a service for that device and confirm a new connection fails.
-4. Turn on "Cut live connections", start a stream, block its service, and confirm the stream stops within a few seconds while other sites still load.
+4. Turn on "Cut live connections", start a stream, block its service, and confirm the stream stops within a few seconds while other sites still load. Unblock it and confirm the service works again without restarting QuietNet.
 5. `docker stop quietnet`, then confirm the device still has internet and `nft list tables` on the Pi shows no `quietnet` table.
