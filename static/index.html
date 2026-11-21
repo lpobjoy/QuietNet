@@ -123,6 +123,31 @@ input[type=time]{border:1px solid var(--line);background:var(--card);border-radi
 <div id="modal" class="modal" hidden></div>
 
 <script>
+/* QuietNet dashboard. One page, no build step, no outside scripts. Notes for whoever edits it next:
+
+   HOW IT IS ORGANISED
+   - S (just below) is the only state: which tab is open, and the latest answers from the server.
+   - api(path, body) is the only way the page talks to the server. No body = a read; a body = a change.
+   - Each view...() function returns the HTML text for one screen, built from S. render() picks the
+     right one and puts it on the page. softRender() does the same on the 4-second timer, but leaves
+     the page alone while someone is typing or has a list open.
+   - refresh() fetches only what the open tab needs, then renders.
+   - Buttons carry data-act="name"; one click listener at the bottom looks the name up in `actions`.
+     To add a button: give it data-act (plus any data-... values it needs) and add a function to `actions`.
+   - Switches, selects and text boxes are handled by the "change" and "input" listeners at the bottom.
+
+   THE ONE RULE THAT MUST NOT BE BROKEN
+   Every value that came from the server or from a person goes through esc() (or num() for numbers)
+   before it is put into HTML. Device names, host names reported by the network, and web addresses
+   are all chosen by someone else. Through the relay, even ids and counts come from a Pi that the
+   relay does not control. An unescaped value is a way to run someone else's script on this page.
+
+   LOCAL AND REMOTE
+   The same file is served by the Pi (server.py) and, edited slightly, by the relay (cloud/relay.py).
+   The relay inserts a script after the opening head tag, setting window.QN_API_BASE, and a bar after
+   the opening body tag. It finds them by plain text search, so keep exactly one of each, written
+   in lower case with no attributes (and do not spell them out in comments like this one). Keep the X-QuietNet header in api(): the relay
+   refuses calls without it. tests/test_packaging.py checks these. */
 const S = {tab:'home', device:null, hours:24, filter:'all', search:'', sort:'n', open:new Set(),
            status:null, devices:[], activity:[], rules:null,
            services:[], groups:[], ctl:{}, group:null, svcOpen:false, schedules:[], edit:null, cloud:null};
@@ -215,7 +240,7 @@ function controls(scope, what){
       const x = c.services[v.id];
       if(x.from && !x.on) return `<button class="svc on" disabled>${esc(v.name)}<small>Blocked ${esc(x.from)}</small></button>`;
       return `<button class="svc ${x.on ? 'on' : ''}" data-act="svc" data-scope="${esc(scope)}" data-s="${esc(v.id)}"
-        data-on="${x.on ? '' : '1'}" aria-pressed="${x.on}">${esc(v.name)}<small>${x.on ? 'Blocked — tap to allow' : 'Allowed'}</small></button>`;
+        data-on="${x.on ? '' : '1'}" aria-pressed="${!!x.on}">${esc(v.name)}<small>${x.on ? 'Blocked — tap to allow' : 'Allowed'}</small></button>`;
     }).join('') + '</div>').join('');
   const isOff = c.off || c.off_from;
   const net = scope === 'all' ? '' : `<div class="row" style="margin-bottom:16px">
@@ -297,7 +322,7 @@ function blockBtn(x, domain){
   if(['service', 'off', 'schedule', 'kill'].includes(x.why)) return '';   // managed with the switches at the top of the page
   return x.b
     ? `<button class="btn" data-act="unblock" data-d="${esc(domain)}">Unblock</button>`
-    : `<button class="btn ${x.v === 'ok' ? '' : 'primary'}" data-act="block" data-d="${esc(domain)}" data-v="${x.v}">Block</button>`;
+    : `<button class="btn ${x.v === 'ok' ? '' : 'primary'}" data-act="block" data-d="${esc(domain)}" data-v="${esc(x.v)}">Block</button>`;
 }
 function activityList(){
   const q = S.search.trim().toLowerCase();
@@ -318,7 +343,7 @@ function activityList(){
     return `<div class="item"><div class="top">
       <div class="info"><span class="title">${esc(g.owner || g.base)}</span>${statusBadges(g)}
         <div class="muted small">${g.owner ? esc(g.base) + ' · ' : ''}contacted ${g.n === 1 ? 'once' : num(g.n) + ' times'}${g.nb ? ' (' + num(g.nb) + ' blocked)' : ''} · last ${ago(g.last)}</div>
-        ${many ? `<button class="expand" data-act="expand" data-b="${esc(g.base)}" aria-expanded="${open}">${open ? 'Hide' : 'Show'} ${g.hosts.length} address${g.hosts.length > 1 ? 'es' : ''}</button>` : ''}
+        ${many ? `<button class="expand" data-act="expand" data-b="${esc(g.base)}" aria-expanded="${open}">${open ? 'Hide' : 'Show'} ${num(g.hosts.length)} address${g.hosts.length > 1 ? 'es' : ''}</button>` : ''}
       </div>${blockBtn(g, g.base)}</div>${hosts}</div>`;
   }).join('');
 }
@@ -332,7 +357,7 @@ function viewDevice(){
   <div class="muted">${esc(d.ip)}${d.hint ? ' · ' + esc(d.hint) : ''}${d.mac ? ' · ' + esc(d.mac) : ''}</div>
   <div class="row" style="margin:10px 0 14px"><label for="groupSel">Group:</label>
     <select id="groupSel"><option value="">None</option>${S.groups.map(g =>
-      `<option value="${g.id}" ${d.group === g.id ? 'selected' : ''}>${esc(g.name)}</option>`).join('')}</select>
+      `<option value="${esc(g.id)}" ${d.group === g.id ? 'selected' : ''}>${esc(g.name)}</option>`).join('')}</select>
     ${S.groups.length ? '' : '<button class="btn link" data-act="tab" data-tab="groups">Create a group</button>'}</div>
   ${d.last ? '' : `<div class="note"><b>This device isn't using QuietNet yet</b>, so nothing can be seen or blocked for it.
     <button class="btn link" data-act="tab" data-tab="setup">Show me how to set it up</button></div>`}
@@ -355,10 +380,10 @@ function viewDevice(){
 /* ---------- Groups ---------- */
 function viewGroups(){
   const cards = S.groups.map(g => `
-    <button class="card device" data-act="opengroup" data-id="${g.id}">
+    <button class="card device" data-act="opengroup" data-id="${esc(g.id)}">
       <div class="name">${esc(g.name)}</div>
-      <div class="muted small">${g.members.length} device${g.members.length === 1 ? '' : 's'}</div>
-      <div class="small" style="margin-top:8px">${g.services} service${g.services === 1 ? '' : 's'} blocked</div>
+      <div class="muted small">${num(g.members.length)} device${g.members.length === 1 ? '' : 's'}</div>
+      <div class="small" style="margin-top:8px">${num(g.services)} service${g.services === 1 ? '' : 's'} blocked</div>
       ${g.off ? '<span class="badge junk" style="margin:6px 0 0">Internet off</span>' : ''}
     </button>`).join('');
   return `<div class="row"><div style="flex:1;min-width:200px"><h2>Groups</h2>
@@ -402,12 +427,12 @@ function whatText(x){
 function viewSchedules(){
   if(S.edit) return scheduleForm();
   const cards = S.schedules.map(x => `<div class="card"><div class="row">
-    <label class="switch"><input type="checkbox" class="schedOn" data-id="${x.id}" ${x.enabled ? 'checked' : ''} aria-label="Use the ${esc(x.name)} schedule"><span></span></label>
+    <label class="switch"><input type="checkbox" class="schedOn" data-id="${esc(x.id)}" ${x.enabled ? 'checked' : ''} aria-label="Use the ${esc(x.name)} schedule"><span></span></label>
     <div style="flex:1;min-width:200px"><h2>${esc(x.name)}${x.active ? '<span class="badge junk">On right now</span>' : ''}${x.enabled ? '' : '<span class="badge">Not in use</span>'}</h2>
       <div>${esc(scopeText(x.scope))} · ${esc(daysText(x.days))}, ${esc(x.start)} to ${esc(x.end)}${x.start > x.end ? ' next morning' : ''}</div>
       <div class="muted small">${esc(whatText(x))}</div></div>
-    <button class="btn" data-act="schededit" data-id="${x.id}">Change</button>
-    <button class="btn link" data-act="scheddelete" data-id="${x.id}">Delete</button></div></div>`).join('');
+    <button class="btn" data-act="schededit" data-id="${esc(x.id)}">Change</button>
+    <button class="btn link" data-act="scheddelete" data-id="${esc(x.id)}">Delete</button></div></div>`).join('');
   return `<div class="row"><div style="flex:1;min-width:200px"><h2>Schedules</h2>
     <p class="muted">Block things automatically at set times — bedtime, homework, school nights.
       Times go by this computer's clock (it's ${esc((S.status || {}).clock || '')} now).</p></div>

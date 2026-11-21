@@ -1,0 +1,18 @@
+# QuietNet has no third-party Python packages, so the only outside software it ships with is the
+# base image of its two containers (Python itself, and the operating system beneath it).
+# Dependabot opens a pull request when a newer base image is published, and keeps the
+# actions used by the test workflow current.
+version: 2
+updates:
+  - package-ecosystem: docker
+    directory: "/"
+    schedule:
+      interval: weekly
+  - package-ecosystem: docker
+    directory: "/cloud"
+    schedule:
+      interval: weekly
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly

@@ -21,7 +21,13 @@ import urllib.request
 
 
 class CloudAgent:
+    """The Pi's side of remote access. One instance, created by server.main().
+
+    State lives in `cfg` (relay address, token, Pi id), saved in data/cloud.json. `state` and
+    `detail` are for the dashboard: off, connecting, online or error, and a sentence of explanation."""
     def __init__(self, local_port, data_dir, log=print):
+        """`local_port` is where this Pi's own dashboard listens; `data_dir` is where
+        cloud.json is kept. Starts nothing; see start()."""
         self.local_port = local_port
         self.path = os.path.join(data_dir, "cloud.json")
         self.log = log
@@ -37,6 +43,7 @@ class CloudAgent:
     # -- config ---------------------------------------------------------
 
     def _load(self):
+        """Read cloud.json. A missing or damaged file means 'not paired'."""
         try:
             with open(self.path) as f:
                 return json.load(f)
@@ -44,18 +51,25 @@ class CloudAgent:
             return {}
 
     def _save(self):
+        """Write cloud.json, readable only by the account QuietNet runs as."""
         try:
-            with open(self.path, "w") as f:
+            # The file holds the token that lets the relay control this QuietNet, so only the
+            # account running QuietNet may read it (0o600 = owner read/write, nobody else).
+            fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w") as f:
                 json.dump(self.cfg, f)
+            os.chmod(self.path, 0o600)                 # also tighten a file created by an older version
         except OSError as e:
             self.log("Could not save cloud settings: %s" % e)
 
     def status(self):
+        """What the dashboard's Remote access card shows. Never includes the token."""
         return {"configured": bool(self.cfg.get("relay")), "paired": bool(self.cfg.get("token")),
                 "relay": self.cfg.get("relay", ""), "name": self.cfg.get("name", ""),
                 "state": self.state, "detail": self.detail}
 
     def forget(self):
+        """Unpair: wipe the saved relay address and token. The loop notices and goes idle."""
         self.cfg = {}
         self._save()
         self.state, self.detail = "off", ""
@@ -63,6 +77,8 @@ class CloudAgent:
     # -- pairing --------------------------------------------------------
 
     def pair(self, relay, code):
+        """Exchange a pairing code for a token and save it. Returns None on success, or a
+        sentence explaining what went wrong (shown to the person as is)."""
         relay = (relay or self.cfg.get("relay", "")).strip().rstrip("/")
         if not relay.startswith(("http://", "https://")):
             relay = "https://" + relay
@@ -86,6 +102,8 @@ class CloudAgent:
 
     def start(self):
         # Allow one-shot pairing from an environment variable on first boot.
+        """Pair from the QUIETNET_PAIR environment variable if set and not yet paired, then
+        start the background loop."""
         code = os.environ.get("QUIETNET_PAIR", "").strip()
         if code and self.cfg.get("relay") and not self.cfg.get("token"):
             err = self.pair(self.cfg["relay"], code)
@@ -93,9 +111,16 @@ class CloudAgent:
         threading.Thread(target=self._run, daemon=True).start()
 
     def stop(self):
+        """Ask the background loop to end."""
         self._stop.set()
 
     def _run(self):
+        """The background loop. While paired: wait on the relay for a request (the relay holds
+        the call open for up to 25 seconds), run it, send the answer, repeat.
+
+        On 401 the relay no longer knows this Pi, so the token is discarded. On other failures the
+        pairing is kept and the loop waits before retrying: 5 seconds after a relay error, and 1, 2,
+        4 ... up to 30 seconds while the relay cannot be reached."""
         backoff = 1
         while not self._stop.is_set():
             if not (self.cfg.get("relay") and self.cfg.get("token")):
@@ -131,6 +156,10 @@ class CloudAgent:
             pass        # the browser's request will simply time out; no harm done
 
     def _local(self, method, path, body):
+        """Send one request to this Pi's own dashboard and return (status, body text).
+
+        Only ever calls 127.0.0.1 on the dashboard's port: the path comes from the relay, but the
+        host and port do not. It names itself 'localhost' because the dashboard refuses anything else."""
         url = "http://127.0.0.1:%d%s" % (self.local_port, path if path.startswith("/") else "/" + path)
         data = body.encode() if (body and method == "POST") else None
         req = urllib.request.Request(url, data=data, method=method,
@@ -145,6 +174,8 @@ class CloudAgent:
             return 502, '{"error":"The Pi could not answer."}'
 
     def _http(self, method, url, obj, timeout, token=False):
+        """One JSON request to the relay; returns the decoded answer ({} if empty). Raises
+        urllib's errors for the caller to handle. token=True adds this Pi's token header."""
         data = json.dumps(obj).encode() if obj is not None else None
         headers = {"Content-Type": "application/json"}
         if token and self.cfg.get("token"):

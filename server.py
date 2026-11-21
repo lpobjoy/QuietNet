@@ -10,10 +10,12 @@ blocked, answers "that doesn't exist".
 No extra software is needed - just Python 3.
 """
 import argparse
+import ipaddress
 import json
 import os
 import queue
 import re
+import signal
 import socket
 import socketserver
 import sqlite3
@@ -29,6 +31,21 @@ from urllib.parse import parse_qs, urlparse
 import enforcer
 import cloud_agent
 
+# MAP OF THIS FILE (each part starts with a "# ----- name" banner):
+#   settings and State   the values you might tune, and S, everything held in memory
+#   database             the SQLite connection, the tables, saved settings, the history writer
+#   rules                the lists, schedules and decision(): is this name blocked for this device, and why
+#   DNS                  reading questions, building answers, asking the real servers, the UDP/TCP listeners
+#   helpers              this computer's address, the neighbour table, the network scan, and the
+#                        api_...() functions that build each dashboard answer
+#   dashboard web server the Web class (every HTTP call) and main()
+#
+# HOW A CHANGE TO A RULE WORKS: the rule sets live in S for speed and in the database so they
+# survive a restart. Every function that changes one updates both while holding db_lock.
+# The DNS path only reads S, without a lock, and never waits on the database.
+#
+# Fuller explanation: docs/ARCHITECTURE.md. Every HTTP call: docs/API.md. Open faults: docs/KNOWN_ISSUES.md.
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.environ.get("QUIETNET_DATA") or os.path.join(HERE, "data")   # where history and rules are kept
 STATIC = os.path.join(HERE, "static")
@@ -36,6 +53,7 @@ COMMUNITY_FILE = os.path.join(DATA, "community_list.txt")
 COMMUNITY_URL = "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts"
 UPSTREAMS = [("1.1.1.1", 53), ("8.8.8.8", 53)]
 KEEP_DAYS = 30
+MAX_BODY = 64 * 1024   # the largest request body the dashboard API will read; real ones are a few hundred bytes
 MAX_TTL = 120   # seconds a device may remember an answer, so new blocks and schedules bite within ~2 minutes
 CLOCK = re.compile(r"([01]\d|2[0-3]):[0-5]\d")
 VALID_NAME = re.compile(r"[a-z0-9_-]+(\.[a-z0-9_-]+)+")
@@ -96,6 +114,11 @@ SECOND_LEVEL = {"co", "com", "org", "net", "gov", "ac", "edu", "ltd", "plc", "me
 
 
 class State:
+    """Everything QuietNet holds in memory while running. There is one instance, `S`.
+
+    The rule sets here mirror tables in the database: init_db() fills them at start-up, and every
+    function that changes one writes the database in the same step, holding db_lock. Reads on the
+    DNS path take no lock - they only look things up in sets and dicts, which is safe in Python."""
     blocked = set()         # addresses you chose to block
     allowed = set()         # addresses you chose to always allow
     junk_builtin = set()
@@ -134,6 +157,8 @@ log_q = queue.Queue()
 # ------------------------------------------------------------------ database
 
 def sql(statement, args=(), commit=False):
+    """Run one SQL statement and return all its rows. Holds db_lock, since one connection is
+    shared by every thread. Pass commit=True for a change that should be saved at once."""
     with db_lock:
         rows = db.execute(statement, args).fetchall()
         if commit:
@@ -142,13 +167,28 @@ def sql(statement, args=(), commit=False):
 
 
 def init_db():
+    """Open (or create) the database, make sure every table exists, and load the saved rules
+    into S. Called once at start-up; the tests call it again to mimic a restart."""
     global db
     os.makedirs(DATA, exist_ok=True)
+    try:
+        os.chmod(DATA, 0o700)       # the folder holds the household's browsing history: owner only
+    except OSError:
+        pass                        # e.g. a mounted volume that does not allow it; carry on
     db = sqlite3.connect(os.path.join(DATA, "quietnet.db"), check_same_thread=False)
     db.execute("PRAGMA journal_mode=WAL")
+    # With the write-ahead log, NORMAL is safe against corruption and avoids forcing the disk after
+    # every batch of history - which matters on a Raspberry Pi's SD card. The worst a power cut can
+    # lose is the last second or so of history.
+    db.execute("PRAGMA synchronous=NORMAL")
     db.executescript("""
         CREATE TABLE IF NOT EXISTS queries(id INTEGER PRIMARY KEY, ts REAL, client TEXT, domain TEXT, blocked INTEGER);
+        -- Two indexes, one per question the dashboard asks of the history:
+        --   q_client_ts: "what did THIS device look up recently?" (the device page) and "when was each device last active?"
+        --   q_ts:        "what happened in the last 24 hours, across all devices?" (the status summary and device counts).
+        --                It carries client and blocked too, so those counts are answered from the index alone.
         CREATE INDEX IF NOT EXISTS q_client_ts ON queries(client, ts);
+        CREATE INDEX IF NOT EXISTS q_ts ON queries(ts, client, blocked);
         CREATE TABLE IF NOT EXISTS blocked(domain TEXT PRIMARY KEY, ts REAL);
         CREATE TABLE IF NOT EXISTS allowed(domain TEXT PRIMARY KEY, ts REAL);
         CREATE TABLE IF NOT EXISTS devices(ip TEXT PRIMARY KEY, name TEXT);
@@ -178,16 +218,23 @@ def init_db():
 
 
 def get_setting(key, default):
+    """Read one saved setting (a text value), or `default` if it was never set."""
     rows = sql("SELECT value FROM settings WHERE key=?", (key,))
     return rows[0][0] if rows else default
 
 
 def set_setting(key, value):
+    """Save one setting, replacing any earlier value."""
     sql("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
         (key, str(value)), commit=True)
 
 
 def log_writer():
+    """Background thread: move recorded lookups from the queue into the database.
+
+    The DNS path only puts a tuple on log_q, so answering a lookup never waits for the disk.
+    This thread gathers a second's worth and saves them in one go. Once an hour it also deletes
+    history older than KEEP_DAYS."""
     last_prune = 0
     while True:
         batch = [log_q.get()]
@@ -208,6 +255,8 @@ def log_writer():
 # ------------------------------------------------------------------ rules
 
 def load_lists():
+    """Load the built-in advert list, the downloaded community list (if present) and the
+    service catalogue from their files into S."""
     path = os.path.join(HERE, "junk_domains.txt")
     with open(path) as f:
         S.junk_builtin = {l.strip().lower() for l in f if l.strip() and not l.startswith("#")}
@@ -221,15 +270,21 @@ def load_lists():
 
 
 def suffixes(domain):
+    """The name and each of its parents, most specific first, stopping before the last part.
+    'a.b.example.com' -> ['a.b.example.com', 'b.example.com', 'example.com'].
+    A rule on any of these applies to the name, which is how one entry covers everything beneath it."""
     parts = domain.split(".")
     return [".".join(parts[i:]) for i in range(len(parts) - 1)]
 
 
 def is_junk(domain):
+    """Is this name, or a parent of it, on the built-in or community advert list?"""
     return any(s in S.junk_builtin or s in S.junk_community for s in suffixes(domain))
 
 
 def load_schedules():
+    """Reload every schedule from the database into S.schedules, and clear the short-lived
+    cache of which ones are in force."""
     S.schedules = [
         {"id": r[0], "name": r[1], "scope": r[2], "days": [int(c) for c in r[3]], "start": r[4], "end": r[5],
          "off": bool(r[6]), "services": json.loads(r[7]), "enabled": bool(r[8])}
@@ -238,6 +293,7 @@ def load_schedules():
 
 
 def clock_minutes(hhmm):
+    """'21:30' -> 1290: minutes since midnight. The text must already match CLOCK."""
     return int(hhmm[:2]) * 60 + int(hhmm[3:])
 
 
@@ -253,6 +309,10 @@ def schedule_in_force(x, now=None):
 
 
 def active_schedules():
+    """The enabled schedules whose time window is open right now.
+
+    Worked out at most once every 5 seconds and remembered, because decision() calls this for
+    every single lookup."""
     stamp, active = S.sched_cache
     now = time.time()
     if now - stamp > 5:
@@ -272,11 +332,14 @@ def scopes_for(client):
 
 
 def internet_off_for(client):
+    """Is all internet off for this device right now - by its own switch, its group's,
+    or an all-internet schedule? (The kill switch is checked separately, as 'all' in S.off.)"""
     scopes = scopes_for(client)
     return any(sc in S.off for sc in scopes) or any(x["off"] for x in active_schedules() if x["scope"] in scopes)
 
 
 def scope_label(scope):
+    """A scope in plain words for the dashboard: 'whole house', 'Kids group' or 'this device'."""
     if scope == "all":
         return "whole house"
     if scope.startswith("group:"):
@@ -320,6 +383,9 @@ def decision(domain, client=None, paused=False):
 
 
 def verdict(domain):
+    """The label the dashboard shows beside a name: 'junk' (on the advert list), 'suspect'
+    (the name contains a word such as 'tracking'; shown for a person to judge, never blocked on
+    its own) or 'ok'. The last part of the name (.com, .net) is ignored when looking for words."""
     if is_junk(domain):
         return "junk"
     if SUSPECT.search(domain.rsplit(".", 1)[0]):
@@ -328,6 +394,9 @@ def verdict(domain):
 
 
 def base_of(domain):
+    """The part of a name that identifies its owner, used to group activity by company:
+    'cdn.example.com' -> 'example.com', and 'news.bbc.co.uk' -> 'bbc.co.uk' (three parts are kept
+    when the ending is a two-letter country after 'co', 'org', 'ac' and the like)."""
     parts = domain.split(".")
     if len(parts) >= 3 and len(parts[-1]) == 2 and parts[-2] in SECOND_LEVEL:
         return ".".join(parts[-3:])
@@ -335,7 +404,12 @@ def base_of(domain):
 
 
 def clean_domain(text):
-    text = (text or "").strip().lower()
+    """Turn whatever a person typed or pasted into a bare address, or None if it isn't one.
+    Drops any 'https://', path, port, trailing dot and leading 'www.', then checks the result.
+    This is the only gate on addresses entering the blocked and allowed lists."""
+    if not isinstance(text, str):
+        return None
+    text = text.strip().lower()
     text = re.sub(r"^[a-z]+://", "", text).split("/")[0].split(":")[0].strip(".")
     if text.startswith("www."):
         text = text[4:]
@@ -343,6 +417,8 @@ def clean_domain(text):
 
 
 def block(domain):
+    """Add an address to your blocked list, and remove any 'always allow' on it or beneath
+    it, which would otherwise defeat the block."""
     with db_lock:
         for a in [a for a in S.allowed if a == domain or a.endswith("." + domain)]:
             S.allowed.discard(a)
@@ -353,6 +429,8 @@ def block(domain):
 
 
 def unblock(domain):
+    """Remove an address from your blocked list. If the advert list would still block it,
+    also add an 'always allow' so that the unblock has an effect."""
     with db_lock:
         S.blocked.discard(domain)
         db.execute("DELETE FROM blocked WHERE domain=?", (domain,))
@@ -363,6 +441,7 @@ def unblock(domain):
 
 
 def forget(domain):
+    """Remove an address from both your blocked list and your allowed list."""
     with db_lock:
         S.blocked.discard(domain)
         S.allowed.discard(domain)
@@ -372,6 +451,11 @@ def forget(domain):
 
 
 def update_community_list():
+    """Download the community advert list, check it, save it and start using it.
+
+    Runs in its own thread (started from the dashboard). Progress and errors are reported through
+    S.list_state and S.list_error. A download with fewer than 1,000 usable lines is treated as
+    broken and thrown away, so a bad download can never replace a good list."""
     S.list_state, S.list_error = "downloading", ""
     try:
         req = urllib.request.Request(COMMUNITY_URL, headers={"User-Agent": "QuietNet"})
@@ -381,7 +465,7 @@ def update_community_list():
         for line in text.splitlines():
             if line.startswith("0.0.0.0 "):
                 d = line.split()[1].lower()
-                if VALID_NAME.fullmatch(d):
+                if VALID_NAME.fullmatch(d) and not d.replace(".", "").isdigit():   # skip the list's own "0.0.0.0 0.0.0.0" line
                     found.add(d)
         if len(found) < 1000:
             raise ValueError("the list looked incomplete")
@@ -396,6 +480,12 @@ def update_community_list():
 # ------------------------------------------------------------------ DNS
 
 def parse_question(data):
+    """Read the question out of a DNS packet. Returns (name, record type, where the question
+    ends), or None if the packet is malformed.
+
+    The name is a run of length-prefixed labels ending in a zero byte. A label byte with its top
+    bits set would be a pointer or a reserved type; questions never legitimately contain those,
+    so such packets are refused outright - nothing here can be made to loop."""
     if len(data) < 17 or int.from_bytes(data[4:6], "big") < 1:
         return None
     pos, labels = 12, []
@@ -418,12 +508,17 @@ def parse_question(data):
 
 
 def reply(data, qend, rcode=0, answer=b""):
+    """Build a DNS reply to the packet `data`: same id and question, the given result code,
+    and at most one answer record (already encoded in `answer`)."""
     head = data[:2] + bytes([0x80 | (data[2] & 0x79), 0x80 | rcode])
     head += b"\x00\x01" + (b"\x00\x01" if answer else b"\x00\x00") + b"\x00\x00\x00\x00"
     return head + data[12:qend] + answer
 
 
 def blocked_reply(data, qtype, qend):
+    """The reply for a blocked name. For an address question the answer is 0.0.0.0 (or ::
+    for IPv6), which devices give up on at once; any other kind of question gets 'no error, no
+    records'. The answer may be remembered for 60 seconds."""
     answer = b""
     if qtype == 1:      # A: answer with 0.0.0.0 so the device gives up straight away
         answer = b"\xc0\x0c\x00\x01\x00\x01\x00\x00\x00\x3c\x00\x04" + bytes(4)
@@ -441,6 +536,7 @@ def answer_ips(resp):
         counts = [int.from_bytes(buf[i:i + 2], "big") for i in (4, 6, 8, 10)]
 
         def skip_name(pos):
+            """Step past one encoded name starting at `pos`; return the position just after it."""
             while True:
                 n = buf[pos]
                 if n == 0:
@@ -468,6 +564,9 @@ def answer_ips(resp):
 
 
 def record_resolved(domain, resp):
+    """Remember which addresses a name was just given, with the time. The enforcer uses
+    this to know which addresses to drop when a name is blocked. Capped at 4,000 names; when
+    full, the 1,000 least recently seen are forgotten."""
     ips = answer_ips(resp)
     if not ips:
         return
@@ -488,7 +587,7 @@ def enforcement_plan():
         return {}
     now = time.time()
     plan = {}
-    for victim in S.enforced:
+    for victim in list(S.enforced):                    # a copy: the dashboard may change the set while we loop
         if internet_off_for(victim) or "all" in S.off:
             plan[victim] = {"off": True, "ips": set()}
             continue
@@ -510,6 +609,9 @@ def cap_ttls(resp, limit=MAX_TTL):
         counts = [int.from_bytes(buf[i:i + 2], "big") for i in (4, 6, 8, 10)]
 
         def skip_name(pos):
+            """Step past one encoded name starting at `pos`; return the position just after it.
+            Unlike the copy in answer_ips, this one refuses reserved label types, because cap_ttls
+            rewrites the packet and must not guess."""
             while True:
                 n = buf[pos]
                 if n == 0:
@@ -541,13 +643,19 @@ def cap_ttls(resp, limit=MAX_TTL):
 
 
 def forward_udp(data):
+    """Ask the real DNS servers over UDP, first one then the spare. Returns the reply, or
+    None if neither answered within 2.5 seconds."""
     for up in UPSTREAMS:
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
                 s.settimeout(2.5)
-                s.sendto(data, up)
+                # connect() makes the system discard packets from any other sender, so only the
+                # server we asked can answer. Without it, anyone who guessed the port and the
+                # two-byte id could slip in a forged answer.
+                s.connect(up)
+                s.send(data)
                 while True:
-                    resp, _ = s.recvfrom(4096)
+                    resp = s.recv(4096)
                     if resp[:2] == data[:2]:
                         return resp
         except OSError:
@@ -556,6 +664,8 @@ def forward_udp(data):
 
 
 def forward_tcp(data):
+    """The same as forward_udp but over TCP, where each message is preceded by its length
+    as two bytes. Used for lookups that arrived over TCP."""
     for up in UPSTREAMS:
         try:
             with socket.create_connection(up, timeout=4) as s:
@@ -568,6 +678,7 @@ def forward_tcp(data):
 
 
 def recv_exact(s, n):
+    """Read exactly n bytes from a connection, or raise ValueError if it closes first."""
     buf = b""
     while len(buf) < n:
         chunk = s.recv(n - len(buf))
@@ -578,6 +689,11 @@ def recv_exact(s, n):
 
 
 def answer_query(data, client, forwarder):
+    """The whole life of one lookup: read it, decide, record it, answer it.
+
+    `forwarder` is forward_udp or forward_tcp (or a stand-in, in tests). Returns the reply bytes,
+    or None when the packet was unreadable and the upstream server did not answer either.
+    The steps are described in docs/ARCHITECTURE.md under 'What happens to one lookup'."""
     q = parse_question(data)
     if not q:
         return forwarder(data)
@@ -597,9 +713,12 @@ def answer_query(data, client, forwarder):
 
 
 def udp_server(sock):
+    """Receive lookups on the UDP socket for ever, handing each to a pool of 64 worker
+    threads so that one slow upstream answer does not hold up the rest."""
     pool = ThreadPoolExecutor(max_workers=64)
 
     def work(data, addr):
+        """Answer one lookup and send the reply back to the device that asked."""
         try:
             resp = answer_query(data, addr[0], forward_udp)
             if resp:
@@ -616,7 +735,10 @@ def udp_server(sock):
 
 
 class TCPHandler(socketserver.BaseRequestHandler):
+    """Handles one DNS lookup that arrived over TCP (one lookup per connection)."""
     def handle(self):
+        """Read the two-byte length and the question, answer it, send the reply the same way.
+        A connection that stalls for 5 seconds is dropped."""
         try:
             self.request.settimeout(5)
             n = int.from_bytes(recv_exact(self.request, 2), "big")
@@ -629,11 +751,15 @@ class TCPHandler(socketserver.BaseRequestHandler):
 
 
 class TCPServer(socketserver.ThreadingTCPServer):
+    """The TCP side of the DNS filter: one short-lived thread per connection."""
     allow_reuse_address = True
     daemon_threads = True
 
 
 def start_dns(port):
+    """Open the DNS port for UDP and TCP and start serving. If the port cannot be opened
+    (usually because something else is using it) the reason is kept in S.dns_error for the
+    dashboard to show, and the rest of QuietNet carries on."""
     S.dns_port = port
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -651,6 +777,8 @@ def start_dns(port):
 # ------------------------------------------------------------------ helpers
 
 def find_local_ip():
+    """This computer's address on the home network (e.g. 192.168.1.60), found by asking the
+    system which address it would use to reach the outside. Nothing is sent."""
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
             s.connect(("192.0.2.1", 80))  # no data is sent; this just asks which address we'd use
@@ -690,6 +818,8 @@ def neighbours():
 
 
 def hint_refresher():
+    """Background thread: every two minutes, look up the host name of each device this
+    computer knows about, so the dashboard can suggest names for them."""
     while True:
         try:
             hints = {}
@@ -704,6 +834,7 @@ def hint_refresher():
 
 
 def reverse_name(ip):
+    """The host name the network reports for an address, without its domain, or '' if none."""
     try:
         name = socket.gethostbyaddr(ip)[0]
         return "" if name == ip else name.split(".")[0]
@@ -753,6 +884,7 @@ def scan_network():
 
 
 def api_status():
+    """GET /api/status: the summary shown at the top of every dashboard page."""
     now = time.time()
     total, blocked = sql("SELECT COUNT(*), COALESCE(SUM(blocked),0) FROM queries WHERE ts>?", (now - 86400,))[0]
     return {
@@ -770,20 +902,27 @@ def api_status():
 
 
 def api_devices():
+    """GET /api/devices: every device that has used QuietNet or been found by a scan,
+    with its name, group, switches and today's counts."""
     since = time.time() - 86400
     names = dict(sql("SELECT ip, name FROM devices"))
     out = {}
 
     def entry(ip):
+        """The dict for one device, created with empty defaults the first time it is asked for."""
         return out.setdefault(ip, {
             "ip": ip, "name": names.get(ip) or "", "hint": S.hints.get(ip, ""), "mac": "",
             "this_computer": ip == S.local_ip, "last": 0, "n": 0, "nb": 0, "on_network": 0,
             "group": S.dev_group.get(ip), "off": internet_off_for(ip),
             "enforced": ip in S.enforced})
 
-    for ip, last, n, nb in sql("""SELECT client, MAX(ts), SUM(CASE WHEN ts>? THEN 1 ELSE 0 END),
-                  SUM(CASE WHEN ts>? THEN blocked ELSE 0 END) FROM queries GROUP BY client""", (since, since)):
-        entry(ip).update(last=last, n=n, nb=nb)
+    # Two small questions, each answered straight from an index, in place of one that read every
+    # row of up to 30 days of history on every dashboard refresh.
+    for ip, last in sql("SELECT client, MAX(ts) FROM queries GROUP BY client"):                  # uses q_client_ts
+        entry(ip)["last"] = last
+    for ip, n, nb in sql("""SELECT client, COUNT(*), COALESCE(SUM(blocked), 0) FROM queries INDEXED BY q_ts
+                            WHERE ts>? GROUP BY client""", (since,)):
+        entry(ip).update(n=n, nb=nb)
     for ip, mac, host, ts in sql("SELECT ip, mac, host, ts FROM seen"):
         d = entry(ip)
         d.update(mac=mac, on_network=ts)
@@ -794,6 +933,8 @@ def api_devices():
 
 
 def api_activity(ip, hours):
+    """GET /api/activity: what one device looked up in the last `hours`, grouped by owner
+    (see base_of), with the label and the current block decision for every name and group."""
     since = time.time() - hours * 3600
     rows = sql("""SELECT domain, COUNT(*), MAX(ts), SUM(blocked) FROM queries
                   WHERE client=? AND ts>? GROUP BY domain""", (ip, since))
@@ -817,13 +958,16 @@ def api_activity(ip, hours):
 
 
 def api_rules():
+    """GET /api/rules: your own blocked and allowed addresses, newest first."""
     def rows(table):
+        """One of the two lists. `table` is only ever the fixed text 'blocked' or 'allowed'."""
         return [{"d": d, "ts": ts, "owner": OWNERS.get(base_of(d), "")} for d, ts in
                 sql("SELECT domain, ts FROM %s ORDER BY ts DESC" % table)]
     return {"blocked": rows("blocked"), "allowed": rows("allowed")}
 
 
 def api_groups():
+    """GET /api/groups: every group with its members and switches, in name order."""
     out = []
     for gid, name in sorted(S.group_names.items(), key=lambda x: x[1].lower()):
         scope = "group:%d" % gid
@@ -864,6 +1008,7 @@ def api_controls(scope):
 
 
 def api_schedules():
+    """GET /api/schedules: every schedule, each marked with whether it is in force now."""
     return [dict(x, active=x["enabled"] and schedule_in_force(x)) for x in S.schedules]
 
 
@@ -901,6 +1046,7 @@ def save_schedule(body):
 
 
 def set_service_block(scope, service, on):
+    """Block or unblock one service for one scope, in memory and in the database."""
     with db_lock:
         if on:
             S.svc_blocks.setdefault(scope, set()).add(service)
@@ -912,6 +1058,7 @@ def set_service_block(scope, service, on):
 
 
 def set_internet_off(scope, off):
+    """Switch all internet off or on for one scope. The scope 'all' is the kill switch."""
     with db_lock:
         if off:
             S.off.add(scope)
@@ -923,6 +1070,8 @@ def set_internet_off(scope, off):
 
 
 def delete_group(gid):
+    """Delete a group and everything that hangs off it: its members' membership, its
+    service blocks, its internet switch and its schedules."""
     scope = "group:%d" % gid
     with db_lock:
         S.group_names.pop(gid, None)
@@ -941,11 +1090,33 @@ def delete_group(gid):
 # ------------------------------------------------------------------ dashboard web server
 
 class Web(BaseHTTPRequestHandler):
+    """The dashboard's web server: serves the page and the JSON API described in docs/API.md.
+
+    It has no login. What protects it is where it listens (this computer only) and the checks in
+    local_only() and do_POST(). Read those before loosening anything here."""
     def log_message(self, *a):
+        """Say nothing: the default would print a line for every request."""
         pass
+
+    def end_headers(self):
+        # Sent with every answer, including errors:
+        #  - the two frame lines stop another website showing this dashboard inside itself and
+        #    tricking someone into clicking its buttons (the kill switch, say);
+        #  - nosniff stops a browser guessing that a JSON answer is really a web page;
+        #  - no-referrer keeps this computer's address out of links followed from the dashboard.
+        """Add the protective headers to every answer, then finish the headers as usual."""
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Content-Security-Policy", "frame-ancestors 'none'")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
+        super().end_headers()
 
     def local_only(self):
         # Only answer when the browser really is talking to this computer by its own name.
+        """True if the request is addressed to localhost; otherwise answers 403 and returns False.
+
+        This defeats 'DNS rebinding': a hostile site can make its own name point at 127.0.0.1 so that
+        your browser calls this server, but the browser still sends that site's name as Host."""
         host = (self.headers.get("Host") or "").rsplit(":", 1)[0]
         if host in ("localhost", "127.0.0.1"):
             return True
@@ -953,6 +1124,7 @@ class Web(BaseHTTPRequestHandler):
         return False
 
     def send_json(self, obj, code=200):
+        """Send `obj` as a JSON answer with the given status."""
         body = json.dumps(obj).encode()
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
@@ -962,6 +1134,7 @@ class Web(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
+        """Every read: the dashboard page and the GET calls in docs/API.md."""
         if not self.local_only():
             return
         url = urlparse(self.path)
@@ -1006,16 +1179,44 @@ class Web(BaseHTTPRequestHandler):
             self.send_error(404)
 
     def do_POST(self):
+        """Every change. This method only checks the request (host, content type, size, shape);
+        handle_post() does the work.
+
+        Requiring 'application/json' is the defence against forged cross-site requests: a web form on
+        another site cannot send that type without first asking this server's permission, which it
+        never gives. Do not accept form-encoded or plain-text bodies here."""
+        # Read the body before anything else, even if the request is about to be refused.
+        # Answering and closing while the sender's data is still unread makes some systems
+        # reset the connection, and the browser then never sees the answer.
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = -1
+        raw = self.rfile.read(length) if 0 <= length <= MAX_BODY else None
         if not self.local_only():
             return
         if "application/json" not in (self.headers.get("Content-Type") or ""):
             return self.send_error(415)
+        if raw is None:
+            return self.send_error(413 if length > MAX_BODY else 400)
         try:
-            body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)) or b"{}")
+            body = json.loads(raw or b"{}")
         except ValueError:
             return self.send_error(400)
-        path = urlparse(self.path).path
+        if not isinstance(body, dict):
+            return self.send_error(400)
+        try:
+            self.handle_post(urlparse(self.path).path, body)
+        except (TypeError, ValueError, AttributeError, KeyError, sqlite3.Error):
+            # A value of the wrong kind (a list where a number belongs, say) that a handler did not
+            # expect. Nothing has been sent yet at this point, so answer with a clean refusal
+            # where the connection would otherwise just drop.
+            self.send_error(400)
 
+    def handle_post(self, path, body):
+
+        """Carry out one change. `body` is already known to be a JSON object. Each branch
+        checks its own values, makes the change and answers; anything unmatched is a 404."""
         if path in ("/api/block", "/api/unblock", "/api/forget"):
             domain = clean_domain(body.get("domain"))
             if not domain:
@@ -1049,8 +1250,14 @@ class Web(BaseHTTPRequestHandler):
             err = CA.pair(body.get("relay", ""), body.get("code", ""))
             return self.send_json({"error": err}, 400) if err else self.send_json({"ok": True})
         if path == "/api/enforce":
-            ip = str(body.get("ip", ""))[:64]
-            if not re.fullmatch(r"\d{1,3}(\.\d{1,3}){3}", ip):
+            # This address is written into a firewall rule, so it must be a real IPv4 address and
+            # nothing else. (A pattern of digits and dots would let 999.999.999.999 through, which
+            # the firewall rejects - and that would stop every other rule loading too.)
+            try:
+                if not isinstance(body.get("ip"), str):
+                    raise ValueError
+                ip = str(ipaddress.IPv4Address(body["ip"]))
+            except ValueError:
                 return self.send_error(400)
             with db_lock:
                 if body.get("on"):
@@ -1109,7 +1316,13 @@ class Web(BaseHTTPRequestHandler):
             set_setting("junk_on", "1" if S.junk_on else "0")
             return self.send_json({"ok": True})
         if path == "/api/pause":
-            minutes = min(max(float(body.get("minutes", 0)), 0), 24 * 60)
+            try:
+                minutes = float(body.get("minutes", 0))
+            except (TypeError, ValueError):
+                return self.send_error(400)
+            if minutes != minutes:                      # "not a number" compares unequal to itself
+                return self.send_error(400)
+            minutes = min(max(minutes, 0), 24 * 60)
             S.paused_until = time.time() + minutes * 60 if minutes else 0
             set_setting("paused_until", S.paused_until)
             return self.send_json({"ok": True})
@@ -1132,7 +1345,15 @@ class Web(BaseHTTPRequestHandler):
         self.send_error(404)
 
 
+def _stop_requested(signum, frame):
+    """`docker stop` and a system shutdown ask politely with SIGTERM. Treat it like Ctrl-C,
+    so the enforcer gets to restore the network before the program exits."""
+    raise KeyboardInterrupt
+
+
 def main():
+    """Start everything: database, lists, DNS filter, enforcer, cloud link, then the dashboard,
+    which runs until Ctrl-C or a stop request and then shuts the others down cleanly."""
     ap = argparse.ArgumentParser(description="QuietNet home advert and tracker blocker")
     ap.add_argument("--dns-port", type=int, default=53)
     ap.add_argument("--web-port", type=int, default=8377)
@@ -1165,14 +1386,18 @@ def main():
     print("\nLeave this window open. Close it to stop QuietNet.\n")
     if not args.no_browser:
         threading.Timer(0.5, webbrowser.open, (url,)).start()
+    signal.signal(signal.SIGTERM, _stop_requested)
     try:
         web.serve_forever()
     except KeyboardInterrupt:
+        pass
+    finally:
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)     # a second request must not interrupt the clean-up
         if ENF:
-            ENF.stop()
+            ENF.stop()                                    # waits until the network is restored
         if CA:
             CA.stop()
-        print("\nQuietNet stopped.")
+        print("\nQuietNet stopped.", flush=True)
 
 
 if __name__ == "__main__":

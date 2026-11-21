@@ -10,6 +10,15 @@ services:
     restart: unless-stopped
     volumes:
       - quietnet-data:/data
+    # Remote access. The dashboard only opens on the Pi itself, so on a Pi with no
+    # screen this is how you reach it. Create a pairing code on your relay, then start with:
+    #   QUIETNET_CLOUD=https://your-relay.example QUIETNET_PAIR=A1B2-C3D4 docker compose up -d
+    # The code is used once; after that the Pi remembers the pairing and both can be left out.
+    environment:
+      - QUIETNET_CLOUD=${QUIETNET_CLOUD:-}
+      - QUIETNET_PAIR=${QUIETNET_PAIR:-}
+    # Give the enforcer time to hand devices back to the router before the container is stopped.
+    stop_grace_period: 20s
     # NET_ADMIN + NET_RAW are needed for the network scan and the live-connection
     # enforcer. They only grant access to this machine's own network.
     cap_add:

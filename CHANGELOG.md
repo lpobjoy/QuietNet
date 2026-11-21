@@ -1,5 +1,26 @@
 # Changelog
 
+## Unreleased
+
+Second review (security, dependencies, efficiency):
+- **Fixed: enforcer rules piled up.** Reloading the firewall table added to the old rules, so a device switched off and back on stayed cut off until QuietNet restarted. Each load now replaces the table.
+- **Fixed: the dashboard could be shown inside another website** and its buttons clicked by trickery. Both web servers now forbid that.
+- **Fixed: forged DNS answers** from a sender other than the server asked are now ignored.
+- **Relay hardening:** wrong passwords and pairing codes are counted and capped; pairing codes last 15 minutes; unknown emails take as long to refuse as wrong passwords; sign-up can be closed with `QUIETNET_SIGNUP=first` or `closed`; request bodies are capped at 64 KB.
+- **Dashboard:** ids and counts are escaped like every other value; input of the wrong type gets a clean refusal; only a real IPv4 address can be enforced.
+- **Privacy on shared machines:** the data folders and the saved relay token are readable by their owner only.
+- **Faster dashboard:** today's totals and the device list are answered from an index, where before they read the whole history. Less disk forcing, which suits an SD card.
+- **For whoever works on this next:** every function and class now has a docstring (a test keeps it so); `server.py` and `relay.py` open with a map; the dashboard script opens with notes for editors; `AGENTS.md` sets out the rules.
+- **Automatic checks:** the tests run on every pull request, and GitHub will propose an update when a newer Python base image is published.
+
+First review:
+- **Fixed: the Pi container did not start.** The `Dockerfile` left out `cloud_agent.py`, which 0.5 began to need.
+- **Fixed: no way in on a Pi with no screen.** The dashboard only opens on the Pi itself, but the README pointed to the Pi's network address. `docker-compose.yml` now accepts `QUIETNET_CLOUD` and `QUIETNET_PAIR` so the Pi can be paired with a relay at start-up, and the README describes this and the SSH tunnel alternative.
+- **Fixed: the enforcer left its changes behind on shutdown.** Stopping QuietNet (Ctrl-C or `docker stop`) now waits while the enforcer hands devices back to the router, removes its firewall table and restores the kernel settings.
+- **Documentation** in `docs/`: how QuietNet works, an API reference, a testing guide, and a list of known issues from a review of 0.5.
+- **Tests** for the parts that had none: the DNS packet handling, the dashboard API, the enforcer's behaviour, the relay, the Pi's link to the relay, and the packaging. 312 tests in all, up from 37.
+- Corrected the relay's description of password storage: it uses PBKDF2, not scrypt.
+
 ## 0.5 — 2026-11-20
 - **Reach your QuietNet from anywhere.** A new relay service (`cloud/`, host it on Railway) lets you sign in to a website and control your home Pi remotely — with no router changes, because the Pi connects *out* to the relay and holds the line open.
 - Accounts (email + PBKDF2-hashed password), signed session cookies, and pairing: create a code on the relay, enter it on the Pi's **Remote access** page.

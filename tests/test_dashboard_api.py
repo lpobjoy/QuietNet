@@ -1,0 +1,569 @@
+"""Checks for the dashboard's web API (the `Web` class in server.py), driven over real
+HTTP on a spare port on this computer.
+
+Run with:  python3 -m unittest discover tests
+
+Standard library only; throwaway data folder; nothing leaves this machine.
+"""
+import http.client
+import json
+import os
+import sys
+import threading
+import time
+import unittest
+from http.server import ThreadingHTTPServer
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from test_quietnet import ADULT, KID, Base, is_blocked, server
+
+
+class Api(Base):
+    @classmethod
+    def setUpClass(cls):
+        cls.httpd = ThreadingHTTPServer(("127.0.0.1", 0), server.Web)
+        cls.httpd.daemon_threads = True
+        cls.port = cls.httpd.server_address[1]
+        threading.Thread(target=cls.httpd.serve_forever, daemon=True).start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
+
+    def setUp(self):
+        super().setUp()
+        for table in ("devices", "seen", "settings"):
+            server.sql("DELETE FROM %s" % table, commit=True)
+        server.S.junk_on, server.S.paused_until = True, 0
+
+    def call(self, method, path, body=None, host="localhost", ctype="application/json", raw=None):
+        headers = {"Host": host}
+        data = raw
+        if body is not None:
+            data = json.dumps(body)
+        if data is not None and ctype:
+            headers["Content-Type"] = ctype
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+        try:
+            conn.request(method, path, body=data, headers=headers)
+            r = conn.getresponse()
+            text = r.read().decode("utf-8", "replace")
+        finally:
+            conn.close()
+        try:
+            return r.status, json.loads(text)
+        except ValueError:
+            return r.status, text
+
+    def get(self, path, **kw):
+        return self.call("GET", path, **kw)
+
+    def post(self, path, body=None, **kw):
+        return self.call("POST", path, body={} if body is None and "raw" not in kw else body, **kw)
+
+    def ok(self, path, body=None):
+        status, out = self.post(path, body)
+        self.assertEqual(status, 200, out)
+        return out
+
+
+class Guards(Api):
+    def test_the_dashboard_page_is_served(self):
+        status, text = self.get("/")
+        self.assertEqual(status, 200)
+        self.assertIn("QuietNet", text)
+
+    def test_localhost_names_are_accepted_with_or_without_a_port(self):
+        for host in ("localhost", "localhost:8377", "127.0.0.1", "127.0.0.1:8377"):
+            self.assertEqual(self.get("/api/status", host=host)[0], 200, host)
+
+    def test_any_other_host_name_is_refused(self):
+        # A hostile web page can point its own name at 127.0.0.1 and have your browser call
+        # this dashboard. The browser still sends the page's name as Host, so refusing on
+        # that stops it. (It also means the dashboard cannot be opened by the Pi's network
+        # address - see docs/KNOWN_ISSUES.md.)
+        for host in ("evil.example", "evil.example:8377", "192.168.1.60:8377", "localhost.evil.example", ""):
+            self.assertEqual(self.get("/api/status", host=host)[0], 403, host)
+            self.assertEqual(self.post("/api/kill", {"on": True}, host=host)[0], 403, host)
+        self.assertNotIn("all", server.S.off)
+
+    def test_changes_must_be_sent_as_json(self):
+        # A plain web form on another site cannot send JSON without the browser asking this
+        # server's permission first, which it never grants. So a forged form post gets nowhere.
+        for ctype in ("application/x-www-form-urlencoded", "text/plain", None):
+            status, _ = self.post("/api/kill", raw='{"on": true}', ctype=ctype)
+            self.assertEqual(status, 415, ctype)
+        self.assertNotIn("all", server.S.off)
+
+    def test_unreadable_json_is_refused(self):
+        self.assertEqual(self.post("/api/kill", raw="{not json")[0], 400)
+        self.assertNotIn("all", server.S.off)
+
+    def test_every_answer_carries_the_protective_headers(self):
+        # Without the frame headers, another website could show this dashboard inside itself,
+        # invisibly, and trick someone into clicking the kill switch.
+        wanted = {"X-Frame-Options": "DENY", "Content-Security-Policy": "frame-ancestors 'none'",
+                  "X-Content-Type-Options": "nosniff", "Referrer-Policy": "no-referrer"}
+        for method, path, host in (("GET", "/", "localhost"), ("GET", "/api/status", "localhost"),
+                                   ("GET", "/api/nope", "localhost"), ("GET", "/api/status", "evil.example"),
+                                   ("POST", "/api/kill", "localhost")):
+            conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+            conn.request(method, path, headers={"Host": host})
+            r = conn.getresponse()
+            r.read()
+            conn.close()
+            for name, value in wanted.items():
+                self.assertEqual(r.getheader(name), value, "%s on %s %s (%d)" % (name, method, path, r.status))
+
+    def test_an_oversized_body_is_refused_unread(self):
+        status, _ = self.post("/api/block", {"domain": "x" * (server.MAX_BODY + 1)})
+        self.assertEqual(status, 413)
+        self.assertEqual(server.S.blocked, set())
+
+    def test_a_nonsense_length_is_refused(self):
+        for length in ("-1", "lots"):
+            conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+            conn.putrequest("POST", "/api/kill", skip_host=True)
+            for name, value in (("Host", "localhost"), ("Content-Type", "application/json"), ("Content-Length", length)):
+                conn.putheader(name, value)
+            conn.endheaders()
+            status = conn.getresponse().status
+            conn.close()
+            self.assertIn(status, (400, 413), length)
+        self.assertNotIn("all", server.S.off)
+
+    def test_json_that_is_not_an_object_is_refused(self):
+        for raw in ("[1, 2]", '"text"', "5", "null"):
+            self.assertEqual(self.post("/api/kill", raw=raw)[0], 400, raw)
+        self.assertNotIn("all", server.S.off)
+
+    def test_values_of_the_wrong_kind_get_a_clean_refusal(self):
+        # Each of these used to make the server drop the connection with no answer.
+        for path, body in (("/api/group", {"name": "Kids", "id": [1]}),
+                           ("/api/group-delete", {"id": {"a": 1}}),
+                           ("/api/device-group", {"ip": "192.168.1.23", "group": [1]}),
+                           ("/api/schedule-delete", {"id": {"a": 1}}),
+                           ("/api/schedule-enable", {"id": [1], "on": True}),
+                           ("/api/pause", {"minutes": "soon"}), ("/api/pause", {"minutes": [10]}),
+                           ("/api/pause", {"minutes": "nan"})):
+            status, _ = self.post(path, body)
+            self.assertEqual(status, 400, (path, body))
+        self.assertEqual(server.S.paused_until, 0)
+
+    def test_unknown_addresses_are_not_found(self):
+        self.assertEqual(self.get("/api/nope")[0], 404)
+        self.assertEqual(self.post("/api/nope")[0], 404)
+        self.assertEqual(self.get("/server.py")[0], 404)
+        self.assertEqual(self.get("/../server.py")[0], 404)
+
+
+class BlockingAddresses(Api):
+    def test_block_then_unblock(self):
+        self.assertEqual(self.ok("/api/block", {"domain": "example.com"}), {"ok": True, "domain": "example.com"})
+        self.assertTrue(is_blocked("shop.example.com", KID))
+        self.ok("/api/unblock", {"domain": "example.com"})
+        self.assertFalse(is_blocked("shop.example.com", KID))
+
+    def test_whatever_is_typed_is_tidied_first(self):
+        out = self.ok("/api/block", {"domain": "https://WWW.Example.com/some/page"})
+        self.assertEqual(out["domain"], "example.com")
+        self.assertEqual(server.S.blocked, {"example.com"})
+
+    def test_nonsense_is_refused_with_a_plain_message(self):
+        for domain in ("", "not an address", None, "localhost"):
+            status, out = self.post("/api/block", {"domain": domain})
+            self.assertEqual(status, 400, domain)
+            self.assertEqual(out, {"error": "That doesn't look like a web address."})
+        self.assertEqual(server.S.blocked, set())
+
+    def test_a_domain_that_is_not_text_is_refused_politely(self):
+        # These used to make the server drop the connection with no answer at all.
+        for path in ("/api/block", "/api/unblock", "/api/forget"):
+            for domain in (42, 4.2, True, ["example.com"], {"d": "example.com"}):
+                self.assertEqual(self.post(path, {"domain": domain})[0], 400, (path, domain))
+        self.assertEqual((server.S.blocked, server.S.allowed), (set(), set()))
+
+    def test_the_rules_page_lists_blocks_and_allows_with_owners(self):
+        self.ok("/api/block", {"domain": "tiktok.com"})
+        self.ok("/api/unblock", {"domain": "doubleclick.net"})         # on the advert list, so it becomes an allow
+        _, rules = self.get("/api/rules")
+        self.assertEqual([(r["d"], r["owner"]) for r in rules["blocked"]], [("tiktok.com", "TikTok")])
+        self.assertEqual([(r["d"], r["owner"]) for r in rules["allowed"]], [("doubleclick.net", "Google adverts")])
+
+    def test_blocking_an_address_removes_allows_beneath_it(self):
+        self.ok("/api/unblock", {"domain": "ads.doubleclick.net"})
+        self.assertEqual(server.S.allowed, {"ads.doubleclick.net"})
+        self.ok("/api/block", {"domain": "doubleclick.net"})
+        self.assertEqual(server.S.allowed, set())
+
+    def test_forget_removes_both_kinds_of_rule(self):
+        self.ok("/api/block", {"domain": "example.com"})
+        self.ok("/api/unblock", {"domain": "doubleclick.net"})
+        self.ok("/api/forget", {"domain": "example.com"})
+        self.ok("/api/forget", {"domain": "doubleclick.net"})
+        self.assertEqual((server.S.blocked, server.S.allowed), (set(), set()))
+        self.assertTrue(is_blocked("ads.doubleclick.net", KID))         # back to the advert list's verdict
+
+    @unittest.skipIf(os.name == "nt", "file permissions work differently on Windows")
+    def test_the_data_folder_is_private_to_its_owner(self):
+        # It holds the household's browsing history.
+        self.assertEqual(os.stat(server.DATA).st_mode & 0o777, 0o700)
+
+    def test_rules_survive_a_restart(self):
+        self.ok("/api/block", {"domain": "example.com"})
+        server.S.blocked = set()
+        server.init_db()                                                # what start-up does
+        self.assertEqual(server.S.blocked, {"example.com"})
+
+
+class Switches(Api):
+    def test_kill_switch_on_and_off(self):
+        self.ok("/api/kill", {"on": True})
+        self.assertTrue(self.get("/api/status")[1]["kill"])
+        self.assertTrue(is_blocked("www.bbc.co.uk", ADULT))
+        self.ok("/api/kill", {"on": False})
+        self.assertFalse(self.get("/api/status")[1]["kill"])
+
+    def test_the_internet_switch_cannot_be_used_for_the_whole_house(self):
+        # Whole-house off is the kill switch's job, so it can't be flipped by accident from a device page.
+        self.assertEqual(self.post("/api/internet", {"scope": "all", "off": True})[0], 400)
+        self.assertNotIn("all", server.S.off)
+
+    def test_internet_off_for_one_device(self):
+        self.ok("/api/internet", {"scope": "device:" + KID, "off": True})
+        self.assertTrue(is_blocked("www.bbc.co.uk", KID))
+        self.assertFalse(is_blocked("www.bbc.co.uk", ADULT))
+        _, controls = self.get("/api/controls?scope=device:" + KID)
+        self.assertTrue(controls["off"])
+        self.ok("/api/internet", {"scope": "device:" + KID, "off": False})
+        self.assertFalse(is_blocked("www.bbc.co.uk", KID))
+
+    def test_badly_formed_scopes_are_refused(self):
+        for scope in ("", "everyone", "group:x", "device:", "device:1.2.3.4; drop table"):
+            self.assertEqual(self.post("/api/internet", {"scope": scope, "off": True})[0], 400, scope)
+            self.assertEqual(self.post("/api/service-block", {"scope": scope, "service": "youtube", "on": True})[0], 400)
+        self.assertEqual(self.get("/api/controls?scope=nonsense")[0], 400)
+        self.assertEqual(self.get("/api/controls")[0], 400)
+        self.assertEqual((server.S.off, server.S.svc_blocks), (set(), {}))
+
+    def test_blocking_a_service(self):
+        self.ok("/api/service-block", {"scope": "device:" + KID, "service": "youtube", "on": True})
+        self.assertTrue(is_blocked("www.youtube.com", KID))
+        self.assertFalse(is_blocked("www.youtube.com", ADULT))
+        _, controls = self.get("/api/controls?scope=device:" + KID)
+        self.assertEqual(controls["services"]["youtube"], {"on": True, "from": ""})
+        self.assertEqual(controls["services"]["netflix"], {"on": False, "from": ""})
+        self.ok("/api/service-block", {"scope": "device:" + KID, "service": "youtube", "on": False})
+        self.assertFalse(is_blocked("www.youtube.com", KID))
+
+    def test_unknown_services_are_refused(self):
+        for service in ("not-a-service", None, 5):
+            status, _ = self.post("/api/service-block", {"scope": "all", "service": service, "on": True})
+            self.assertEqual(status, 400, service)
+
+    def test_a_device_page_explains_blocks_it_inherits(self):
+        gid = self.ok("/api/group", {"name": "Kids"})["id"]
+        self.ok("/api/device-group", {"ip": KID, "group": gid})
+        self.ok("/api/service-block", {"scope": "all", "service": "tiktok", "on": True})
+        self.ok("/api/service-block", {"scope": "group:%d" % gid, "service": "fortnite", "on": True})
+        self.ok("/api/internet", {"scope": "group:%d" % gid, "off": True})
+        _, c = self.get("/api/controls?scope=device:" + KID)
+        self.assertEqual(c["services"]["tiktok"], {"on": False, "from": "for the whole house"})
+        self.assertEqual(c["services"]["fortnite"], {"on": False, "from": "for the Kids group"})
+        self.assertEqual((c["off"], c["off_from"]), (False, "for the Kids group"))
+        self.ok("/api/kill", {"on": True})
+        self.assertEqual(self.get("/api/controls?scope=device:" + KID)[1]["off_from"], "by the kill switch")
+
+    def test_the_service_catalogue_hides_the_address_lists(self):
+        _, services = self.get("/api/services")
+        self.assertGreater(len(services), 20)
+        self.assertEqual(set(services[0]), {"id", "name", "cat"})
+
+    def test_advert_blocking_can_be_switched_off_and_stays_off_after_a_restart(self):
+        self.ok("/api/junk-switch", {"on": False})
+        self.assertFalse(is_blocked("ads.doubleclick.net", KID))
+        self.assertFalse(self.get("/api/status")[1]["junk_on"])
+        server.S.junk_on = True
+        server.init_db()
+        self.assertFalse(server.S.junk_on)
+
+    def test_pause_for_ten_minutes_then_resume(self):
+        self.ok("/api/pause", {"minutes": 10})
+        left = self.get("/api/status")[1]["paused_for"]
+        self.assertTrue(590 <= left <= 600, left)
+        self.assertFalse(is_blocked("ads.doubleclick.net", KID))
+        self.ok("/api/pause", {"minutes": 0})
+        self.assertEqual(self.get("/api/status")[1]["paused_for"], 0)
+        self.assertTrue(is_blocked("ads.doubleclick.net", KID))
+
+    def test_a_pause_can_never_run_longer_than_a_day(self):
+        self.ok("/api/pause", {"minutes": 10 ** 9})
+        self.assertLessEqual(self.get("/api/status")[1]["paused_for"], 24 * 3600)
+        self.ok("/api/pause", {"minutes": -5})
+        self.assertEqual(self.get("/api/status")[1]["paused_for"], 0)
+
+
+class Groups(Api):
+    def test_create_rename_and_list(self):
+        gid = self.ok("/api/group", {"name": "  Kids  "})["id"]
+        self.ok("/api/device-group", {"ip": KID, "group": gid})
+        self.ok("/api/group", {"id": gid, "name": "Children"})
+        _, groups = self.get("/api/groups")
+        self.assertEqual(groups, [{"id": gid, "name": "Children", "off": False, "members": [KID], "services": 0}])
+
+    def test_a_group_needs_a_name(self):
+        status, out = self.post("/api/group", {"name": "   "})
+        self.assertEqual((status, out), (400, {"error": "Please give the group a name."}))
+        self.assertEqual(server.S.group_names, {})
+
+    def test_long_names_are_cut_to_forty_characters(self):
+        self.ok("/api/group", {"name": "x" * 200})
+        self.assertEqual([len(n) for n in server.S.group_names.values()], [40])
+
+    def test_a_device_is_in_one_group_at_a_time(self):
+        kids = self.ok("/api/group", {"name": "Kids"})["id"]
+        tvs = self.ok("/api/group", {"name": "TVs"})["id"]
+        self.ok("/api/device-group", {"ip": KID, "group": kids})
+        self.ok("/api/device-group", {"ip": KID, "group": tvs})
+        self.assertEqual(server.S.dev_group, {KID: tvs})
+
+    def test_choosing_no_group_takes_the_device_out(self):
+        gid = self.ok("/api/group", {"name": "Kids"})["id"]
+        self.ok("/api/device-group", {"ip": KID, "group": gid})
+        self.ok("/api/device-group", {"ip": KID, "group": None})
+        self.assertEqual(server.S.dev_group, {})
+        self.ok("/api/device-group", {"ip": KID, "group": 9999})        # a group that doesn't exist
+        self.assertEqual(server.S.dev_group, {})
+
+    def test_deleting_a_group_takes_its_rules_and_schedules_with_it(self):
+        gid = self.ok("/api/group", {"name": "Kids"})["id"]
+        scope = "group:%d" % gid
+        self.ok("/api/device-group", {"ip": KID, "group": gid})
+        self.ok("/api/internet", {"scope": scope, "off": True})
+        self.ok("/api/service-block", {"scope": scope, "service": "youtube", "on": True})
+        self.ok("/api/schedule", {"name": "Bedtime", "scope": scope, "days": [0], "start": "21:00", "end": "07:00", "off": True})
+        self.ok("/api/group-delete", {"id": gid})
+        self.assertEqual(self.get("/api/groups")[1], [])
+        self.assertEqual(self.get("/api/schedules")[1], [])
+        self.assertFalse(is_blocked("www.youtube.com", KID))
+        server.init_db()                                                # nothing comes back after a restart
+        self.assertEqual((server.S.group_names, server.S.dev_group, server.S.off, server.S.svc_blocks), ({}, {}, set(), {}))
+
+    def test_deleting_a_group_that_is_not_there_is_harmless(self):
+        self.ok("/api/group-delete", {"id": 12345})
+
+
+class ScheduleApi(Api):
+    GOOD = {"name": "Homework", "scope": "all", "days": [0, 1, 2, 3, 4], "start": "00:00", "end": "23:59",
+            "off": False, "services": ["youtube"]}
+
+    def test_a_bad_schedule_comes_back_with_a_plain_message(self):
+        status, out = self.post("/api/schedule", dict(self.GOOD, days=[]))
+        self.assertEqual((status, out), (400, {"error": "Please choose at least one day."}))
+        status, out = self.post("/api/schedule", dict(self.GOOD, end="00:00"))
+        self.assertEqual(out, {"error": "The start and end times can't be the same."})
+        self.assertEqual(self.get("/api/schedules")[1], [])
+
+    def test_a_saved_schedule_is_listed_with_whether_it_is_on_right_now(self):
+        every_day = dict(self.GOOD, days=[0, 1, 2, 3, 4, 5, 6])
+        self.ok("/api/schedule", every_day)
+        _, schedules = self.get("/api/schedules")
+        self.assertEqual(len(schedules), 1)
+        x = schedules[0]
+        self.assertEqual((x["name"], x["scope"], x["services"], x["off"], x["enabled"]),
+                         ("Homework", "all", ["youtube"], False, True))
+        self.assertEqual(x["active"], time.strftime("%H:%M") != "23:59")
+
+    def test_switching_a_schedule_off_and_on(self):
+        self.ok("/api/schedule", dict(self.GOOD, days=[0, 1, 2, 3, 4, 5, 6], start="00:00", end="23:59"))
+        sid = self.get("/api/schedules")[1][0]["id"]
+        self.ok("/api/schedule-enable", {"id": sid, "on": False})
+        x = self.get("/api/schedules")[1][0]
+        self.assertEqual((x["enabled"], x["active"]), (False, False))
+        self.assertFalse(is_blocked("www.youtube.com", KID))
+        self.ok("/api/schedule-enable", {"id": sid, "on": True})
+        self.assertTrue(self.get("/api/schedules")[1][0]["enabled"])
+
+    def test_deleting_a_schedule(self):
+        self.ok("/api/schedule", self.GOOD)
+        sid = self.get("/api/schedules")[1][0]["id"]
+        self.ok("/api/schedule-delete", {"id": sid})
+        self.assertEqual(self.get("/api/schedules")[1], [])
+
+    def test_an_all_internet_schedule_ignores_any_service_list(self):
+        self.ok("/api/schedule", dict(self.GOOD, off=True, services=["youtube", "netflix"]))
+        x = self.get("/api/schedules")[1][0]
+        self.assertEqual((x["off"], x["services"]), (True, []))
+
+    def test_a_schedule_for_a_group_that_does_not_exist_is_refused(self):
+        status, out = self.post("/api/schedule", dict(self.GOOD, scope="group:77"))
+        self.assertEqual((status, out), (400, {"error": "Please choose who the schedule is for."}))
+
+
+class Devices(Api):
+    def log(self, client, domain, blocked=0, ago=60):
+        server.sql("INSERT INTO queries(ts,client,domain,blocked) VALUES(?,?,?,?)",
+                   (time.time() - ago, client, domain, blocked), commit=True)
+
+    def test_a_device_appears_once_it_has_looked_something_up(self):
+        self.log(KID, "www.bbc.co.uk")
+        self.log(KID, "ads.doubleclick.net", blocked=1)
+        self.log(KID, "old.example.com", ago=2 * 86400)                 # more than a day ago: not in today's count
+        _, devices = self.get("/api/devices")
+        self.assertEqual(len(devices), 1)
+        d = devices[0]
+        self.assertEqual((d["ip"], d["n"], d["nb"], d["name"], d["off"], d["enforced"]), (KID, 2, 1, "", False, False))
+
+    def test_naming_a_device(self):
+        self.log(KID, "www.bbc.co.uk")
+        self.ok("/api/device-name", {"ip": KID, "name": "  Gabe's tablet  "})
+        self.assertEqual(self.get("/api/devices")[1][0]["name"], "Gabe's tablet")
+        self.ok("/api/device-name", {"ip": KID, "name": "y" * 100})
+        self.assertEqual(len(self.get("/api/devices")[1][0]["name"]), 40)
+
+    def test_devices_found_by_a_scan_are_listed_even_before_they_use_quietnet(self):
+        server.sql("INSERT INTO seen(ip,mac,host,ts) VALUES(?,?,?,?)", (ADULT, "aa:bb:cc:dd:ee:ff", "laptop", time.time()),
+                   commit=True)
+        d = self.get("/api/devices")[1][0]
+        self.assertEqual((d["ip"], d["mac"], d["hint"], d["n"], d["last"]), (ADULT, "aa:bb:cc:dd:ee:ff", "laptop", 0, 0))
+
+    def test_most_recently_active_devices_come_first(self):
+        self.log(KID, "www.bbc.co.uk", ago=500)
+        self.log(ADULT, "www.bbc.co.uk", ago=5)
+        server.sql("INSERT INTO seen(ip,mac,host,ts) VALUES('192.168.1.9','','',0)", commit=True)
+        self.assertEqual([d["ip"] for d in self.get("/api/devices")[1]], [ADULT, KID, "192.168.1.9"])
+
+    def test_a_device_shows_its_group_and_whether_its_internet_is_off(self):
+        self.log(KID, "www.bbc.co.uk")
+        gid = self.ok("/api/group", {"name": "Kids"})["id"]
+        self.ok("/api/device-group", {"ip": KID, "group": gid})
+        self.ok("/api/internet", {"scope": "group:%d" % gid, "off": True})
+        d = self.get("/api/devices")[1][0]
+        self.assertEqual((d["group"], d["off"]), (gid, True))
+
+    def test_activity_is_grouped_by_company(self):
+        for name in ("www.bbc.co.uk", "www.bbc.co.uk", "news.bbc.co.uk"):
+            self.log(KID, name)
+        self.log(KID, "stats.g.doubleclick.net", blocked=1)
+        self.log(ADULT, "www.netflix.com")
+        _, groups = self.get("/api/activity?ip=%s&hours=24" % KID)
+        self.assertEqual([g["base"] for g in groups], ["bbc.co.uk", "doubleclick.net"])      # busiest first
+        bbc, ads = groups
+        self.assertEqual((bbc["owner"], bbc["n"], bbc["nb"], bbc["v"], bbc["b"]), ("BBC", 3, 0, "ok", False))
+        self.assertEqual([(h["d"], h["n"]) for h in bbc["hosts"]], [("www.bbc.co.uk", 2), ("news.bbc.co.uk", 1)])
+        self.assertEqual((ads["owner"], ads["v"], ads["b"], ads["why"], ads["nb"]),
+                         ("Google adverts", "junk", True, "list", 1))
+
+    def test_activity_shows_why_something_is_blocked_for_this_device(self):
+        self.log(KID, "www.youtube.com")
+        self.ok("/api/service-block", {"scope": "device:" + KID, "service": "youtube", "on": True})
+        g = self.get("/api/activity?ip=%s" % KID)[1][0]
+        self.assertEqual((g["b"], g["why"], g["svc"], g["some_blocked"]), (True, "service", "YouTube", True))
+
+    def test_activity_respects_the_time_window(self):
+        self.log(KID, "old.example.com", ago=3 * 3600)
+        self.log(KID, "new.example.com", ago=60)
+        _, groups = self.get("/api/activity?ip=%s&hours=1" % KID)
+        self.assertEqual([h["d"] for g in groups for h in g["hosts"]], ["new.example.com"])
+        self.assertEqual(self.get("/api/activity?ip=%s&hours=banana" % KID)[0], 200)      # falls back to a day
+
+    def test_clearing_one_devices_history_leaves_the_others(self):
+        self.log(KID, "www.bbc.co.uk")
+        self.log(ADULT, "www.bbc.co.uk")
+        self.ok("/api/clear-history", {"ip": KID})
+        self.assertEqual([d["ip"] for d in self.get("/api/devices")[1]], [ADULT])
+        self.ok("/api/clear-history", {})
+        self.assertEqual(self.get("/api/devices")[1], [])
+
+    def test_history_questions_are_answered_from_an_index(self):
+        # With 30 days of a household's lookups, a question that reads every row makes the dashboard
+        # crawl. Ask the database how it would answer each one and check it names an index.
+        def plan(statement, args):
+            return " | ".join(row[-1] for row in server.sql("EXPLAIN QUERY PLAN " + statement, args))
+        today = plan("SELECT COUNT(*), COALESCE(SUM(blocked),0) FROM queries WHERE ts>?", (0,))
+        self.assertIn("COVERING INDEX q_ts", today)
+        counts = plan("""SELECT client, COUNT(*), COALESCE(SUM(blocked), 0) FROM queries INDEXED BY q_ts
+                         WHERE ts>? GROUP BY client""", (0,))
+        self.assertIn("COVERING INDEX q_ts", counts)
+        last = plan("SELECT client, MAX(ts) FROM queries GROUP BY client", ())
+        self.assertIn("COVERING INDEX q_client_ts", last)
+        activity = plan("SELECT domain, COUNT(*), MAX(ts), SUM(blocked) FROM queries WHERE client=? AND ts>? GROUP BY domain",
+                        (KID, 0))
+        self.assertIn("INDEX q_client_ts (client=? AND ts>?)", activity)
+
+    def test_the_status_summary_counts_today(self):
+        self.log(KID, "www.bbc.co.uk")
+        self.log(KID, "ads.doubleclick.net", blocked=1)
+        self.log(KID, "old.example.com", blocked=1, ago=2 * 86400)
+        _, st = self.get("/api/status")
+        self.assertEqual(st["today"], {"total": 2, "blocked": 1})
+        self.assertGreater(st["junk_count"], 100)
+        self.assertRegex(st["clock"], r"^\d\d:\d\d$")
+        self.assertEqual(st["enforcer"]["active"], False)
+
+
+class EnforceAndCloud(Api):
+    def test_cut_live_connections_is_remembered_per_device(self):
+        self.ok("/api/enforce", {"ip": KID, "on": True})
+        self.assertEqual(server.S.enforced, {KID})
+        server.S.enforced = set()
+        server.init_db()
+        self.assertEqual(server.S.enforced, {KID})                      # survives a restart
+        self.ok("/api/enforce", {"ip": KID, "on": False})
+        self.assertEqual(server.S.enforced, set())
+
+    def test_only_a_plain_ipv4_address_can_be_enforced(self):
+        # This value ends up inside a firewall rule, so nothing else may get through.
+        for ip in ("", "not-an-ip", "192.168.1", "192.168.1.23/24", "192.168.1.23 drop", "fe80::1",
+                   "192.168.1.23\n192.168.1.24", None, "999.999.999.999", "192.168.1.256", 3232235799, ["192.168.1.23"]):
+            self.assertEqual(self.post("/api/enforce", {"ip": ip, "on": True})[0], 400, ip)
+        self.assertEqual(server.S.enforced, set())
+
+    def test_remote_access_reports_off_when_the_link_is_not_running(self):
+        real = server.CA
+        server.CA = None
+        try:
+            self.assertEqual(self.get("/api/cloud")[1], {"configured": False, "paired": False, "state": "off"})
+            status, out = self.post("/api/cloud", {"relay": "x", "code": "y"})
+            self.assertEqual((status, out), (400, {"error": "Remote access isn't available."}))
+        finally:
+            server.CA = real
+
+    def test_pairing_and_forgetting_go_through_to_the_cloud_link(self):
+        class Link:
+            asked, forgotten = [], 0
+
+            def pair(self, relay, code):
+                self.asked.append((relay, code))
+                return None if code == "GOOD" else "That pairing code is wrong or already used."
+
+            def forget(self):
+                Link.forgotten += 1
+
+            def status(self):
+                return {"configured": True, "paired": True, "state": "online"}
+
+        real = server.CA
+        server.CA = Link()
+        try:
+            self.ok("/api/cloud", {"relay": "relay.example", "code": "GOOD"})
+            status, out = self.post("/api/cloud", {"relay": "relay.example", "code": "BAD"})
+            self.assertEqual((status, out["error"]), (400, "That pairing code is wrong or already used."))
+            self.ok("/api/cloud", {"action": "forget"})
+            self.assertEqual(self.get("/api/cloud")[1]["state"], "online")
+            self.assertEqual((Link.asked, Link.forgotten), ([("relay.example", "GOOD"), ("relay.example", "BAD")], 1))
+        finally:
+            server.CA = real
+
+    def test_the_enforcer_reports_unavailable_when_it_was_never_started(self):
+        real = server.ENF
+        server.ENF = None
+        try:
+            self.assertEqual(self.get("/api/enforcer")[1], {"available": False, "reason": "not started", "active": False})
+        finally:
+            server.ENF = real
+
+
+if __name__ == "__main__":
+    unittest.main()

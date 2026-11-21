@@ -28,7 +28,18 @@ See what every device in your home is talking to, block the adverts and trackers
 docker compose up -d
 ```
 
-QuietNet then runs all the time and restarts with the machine. It installs nothing from the internet — the container is just Python and QuietNet's own code. The dashboard is at `http://<the-pi's-address>:8377`. Host networking is used so QuietNet can see the home network and answer DNS on port 53.
+QuietNet then runs all the time and restarts with the machine. It installs nothing from the internet — the container is just Python and QuietNet's own code. Host networking is used so QuietNet can see the home network and answer DNS on port 53.
+
+The dashboard only opens on the computer QuietNet runs on, at <http://localhost:8377>. On a Pi with no screen, reach it one of two ways:
+
+- **Through your relay** (see [Reach it from anywhere](#reach-it-from-anywhere-optional)). Create a pairing code on the relay, then start the Pi with the relay's address and the code:
+
+  ```bash
+  QUIETNET_CLOUD=https://your-relay.up.railway.app QUIETNET_PAIR=A1B2-C3D4 docker compose up -d
+  ```
+
+  The code is used once. After that the Pi remembers the pairing and a plain `docker compose up -d` is enough.
+- **Through an SSH tunnel** from another computer on your network: `ssh -L 8377:localhost:8377 pi@<the-pi's-address>`, then open <http://localhost:8377> on that computer.
 
 > Running it on an always-on box like a Raspberry Pi is the intended setup: it works for every device in the house without touching your router, and it doesn't depend on your Mac being awake.
 
@@ -68,7 +79,7 @@ Because the Pi can't usually be reached from the internet directly, it works the
 
 1. Deploy the relay — see [`cloud/README.md`](cloud/README.md). You get a web address like `your-relay.up.railway.app`.
 2. Open it, create an account, and choose **Add a QuietNet** to get a pairing code.
-3. On the Pi's own dashboard, open **Set up a device → Remote access**, enter the relay address and the code.
+3. On the Pi's own dashboard, open **Set up a device → Remote access**, enter the relay address and the code. (On a Pi with no screen, pass them when starting the container instead — see [Start it](#start-it).)
 
 After that, sign in to the relay from anywhere to control your Pi. Only your account can reach it, and the relay never stores your history or rules — it just passes your requests through to the Pi while you're looking.
 
@@ -98,12 +109,25 @@ QuietNet uses no third-party packages or libraries. Everything — the DNS filte
 | `junk_domains.txt` | The built-in advert and tracker list |
 | `Start QuietNet.command` | Double-click launcher for macOS |
 | `Dockerfile`, `docker-compose.yml` | Run it in a container on a Pi or any Linux box |
-| `tests/` | Automated checks for the rules engine (standard library only) |
+| `tests/` | Automated checks for every part: rules, DNS, dashboard API, enforcer, relay and remote link (standard library only) |
+| `docs/` | How it works, the API, how to test it, and known issues |
+| `AGENTS.md` | Rules for anyone, person or AI agent, changing the code |
 | `data/` | Created when it runs: history, your rules, downloaded list (never uploaded) |
 
 Options for advanced use: `python3 server.py --dns-port 53 --web-port 8377 --no-browser`.
 
 See [CHANGELOG.md](CHANGELOG.md) for what changed in each version.
+
+## Documentation
+
+- [How QuietNet works](docs/ARCHITECTURE.md) — the parts, what happens to a lookup, the order rules are checked in, the enforcer, remote access, the security model, and what is stored.
+- [API reference](docs/API.md) — every call the dashboard and the relay accept.
+- [Testing](docs/TESTING.md) — how to run the tests and what they cover.
+- [Known issues](docs/KNOWN_ISSUES.md) — faults and gaps found in review, with suggested fixes.
+- [Hosting the relay](cloud/README.md)
+- [Guide for agents](AGENTS.md) — what must stay true when changing the code.
+
+Run the tests with `python3 -m unittest discover tests`.
 
 ## Licence
 

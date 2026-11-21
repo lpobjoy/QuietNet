@@ -40,6 +40,7 @@ IS_LINUX = os.path.exists("/proc/net/route")
 # ---------------------------------------------------------------- pure helpers
 
 def mac_to_bytes(mac):
+    """'aa:bb:cc:dd:ee:ff' -> the six raw bytes. Raises ValueError for anything else."""
     parts = mac.split(":")
     if len(parts) != 6:
         raise ValueError("not a hardware address: %r" % mac)
@@ -65,7 +66,14 @@ def nft_ruleset(plan, our_ip):
     plan: {victim_ip: {"off": bool, "ips": [blocked ip, ...]}}
     'off' means cut everything for that device (except reaching QuietNet itself);
     otherwise only the listed addresses are dropped."""
-    lines = ["table inet quietnet {", "  chain forward {", "    type filter hook forward priority -150; policy accept;"]
+    # Loading a table that already exists ADDS to it; it does not replace it. Without the first
+    # two lines, a rule dropped from the plan would stay in the kernel - a device whose internet
+    # was switched back on would stay cut off until QuietNet restarted. "Declare, delete, define"
+    # is the standard way to replace a table: the first line makes sure there is something to
+    # delete (so the delete cannot fail), and nft applies the whole text as one step, so there is
+    # no moment with half the rules loaded.
+    lines = ["table inet quietnet", "delete table inet quietnet",
+             "table inet quietnet {", "  chain forward {", "    type filter hook forward priority -150; policy accept;"]
     for victim, rule in sorted(plan.items()):
         if rule.get("off"):
             lines.append("    ip saddr %s ip daddr != %s drop" % (victim, our_ip))
@@ -105,6 +113,7 @@ def interface_and_gateway():
 
 
 def mac_of_interface(iface):
+    """The hardware address of one of this machine's network interfaces, or None."""
     try:
         with open("/sys/class/net/%s/address" % iface) as f:
             return f.read().strip()
@@ -113,6 +122,7 @@ def mac_of_interface(iface):
 
 
 def sysctl_get(key):
+    """Read one kernel setting as text, or '' if it cannot be read."""
     try:
         return subprocess.run(["sysctl", "-n", key], capture_output=True, text=True, timeout=5).stdout.strip()
     except (OSError, subprocess.SubprocessError):
@@ -120,6 +130,8 @@ def sysctl_get(key):
 
 
 def sysctl_set(key, value):
+    """Change one kernel setting. Failures are ignored; _why_unavailable has already
+    checked for the admin rights this needs."""
     try:
         subprocess.run(["sysctl", "-w", "%s=%s" % (key, value)], capture_output=True, timeout=5)
     except (OSError, subprocess.SubprocessError):
@@ -134,6 +146,8 @@ class Enforcer:
     returns {ip: mac}. Call start() once; it does nothing until plan() is non-empty."""
 
     def __init__(self, local_ip, plan, neighbours, log=print):
+        """Work out this machine's network (interface, router, own hardware address) and which
+        firewall tool is installed. Touches nothing on the network; start() does that."""
         self.local_ip = local_ip
         self.plan = plan
         self.neighbours = neighbours
@@ -148,10 +162,13 @@ class Enforcer:
         self._active = False
         self._stop = threading.Event()
         self._lock = threading.RLock()
+        self._thread = None
 
     # -- availability -------------------------------------------------------
 
     def _why_unavailable(self):
+        """A plain-English reason the enforcer cannot run here, or '' if it can.
+        Shown on the dashboard, so keep the wording friendly."""
         if not IS_LINUX or AF_PACKET is None:
             return "The enforcer runs on Linux (your Raspberry Pi). On this computer it's off; blocks still apply to new connections."
         if os.geteuid() != 0:
@@ -163,26 +180,33 @@ class Enforcer:
         return ""
 
     def available(self):
+        """Can the enforcer run on this machine at all?"""
         return not self.reason
 
     def status(self):
+        """What the dashboard needs to know: available, why not, active, tool and router."""
         return {"available": self.available(), "reason": self.reason, "active": self._active,
                 "backend": self.backend, "gateway": self.gateway_ip}
 
     # -- lifecycle ----------------------------------------------------------
 
     def start(self):
+        """Start the background thread, if the enforcer can run here. Call once."""
         if not self.available():
             self.log("Enforcer off: " + self.reason)
             return
-        threading.Thread(target=self._run, daemon=True).start()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
 
     def _open_socket(self):
+        """Open the raw socket used to send ARP frames. Needs admin rights or NET_RAW."""
         s = socket.socket(AF_PACKET, socket.SOCK_RAW, socket.htons(ETH_ARP))
         s.bind((self.iface, ETH_ARP))
         return s
 
     def _turn_on_routing(self):
+        """Remember the current kernel settings, then make this machine forward packets
+        and stop it sending 'redirect' hints. Undone by _restore_routing."""
         for key in ("net.ipv4.ip_forward",
                     "net.ipv4.conf.all.send_redirects",
                     "net.ipv4.conf.%s.send_redirects" % self.iface):
@@ -192,12 +216,15 @@ class Enforcer:
         sysctl_set("net.ipv4.conf.%s.send_redirects" % self.iface, "0")
 
     def _restore_routing(self):
+        """Put back the kernel settings saved by _turn_on_routing."""
         for key, value in self._saved_sysctls.items():
             if value != "":
                 sysctl_set(key, value)
         self._saved_sysctls = {}
 
     def _run(self):
+        """The background thread: prepare, tick every 2 seconds until asked to stop, then clean up.
+        A tick that fails is reported and the next one tries again."""
         self._sock = self._open_socket()
         if self.backend == "iptables":
             subprocess.run(["iptables", "-N", "QUIETNET"], capture_output=True)
@@ -212,6 +239,9 @@ class Enforcer:
         self._teardown()
 
     def _tick(self):
+        """One pass: fetch the current plan, load the firewall rules, steer the chosen devices.
+        This computer is never included. Routing is switched on when the first device is chosen and
+        restored when the last is released."""
         plan = {ip: r for ip, r in (self.plan() or {}).items() if ip != self.local_ip}
         with self._lock:
             if plan and not self._saved_sysctls:
@@ -223,6 +253,8 @@ class Enforcer:
                 self._restore_routing()
 
     def _spoof(self, plan):
+        """Send each chosen device an ARP message saying the router's address is at our hardware
+        address, so it sends its outgoing traffic to us. Repeated every tick: devices forget."""
         hosts = self.neighbours()
         for victim in plan:
             mac = hosts.get(victim)
@@ -234,6 +266,9 @@ class Enforcer:
                 self.log("Could not steer %s: %s" % (victim, e))
 
     def _apply_firewall(self, plan):
+        """Load the drop rules for the plan, but only if they differ from what is already
+        loaded. With nft the whole table is replaced in one step (see nft_ruleset), so there is never
+        a half-applied state and no rule outlives the plan that asked for it."""
         if self.backend == "nft":
             text = nft_ruleset(plan, self.local_ip)
             if text != self._applied:
@@ -252,10 +287,18 @@ class Enforcer:
 
     # -- stop and restore ---------------------------------------------------
 
-    def stop(self):
+    def stop(self, wait=15):
+        """Ask the enforcer to stop, and wait (up to `wait` seconds) until it has handed every
+        device back to the router and removed its firewall rules. Without the wait, the program
+        could exit first and leave those behind."""
         self._stop.set()
+        t = self._thread
+        if t and t.is_alive() and t is not threading.current_thread():
+            t.join(wait)
 
     def _teardown(self):
+        """Undo everything: tell every device the router's real hardware address (five times, in
+        case a message is lost), remove the firewall rules, restore the kernel settings, close the socket."""
         with self._lock:
             # Heal every device we steered: tell it the router's real address again, a few times.
             hosts = self.neighbours()
