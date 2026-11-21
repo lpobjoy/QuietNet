@@ -1185,18 +1185,22 @@ class Web(BaseHTTPRequestHandler):
         Requiring 'application/json' is the defence against forged cross-site requests: a web form on
         another site cannot send that type without first asking this server's permission, which it
         never gives. Do not accept form-encoded or plain-text bodies here."""
+        # Read the body before anything else, even if the request is about to be refused.
+        # Answering and closing while the sender's data is still unread makes some systems
+        # reset the connection, and the browser then never sees the answer.
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = -1
+        raw = self.rfile.read(length) if 0 <= length <= MAX_BODY else None
         if not self.local_only():
             return
         if "application/json" not in (self.headers.get("Content-Type") or ""):
             return self.send_error(415)
+        if raw is None:
+            return self.send_error(413 if length > MAX_BODY else 400)
         try:
-            length = int(self.headers.get("Content-Length") or 0)
-        except ValueError:
-            return self.send_error(400)
-        if length < 0 or length > MAX_BODY:
-            return self.send_error(413)
-        try:
-            body = json.loads(self.rfile.read(length) or b"{}")
+            body = json.loads(raw or b"{}")
         except ValueError:
             return self.send_error(400)
         if not isinstance(body, dict):
