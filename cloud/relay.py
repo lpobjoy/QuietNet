@@ -343,6 +343,7 @@ class Relay(BaseHTTPRequestHandler):
     Every handler that acts for a signed-in person starts by calling user() or my_pi(). Keep it so:
     there is no other check between a request and someone's home network."""
     server_version = "QuietNet"
+    raw_body = None         # the body of the POST being handled; set by do_POST
 
     def log_message(self, *a):
         """Say nothing: the host keeps its own request log."""
@@ -366,7 +367,9 @@ class Relay(BaseHTTPRequestHandler):
     # -- helpers --------------------------------------------------------
 
     def read_body(self):
-        """The request body as bytes, or None if it is missing a sensible length or is too big."""
+        """Read the request body from the connection: bytes, or None if its stated length is
+        nonsense or over MAX_BODY. Called once per POST, by do_POST, which keeps the result in
+        self.raw_body for the handlers."""
         try:
             n = int(self.headers.get("Content-Length") or 0)
         except ValueError:
@@ -426,14 +429,14 @@ class Relay(BaseHTTPRequestHandler):
         """The request body as a JSON object. Anything unreadable, oversized or not an
         object counts as empty."""
         try:
-            obj = json.loads(self.read_body() or b"{}")
+            obj = json.loads(self.raw_body or b"{}")
         except (ValueError, TypeError):
             return {}
         return obj if isinstance(obj, dict) else {}
 
     def body_form(self):
         """The request body as form fields (first value of each). Oversized counts as empty."""
-        raw = self.read_body() or b""
+        raw = self.raw_body or b""
         return {k: v[0] for k, v in parse_qs(raw.decode("utf-8", "ignore")).items()}
 
     def my_pi(self, pi_id):
@@ -469,7 +472,12 @@ class Relay(BaseHTTPRequestHandler):
         self.send_error(404)
 
     def do_POST(self):
-        """Route every POST to its handler."""
+        """Route every POST to its handler.
+
+        The body is read here, first, whichever handler runs and even if it will be refused.
+        Answering and closing while the sender's data is still unread makes some systems reset
+        the connection, and the browser then never sees the answer."""
+        self.raw_body = self.read_body()
         p = urlparse(self.path).path
         if p == "/agent/pair":
             return self.agent_pair()
@@ -683,10 +691,9 @@ class Relay(BaseHTTPRequestHandler):
 
         payload = {"method": method, "path": rest + (("?" + query) if query else "")}
         if method == "POST":
-            raw = self.read_body()
-            if raw is None:
+            if self.raw_body is None:
                 return self.send_error(413)
-            payload["body"] = raw.decode("utf-8", "ignore")
+            payload["body"] = self.raw_body.decode("utf-8", "ignore")
         resp = bridge.call(pid, payload)
         if resp is None:
             return self.send_json({"error": "Your QuietNet didn't answer in time."}, 504)
