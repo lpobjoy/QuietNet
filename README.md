@@ -22,6 +22,8 @@ See what every device in your home is talking to, block the adverts and trackers
 
 **On a Mac (for trying it out):** double-click **Start QuietNet.command**. A window opens (leave it open) and the dashboard appears at <http://localhost:8377>. The first time, macOS may ask whether Python can accept incoming connections, or find devices on your local network — choose **Allow** for both.
 
+If the launcher says it can't find a working Python, install it from [python.org](https://www.python.org/downloads/macos/) or run `xcode-select --install`. With Python from python.org, pairing with a relay borrows the Mac's own security certificates; if it still says the relay's certificate couldn't be checked, open that Python's folder in Applications and double-click **Install Certificates.command**, then restart QuietNet.
+
 **On a Raspberry Pi or any Linux box (for leaving it running):** with Docker installed, run:
 
 ```bash
@@ -29,6 +31,8 @@ docker compose up -d
 ```
 
 QuietNet then runs all the time and restarts with the machine. It installs nothing from the internet — the container is just Python and QuietNet's own code. Host networking is used so QuietNet can see the home network and answer DNS on port 53.
+
+Schedules follow the Pi's own time zone, summer time included: the compose file shares it with the container. To choose a zone by name instead, start with `TZ=Europe/London docker compose up -d` (never set `TZ` to nothing, which means UTC). On Docker Desktop for Mac or Windows the shared zone is usually UTC, so set `TZ` by name there. If you upgraded from a version before this and had shifted your schedule times to make up for UTC, rebuild with `docker compose up -d --build` and put them back to the real times.
 
 The dashboard only opens on the computer QuietNet runs on, at <http://localhost:8377>. On a Pi with no screen, reach it one of two ways:
 
@@ -55,9 +59,9 @@ The dashboard only opens on the computer QuietNet runs on, at <http://localhost:
 
 ## How it works
 
-Every device has a setting called DNS — the "phone book" it uses to find addresses on the internet. When a device is pointed at QuietNet, it asks QuietNet first. QuietNet writes the request down, then either passes it on (to 1.1.1.1, with 8.8.8.8 as a spare) or, if it's blocked, answers "that doesn't exist".
+Every device has a setting called DNS — the "phone book" it uses to find addresses on the internet. When a device is pointed at QuietNet, it asks QuietNet first. QuietNet writes the request down, then either passes it on (to 1.1.1.1, with 8.8.8.8 as a spare) or, if it's blocked, answers "that doesn't exist". Names that only exist on your home network, such as `printer.lan`, are asked of your router instead and never leave the house.
 
-Rules are checked in this order: internet switched off → addresses you blocked or allowed yourself → blocked services → the advert list.
+Rules are checked in this order: internet switched off → addresses you blocked or allowed yourself → blocked services → the advert list. The kill switch, internet switches and bedtimes never cut off the QuietNet computer itself, so it keeps its link to your relay and can always be switched back on from outside.
 
 ## Cutting live connections (the enforcer)
 
@@ -72,7 +76,7 @@ When you turn on **Cut live connections** for a device (on that device's page), 
   echo net.ipv4.ip_forward=1 | sudo tee /etc/sysctl.d/90-quietnet.conf && sudo sysctl --system
   ```
 
-  If it's missing — or another firewall on the Pi (often Docker's own) would drop the traffic — QuietNet **won't steer** the device rather than cut it off, and the device's page says exactly what to run.
+  If it's missing — or another firewall on the Pi (often Docker's own, or firewalld) would drop the traffic — QuietNet **won't steer** the device rather than cut it off, and the device's page says exactly what to run for each firewall in the way. With firewalld or ufw, that command lasts until the firewall reloads, so also add the rule to that firewall's own settings.
 - **Opt-in per device.** It only ever touches devices you switch it on for — never the router, the Pi itself, or anything outside your home network — and hands each device straight back to the router when you switch it off. If a different device later gets the same network number, it's left alone.
 - **Safe if stopped suddenly.** `docker stop`, a restart or a crash all end with devices handed back to the router: QuietNet notes what it changed, and puts it back first thing at its next start if it didn't get the chance.
 - **Works best when the device uses QuietNet for DNS** (the normal setup), because that's how QuietNet learns which addresses belong to Disney+, Fortnite and so on.

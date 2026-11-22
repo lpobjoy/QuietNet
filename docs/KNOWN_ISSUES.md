@@ -1,6 +1,6 @@
 # Known issues
 
-Two reviews have been made: of version 0.5 on 21 November 2026, and a second, deeper pass the same day covering security, the software QuietNet depends on, and efficiency. A third, on 22 November, looked at the enforcer, the relay and the DNS filter, followed by an independent check of its fixes and a live test of the enforcer between two containers. This file lists what is still open, then what has been fixed.
+Two reviews have been made: of version 0.5 on 21 November 2026, and a second, deeper pass the same day covering security, the software QuietNet depends on, and efficiency. A third, on 22 November, looked at the enforcer, the relay and the DNS filter, followed by an independent check of its fixes and a live test of the enforcer between two containers. A fourth, also on 22 November, looked again at every part (the DNS filter, the database, the relay, the Pi's link to it, the enforcer's firewall check, the dashboard page and the packaging) and fixed 32 points. This file lists what is still open, then what has been fixed.
 
 The numbers are referred to from tests and other documents. Keep them stable.
 
@@ -10,9 +10,11 @@ The numbers are referred to from tests and other documents. Keep them stable.
 
 Docker sets the host's rule for forwarded traffic to "drop unless allowed". An accept in the enforcer's own table does not override a drop in another, so a steered device would be cut off completely.
 
-**Now handled (22 November):** before steering, the enforcer asks every firewall tool present whether another firewall would drop passed-on traffic. If one would, it does not steer, and the device page says what to run on the Pi (`sudo iptables -I DOCKER-USER -i eth0 -o eth0 -j ACCEPT`). Once that accept is in place the check clears and steering starts. This was confirmed in a two-container test with a Docker-style "drop" rule loaded: refused with the advice shown; the advice followed; steering started within 30 seconds and the device kept its internet. QuietNet does not add the accept itself, since that changes the owner's firewall.
+**Now handled (22 November):** before steering, the enforcer asks every firewall tool present whether another firewall would drop passed-on traffic. If one would, it does not steer, and the device page says what to run on the Pi. Once that accept is in place the check clears and steering starts.
 
-**Still to check on a real Pi with Docker:** that the check spots Docker's real rules there, and that the advice clears it.
+Since the fourth review, each firewall table is judged on its own: an accept in Docker's table no longer hides a reject in firewalld's, because in the kernel each table decides separately. Every table in the way is named, each with a command that suits it: `sudo iptables -I DOCKER-USER -i eth0 -o eth0 -j ACCEPT` for Docker's, `sudo iptables -I FORWARD …` for a rule made with `iptables` without Docker (ufw, for example), and `sudo nft insert rule <family> <table> <chain> iifname eth0 oifname eth0 accept` for anything else, such as firewalld. These commands last until the firewall is reloaded: firewalld drops them on a reload and ufw on a restart, so on those hosts the owner needs to make the rule permanent in that firewall's own settings. This was confirmed in a two-container test with a Docker-style "drop" rule loaded: refused with the advice shown; the advice followed; steering started within 30 seconds and the device kept its internet. QuietNet does not add the accept itself, since that changes the owner's firewall.
+
+**Still to check on a real Pi with Docker:** that the check spots Docker's real rules there, and that the advice clears it. With Docker and firewalld together: that steering stays refused until both commands have been run, then starts; and that the `nft insert` command works against a real firewalld table.
 
 ### 15. The firewall reload fix needs confirming on a Pi
 
@@ -23,6 +25,24 @@ Issue 15 (below, under Fixed) was confirmed against the real `nft` tool. On 22 N
 In the two-container test, a steered device that was already settled sometimes got about one to three seconds of traffic through just after the kill switch was turned on. After that, nothing got through in 60 to 100 seconds of trying. The DNS block applies at once, so this only affects connections that were already open.
 
 **Still to check on a real Pi:** how long the gap is with real devices (phones and TVs answer ARP differently from Linux). It is not being tuned further for now.
+
+### 78. Home-network names sent to the router
+
+Since the fourth review, names such as `printer.lan` or `nas.home`, and reverse lookups of home addresses, go to the home router instead of 1.1.1.1 (fixed issue 48). Two gaps remain:
+
+- QuietNet will not send a name back to the router if the router itself asked. But a router set up to send its own lookups to QuietNet through another route could still make the two ask each other in turn.
+- Single-word names (a plain `nas`, with no ending) still go to the public servers. Some routers answer those for home devices.
+
+**Still to check on a real Pi:** that home names resolve through a real router, and that the device name hints work when the Pi uses itself for DNS.
+
+### 79. Other fourth-review changes that need a real Pi or host
+
+These could only be checked with stand-ins here:
+
+- **Time zone in the container.** After `docker compose up -d --build`, `docker exec quietnet date` should show the Pi's local time, and the dashboard clock should match the Pi.
+- **This computer's address changing.** When the Pi's address changes, the enforcer is told the new one. Check that its own-address rules follow within a minute.
+- **A Pi with `iptables` but no `nft`.** With nothing enforced, no `iptables` commands should run each tick.
+- **The relay behind Railway.** Limits per network address read the last entry of the `X-Forwarded-For` header. Check that Railway's proxy adds it there (rather than replacing the header) and that there is only one proxy in front. If every caller looks the same, the per-address limit behaves like the old shared one.
 
 ## Open: design decisions for the owner
 
@@ -37,7 +57,7 @@ The DNS filter listens on IPv4 addresses only, and the enforcer steers and drops
 
 ### 6. Sign-up on the relay is open unless you close it
 
-Anyone who finds the relay's address can create an account. Accounts cannot see each other's Pis, so this exposes nothing, but it is an open door on a public server. A setting now exists to close it: `QUIETNET_SIGNUP=first` allows only the first account, and `closed` allows none. The default is still `open`, so that existing set-ups behave as before.
+Anyone who finds the relay's address can create an account. Accounts cannot see each other's Pis, so this exposes nothing, but it is an open door on a public server. A setting now exists to close it: `QUIETNET_SIGNUP=first` allows only the first account, and `closed` allows none. The default is still `open`, so that existing set-ups behave as before. Since the fourth review, a misspelt value (anything other than `open`, `first` or `closed`) closes sign-up and is warned about at start-up, rather than leaving it open.
 
 **Recommended:** set `QUIETNET_SIGNUP=first` on Railway. Consider making it the default.
 
@@ -63,6 +83,18 @@ The relay's limits reset when it restarts. (The lock-out half of this issue is f
 - Pi tokens are stored as plain text in `relay.db`. Storing a hash would mean a leaked database could not be used to pose as a Pi. The data folder is now private to its owner, which narrows this.
 - The sign-in form carries no one-time token, so another site could sign a visitor in to the attacker's own account ("login forgery"). The visitor would see the attacker's QuietNets, not their own. Low risk.
 - The sign-up form says when an email already has an account. Low risk for a single-owner relay.
+- The overall cap on wrong pairing codes was raised from 20 to 200 in 10 minutes, now that each network address has its own cap of 20. Codes are 32 bits, so someone guessing without stop has about a 1 in 400 chance a year of hitting a given live code, against about 1 in 4,000 before. Judged acceptable; the owner may want to confirm.
+- The relay's room for large answers (48 MB) counts each answer's stated size. While one is being read, memory briefly reaches two to three times that size.
+
+### 80. TCP lookups have no per-device share
+
+Since the fourth review, one device can hold at most 16 of the 256 places for lookups over UDP (fixed issue 49). Lookups over TCP still share 64 connections across the house with no per-device share, so one device could fill them. TCP is used only for large answers, so ordinary lookups are not affected.
+
+### 81. The community list download can fail on a Mac with Python from python.org
+
+That Python has no certificate list of its own until "Install Certificates.command" is run. The Pi's link to the relay now borrows the system's list in that case (fixed issue 69), but the community advert list download in `server.py` does not, so it fails with a certificate error.
+
+**Fix:** use `cloud_agent.tls_context()` for the download too.
 
 ### 20. A relay address beginning `http://` is accepted
 
@@ -82,10 +114,24 @@ QuietNet keeps no memory of answers. Because it also cuts every answer's lifetim
 
 **Fix:** keep answers in memory for their (shortened) lifetime, keyed by name and record type, and clear the memory whenever a rule changes.
 
+### 82. Dashboard reads still hold the database lock
+
+Since the fourth review, DNS answers never wait for the database (fixed issue 50). But clearing the history, and the dashboard's own history questions, still hold the database lock while they run, so they can hold up other dashboard calls and the history writer for a moment.
+
+**Fix:** a second, read-only database connection for the dashboard's questions.
+
+### 83. A device's activity list is sent in full every 30 seconds
+
+Since the fourth review, the dashboard fetches an open device's activity list every 30 seconds rather than every 4 (fixed issue 73). The server has no way to say "nothing has changed", so each fetch still sends the whole list, which for a busy device over a week is large, especially through the relay.
+
+**Fix:** let the page send back a marker of the last change it saw, and answer "unchanged" when nothing is new; or cap the names listed per company.
+
 ### 12. Minor
 
 - The README and the comment at the top of `server.py` say blocked lookups are answered "that doesn't exist". They are answered with the address `0.0.0.0`, which devices treat the same way.
 - The enforcer drops addresses handed out in the last six hours. A service that moves to new addresses is covered as soon as the device looks them up through QuietNet.
+- On Safari before 14.1, rows of buttons and labels sit closer together than intended (the page uses flex `gap`, which those versions ignore). Nothing breaks or disappears.
+- When a network is too big to scan in full, the scan covers the 1,024 addresses around this computer and the API says so (`capped`), but the dashboard page does not yet tell the person.
 
 ## Software QuietNet depends on
 
@@ -111,6 +157,43 @@ The Python security fixes published during 2026 were checked against the modules
 This check used the published release notes. It is not a scan of the built image, which needs a tool such as `docker scout` or `trivy` run against the image itself.
 
 ## Fixed
+
+### In the fourth review (22 November)
+
+| # | What was wrong | Fix |
+| --- | --- | --- |
+| 46 | **The kill switch, a switched-off "this device" or a whole-house bedtime also cut off QuietNet's own computer**, so the Pi lost its link to the relay (and could not be switched back on from outside), its clock and its list downloads | QuietNet's own computer is never cut off by these. Ordinary blocks (your own, the advert list, blocked services) still apply to it |
+| 47 | **Names that skip the checks** (odd characters, home-network endings, reverse lookups) **were passed to the internet even while a device's internet was off**, so they could be used to get data out. A packet QuietNet couldn't read was passed on untouched | While a device's internet is off these get the blocked answer. An unreadable packet gets a "format error" answer, or none if it is too short or is itself an answer, and is never passed on |
+| 48 | **Home-network names and reverse lookups of home addresses went to 1.1.1.1 and 8.8.8.8**, which can't answer them, and told those servers about the home network | They go to the home router (read from the Pi's routing table, looked up again every five minutes). If the router isn't known, or the router itself asked, the answer is "no such name". `.home.arpa` is now treated as a home ending too |
+| 49 | **One device could take all 256 places for lookups**, stopping everyone else's | At most 16 per device (UDP) |
+| 50 | **DNS answers could wait for the database** while the dashboard asked a question, the history was trimmed or cleared | The addresses remembered for the enforcer have their own lock; answering a lookup never waits for the database |
+| 51 | **The network scan held the database lock for up to eight seconds** while it waited for device names | It waits for the names first and holds the lock only to save them |
+| 52 | **Every history trim read the whole table** | Two steps, one finding old rows through the time index, the other surplus rows by row number |
+| 53 | **The device list read through the whole history** to find each device's last lookup, on every refresh | It jumps from device to device in the index, so the work grows with the number of devices, not the size of the history |
+| 54 | **The enforcer's plan worked out every remembered name for every device every two seconds** | Each name's answer is remembered and worked out again only for new names, after a rule change, or once a minute. Addresses are always read fresh |
+| 55 | **The status summary joined both advert lists on every call** (every four seconds, 100,000+ names) | The count is worked out when a list changes |
+| 56 | **This computer's address was only found at start-up**, so a Pi that started before its network was ready kept `127.0.0.1` | Looked up again every 10 seconds until found, then every minute; the enforcer is told. A lost network keeps the last good address |
+| 57 | **The network scan assumed a network of 254 addresses**, missing devices on bigger home networks | It reads the real size from the routing table and scans all of it, up to 1,024 addresses (those around this computer, if the network is bigger). The answer says what was covered |
+| 58 | **Any website could sign you out of the relay** by sending your browser to `/logout` | Opening `/logout` only shows a "Sign out?" button. Signing out needs a form carrying a token tied to your session |
+| 59 | **One stranger sending wrong pairing codes stopped everyone pairing** (a single shared limit of 20), and a Pi on a `QUIETNET_PAIR` code gave up after one failure | Wrong codes are counted per network address (20 in 10 minutes), with a higher overall limit (200). The Pi tries its code again after any refusal except "wrong or expired", waiting 5 seconds at first and up to a minute |
+| 60 | **Only two large answers could be read at once across the whole relay**, so one Pi could hold both places and everyone else's longer pages timed out | One at a time per account (so one person can't take all the room by pairing several Pis), and at most 48 MB across every account. An answer that can't get room within 10 seconds is refused and the browser told at once (`503`) |
+| 61 | **A large answer could tie up the relay's memory**: a slow upload held its room for as long as it liked, and several copies of each answer were kept | A body must arrive within 30 seconds, reading stops if the browser has given up, and only one copy is kept |
+| 62 | **Sign-ins with the right password were never limited**, so a flood of sign-ins could keep the relay's processor busy checking passwords | Every attempt counts: 30 per account and 60 per network address in 15 minutes (a browser that has signed in before has its own cap of 30). At most four passwords are checked at once; beyond that the answer is "The relay is busy" |
+| 63 | **The relay had no limit on connections or threads** | At most 300 connections (more are told the relay is busy), 150 of them waiting Pis, one waiting poll per Pi, 10 seconds for a request's headers and 30 seconds for its body to arrive |
+| 64 | **An account could create and pair QuietNets without limit**, filling the relay's disk | At most 10 per account, and 20 successful pairings a day |
+| 65 | **Finding a Pi by its token or pairing code read the whole table**, and removed Pis stayed in the relay's memory | Indexes added (an existing database gains them at start-up); removed Pis are forgotten |
+| 66 | **A relay cookie with non-English letters dropped the connection** | It counts as signed out |
+| 67 | **A misspelt `QUIETNET_SIGNUP` left sign-up open** | Any value other than `open`, `first` or `closed` closes it, with a warning at start-up |
+| 68 | **The Pi's link to the relay could stop for good after an unexpected error**, such as a cut-off answer during a relay restart, until the container was restarted | Every error is caught; the link tries again after 1 second, then longer, up to 30, and the Remote access card says what happened |
+| 69 | **On a Mac with Python from python.org, pairing failed certificate checks**, and the message said the relay couldn't be reached | If Python has no certificate list, it borrows the system's own. If none is found, the message names "Install Certificates.command". Checks are never switched off. (The list download still has this fault: issue 81) |
+| 70 | **An accept in one firewall table hid a reject in another**, so with Docker and firewalld a device could be steered and lose its internet | Every table's forwarding chain is judged on its own |
+| 71 | **The firewall advice was always Docker's command**, which does nothing for firewalld, or for ufw without Docker | The advice suits the firewall in the way, and every one in the way is listed with its own command |
+| 72 | **With only `iptables`, three commands ran every two seconds** even with no device enforced | Nothing runs until a device is enforced; leftover rules are still emptied, including when the firewall lock was busy at start-up |
+| 73 | **The dashboard's four-second refresh could overlap itself**, and fetched a device's whole activity list every time, even in a background tab | It waits for the previous refresh (for up to 30 seconds, so one request that never finishes can't stop it for good), pauses while the tab is hidden or a dialog is open, and fetches the activity list every 30 seconds |
+| 74 | **The dashboard stuck on "Starting…" on Safari before 13.1** (iOS 12), because its script used a newer operator | The script uses only what those versions understand |
+| 75 | **Dialogs appeared off-screen on Safari before 14.1**, so the page looked stuck after pressing the kill switch | The page spells out the positions those versions need |
+| 76 | **Schedules ran on UTC inside the Pi container**, an hour or more out for most homes | The container shares the Pi's time zone and includes the time zone tables; `TZ` can name one instead |
+| 77 | **On a Mac without Apple's developer tools, the launcher ran Apple's Python stand-in a second time**, ending on an error from Apple's tools | It recognises the stand-in, never runs it, and says how to get Python (python.org or `xcode-select --install`) |
 
 ### In the third review (22 November)
 

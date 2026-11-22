@@ -116,43 +116,111 @@ def iptables_rules(plan, our_ip):
     return cmds
 
 
-FINAL_REJECT = re.compile(r"^\s*(counter(\s+packets\s+\d+\s+bytes\s+\d+)?\s+)?(drop|reject)\b")
+_COUNTER = r"(counter(\s+packets\s+\d+\s+bytes\s+\d+)?\s+)?"
+FINAL_REJECT = re.compile(r"^\s*" + _COUNTER + r"(drop|reject)\b")
+_PLAIN_JUMP = re.compile(r"^\s*" + _COUNTER + r"(jump|goto)\s+(\S+)\s*$")
+_PLAIN_RETURN = re.compile(r"^\s*" + _COUNTER + r"return\s*$")
+
+
+def _nft_tables(ruleset_text):
+    """Read `nft list ruleset` into {(family, table): {chain: {"forward": bool, "drop": bool,
+    "rules": [rule text, ...]}}}. "forward" means the chain is hooked on forwarded traffic, and
+    "drop" that its policy drops whatever reaches the end. Sets and other blocks are skipped."""
+    tables, depth, table, chain = {}, 0, None, None
+    for line in ruleset_text.splitlines():
+        s = line.strip()
+        if depth == 0:
+            m = re.match(r"table\s+(\S+)\s+(\S+)\s*\{", s)
+            if m:
+                table = (m.group(1), m.group(2))
+                tables.setdefault(table, {})
+        elif depth == 1 and table:
+            m = re.match(r"chain\s+(\S+)\s*\{", s)
+            if m:
+                chain = tables[table].setdefault(m.group(1), {"forward": False, "drop": False, "rules": []})
+        elif depth == 2 and chain is not None:
+            if re.search(r"\bhook\s+forward\b", s):
+                chain["forward"] = True
+                chain["drop"] = bool(re.search(r"\bpolicy\s+drop\b", s))
+            elif s and s != "}":
+                chain["rules"].append(s)
+        depth = max(0, depth + s.count("{") - s.count("}"))
+        if depth <= 1:
+            chain = None
+        if depth == 0:
+            table = None
+    return tables
+
+
+def _chain_verdict(chains, name, iface, seen, base=True):
+    """What happens to traffic coming in on `iface` and going back out of it when it runs through
+    one chain: "accept", "drop", "end" (the base chain's policy decides), or None (it carries on
+    after the rule that jumped here). Only rules that apply to all traffic are followed, plus the
+    accept our advice adds, so a rule that only matches some traffic never clears a firewall.
+
+    base: is this the forward chain itself, or a chain reached from it only by goto? A goto
+    target that runs out of rules ends the forward chain there, but one reached (at any depth)
+    through a jump goes back and carries on after that jump, as nftables does."""
+    if name in seen or name not in chains:
+        return None
+    seen = seen | {name}
+    ours = re.compile(r'^iifname "?%s"?\s+oifname "?%s"?\s.*\baccept\s*$' % (re.escape(iface), re.escape(iface)))
+    for rule in chains[name]["rules"]:
+        if ours.match(rule):
+            return "accept"
+        if FINAL_REJECT.match(rule):
+            return "drop"
+        if _PLAIN_RETURN.match(rule):
+            return None
+        m = _PLAIN_JUMP.match(rule)
+        if m:
+            goto = m.group(3) == "goto"
+            verdict = _chain_verdict(chains, m.group(4), iface, seen, base and goto)
+            if goto:
+                return verdict or ("end" if base else None)
+            if verdict:
+                return verdict
+    return None
+
+
+def forward_blockers(ruleset_text, iface):
+    """Every *other* firewall chain, as listed by `nft list ruleset`, that would drop the traffic
+    we forward. Returns [(family, table, chain, made_by_docker), ...]; [] means all clear.
+
+    In nftables each table's forward chain is run in turn and every one must let a packet through:
+    an accept in one table does not override a drop or reject in another. So each chain is judged
+    on its own. Docker sets its forward policy to drop; firewalld ends its forward chain with a
+    reject. Either is fine if the same chain (or a chain it always jumps to) first accepts traffic
+    coming in on our network connection and going back out of it - the rule our advice adds."""
+    found = []
+    for (family, table), chains in sorted(_nft_tables(ruleset_text).items()):
+        if table == TABLE or family not in ("ip", "inet"):
+            continue                  # only ip and inet tables see the IPv4 traffic we forward
+        for name, chain in sorted(chains.items()):
+            if not chain["forward"]:
+                continue
+            verdict = _chain_verdict(chains, name, iface, frozenset())
+            if verdict == "drop" or (verdict != "accept" and chain["drop"]):
+                found.append((family, table, name, family == "ip" and "DOCKER-USER" in chains))
+    return found
 
 
 def foreign_forward_drop(ruleset_text, iface):
     """Would some *other* firewall, as listed by `nft list ruleset`, drop the traffic we forward?
+    Returns the first offending table's name, or '' (see forward_blockers for the details)."""
+    found = forward_blockers(ruleset_text, iface)
+    return found[0][1] if found else ""
 
-    Docker sets the forward policy to drop; firewalld ends its forward chain with a reject.
-    An 'accept' in our own table does not override either, so a steered device would lose its
-    internet entirely. It is fine, though, if the rules explicitly accept traffic coming in on our
-    network connection and going back out of it - which is what the advice we show adds
-    (`iptables -I DOCKER-USER -i eth0 -o eth0 -j ACCEPT`). Returns the offending table's name, or ''."""
-    if re.search(r'iifname "%s".*oifname "%s".*accept' % (re.escape(iface), re.escape(iface)), ruleset_text):
-        return ""
-    table, in_forward, last_rule, blocker = None, False, "", ""
-    for line in ruleset_text.splitlines():
-        m = re.match(r"\s*table\s+\S+\s+(\S+)\s*\{", line)
-        if m:
-            table = m.group(1)
-            continue
-        if re.match(r"\s*chain\s+\S+\s*\{", line):
-            in_forward, last_rule = False, ""
-            continue
-        if table == TABLE:
-            continue
-        if re.search(r"hook\s+forward\b", line):
-            in_forward = True
-            if re.search(r"policy\s+drop", line):
-                blocker = blocker or table or "unknown"
-            continue
-        if in_forward:
-            if line.strip() == "}":
-                if FINAL_REJECT.match(last_rule):
-                    blocker = blocker or table or "unknown"
-                in_forward = False
-            elif line.strip():
-                last_rule = line
-    return blocker
+
+def nft_advice(family, table, chain, docker, iface):
+    """The command that lets our forwarded traffic through one blocking nftables chain. Docker's
+    rules go in its DOCKER-USER chain, which Docker keeps for exactly this; a chain made with
+    iptables (ip filter FORWARD) is changed with iptables; anything else is changed with nft."""
+    if docker:
+        return "sudo iptables -I DOCKER-USER -i %s -o %s -j ACCEPT" % (iface, iface)
+    if (family, table, chain) == ("ip", "filter", "FORWARD"):
+        return "sudo iptables -I FORWARD -i %s -o %s -j ACCEPT" % (iface, iface)
+    return "sudo nft insert rule %s %s %s iifname %s oifname %s accept" % (family, table, chain, iface, iface)
 
 
 def iptables_forward_drop(listing, iface):
@@ -162,6 +230,13 @@ def iptables_forward_drop(listing, iface):
         return False
     return bool(re.search(r"^-P FORWARD DROP", listing, re.M)) or \
         bool(re.search(r"^-A FORWARD -j (REJECT|DROP)\b", listing, re.M))
+
+
+def iptables_advice(tool, listing, iface):
+    """The command that lets our forwarded traffic through, for rules listed by `<tool> -S`:
+    into Docker's DOCKER-USER chain if Docker made one, otherwise at the top of FORWARD."""
+    chain = "DOCKER-USER" if re.search(r"^-N DOCKER-USER\b", listing, re.M) else "FORWARD"
+    return "sudo %s -I %s -i %s -o %s -j ACCEPT" % (tool, chain, iface, iface)
 
 
 def target_problem(ip, subnet, gateway_ip, local_ip):
@@ -300,6 +375,7 @@ class Enforcer:
         self._saved_sysctls = {}      # setting -> original value, only for settings we changed
         self._spoofed = {}            # device address -> the hardware address we steered
         self._applied = ""            # last firewall text we pushed, to avoid needless reloads
+        self._ipt_loaded = False      # iptables only: our chain may hold drop rules that must be cleared
         self._fw_checked, self._fw_blocker = 0.0, ""
         self.device_problems = {}     # device address -> a problem with that device alone
         self._pending = {}            # device address -> (hardware address, times answers are due)
@@ -482,17 +558,13 @@ class Enforcer:
         if sysctl_get("net.ipv4.ip_forward") != "1":
             return ("This machine won't pass traffic on, so steering a device would cut it off. On the Pi, run: "
                     "echo net.ipv4.ip_forward=1 | sudo tee /etc/sysctl.d/90-quietnet.conf && sudo sysctl --system")
-        other = self._forward_blocker()
-        if other:
-            return ("Another firewall on this machine (%s, often Docker's) blocks passed-on traffic, so steering "
-                    "a device would cut it off. To allow it, run on the Pi: "
-                    "sudo iptables -I DOCKER-USER -i %s -o %s -j ACCEPT" % (other, self.iface, self.iface))
-        return ""
+        return self._forward_blocker()
 
     def _forward_blocker(self):
-        """Name of any other firewall that would drop the traffic we pass on, or ''. Asked of every
-        firewall tool present, because rules can live where one tool can't see them (rules made with
-        iptables-legacy are invisible to nft).
+        """Why another firewall stops us passing traffic on, in plain English with the command that
+        fixes it, or ''. Asked of every firewall tool present, because rules can live where one
+        tool can't see them (rules made with iptables-legacy are invisible to nft). Every blocker
+        found is named, with its own command, so one fix doesn't just uncover the next.
 
         It fails closed: if a tool that is present can't be asked, that counts as a blocker, since
         steering into a firewall we couldn't see may cut the device off. A clean answer is
@@ -501,6 +573,7 @@ class Enforcer:
         if now - self._fw_checked < 30:
             return self._fw_blocker
         tools = [t for t in ("nft", "iptables", "iptables-legacy") if t == self.backend or shutil.which(t)]
+        names, fixes = [], []
         for tool in tools:
             args = ["nft", "list", "ruleset"] if tool == "nft" else [tool, "-w", "5", "-S"]
             try:
@@ -511,17 +584,26 @@ class Enforcer:
                     re.search(r"does not exist|insmod", p.stderr or ""):
                 continue                     # the old firewall isn't loaded at all, so it holds no rules
             if p is None or p.returncode != 0:
-                return "rules that %s couldn't list" % tool
+                return ("QuietNet couldn't read this machine's firewall rules with %s, so it won't steer a device "
+                        "in case they would cut it off. Check that 'sudo %s' works on the Pi."
+                        % (tool, " ".join(a for a in args if a not in ("-w", "5"))))
             if tool == "nft":
-                table = foreign_forward_drop(p.stdout or "", self.iface)
-                if table:
-                    self._fw_checked, self._fw_blocker = now, "table '%s'" % table
-                    return self._fw_blocker
+                for family, table, chain, docker in forward_blockers(p.stdout or "", self.iface):
+                    names.append(("Docker's table '%s'" if docker else "table '%s'") % table)
+                    fixes.append(nft_advice(family, table, chain, docker, self.iface))
             elif iptables_forward_drop(p.stdout or "", self.iface):
-                self._fw_checked, self._fw_blocker = now, "%s's forwarding rules" % tool
-                return self._fw_blocker
-        self._fw_checked, self._fw_blocker = now, ""
-        return ""
+                names.append("%s's forwarding rules" % tool)
+                fixes.append(iptables_advice(tool, p.stdout or "", self.iface))
+        message = ""
+        if names:
+            unique = []
+            for fix in fixes:                # nft and iptables can both see the same rules
+                if fix not in unique:
+                    unique.append(fix)
+            message = ("Another firewall on this machine (%s) blocks passed-on traffic, so steering a device "
+                       "would cut it off. To allow it, run on the Pi: %s" % (", ".join(names), " && ".join(unique)))
+        self._fw_checked, self._fw_blocker = now, message
+        return message
 
     def _restore_routing(self):
         """Put back the kernel settings we changed, and clear the notes."""
@@ -697,7 +779,9 @@ class Enforcer:
         loaded. With nft the whole table is replaced in one step (see nft_ruleset), so there is never
         a half-applied state and no rule outlives the plan that asked for it. With iptables, the
         chain and the jump to it are checked every time (something else may have flushed them), and
-        the rules count as loaded only if every command worked."""
+        the rules count as loaded only if every command worked. While nothing is enforced and no
+        rules are left to clear, iptables isn't run at all: each call takes the firewall lock that
+        Docker and ufw also need, and the empty plan is asked for every two seconds."""
         if self.backend == "nft":
             text = nft_ruleset(plan, self.local_ip)
             if text != self._applied:
@@ -707,6 +791,10 @@ class Enforcer:
                 else:
                     self._applied = text
         elif self.backend == "iptables":
+            if not plan and not self._ipt_loaded:
+                return
+            if plan:
+                self._ipt_loaded = True
             # If the chain had to be made, or the jump put back, or the chain no longer holds the
             # rules we loaded, something else has flushed the firewall: load the rules again.
             created = ipt("iptables", ["-N", "QUIETNET"])
@@ -721,6 +809,8 @@ class Enforcer:
                 self._applied = key if ok else ""
                 if not ok:
                     self.log("iptables update failed; will try again.")
+            if not plan and self._applied == key:
+                self._ipt_loaded = False          # emptied: nothing more to clear until a plan returns
 
     def _chain_rule_count(self):
         """How many rules QuietNet's iptables chain holds right now, or None if that can't be told."""
@@ -740,6 +830,15 @@ class Enforcer:
             ipt("iptables", ["-D", "FORWARD", "-j", "QUIETNET"])
             ipt("iptables", ["-F", "QUIETNET"])
             ipt("iptables", ["-X", "QUIETNET"])
+            # If the chain is still there (another program held the lock, say), it may still hold
+            # drop rules, so the next tick with nothing enforced must still empty it.
+            # Only a definite "no such chain" (exit code 1) counts as gone: a busy lock or a
+            # time-out says nothing, so the chain is treated as still loaded.
+            try:
+                p = subprocess.run(["iptables", "-w", "5", "-n", "-L", "QUIETNET"], capture_output=True, timeout=15)
+            except (OSError, subprocess.SubprocessError):
+                p = None
+            self._ipt_loaded = not (p is not None and p.returncode == 1)
         self._applied = ""
 
     # -- stop and restore ---------------------------------------------------

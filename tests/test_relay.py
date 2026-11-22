@@ -8,6 +8,7 @@ a throwaway data folder, and a pretend Pi answers its calls. Nothing leaves this
 """
 import http.client
 import json
+import re
 import socket
 import os
 import sys
@@ -68,7 +69,7 @@ class RelayCase(unittest.TestCase):
     def setUpClass(cls):
         if relay.db is None:
             relay.init_db()
-        cls.httpd = ThreadingHTTPServer(("127.0.0.1", 0), relay.Relay)
+        cls.httpd = relay.RelayServer(("127.0.0.1", 0), relay.Relay)
         cls.httpd.daemon_threads = True
         cls.port = cls.httpd.server_address[1]
         threading.Thread(target=cls.httpd.serve_forever, daemon=True).start()
@@ -84,7 +85,9 @@ class RelayCase(unittest.TestCase):
         with relay.bridge.lock:
             relay.bridge.queues.clear()
             relay.bridge.waiting.clear()
+            relay.bridge.pollers.clear()
         relay.throttle.failures.clear()
+        self.limit("big_answers", relay.BigAnswers(relay.BIG_ANSWER_BUDGET))
 
     def limit(self, name, value):
         """Change one of the relay's limits for the length of a test."""
@@ -97,6 +100,11 @@ class RelayCase(unittest.TestCase):
         self.assertEqual(status, 303)
         self.assertEqual(r.getheader("Location"), "/")
         return b
+
+    def sign_out(self, browser, page="/"):
+        """Press the sign-out button on a page, as the browser would: post its form, token and all."""
+        token = re.search(r'name="token" value="([0-9a-f]+)"', browser.get(page)[1]).group(1)
+        return browser.post("/logout", form={"token": token})
 
     def paired_pi(self, browser, name="Home Pi"):
         """Create a Pi on the website and pair it, the way the real Pi does. Returns (id, token)."""
@@ -309,9 +317,40 @@ class Accounts(RelayCase):
 
     def test_signing_out_ends_the_session(self):
         b = self.signed_in()
-        b.get("/logout")
+        self.sign_out(b)
         status, _, r = b.get("/")
         self.assertEqual((status, r.getheader("Location")), (303, "/login"))
+
+    def test_the_sign_out_button_on_the_remote_dashboard_works(self):
+        b = self.signed_in()
+        pid, _ = self.paired_pi(b)
+        self.sign_out(b, "/pi/%s/" % pid)
+        self.assertEqual(b.get("/")[0], 303)
+
+    def test_opening_the_sign_out_address_only_offers_a_button(self):
+        # Any website can send your browser to an address, so a plain visit must not sign you out.
+        b = self.signed_in()
+        status, text, r = b.get("/logout")
+        self.assertEqual(status, 200)
+        self.assertIn('action="/logout"', text)
+        self.assertIsNone(r.getheader("Set-Cookie"))
+        self.assertEqual(b.get("/")[0], 200)
+
+    def test_a_sign_out_without_the_pages_token_changes_nothing(self):
+        # A form on another website can post to /logout, but it can't know the token.
+        b = self.signed_in()
+        for form in ({}, {"token": "0" * 32}, {"token": "\u00e9" * 32}):
+            status, _, r = b.post("/logout", form=form)
+            self.assertEqual((status, r.getheader("Location")), (303, "/"), form)
+            self.assertIsNone(r.getheader("Set-Cookie"), form)
+        self.assertEqual(b.get("/")[0], 200)
+
+    def test_one_sessions_sign_out_token_does_not_work_for_another(self):
+        mine, theirs = self.signed_in(), self.signed_in("mallory@example.com")
+        token = re.search(r'name="token" value="([0-9a-f]+)"', theirs.get("/")[1]).group(1)
+        _, _, r = mine.post("/logout", form={"token": token})
+        self.assertIsNone(r.getheader("Set-Cookie"))
+        self.assertEqual(mine.get("/")[0], 200)
 
     def test_a_forged_cookie_does_not_sign_you_in(self):
         self.signed_in()
@@ -651,7 +690,7 @@ class GuessLimits(RelayCase):
 
     def test_signing_out_forgets_the_browser(self):
         b = self.signed_in()
-        _, _, r = b.get("/logout")
+        _, _, r = self.sign_out(b)
         cleared = [v for k, v in r.getheaders() if k.lower() == "set-cookie" and v.startswith("qn_known=;")]
         self.assertTrue(cleared)
         self.assertIn("Max-Age=0", cleared[0])
@@ -870,6 +909,428 @@ class OversizedAndOddInput(RelayCase):
         email = "a" * 250 + "@example.com"
         status, text, _ = Browser(self.port).post("/signup", form={"email": email, "password": PASSWORD})
         self.assertIn("Enter a valid email", text)
+
+
+
+# ------------------------------------------------------------------ cookies the relay didn't make
+
+class OddCookies(RelayCase):
+    def test_a_session_cookie_with_non_ascii_letters_is_not_valid(self):
+        self.assertIsNone(relay.read_session("\xc3\xa9.9999999999.%s" % ("0" * 32)))
+        self.assertIsNone(relay.read_session("1.9999999999.\xc3\xa9"))
+
+    def test_a_non_ascii_session_cookie_gets_the_signed_out_answer(self):
+        # Another site on the same domain could set such a cookie; the relay must still answer.
+        b = Browser(self.port)
+        b.cookie = "qn_session=\xc3\xa9.1.x"
+        status, _, r = b.get("/")
+        self.assertEqual((status, r.getheader("Location")), (303, "/login"))
+
+    def test_a_non_ascii_known_browser_cookie_does_not_stop_signing_in(self):
+        self.signed_in()
+        status, _, _ = Browser(self.port).post("/login", form={"email": "lewis@example.com", "password": PASSWORD},
+                                               headers={"Cookie": "qn_known=1.\xc3\xa9"})
+        self.assertEqual(status, 303)
+
+
+# ------------------------------------------------------------------ the sign-up setting
+
+class SignupSetting(RelayCase):
+    def test_an_unrecognised_setting_keeps_sign_up_closed(self):
+        self.limit("SIGNUP", "close")               # a typo for "closed"
+        status, _, _ = Browser(self.port).post("/signup", form={"email": "a@example.com", "password": PASSWORD})
+        self.assertEqual(status, 403)
+        self.assertEqual(relay.sql("SELECT COUNT(*) FROM users", one=True)[0], 0)
+
+    def test_an_unrecognised_setting_is_warned_about(self):
+        self.limit("SIGNUP", "frist")
+        self.assertIn("frist", relay.signup_warning())
+        self.assertIn("switched off", relay.signup_warning())
+
+    def test_the_known_settings_give_no_warning(self):
+        for mode in ("open", "first", "closed"):
+            self.limit("SIGNUP", mode)
+            self.assertIsNone(relay.signup_warning(), mode)
+
+
+# ------------------------------------------------------------------ pairing limits
+
+class PairingLimits(RelayCase):
+    def pair(self, code, address):
+        return Browser(self.port).post("/agent/pair", data={"code": code}, headers={"X-Forwarded-For": address})
+
+    def new_code(self, browser, name="Home Pi"):
+        browser.post("/pis/new", form={"name": name})
+        return relay.sql("SELECT code FROM pis WHERE name=?", (name,), one=True)[0]
+
+    def test_bad_codes_from_one_address_are_capped(self):
+        self.limit("PAIR_LIMIT_PER_ADDRESS", (3, 600))
+        code = self.new_code(self.signed_in())
+        for i in range(3):
+            self.assertEqual(self.pair("0000-000%d" % i, "203.0.113.9")[0], 400)
+        self.assertEqual(self.pair(code, "203.0.113.9")[0], 429)
+
+    def test_bad_codes_from_one_address_do_not_stop_another_address_pairing(self):
+        self.limit("PAIR_LIMIT_PER_ADDRESS", (3, 600))
+        code = self.new_code(self.signed_in())
+        for i in range(5):
+            self.pair("0000-000%d" % i, "203.0.113.9")
+        self.assertEqual(self.pair(code, "198.51.100.7")[0], 200)
+
+    def test_the_address_added_last_by_the_proxy_is_the_one_counted(self):
+        # Earlier entries in X-Forwarded-For are whatever the sender wrote, so they can't dodge the limit.
+        self.limit("PAIR_LIMIT_PER_ADDRESS", (3, 600))
+        code = self.new_code(self.signed_in())
+        for i in range(3):
+            self.pair("0000-000%d" % i, "10.0.0.%d, 203.0.113.9" % i)
+        self.assertEqual(self.pair(code, "10.9.9.9, 203.0.113.9")[0], 429)
+
+    def test_ipv6_addresses_in_one_block_share_a_limit(self):
+        self.limit("PAIR_LIMIT_PER_ADDRESS", (3, 600))
+        code = self.new_code(self.signed_in())
+        for i in range(3):
+            self.pair("0000-000%d" % i, "2001:db8:1:2::%d" % (i + 1))
+        self.assertEqual(self.pair(code, "2001:db8:1:2::99")[0], 429)
+
+    def test_successful_pairings_are_capped_per_account(self):
+        self.limit("PAIR_LIMIT_PER_ACCOUNT", (2, 3600))
+        b = self.signed_in()
+        self.paired_pi(b, "One")
+        self.paired_pi(b, "Two")
+        code = self.new_code(b, "Three")
+        status, text, _ = self.pair(code, "198.51.100.7")
+        self.assertEqual(status, 429)
+        self.assertIn("too many", json.loads(text)["error"])
+        self.assertEqual(relay.sql("SELECT paired FROM pis WHERE name='Three'", one=True)[0], 0)
+
+
+# ------------------------------------------------------------------ how many QuietNets, and finding them fast
+
+class QuietNetsPerAccount(RelayCase):
+    def test_an_account_can_hold_at_most_the_set_number_of_quietnets(self):
+        self.limit("MAX_PIS_PER_ACCOUNT", 2)
+        b = self.signed_in()
+        b.post("/pis/new", form={"name": "One"})
+        b.post("/pis/new", form={"name": "Two"})
+        status, text, _ = b.post("/pis/new", form={"name": "Three"})
+        self.assertEqual(status, 403)
+        self.assertIn("Remove one before adding another", text)
+        self.assertEqual(relay.sql("SELECT COUNT(*) FROM pis", one=True)[0], 2)
+
+    def test_one_accounts_quietnets_do_not_count_against_another(self):
+        self.limit("MAX_PIS_PER_ACCOUNT", 1)
+        self.signed_in().post("/pis/new", form={"name": "One"})
+        status, _, _ = self.signed_in("hannah@example.com").post("/pis/new", form={"name": "Two"})
+        self.assertEqual(status, 303)
+
+    def test_removing_a_pi_forgets_it_in_the_bridge(self):
+        b = self.signed_in()
+        pid, token = self.paired_pi(b)
+        self.limit("POLL_TIMEOUT", 0.1)
+        Browser(self.port).get("/agent/poll", headers={"X-QuietNet-Token": token})
+        self.assertIn(pid, relay.bridge.cond)
+        b.post("/pis/%s/delete" % pid)
+        self.assertNotIn(pid, relay.bridge.cond)
+
+    def plan(self, query, args):
+        """How SQLite would run a query, as one line of text."""
+        return " ".join(str(row[-1]) for row in relay.sql("EXPLAIN QUERY PLAN " + query, args))
+
+    def test_a_pis_lookup_by_token_uses_an_index(self):
+        self.assertIn("USING INDEX pis_token", self.plan("SELECT id FROM pis WHERE token=? AND paired=1", ("x",)))
+
+    def test_a_lookup_by_pairing_code_uses_an_index(self):
+        self.assertIn("USING INDEX pis_code", self.plan(
+            "SELECT id, user_id FROM pis WHERE code=? AND paired=0 AND code_ts>?", ("x", 0)))
+
+    def test_an_existing_database_gains_the_lookup_indexes(self):
+        import sqlite3
+        folder = tempfile.mkdtemp(prefix="quietnet-relay-old-")
+        old = sqlite3.connect(os.path.join(folder, "relay.db"))
+        old.executescript("""
+            CREATE TABLE users(id INTEGER PRIMARY KEY, email TEXT UNIQUE, pw TEXT, created REAL);
+            CREATE TABLE pis(id TEXT PRIMARY KEY, user_id INTEGER, name TEXT, token TEXT,
+                code TEXT, paired INTEGER, created REAL, last_seen REAL, code_ts REAL DEFAULT 0);
+            CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT);
+        """)
+        old.commit()
+        old.close()
+        keep = (relay.db, relay.SECRET, relay.DATA)
+        try:
+            relay.DATA = folder
+            relay.init_db()
+            names = {row[0] for row in relay.sql("SELECT name FROM sqlite_master WHERE type='index'")}
+            relay.db.close()
+        finally:
+            relay.db, relay.SECRET, relay.DATA = keep
+        self.assertTrue({"pis_token", "pis_code", "pis_user"} <= names, names)
+
+
+# ------------------------------------------------------------------ the cost of signing in
+
+class SignInCost(RelayCase):
+    def login(self, email="lewis@example.com", password=PASSWORD, headers=None):
+        return Browser(self.port).post("/login", form={"email": email, "password": password}, headers=headers)
+
+    def test_signing_in_correctly_over_and_over_is_capped(self):
+        self.signed_in()
+        self.limit("LOGIN_TRIES_PER_EMAIL", (3, 600))
+        for _ in range(3):
+            self.assertEqual(self.login()[0], 303)
+        self.assertEqual(self.login()[0], 429)
+
+    def test_sign_in_attempts_from_one_address_are_capped(self):
+        self.signed_in()
+        self.signed_in("hannah@example.com")
+        self.limit("LOGIN_TRIES_PER_ADDRESS", (3, 600))
+        here = {"X-Forwarded-For": "203.0.113.9"}
+        for _ in range(3):
+            self.login(headers=here)
+        self.assertEqual(self.login("hannah@example.com", headers=here)[0], 429)
+
+    def test_sign_in_attempts_from_one_address_do_not_block_another(self):
+        self.signed_in()
+        self.limit("LOGIN_TRIES_PER_ADDRESS", (3, 600))
+        for _ in range(3):
+            self.login(headers={"X-Forwarded-For": "203.0.113.9"})
+        self.assertEqual(self.login(headers={"X-Forwarded-For": "198.51.100.7"})[0], 303)
+
+    def test_a_known_browser_signing_in_over_and_over_is_capped(self):
+        self.signed_in()
+        _, _, r = self.login()
+        marker = [v for k, v in r.getheaders() if k.lower() == "set-cookie" and v.startswith("qn_known=")][0]
+        self.limit("LOGIN_TRIES_KNOWN_BROWSER", (3, 600))
+        for _ in range(3):
+            self.assertEqual(self.login(headers={"Cookie": marker.split(";")[0]})[0], 303)
+        self.assertEqual(self.login(headers={"Cookie": marker.split(";")[0]})[0], 429)
+
+    def test_only_a_few_passwords_are_checked_at_once(self):
+        self.signed_in()
+        self.limit("password_checks", threading.BoundedSemaphore(1))
+        self.limit("PASSWORD_CHECK_WAIT", 0.1)
+        relay.password_checks.acquire()                 # another sign-in is checking a password right now
+        self.addCleanup(relay.password_checks.release)
+        status, text, _ = self.login()
+        self.assertEqual(status, 503)
+        self.assertIn("busy", text)
+
+
+# ------------------------------------------------------------------ connections and threads
+
+class ConnectionLimits(RelayCase):
+    def busy_server(self):
+        """A second relay server that handles only one connection at a time."""
+        httpd = relay.RelayServer(("127.0.0.1", 0), relay.Relay, max_connections=1)
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        self.addCleanup(httpd.server_close)
+        self.addCleanup(httpd.shutdown)
+        return httpd
+
+    def test_connections_beyond_the_cap_are_told_the_relay_is_busy(self):
+        httpd = self.busy_server()
+        with socket.create_connection(("127.0.0.1", httpd.server_address[1]), timeout=5):   # holds the only place
+            time.sleep(0.2)
+            status, text, _ = Browser(httpd.server_address[1]).get("/healthz")
+        self.assertEqual(status, 503)
+        self.assertIn("busy", text)
+
+    def test_the_busy_answer_carries_the_protective_headers(self):
+        httpd = self.busy_server()
+        with socket.create_connection(("127.0.0.1", httpd.server_address[1]), timeout=5):
+            time.sleep(0.2)
+            r = Browser(httpd.server_address[1]).get("/healthz")[2]
+        for name, value in Headers.WANTED.items():
+            self.assertEqual(r.getheader(name), value, name)
+
+    def test_a_place_is_freed_when_a_connection_ends(self):
+        httpd = self.busy_server()
+        self.assertEqual(Browser(httpd.server_address[1]).get("/healthz")[0], 200)
+        time.sleep(0.2)
+        self.assertEqual(Browser(httpd.server_address[1]).get("/healthz")[0], 200)
+
+    def test_waiting_pis_beyond_their_cap_are_told_to_try_again(self):
+        pid, token = self.paired_pi(self.signed_in())
+        self.limit("poll_slots", threading.BoundedSemaphore(1))
+        relay.poll_slots.acquire()                      # another Pi is waiting in the only place
+        self.addCleanup(relay.poll_slots.release)
+        status, _, _ = Browser(self.port).get("/agent/poll", headers={"X-QuietNet-Token": token})
+        self.assertEqual(status, 503)
+
+    def test_a_body_that_trickles_in_too_slowly_is_dropped(self):
+        # Each wait for more data is short, but the whole body still has to arrive in time.
+        self.limit("BODY_SECONDS", 1)
+        with socket.create_connection(("127.0.0.1", self.port), timeout=5) as s:
+            s.sendall(b"POST /login HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\n")
+            started = time.time()
+            try:
+                while time.time() - started < 6:
+                    s.sendall(b"e")
+                    time.sleep(0.2)
+                    s.setblocking(False)
+                    try:
+                        if s.recv(4096) == b"":
+                            break
+                    except BlockingIOError:
+                        pass
+                    finally:
+                        s.setblocking(True)
+            except OSError:
+                pass
+        self.assertLess(time.time() - started, 4)
+
+
+    def test_a_request_whose_headers_trickle_in_too_slowly_is_dropped(self):
+        # Each wait for more data is short, but the first line and headers still have to arrive in time.
+        self.limit("HEADER_SECONDS", 1)
+        httpd = self.busy_server()
+        with socket.create_connection(("127.0.0.1", httpd.server_address[1]), timeout=5) as s:
+            s.sendall(b"GET /healthz HTTP/1.1\r\nHost: x\r\n")
+            started = time.time()
+            try:
+                while time.time() - started < 6:
+                    s.sendall(b"X")
+                    time.sleep(0.2)
+                    s.setblocking(False)
+                    try:
+                        if s.recv(4096) == b"":
+                            break
+                    except BlockingIOError:
+                        pass
+                    finally:
+                        s.setblocking(True)
+            except OSError:
+                pass
+            self.assertLess(time.time() - started, 4)
+        time.sleep(0.2)
+        self.assertEqual(Browser(httpd.server_address[1]).get("/healthz")[0], 200)     # its place was freed
+
+    def test_a_request_whose_headers_arrive_in_time_is_answered(self):
+        self.limit("HEADER_SECONDS", 1)
+        httpd = self.busy_server()
+        self.assertEqual(Browser(httpd.server_address[1]).get("/healthz")[0], 200)
+        time.sleep(1.5)                                 # the clock is stopped once the headers are in
+        self.assertEqual(Browser(httpd.server_address[1]).get("/healthz")[0], 200)
+
+
+class BridgePolls(unittest.TestCase):
+    def test_a_new_poll_from_a_pi_ends_its_older_one(self):
+        bridge = relay.Bridge()
+        real = relay.POLL_TIMEOUT
+        relay.POLL_TIMEOUT = 5
+        self.addCleanup(setattr, relay, "POLL_TIMEOUT", real)
+        ended = {}
+
+        def first():
+            started = time.time()
+            ended["result"] = bridge.poll("pi-1")
+            ended["after"] = time.time() - started
+
+        t1 = threading.Thread(target=first, daemon=True)
+        t1.start()
+        time.sleep(0.2)
+        t2 = threading.Thread(target=bridge.poll, args=("pi-1",), daemon=True)
+        t2.start()
+        t1.join(3)
+        bridge.forget("pi-1")                           # ends the second poll too
+        t2.join(3)
+        self.assertIsNone(ended["result"])
+        self.assertLess(ended["after"], 2)
+
+
+# ------------------------------------------------------------------ memory held by large answers
+
+class BigAnswerRoom(unittest.TestCase):
+    def test_one_account_holds_at_most_one_large_answers_worth_of_room(self):
+        # The room is kept per account, so pairing more Pis of your own doesn't get you more of it.
+        room = relay.BigAnswers(1000)
+        self.assertIsNotNone(room.take(7, 100, 0))      # account 7's first Pi
+        self.assertIsNone(room.take(7, 100, 0.05))      # account 7's second Pi must wait its turn
+        self.assertIsNotNone(room.take(8, 100, 0))      # another account still gets room
+
+    def test_large_answers_together_stay_within_the_budget(self):
+        room = relay.BigAnswers(1000)
+        self.assertIsNotNone(room.take("pi-1", 600, 0))
+        self.assertIsNone(room.take("pi-2", 600, 0.05))
+
+    def test_giving_back_frees_the_room(self):
+        room = relay.BigAnswers(1000)
+        ticket = room.take("pi-1", 600, 0)
+        room.give_back(ticket)
+        self.assertEqual(room.used, 0)
+        self.assertIsNotNone(room.take("pi-1", 600, 0))
+
+    def test_giving_back_a_ticket_twice_does_not_free_someone_elses_room(self):
+        room = relay.BigAnswers(1000)
+        old = room.take("pi-1", 600, 0)
+        room.give_back(old)
+        room.take("pi-1", 600, 0)
+        room.give_back(old)
+        self.assertEqual(room.used, 600)
+
+
+class BigAnswersOverTheWire(RelayCase):
+    API = {"X-QuietNet": "1"}
+    BIG = json.dumps({"hosts": ["n%d.example.com" % i for i in range(20000)]})
+
+    def test_room_for_a_large_answer_is_given_back_once_the_browser_has_it(self):
+        b = self.signed_in()
+        pid, token = self.paired_pi(b)
+        t, _ = self.pretend_pi(token, body=self.BIG)
+        self.assertEqual(b.get("/pi/%s/api/activity" % pid, headers=self.API)[0], 200)
+        t.join(5)
+        self.assertEqual((relay.big_answers.used, relay.big_answers.held), (0, {}))
+
+    def test_a_large_answer_with_no_room_is_refused_and_the_browser_told_at_once(self):
+        b = self.signed_in()
+        pid, token = self.paired_pi(b)
+        self.limit("big_answers", relay.BigAnswers(relay.MAX_BODY * 2))
+        self.limit("BIG_ANSWER_WAIT", 0.1)
+        t, _ = self.pretend_pi(token, body=self.BIG)
+        started = time.time()
+        status, text, _ = b.get("/pi/%s/api/activity" % pid, headers=self.API)
+        t.join(5)
+        self.assertEqual(status, 503)
+        self.assertIn("too large", json.loads(text)["error"])
+        self.assertLess(time.time() - started, 5)
+
+    def test_a_large_answer_stops_being_read_when_the_browser_gives_up(self):
+        b = self.signed_in()
+        pid, token = self.paired_pi(b)
+        self.limit("CALL_TIMEOUT", 0.5)
+        most = {"used": 0}
+        done = threading.Event()
+
+        def watch():
+            while not done.is_set():
+                most["used"] = max(most["used"], relay.big_answers.used)
+                time.sleep(0.02)
+
+        def slow_pi():
+            _, text, _ = Browser(self.port).get("/agent/poll", headers={"X-QuietNet-Token": token})
+            call_id = json.loads(text)["id"]
+            with socket.create_connection(("127.0.0.1", self.port), timeout=5) as s:
+                s.sendall(("POST /agent/respond HTTP/1.1\r\nHost: x\r\nX-QuietNet-Token: %s\r\n"
+                           "X-QuietNet-Call: %s\r\nContent-Length: 1000000\r\n\r\n" % (token, call_id)).encode())
+                try:
+                    for _ in range(40):
+                        s.sendall(b"x" * 100)
+                        time.sleep(0.1)
+                except OSError:
+                    pass
+
+        watcher = threading.Thread(target=watch, daemon=True)
+        watcher.start()
+        pi = threading.Thread(target=slow_pi, daemon=True)
+        pi.start()
+        self.assertEqual(b.get("/pi/%s/api/activity" % pid, headers=self.API)[0], 504)
+        deadline = time.time() + 3
+        while relay.big_answers.used and time.time() < deadline:
+            time.sleep(0.05)
+        freed = relay.big_answers.used == 0 and pi.is_alive()     # freed while the Pi was still sending
+        done.set()
+        pi.join(6)
+        self.assertEqual(most["used"], 1000000)
+        self.assertTrue(freed)
 
 
 if __name__ == "__main__":

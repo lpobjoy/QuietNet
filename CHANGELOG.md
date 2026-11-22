@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+Fourth review (every part looked at again; 32 points fixed, known issues 46 to 77):
+- **Fixed: the kill switch, internet-off and whole-house bedtimes also cut off QuietNet's own computer**, so a Pi lost its link to the relay and couldn't be switched back on from outside. Its own lookups are now exempt from these (ordinary blocks still apply). The dashboard no longer shows it as switched off, and refuses to switch it off.
+- **Fixed: names that skip the checks could get out while a device's internet was off.** Home-network names, reverse lookups and names with odd characters now get the blocked answer then, and a packet QuietNet can't read is never passed on.
+- **Fixed: home-network names went to 1.1.1.1 and 8.8.8.8.** `printer.lan`, `nas.home` and reverse lookups of home addresses now go to the home router, or get "no such name" if it isn't known.
+- **Fixed: any website could sign you out of the relay.** Signing out is now a button that posts a form with a token; opening `/logout` only asks.
+- **Fixed: the relay could be swamped.** Connections, waiting Pis, password checks, large answers (one per account, 48 MB in all), slow headers and slow uploads are all capped; every sign-in counts towards a limit, not just wrong ones; an account may hold 10 QuietNets and pair 20 a day.
+- **Fixed: one stranger could stop everyone pairing** with wrong codes. They are now counted per network address, and a Pi started with `QUIETNET_PAIR` keeps trying its code while the relay is busy or down.
+- **Fixed: the Pi's link to the relay could stop for good** after an unexpected answer, until the container was restarted. It now always tries again.
+- **Fixed: with Docker and firewalld together, a steered device could lose its internet.** Each firewall table is checked on its own, and the advice names a command that suits each firewall in the way.
+- **Fixed: schedules ran on UTC in the Pi container.** It now uses the Pi's time zone (see `TZ` in `docker-compose.yml`). If you had shifted schedule times to make up for UTC, put them back to real local times after rebuilding.
+- **Fixed: one device could take every place for lookups.** Each may hold at most 16 at once.
+- **Fixed: a misspelt `QUIETNET_SIGNUP` left sign-up open.** Unknown values now close it, with a warning.
+- **Faster:** DNS answers never wait for the database; the history trim and device list use indexes properly; the enforcer's plan only works out what has changed; the status summary no longer rebuilds the advert lists; the relay finds Pis through indexes; with only `iptables`, nothing runs while no device is enforced.
+- **Dashboard:** works again on Safari 12 to 14.0 (it stuck on "Starting…", and dialogs were off-screen); the four-second refresh no longer overlaps, pauses in a background tab, and fetches an open device's activity every 30 seconds.
+- **Network scan:** covers the real size of the home network, up to 1,024 addresses; it no longer holds up the database while waiting for names; the Pi's own address is picked up when the network comes up or changes.
+- **Mac:** pairing works with Python from python.org (it borrows the system's certificates), and the message names "Install Certificates.command" if needed. The launcher no longer runs Apple's Python stand-in a second time, and says how to get Python.
+- Still open from this review: issues 78 to 83 (home names and the router, real-Pi checks, TCP per-device share, the list download on python.org Python, dashboard reads holding the database lock, the activity list sent in full).
+
 Third review (the enforcer, the relay and the DNS filter), with an independent check of the fixes and a live test of the enforcer between two containers:
 - **Fixed: the enforcer could cut a device off by mistake.** It now won't steer a device when the Pi isn't passing traffic on, or when another firewall (often Docker's) would drop it, and the device page says what to run on the Pi. It never steers the router, the Pi itself or another network, and leaves an address alone if a different device now has it.
 - **Fixed: devices weren't always handed back.** A device switched off is handed back at once. After a crash or `docker kill`, the next start undoes what was left behind, using notes the enforcer keeps as it works. "Hand back" messages now come from the Pi's own hardware address (Wi-Fi was dropping them).

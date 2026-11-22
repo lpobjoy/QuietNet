@@ -274,6 +274,14 @@ class Switches(Api):
         self.ok("/api/internet", {"scope": "device:" + KID, "off": False})
         self.assertFalse(is_blocked("www.bbc.co.uk", KID))
 
+    def test_the_internet_switch_is_refused_for_this_computer(self):
+        self.addCleanup(setattr, server.S, "local_ip", server.S.local_ip)
+        server.S.local_ip = "192.168.1.60"
+        status, out = self.post("/api/internet", {"scope": "device:192.168.1.60", "off": True})
+        self.assertEqual(status, 400)
+        self.assertIn("computer it runs on", out["error"])
+        self.assertNotIn("device:192.168.1.60", server.S.off)
+
     def test_badly_formed_scopes_are_refused(self):
         for scope in ("", "everyone", "group:x", "device:", "device:1.2.3.4; drop table"):
             self.assertEqual(self.post("/api/internet", {"scope": scope, "off": True})[0], 400, scope)
@@ -521,11 +529,24 @@ class Devices(Api):
         counts = plan("""SELECT client, COUNT(*), COALESCE(SUM(blocked), 0) FROM queries INDEXED BY q_ts
                          WHERE ts>? GROUP BY client""", (0,))
         self.assertIn("COVERING INDEX q_ts", counts)
-        last = plan("SELECT client, MAX(ts) FROM queries GROUP BY client", ())
+        last = plan(server.LAST_SEEN_SQL, ())
         self.assertIn("COVERING INDEX q_client_ts", last)
         activity = plan("SELECT domain, COUNT(*), MAX(ts), SUM(blocked) FROM queries WHERE client=? AND ts>? GROUP BY domain",
                         (KID, 0))
         self.assertIn("INDEX q_client_ts (client=? AND ts>?)", activity)
+
+    def test_each_devices_last_lookup_is_found_without_walking_the_whole_history(self):
+        # The device list refreshes every 4 seconds; walking a month of history each time is too slow.
+        plan = " | ".join(row[-1] for row in server.sql("EXPLAIN QUERY PLAN " + server.LAST_SEEN_SQL))
+        self.assertNotIn("SCAN queries", plan)
+        self.assertIn("q_client_ts (client=?)", plan)
+
+    def test_a_devices_last_lookup_is_its_newest(self):
+        self.log(KID, "a.example.com", ago=500)
+        self.log(KID, "b.example.com", ago=5)
+        self.log(KID, "c.example.com", ago=50)
+        last = self.get("/api/devices")[1][0]["last"]
+        self.assertAlmostEqual(last, time.time() - 5, delta=3)
 
     def test_the_status_summary_counts_today(self):
         self.log(KID, "www.bbc.co.uk")
@@ -536,6 +557,69 @@ class Devices(Api):
         self.assertGreater(st["junk_count"], 100)
         self.assertRegex(st["clock"], r"^\d\d:\d\d$")
         self.assertEqual(st["enforcer"]["active"], False)
+
+
+class Scanning(Api):
+    def setUp(self):
+        super().setUp()
+        self.addCleanup(setattr, server.S, "local_ip", server.S.local_ip)
+        self.addCleanup(setattr, server.S, "scan_info", server.S.scan_info)
+        server.S.local_ip = "192.168.4.20"
+        # A stand-in for the home network's size, and for the names devices report.
+        self.subnet = server.ipaddress.IPv4Network("192.168.4.0/22")
+        for name, stand_in in (("home_subnet", lambda ip: self.subnet), ("reverse_name", lambda ip: "")):
+            p = mock.patch.object(server, name, stand_in)
+            p.start()
+            self.addCleanup(p.stop)
+
+    def scan(self):
+        """Run a scan with a socket that sends nothing and no pauses. The socket is replaced only
+        for the scan itself: the tests' own web requests need the real one."""
+        with mock.patch.object(server.socket, "socket", mock.MagicMock()), \
+                mock.patch.object(server.time, "sleep", lambda s: None):
+            server.scan_network()
+
+    def test_a_scan_lists_devices_anywhere_on_the_home_network(self):
+        self.neighbours_now = {"192.168.5.37": "aa:aa:aa:aa:aa:01", "192.168.5.255": "aa:aa:aa:aa:aa:02",
+                               "10.0.0.5": "aa:aa:aa:aa:aa:03", "192.168.7.255": "ff:ff:ff:ff:ff:fe"}
+        self.scan()
+        seen = {r[0] for r in server.sql("SELECT ip FROM seen")}
+        self.assertEqual(seen, {"192.168.4.20", "192.168.5.37", "192.168.5.255"})
+
+    def test_a_scan_waits_for_device_names_without_holding_the_database_lock(self):
+        # Name lookups can take seconds; the dashboard and history writer must not wait behind them.
+        self.neighbours_now = {"192.168.5.37": "aa:aa:aa:aa:aa:01"}
+        free = []
+
+        def lock_is_free():
+            ok = server.db_lock.acquire(blocking=False)     # released by the thread that took it
+            if ok:
+                server.db_lock.release()
+            free.append(ok)
+
+        def name_of(ip):
+            t = threading.Thread(target=lock_is_free)
+            t.start()
+            t.join()
+            return "tv"
+        server.reverse_name = name_of
+        self.scan()
+        self.assertTrue(free and all(free))
+
+    def test_the_scan_answer_says_when_the_network_was_too_big_to_scan_in_full(self):
+        self.subnet = server.ipaddress.IPv4Network("192.168.0.0/16")
+        with mock.patch.object(server, "scan_network", lambda: None):
+            out = self.ok("/api/scan")
+        server.S.scan_state = "idle"
+        self.assertEqual((out["capped"], out["network"]), (True, "192.168.0.0/16"))
+        self.assertLessEqual(out["addresses"], server.MAX_SCAN)
+
+    def test_the_status_summary_says_what_the_last_scan_covered(self):
+        with mock.patch.object(server, "scan_network", lambda: None):
+            self.ok("/api/scan")
+        server.S.scan_state = "idle"
+        scan = self.get("/api/status")[1]["scan"]
+        self.assertEqual((scan["network"], scan["addresses"], scan["capped"]), ("192.168.4.0/22", 1022, False))
 
 
 class EnforceAndCloud(Api):

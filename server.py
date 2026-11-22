@@ -55,6 +55,7 @@ UPSTREAMS = [("1.1.1.1", 53), ("8.8.8.8", 53)]
 KEEP_DAYS = 30
 MAX_HISTORY_ROWS = 2_000_000   # history is also capped by size, so a chatty device can't fill the SD card
 MAX_DNS_WAITING = 256          # lookups being answered at once; beyond this new ones are dropped (devices retry)
+MAX_DNS_PER_DEVICE = 16        # of those, how many one device may have in hand, so one device can't take them all
 MAX_TCP_CLIENTS = 64           # DNS-over-TCP connections open at once
 TCP_DEADLINE = 8               # seconds a TCP client gets to send its whole question
 RESOLVED_HOURS = 6             # how long we remember which addresses a name pointed to
@@ -63,6 +64,9 @@ MAX_TTL = 120   # seconds a device may remember an answer, so new blocks and sch
 CLOCK = re.compile(r"([01]\d|2[0-3]):[0-5]\d")
 VALID_NAME = re.compile(r"[a-z0-9_-]+(\.[a-z0-9_-]+)+")
 IGNORED_ENDINGS = (".arpa", ".local", ".lan", ".home", ".internal")
+# Names only the home router can answer. They are sent to it, never to the public servers.
+HOME_ENDINGS = (".local", ".lan", ".home", ".internal", ".home.arpa")
+ROUTER_RECHECK = 300           # seconds between looks at which router this computer uses
 # The system's own tool for listing network neighbours. Look in the usual places
 # because the program isn't always started with those folders on its search path.
 ARP = next((p for p in ("/usr/sbin/arp", "/sbin/arp", "/usr/bin/arp") if os.path.exists(p)), "arp")
@@ -128,6 +132,7 @@ class State:
     allowed = set()         # addresses you chose to always allow
     junk_builtin = set()
     junk_community = set()
+    junk_count = 0          # names on both advert lists together, worked out when either list changes
     junk_on = True
     paused_until = 0.0
     dns_error = None
@@ -150,6 +155,11 @@ class State:
     sched_cache = (0.0, [])  # (when worked out, schedules in force at that moment)
     scan_state = "idle"     # idle | scanning
     scan_ts = 0.0
+    scan_info = {}          # what the last scan covered: {"network", "addresses", "capped"}
+    rules_version = 0       # goes up whenever a rule changes; the enforcer's plan cache watches it
+    plan_cache = {}         # see enforcement_plan
+    router = ""           # the home router's address, for home-network names ('' = not known)
+    router_checked = None   # when (time.monotonic()) the router's address was last looked up
 
 
 S = State()
@@ -157,7 +167,15 @@ ENF = None
 CA = None
 db = None
 db_lock = threading.RLock()
+# S.resolved has a small lock of its own, not db_lock: every allowed lookup records its addresses
+# there before the answer goes back, and it must never wait behind a slow database query.
+resolved_lock = threading.Lock()
 log_q = queue.Queue()
+
+
+def rules_changed():
+    """Note that a rule has changed, so the enforcer's remembered plan is worked out afresh."""
+    S.rules_version += 1
 
 
 # ------------------------------------------------------------------ database
@@ -227,6 +245,7 @@ def init_db():
     load_schedules()
     S.junk_on = get_setting("junk_on", "1") == "1"
     S.paused_until = float(get_setting("paused_until", "0"))
+    rules_changed()
 
 
 def get_setting(key, default):
@@ -265,6 +284,10 @@ def log_writer():
 
 
 PRUNE_BATCH = 5000      # rows deleted per step when trimming history
+# One step of the trim each: rows older than a time (found through q_ts), and rows at or below a
+# row number (found by row number). See prune_history.
+PRUNE_OLD_SQL = "DELETE FROM queries WHERE id IN (SELECT id FROM queries WHERE ts<? LIMIT ?)"
+PRUNE_SURPLUS_SQL = "DELETE FROM queries WHERE id IN (SELECT id FROM queries WHERE id<=? ORDER BY id LIMIT ?)"
 
 
 def prune_history():
@@ -273,19 +296,29 @@ def prune_history():
 
     Deletes PRUNE_BATCH rows at a time, letting go of db_lock between steps. The first trim after
     an upgrade can mean millions of rows; done in one go on an SD card, that would hold the lock
-    for many seconds, and every DNS answer (which records addresses under the same lock) would
-    wait. Call it without holding db_lock."""
+    for many seconds, and the dashboard and the history writer would wait. Call it without
+    holding db_lock.
+
+    The two limits are asked separately so each question is answered from an index: old rows
+    through q_ts, surplus rows by their row number. Asked together (with OR) the database would
+    read the whole table every time, even when nothing is due."""
     cutoff_ts = time.time() - KEEP_DAYS * 86400
-    while True:
-        with db_lock:
-            top = db.execute("SELECT MAX(id) FROM queries").fetchone()[0] or 0
-            n = db.execute("""DELETE FROM queries WHERE id IN (
-                                  SELECT id FROM queries WHERE ts<? OR id<=? ORDER BY id LIMIT ?)""",
-                           (cutoff_ts, top - MAX_HISTORY_ROWS, PRUNE_BATCH)).rowcount
-            db.commit()
-        if n < PRUNE_BATCH:
-            return
-        time.sleep(0.05)                     # give the DNS path a turn at the lock
+    for statement, limit in ((PRUNE_OLD_SQL, lambda: cutoff_ts), (PRUNE_SURPLUS_SQL, oldest_to_drop)):
+        while True:
+            with db_lock:
+                n = db.execute(statement, (limit(), PRUNE_BATCH)).rowcount
+                db.commit()
+            if n < PRUNE_BATCH:
+                break
+            time.sleep(0.05)                 # give the dashboard and the history writer a turn at the lock
+
+
+def oldest_to_drop():
+    """The row number at and below which history is over MAX_HISTORY_ROWS and should go.
+    Each new row gets a higher row number than any row already there, so the newest
+    MAX_HISTORY_ROWS rows are the ones above it."""
+    top = sql("SELECT MAX(id) FROM queries")[0][0] or 0
+    return top - MAX_HISTORY_ROWS
 
 
 # ------------------------------------------------------------------ rules
@@ -299,10 +332,19 @@ def load_lists():
     if os.path.exists(COMMUNITY_FILE):
         with open(COMMUNITY_FILE) as f:
             S.junk_community = {l.strip() for l in f if l.strip()}
+    count_junk()
     with open(os.path.join(HERE, "services.json")) as f:
         S.services = json.load(f)
     S.svc_names = {v["id"]: v["name"] for v in S.services}
     S.dom2svc = {d: v["id"] for v in S.services for d in v["domains"]}
+
+
+def count_junk():
+    """Work out how many names the two advert lists hold between them, for the dashboard.
+
+    Done once when a list is loaded or downloaded, not on every status request: counting means
+    joining the two lists, which with a community list of 100,000+ names is a big set to build."""
+    S.junk_count = len(S.junk_builtin | S.junk_community)
 
 
 def suffixes(domain):
@@ -326,6 +368,7 @@ def load_schedules():
          "off": bool(r[6]), "services": json.loads(r[7]), "enabled": bool(r[8])}
         for r in sql("SELECT id,name,scope,days,t_from,t_to,off,services,enabled FROM schedules ORDER BY id")]
     S.sched_cache = (0.0, [])
+    rules_changed()
 
 
 def clock_minutes(hhmm):
@@ -369,7 +412,10 @@ def scopes_for(client):
 
 def internet_off_for(client):
     """Is all internet off for this device right now - by its own switch, its group's,
-    or an all-internet schedule? (The kill switch is checked separately, as 'all' in S.off.)"""
+    or an all-internet schedule? (The kill switch is checked separately, as 'all' in S.off.)
+    Never for QuietNet's own machine, which internet_cut() never cuts off either."""
+    if is_this_computer(client):
+        return False
     scopes = scopes_for(client)
     return any(sc in S.off for sc in scopes) or any(x["off"] for x in active_schedules() if x["scope"] in scopes)
 
@@ -383,21 +429,41 @@ def scope_label(scope):
     return "this device"
 
 
+def is_this_computer(client):
+    """Is this address QuietNet's own machine? Its lookups (the relay link, the clock, list
+    downloads) are not a household device's, so the kill switch and 'internet off' never apply."""
+    return client in ("127.0.0.1", "::1") or (client is not None and client == S.local_ip)
+
+
+def internet_cut(client):
+    """Is all internet off for this device right now? Returns (why, detail) - why is 'kill' (the
+    kill switch), 'off' (its own, its group's or the house's switch) or 'schedule' (an all-internet
+    schedule; detail is its name) - or None if not. QuietNet's own machine is never cut off,
+    or it would lose the relay and could not be switched back on from outside."""
+    if is_this_computer(client):
+        return None
+    if "all" in S.off:
+        return "kill", ""
+    scopes = scopes_for(client)
+    if any(sc in S.off for sc in scopes):
+        return "off", ""
+    for x in active_schedules():
+        if x["off"] and x["scope"] in scopes:
+            return "schedule", x["name"]
+    return None
+
+
 def decision(domain, client=None, paused=False):
     """Returns (blocked?, why, detail).
 
     why is 'kill', 'off', 'schedule', 'you', 'allowed', 'service', 'list' or None.
     'paused' only pauses advert blocking and your own address blocks -
     the kill switch, schedules, blocked services and switched-off devices stay in force."""
-    if "all" in S.off:
-        return True, "kill", ""
+    cut = internet_cut(client)
+    if cut:
+        return (True,) + cut
     scopes = scopes_for(client)
-    if any(sc in S.off for sc in scopes):
-        return True, "off", ""
     timed = [x for x in active_schedules() if x["scope"] in scopes]
-    for x in timed:
-        if x["off"]:
-            return True, "schedule", x["name"]
     names = suffixes(domain)
     for s in names:
         if s in S.blocked and not paused:
@@ -462,6 +528,7 @@ def block(domain):
         S.blocked.add(domain)
         db.execute("INSERT OR REPLACE INTO blocked VALUES(?,?)", (domain, time.time()))
         db.commit()
+        rules_changed()
 
 
 def unblock(domain):
@@ -474,6 +541,7 @@ def unblock(domain):
             S.allowed.add(domain)
             db.execute("INSERT OR REPLACE INTO allowed VALUES(?,?)", (domain, time.time()))
         db.commit()
+        rules_changed()
 
 
 def forget(domain):
@@ -484,6 +552,7 @@ def forget(domain):
         db.execute("DELETE FROM blocked WHERE domain=?", (domain,))
         db.execute("DELETE FROM allowed WHERE domain=?", (domain,))
         db.commit()
+        rules_changed()
 
 
 def update_community_list():
@@ -508,6 +577,7 @@ def update_community_list():
         with open(COMMUNITY_FILE, "w") as f:
             f.write("\n".join(sorted(found)))
         S.junk_community = found
+        count_junk()
         S.list_state = "idle"
     except Exception as e:
         S.list_state, S.list_error = "error", str(e)
@@ -603,12 +673,15 @@ def record_resolved(domain, resp):
     """Remember which addresses a name was just given, with the time. The enforcer uses
     this to know which addresses to drop when a name is blocked. Addresses older than
     RESOLVED_HOURS are forgotten, and at most 64 are kept per name (some names rotate through
-    hundreds). Capped at 4,000 names; when full, the 1,000 least recently seen are forgotten."""
+    hundreds). Capped at 4,000 names; when full, the 1,000 least recently seen are forgotten.
+
+    This runs before every allowed answer is sent, so it takes only resolved_lock, never db_lock:
+    a slow dashboard query or a history trim must not hold up anyone's lookups."""
     ips = answer_ips(resp)
     if not ips:
         return
     now = time.time()
-    with db_lock:
+    with resolved_lock:
         m = S.resolved.setdefault(domain, {})
         for ip in ips:
             m[ip] = now
@@ -644,27 +717,47 @@ def enforcement_plan():
 
     'off' covers the kill switch, the device's internet switch and an 'all internet' schedule.
     Otherwise the addresses of names blocked by you, by a service block or by a schedule are cut.
-    Pausing advert blocking pauses it here too."""
+    Pausing advert blocking pauses it here too.
+
+    This runs every two seconds, and the answer for a given name and device only changes when a
+    rule does. So each name's answer is remembered (in S.plan_cache) and worked out again only
+    for names not seen before, or when a rule, the pause, the schedules in force or the set of
+    enforced devices has changed - and in any case at least once a minute."""
     with db_lock:                                      # copies: other threads change these while we work
         victims = {ip: S.enforced_mac.get(ip, "") for ip in S.enforced}
-        resolved = {d: dict(m) for d, m in S.resolved.items()}
     if not victims:
         return {}
+    with resolved_lock:
+        names = list(S.resolved)
     now = time.time()
     paused = now < S.paused_until
-    plan = {}
-    for victim, mac in victims.items():
-        # A made-up name only comes back blocked for one of the 'everything' reasons.
-        blocked, why, _ = decision("quietnet.invalid", victim, paused)
-        if blocked and why in ("kill", "off", "schedule"):
-            plan[victim] = {"off": True, "ips": set(), "mac": mac}
-            continue
-        ips = set()
-        for domain, ipmap in resolved.items():
-            blocked, why, _ = decision(domain, victim, paused)
-            if blocked and why in ENFORCE_WHY:
-                ips.update(ip for ip, ts in ipmap.items() if now - ts < RESOLVED_HOURS * 3600 and ":" not in ip)
-        plan[victim] = {"off": False, "ips": ips, "mac": mac}
+    key = (S.rules_version, paused, tuple(sorted(x["id"] for x in active_schedules())),
+           tuple(sorted(victims)), S.local_ip)
+    cache = S.plan_cache
+    if cache.get("key") != key or now - cache.get("made", 0) > 60:
+        cache = S.plan_cache = {"key": key, "made": now, "off": {}, "cut": {}}
+    for victim in victims:
+        if victim not in cache["off"]:
+            # A made-up name only comes back blocked for one of the 'everything' reasons.
+            blocked, why, _ = decision("quietnet.invalid", victim, paused)
+            cache["off"][victim] = blocked and why in ("kill", "off", "schedule")
+    cut = {}                                           # name -> the enforced devices it is cut for
+    for domain in names:
+        who = cache["cut"].get(domain)
+        if who is None:
+            who = frozenset(v for v in victims if not cache["off"][v]
+                            and decision(domain, v, paused)[1] in ENFORCE_WHY)
+        cut[domain] = who
+    cache["cut"] = cut                                 # names that have been forgotten drop out here
+    plan = {v: {"off": cache["off"][v], "ips": set(), "mac": mac} for v, mac in victims.items()}
+    with resolved_lock:
+        for domain, who in cut.items():
+            ipmap = S.resolved.get(domain) if who else None
+            if not ipmap:
+                continue
+            ips = [ip for ip, ts in ipmap.items() if now - ts < RESOLVED_HOURS * 3600 and ":" not in ip]
+            for v in who:
+                plan[v]["ips"].update(ips)
     return plan
 
 
@@ -711,10 +804,11 @@ def cap_ttls(resp, limit=MAX_TTL):
         return resp
 
 
-def forward_udp(data):
+def forward_udp(data, servers=None):
     """Ask the real DNS servers over UDP, first one then the spare. Returns the reply, or
-    None if neither answered within 2.5 seconds."""
-    for up in UPSTREAMS:
+    None if neither answered within 2.5 seconds. `servers` replaces the usual list (it is
+    used to send home-network names to the router)."""
+    for up in servers or UPSTREAMS:
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
                 s.settimeout(2.5)
@@ -745,10 +839,10 @@ def same_question(query, resp):
     return len(resp) >= end and resp[12:end].lower() == query[12:end].lower()
 
 
-def forward_tcp(data):
+def forward_tcp(data, servers=None):
     """The same as forward_udp but over TCP, where each message is preceded by its length
     as two bytes. Used for lookups that arrived over TCP."""
-    for up in UPSTREAMS:
+    for up in servers or UPSTREAMS:
         try:
             with socket.create_connection(up, timeout=4) as s:
                 s.sendall(len(data).to_bytes(2, "big") + data)
@@ -777,26 +871,96 @@ def recv_exact(s, n, deadline=None):
     return buf
 
 
+def unreadable_reply(data):
+    """The reply to a packet whose question can't be read: 'format error' with the same id, if
+    at least the 12-byte header is there and it is a question rather than a reply. Otherwise
+    None, meaning send nothing. Such packets are never passed on to the internet."""
+    if len(data) < 12 or data[2] & 0x80:
+        return None
+    return data[:2] + bytes([0x80 | (data[2] & 0x79), 0x80 | 1]) + bytes(8)
+
+
+def is_private_reverse(name):
+    """Is this a reverse lookup (address to name) of a home-network or private address -
+    10.x, 172.16-31.x, 192.168.x, 169.254.x, 127.x, or IPv6 fc00::/7 and fe80::/10? Only the
+    home router knows those names, so they must not go to the public servers."""
+    if name.endswith(".in-addr.arpa"):
+        octets = name[:-len(".in-addr.arpa")].split(".")[::-1]
+        if octets[0] in ("10", "127"):
+            return True
+        if len(octets) < 2:
+            return False
+        if octets[:2] in (["192", "168"], ["169", "254"]):
+            return True
+        return octets[0] == "172" and octets[1].isdigit() and 16 <= int(octets[1]) <= 31
+    if name.endswith(".ip6.arpa"):
+        nibbles = "".join(name[:-len(".ip6.arpa")].split(".")[::-1])
+        return nibbles[:2] in ("fc", "fd") or (nibbles[:2] == "fe" and nibbles[2:3] in ("8", "9", "a", "b"))
+    return False
+
+
+def is_home_name(name):
+    """Is this a name only the home network can answer: .local, .lan, .home, .internal,
+    .home.arpa, or a reverse lookup of a private address?"""
+    return name.endswith(HOME_ENDINGS) or is_private_reverse(name)
+
+
+def home_router():
+    """The home router's address, to send home-network names to, or None if it isn't known.
+    Read from the system's routing table (Linux only) and looked up again every ROUTER_RECHECK
+    seconds, so a lookup costs nothing. Never this computer itself, which would loop."""
+    now = time.monotonic()
+    if S.router_checked is None or now - S.router_checked > ROUTER_RECHECK:
+        S.router_checked = now
+        try:
+            S.router = enforcer.interface_and_gateway()[1] or ""
+        except Exception:
+            S.router = ""
+    if not S.router or is_this_computer(S.router):
+        return None
+    return S.router
+
+
+def ask_router(data, client, qend, forwarder):
+    """Answer a home-network name by asking the home router. If the router isn't known, or the
+    question came from the router itself (asking it back would go round in circles), the answer
+    is 'no such name'. If the router doesn't answer, 'server failure'."""
+    router = home_router()
+    if not router or client == router:
+        return reply(data, qend, 3)
+    resp = forwarder(data, servers=[(router, 53)])
+    return cap_ttls(resp) if resp else reply(data, qend, 2)
+
+
 def answer_query(data, client, forwarder):
     """The whole life of one lookup: read it, decide, record it, answer it.
 
     `forwarder` is forward_udp or forward_tcp (or a stand-in, in tests). Returns the reply bytes,
-    or None when the packet was unreadable and the upstream server did not answer either.
+    or None when nothing should be sent back.
     The steps are described in docs/ARCHITECTURE.md under 'What happens to one lookup'."""
     q = parse_question(data)
     if not q:
-        return forwarder(data)
+        return unreadable_reply(data)
     name, qtype, qend = q
     loggable = bool(VALID_NAME.fullmatch(name)) and not name.endswith(IGNORED_ENDINGS)
-    if client == "127.0.0.1":
+    if client in ("127.0.0.1", "::1"):
         client = S.local_ip
-    blocked = loggable and decision(name, client, time.time() < S.paused_until)[0]
-    if loggable:
-        log_q.put((time.time(), client, name, 1 if blocked else 0))
+    if not loggable:
+        # Names that skip the checks: odd characters, home-network endings, reverse lookups.
+        # If this device's internet is off they get the blocked answer, so they can't be used
+        # to tunnel out. Otherwise home-network names go to the router, the rest to the internet.
+        if internet_cut(client):
+            return blocked_reply(data, qtype, qend)
+        if is_home_name(name):
+            return ask_router(data, client, qend, forwarder)
+        resp = forwarder(data)
+        return cap_ttls(resp) if resp else reply(data, qend, 2)
+    blocked = decision(name, client, time.time() < S.paused_until)[0]
+    log_q.put((time.time(), client, name, 1 if blocked else 0))
     if blocked:
         return blocked_reply(data, qtype, qend)
     resp = forwarder(data)
-    if resp and loggable:
+    if resp:
         record_resolved(name, resp)
     return cap_ttls(resp) if resp else reply(data, qend, 2)
 
@@ -804,11 +968,14 @@ def answer_query(data, client, forwarder):
 def udp_server(sock):
     """Receive lookups on the UDP socket for ever, handing each to a pool of 64 worker
     threads so that one slow upstream answer does not hold up the rest. At most
-    MAX_DNS_WAITING are in hand at once; beyond that, new lookups are dropped rather than
-    queued without limit (a flood from one device, or the internet being down). Devices
-    simply ask again."""
+    MAX_DNS_WAITING are in hand at once, and at most MAX_DNS_PER_DEVICE from any one device;
+    beyond that, new lookups are dropped rather than queued without limit (a flood from one
+    device, or the internet being down). The per-device share means one busy or broken device
+    can't use up every slot and stop everyone else's lookups. Devices simply ask again."""
     pool = ThreadPoolExecutor(max_workers=64)
     slots = threading.BoundedSemaphore(MAX_DNS_WAITING)
+    in_hand = {}                    # device address -> lookups of its being answered now
+    in_hand_lock = threading.Lock()
 
     def work(data, addr):
         """Answer one lookup and send the reply back to the device that asked."""
@@ -819,6 +986,12 @@ def udp_server(sock):
         except Exception as e:
             print("Lookup problem:", e)
         finally:
+            with in_hand_lock:
+                left = in_hand.get(addr[0], 1) - 1
+                if left > 0:
+                    in_hand[addr[0]] = left
+                else:
+                    in_hand.pop(addr[0], None)
             slots.release()
 
     while True:
@@ -826,8 +999,12 @@ def udp_server(sock):
             data, addr = sock.recvfrom(4096)
         except OSError:
             continue
-        if slots.acquire(blocking=False):
-            pool.submit(work, data, addr)
+        with in_hand_lock:
+            mine = in_hand.get(addr[0], 0)
+            if mine >= MAX_DNS_PER_DEVICE or not slots.acquire(blocking=False):
+                continue
+            in_hand[addr[0]] = mine + 1
+        pool.submit(work, data, addr)
 
 
 class TCPHandler(socketserver.BaseRequestHandler):
@@ -908,6 +1085,37 @@ def find_local_ip():
         return "127.0.0.1"
 
 
+def refresh_local_ip():
+    """Look up this computer's address again and, if it has changed, use the new one everywhere:
+    the dashboard, the network scan, the 'this computer' checks and the enforcer. Returns True
+    if it changed.
+
+    A lost network (no address found) keeps the last good address rather than falling back to
+    127.0.0.1: devices are still set to use it, and it will very likely come back."""
+    new = find_local_ip()
+    if new == S.local_ip or (new == "127.0.0.1" and S.local_ip != "127.0.0.1"):
+        return False
+    S.local_ip = new
+    if ENF is not None:
+        ENF.local_ip = new
+    rules_changed()                     # 'this computer' is exempt from some rules
+    print("This computer's address is now %s (type this into a device's DNS setting)." % new, flush=True)
+    return True
+
+
+def address_watcher():
+    """Background thread: keep S.local_ip up to date. At start-up the network may not be ready
+    yet (a Raspberry Pi can start QuietNet before Wi-Fi is connected), and the router may later
+    hand this computer a different address. Checks every 10 seconds while there is no address,
+    and every minute after that."""
+    while True:
+        time.sleep(10 if S.local_ip == "127.0.0.1" else 60)
+        try:
+            refresh_local_ip()
+        except Exception as e:
+            print("Could not check this computer's address:", e, flush=True)
+
+
 def neighbours():
     """Which devices this computer currently knows about: {ip: mac}.
 
@@ -963,34 +1171,95 @@ def reverse_name(ip):
         return ""
 
 
+MAX_SCAN = 1024        # the most addresses one network scan knocks on
+
+
+def home_subnet(local_ip):
+    """The home network this computer's address belongs to, e.g. 192.168.4.0/22.
+
+    Read from the routing table where the system has one we can read (Linux, e.g. a Raspberry
+    Pi). Elsewhere, or if it can't be read, the usual home size is assumed: the 256 addresses
+    sharing the first three numbers with ours."""
+    try:
+        me = ipaddress.IPv4Address(local_ip)
+        iface = enforcer.interface_and_gateway()[0]
+        subnet = enforcer.local_subnet(iface) if iface else None
+        if subnet is not None and me in subnet and subnet.prefixlen < 31:
+            return subnet
+        return ipaddress.IPv4Network("%s/24" % local_ip, strict=False)
+    except ValueError:
+        return None
+
+
+def scan_targets(local_ip, subnet):
+    """Which addresses a network scan knocks on: (the addresses, whether the list was cut short).
+
+    Every usable address on the home network, but at most MAX_SCAN of them. On a bigger network
+    the MAX_SCAN addresses around this computer's own are chosen, as that is where a home
+    router hands out addresses."""
+    me = ipaddress.IPv4Address(local_ip)
+    block = subnet
+    if subnet.num_addresses - 2 > MAX_SCAN:
+        block = ipaddress.IPv4Network("%s/%d" % (me, 32 - (MAX_SCAN.bit_length() - 1)), strict=False)
+    hosts = [ip for ip in block if ip not in (subnet.network_address, subnet.broadcast_address)]
+    return [str(ip) for ip in hosts], block != subnet
+
+
+def scan_plan():
+    """Work out what a network scan will cover, keep it in S.scan_info for the dashboard, and
+    return (the home network, the addresses to knock on). (None, []) if this computer has no
+    usable address on a home network yet."""
+    subnet = home_subnet(S.local_ip)
+    if subnet is None or S.local_ip.startswith("127."):
+        S.scan_info = {"network": "", "addresses": 0, "capped": False}
+        return None, []
+    targets, capped = scan_targets(S.local_ip, subnet)
+    S.scan_info = {"network": str(subnet), "addresses": len(targets), "capped": capped}
+    return subnet, targets
+
+
 def scan_network():
-    """Find every device on the home network (the 254 addresses next to this computer's)."""
+    """Find every device on the home network (every address on it, up to MAX_SCAN)."""
     S.scan_state = "scanning"
     try:
-        prefix = S.local_ip.rsplit(".", 1)[0] + "."
+        subnet, targets = scan_plan()
+        if subnet is None:
+            return
         # Knock on every address. Any device that is switched on has to reveal its
         # hardware address to this computer in order to receive the knock.
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
             for _ in range(2):
-                for i in range(1, 255):
+                for ip in targets:
                     try:
-                        sock.sendto(b"\0", (prefix + str(i), 9))
+                        sock.sendto(b"\0", (ip, 9))
                     except OSError:
                         pass
                 time.sleep(1.2)
-        found = {ip: mac for ip, mac in neighbours().items()
-                 if ip.startswith(prefix) and not ip.endswith(".255")}
+        skip = (subnet.network_address, subnet.broadcast_address)
+        found = {}
+        for ip, mac in neighbours().items():
+            try:
+                addr = ipaddress.IPv4Address(ip)
+            except ValueError:
+                continue
+            if addr in subnet and addr not in skip:
+                found[ip] = mac
         found.setdefault(S.local_ip, "")
         pool = ThreadPoolExecutor(max_workers=32)
         jobs = {ip: pool.submit(reverse_name, ip) for ip in found}
         deadline = time.time() + 8
+        # Wait for the names before taking db_lock: these are network waits of up to 8 seconds,
+        # and the dashboard and the history writer would otherwise wait behind them.
+        hosts = {}
+        for ip, job in jobs.items():
+            try:
+                hosts[ip] = job.result(timeout=max(0.1, deadline - time.time()))
+            except Exception:
+                hosts[ip] = ""
         now = time.time()
         with db_lock:
-            for ip, job in jobs.items():
-                try:
-                    host = job.result(timeout=max(0.1, deadline - time.time()))
-                except Exception:
-                    host = ""
+            for ip in jobs:
+                host = hosts[ip]
                 db.execute("""INSERT INTO seen(ip,mac,host,ts) VALUES(?,?,?,?) ON CONFLICT(ip) DO UPDATE SET
                               mac=excluded.mac, ts=excluded.ts,
                               host=CASE WHEN excluded.host='' THEN seen.host ELSE excluded.host END""",
@@ -1012,14 +1281,26 @@ def api_status():
         "ip": S.local_ip, "dns_ok": S.dns_error is None, "dns_error": S.dns_error, "dns_port": S.dns_port,
         "paused_for": max(0, int(S.paused_until - now)), "junk_on": S.junk_on,
         "kill": "all" in S.off, "clock": time.strftime("%H:%M"),
-        "junk_count": len(S.junk_builtin | S.junk_community),
+        "junk_count": S.junk_count,
         "community": {"installed": bool(S.junk_community), "count": len(S.junk_community),
                       "updated": os.path.getmtime(COMMUNITY_FILE) if os.path.exists(COMMUNITY_FILE) else None,
                       "state": S.list_state, "error": S.list_error},
         "today": {"total": total, "blocked": blocked},
-        "scan": {"state": S.scan_state, "ts": S.scan_ts},
+        "scan": dict(S.scan_info, state=S.scan_state, ts=S.scan_ts),
         "enforcer": ENF.status() if ENF else {"available": False, "reason": "", "active": False},
     }
+
+
+# When each device last looked something up. A plain "GROUP BY client" would walk every entry of
+# the q_client_ts index (up to MAX_HISTORY_ROWS) on every dashboard refresh. This instead hops from
+# one device to the next in that index, and reads each device's latest time from its end, so the
+# work grows with the number of devices, not with the size of the history.
+LAST_SEEN_SQL = """
+    WITH RECURSIVE c(x) AS (
+        SELECT MIN(client) FROM queries
+        UNION ALL
+        SELECT (SELECT MIN(client) FROM queries WHERE client>x) FROM c WHERE x IS NOT NULL)
+    SELECT x, (SELECT MAX(ts) FROM queries WHERE client=x) FROM c WHERE x IS NOT NULL"""
 
 
 def api_devices():
@@ -1039,7 +1320,7 @@ def api_devices():
 
     # Two small questions, each answered straight from an index, in place of one that read every
     # row of up to 30 days of history on every dashboard refresh.
-    for ip, last in sql("SELECT client, MAX(ts) FROM queries GROUP BY client"):                  # uses q_client_ts
+    for ip, last in sql(LAST_SEEN_SQL):
         entry(ip)["last"] = last
     for ip, n, nb in sql("""SELECT client, COUNT(*), COALESCE(SUM(blocked), 0) FROM queries INDEXED BY q_ts
                             WHERE ts>? GROUP BY client""", (since,)):
@@ -1176,6 +1457,7 @@ def set_service_block(scope, service, on):
             S.svc_blocks.get(scope, set()).discard(service)
             db.execute("DELETE FROM service_blocks WHERE scope=? AND service=?", (scope, service))
         db.commit()
+        rules_changed()
 
 
 def set_internet_off(scope, off):
@@ -1188,6 +1470,7 @@ def set_internet_off(scope, off):
             S.off.discard(scope)
             db.execute("DELETE FROM internet_off WHERE scope=?", (scope,))
         db.commit()
+        rules_changed()
 
 
 def delete_group(gid):
@@ -1347,6 +1630,7 @@ class Web(BaseHTTPRequestHandler):
         try:
             self.handle_post(urlparse(self.path).path, body)
             if ENF:
+                rules_changed()
                 ENF.poke()                        # a rule may have changed: let the enforcer act on it now
         except (TypeError, ValueError, AttributeError, KeyError, sqlite3.Error):
             # A value of the wrong kind (a list where a number belongs, say) that a handler did not
@@ -1376,6 +1660,9 @@ class Web(BaseHTTPRequestHandler):
             if path == "/api/internet":
                 if scope == "all":
                     return self.send_error(400)
+                if body.get("off") and scope.startswith("device:") and is_this_computer(scope[7:]):
+                    return self.send_json({"error": "QuietNet can't switch off the internet for the "
+                                                    "computer it runs on."}, 400)
                 set_internet_off(scope, bool(body.get("off")))
             else:
                 if body.get("service") not in S.svc_names:
@@ -1468,6 +1755,7 @@ class Web(BaseHTTPRequestHandler):
                     S.dev_group.pop(ip, None)
                     db.execute("DELETE FROM device_group WHERE ip=?", (ip,))
                 db.commit()
+                rules_changed()
             return self.send_json({"ok": True})
         if path == "/api/junk-switch":
             S.junk_on = bool(body.get("on"))
@@ -1487,8 +1775,11 @@ class Web(BaseHTTPRequestHandler):
         if path == "/api/scan":
             if S.scan_state != "scanning":
                 S.scan_state = "scanning"
+                scan_plan()                       # so the answer can say how much will be scanned
                 threading.Thread(target=scan_network, daemon=True).start()
-            return self.send_json({"ok": True})
+            # 'capped' is true when the home network is bigger than MAX_SCAN addresses and only
+            # the MAX_SCAN around this computer's own address are knocked on.
+            return self.send_json(dict(S.scan_info, ok=True))
         if path == "/api/update-list":
             if S.list_state != "downloading":
                 threading.Thread(target=update_community_list, daemon=True).start()
@@ -1528,6 +1819,7 @@ def main():
     global ENF
     ENF = enforcer.Enforcer(S.local_ip, enforcement_plan, neighbours, data_dir=DATA, learn_mac=learn_enforced_mac)
     ENF.start()
+    threading.Thread(target=address_watcher, daemon=True).start()
     global CA
     CA = cloud_agent.CloudAgent(args.web_port, DATA)
     CA.start()

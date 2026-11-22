@@ -6,8 +6,10 @@ FROM python:3.13-slim
 # live-connection enforcer to drop blocked traffic (nftables), and the older iptables
 # commands, used only to *read* the Pi's other firewall rules - Docker on some Pis keeps its
 # rules where nft can't see them, and steering into a firewall we can't see could cut a
-# device off. (No Python packages are installed.)
-RUN apt-get update && apt-get install -y --no-install-recommends nftables iptables \
+# device off. Also the time zone tables (tzdata), so schedules can follow the household's
+# local time and its clock changes instead of UTC (see TZ in docker-compose.yml).
+# (No Python packages are installed.)
+RUN apt-get update && apt-get install -y --no-install-recommends nftables iptables tzdata \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

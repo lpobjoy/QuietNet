@@ -18,10 +18,12 @@ import base64
 import hashlib
 import hmac
 import html
+import ipaddress
 import json
 import os
 import re
 import secrets
+import socket
 import sqlite3
 import threading
 import time
@@ -32,14 +34,16 @@ from urllib.parse import parse_qs, urlparse
 #   settings              timeouts, limits, who may sign up
 #   storage               relay.db: users, pis, and the secret that signs session cookies
 #   passwords & sessions  PBKDF2 password records; signed "user.expiry.signature" cookies
-#   limits on guessing    Throttle: caps wrong passwords and wrong pairing codes
-#   the relay bridge      Bridge: hands a browser's request to the right Pi and waits for its answer
+#   limits on guessing    Throttle: caps wrong passwords, sign-in attempts and wrong pairing codes
+#   the relay bridge      Bridge: hands a browser's request to the right Pi and waits for its answer;
+#                         BigAnswers: caps the memory held by large Pi answers
 #   small HTML pages      the page layout
 #   web server            Relay: accounts, pairing, the Pi-side calls, and browser -> Pi relaying
 #
-# THREADS: one per request (ThreadingHTTPServer). A Pi's poll and a browser's relayed call are both
-# threads that sleep inside Bridge until the other arrives. All shared state is in Bridge, Throttle
-# and the database, each guarded by its own lock.
+# THREADS: one per connection (RelayServer), at most MAX_CONNECTIONS at once, of which at most MAX_POLLS
+# may be Pis waiting for work. A Pi's poll and a browser's relayed call are both threads that sleep
+# inside Bridge until the other arrives. All shared state is in Bridge, BigAnswers, Throttle and the
+# database, each guarded by its own lock.
 #
 # Fuller explanation: docs/ARCHITECTURE.md (Remote access, Security model). Every call: docs/API.md.
 
@@ -51,19 +55,39 @@ POLL_TIMEOUT = 25          # how long the Pi's long-poll waits before returning 
 OFFLINE_AFTER = 40         # a Pi not seen for this many seconds is treated as offline
 MAX_BODY = 64 * 1024       # the largest request body the relay will read; real ones are a few hundred bytes
 MAX_ANSWER = 16 * 1024 * 1024   # ...except a paired Pi's answers, which can be large (a week of a busy device's history)
+BIG_ANSWER_BUDGET = 48 * 1024 * 1024   # the most large-answer bytes held at once, across every Pi (see BigAnswers)
+BIG_ANSWER_WAIT = 10       # how long a large answer may wait for room before it is refused
+BODY_SECONDS = 30          # the longest a request body may take to arrive, however slowly it trickles in
+HEADER_SECONDS = 10        # the longest a request's first line and headers may take to arrive (see Relay.handle_one_request)
+MAX_CONNECTIONS = 300      # connections handled at once; more are turned away with "busy"
+MAX_POLLS = 150            # of those, how many may be Pis waiting for work, so browsers always have room
+MAX_PIS_PER_ACCOUNT = 10   # QuietNets one account may have, paired or waiting
+PASSWORD_CHECKS_AT_ONCE = 4     # sign-ins checking a password at the same moment (each takes real processor time)
+PASSWORD_CHECK_WAIT = 5    # how long a sign-in waits for its turn to have its password checked
 KNOWN_DEVICE_DAYS = 365    # how long a browser is remembered as having signed in to an account before
 PAIR_CODE_MINUTES = 15     # how long a pairing code stays valid after it is shown
 # Who may create an account, set with the QUIETNET_SIGNUP environment variable:
 #   open   - anyone who finds the address (the default)
 #   first  - only while no account exists yet, i.e. the person who set the relay up
 #   closed - nobody
+# Any other value is treated as closed, with a warning at start-up, so a typo never leaves it open.
 SIGNUP = os.environ.get("QUIETNET_SIGNUP", "open").strip().lower()
+SIGNUP_MODES = ("open", "first", "closed")
 # Limits on wrong guesses: (how many failures, within how many seconds). See Throttle below.
 LOGIN_LIMIT_PER_EMAIL = (5, 15 * 60)
 LOGIN_LIMIT_OVERALL = (60, 5 * 60)
 LOGIN_LIMIT_KNOWN_BROWSER = (20, 15 * 60)   # a browser that signed in before has its own, looser cap
-MAX_BIG_ANSWERS_AT_ONCE = 2                 # large Pi answers being read at the same time
-PAIR_LIMIT_OVERALL = (20, 10 * 60)
+# Limits on sign-in attempts of any outcome, right or wrong, so that signing in over and over with a
+# correct password can't keep the processor busy checking passwords.
+LOGIN_TRIES_PER_EMAIL = (30, 15 * 60)
+LOGIN_TRIES_PER_ADDRESS = (60, 15 * 60)
+LOGIN_TRIES_KNOWN_BROWSER = (30, 15 * 60)
+# Wrong pairing codes: per network address, and a higher limit across everyone. Codes are 32 bits,
+# so even the overall limit leaves guessing a live code hopeless; the per-address limit means one
+# stranger sending bad codes can't stop everyone else pairing.
+PAIR_LIMIT_PER_ADDRESS = (20, 10 * 60)
+PAIR_LIMIT_OVERALL = (200, 10 * 60)
+PAIR_LIMIT_PER_ACCOUNT = (20, 24 * 3600)    # successful pairings per account per day
 SIGNUP_LIMIT_OVERALL = (10, 60 * 60)
 EMAIL_RE = re.compile(r"[^@\s]+@[^@\s]+\.[^@\s]+")
 
@@ -120,6 +144,13 @@ def init_db():
     # Databases made by 0.5 lack the column, so add it if it is missing.
     if "code_ts" not in [row[1] for row in db.execute("PRAGMA table_info(pis)")]:
         db.execute("ALTER TABLE pis ADD COLUMN code_ts REAL DEFAULT 0")
+    # Pis look themselves up by token on every poll and answer, and by code when pairing; the home
+    # page lists an account's Pis. Without these, each would read the whole table.
+    db.executescript("""
+        CREATE INDEX IF NOT EXISTS pis_token ON pis(token);
+        CREATE INDEX IF NOT EXISTS pis_code ON pis(code);
+        CREATE INDEX IF NOT EXISTS pis_user ON pis(user_id);
+    """)
     db.commit()
     row = sql("SELECT value FROM meta WHERE key='secret'", one=True)
     if row:
@@ -162,16 +193,29 @@ def make_session(user_id):
 
 
 def read_session(cookie):
-    """The user id a session cookie belongs to, or None if it is forged, altered or expired."""
+    """The user id a session cookie belongs to, or None if it is forged, altered or expired.
+    A cookie with letters outside plain ASCII (which another site on the same domain could set)
+    is simply not valid; it must not be passed to compare_digest, which refuses such text."""
     try:
         uid, exp, sig = cookie.split(".")
+        if not cookie.isascii():
+            return None
         msg = "%s.%s" % (uid, exp)
         good = hmac.new(SECRET, msg.encode(), hashlib.sha256).hexdigest()[:32]
         if hmac.compare_digest(sig, good) and int(exp) > time.time():
             return int(uid)
-    except (ValueError, AttributeError):
+    except (ValueError, AttributeError, TypeError):
         pass
     return None
+
+
+def sign_out_token(session):
+    """The token the sign-out button must send back, worked out from the session cookie.
+
+    Another website can make your browser send a request to /logout, but it can't read our pages,
+    so it can't know this token. Without it, any site could sign you out and remove the 'signed in
+    here before' marker, which is what keeps strangers from locking you out with wrong guesses."""
+    return hmac.new(SECRET, b"sign-out." + session.encode("utf-8", "replace"), hashlib.sha256).hexdigest()[:32]
 
 
 # ------------------------------------------------------------------ limits on guessing
@@ -183,10 +227,12 @@ class Throttle:
     all day. This keeps a short memory of failures (in memory only; it resets on restart)
     so that guessing is cut off long before it could succeed.
 
-    Names used: "login:<email>" (per account), "login" (all accounts together, which also caps
-    the processor time spent checking passwords), "pair" and "signup" (overall).
-    The overall limits cannot be dodged by changing network address, because they do not
-    depend on the caller's address at all."""
+    Names used for wrong guesses: "login:<email>" (per account), "login" (all accounts together),
+    "login-known:<email>" (a browser that signed in before), "pair-from:<address>" and "pair"
+    (overall). Names that count every attempt, right or wrong: "login-tries:<email>",
+    "login-from:<address>", "login-known-tries:<email>", "paired:<user id>" (successful pairings)
+    and "signup". The overall limits cannot be dodged by changing network address, because they do
+    not depend on the caller's address at all."""
 
     def __init__(self):
         """Starts with no failures recorded."""
@@ -228,11 +274,26 @@ def new_pair_code():
     return "%s-%s" % (secrets.token_hex(2).upper(), secrets.token_hex(2).upper())
 
 
+def signup_mode():
+    """The sign-up setting in force: SIGNUP if it is one QuietNet knows, otherwise 'closed', so a
+    misspelt setting shuts the door rather than leaving it open."""
+    return SIGNUP if SIGNUP in SIGNUP_MODES else "closed"
+
+
+def signup_warning():
+    """A warning to print at start-up if QUIETNET_SIGNUP holds a value QuietNet doesn't know, else None."""
+    if SIGNUP in SIGNUP_MODES:
+        return None
+    return ("Warning: QUIETNET_SIGNUP is set to %r, which QuietNet doesn't recognise. Use open, first or "
+            "closed. New accounts are switched off until it is corrected." % SIGNUP)
+
+
 def signup_allowed():
     """Whether a new account may be created right now (see SIGNUP at the top of the file)."""
-    if SIGNUP == "closed":
+    mode = signup_mode()
+    if mode == "closed":
         return False
-    if SIGNUP == "first":
+    if mode == "first":
         return sql("SELECT COUNT(*) FROM users", one=True)[0] == 0
     return True
 
@@ -257,10 +318,13 @@ def known_device_token(uid, pw_record):
 
 def is_known_device(value, uid, pw_record):
     """True if `value` (the qn_known cookie) is the marker for this account and its current password."""
-    return bool(value) and hmac.compare_digest(value, known_device_token(uid, pw_record))
+    if not value or not value.isascii():         # compare_digest refuses text outside plain ASCII
+        return False
+    return hmac.compare_digest(value, known_device_token(uid, pw_record))
 
 
-big_answers = threading.BoundedSemaphore(MAX_BIG_ANSWERS_AT_ONCE)
+password_checks = threading.BoundedSemaphore(PASSWORD_CHECKS_AT_ONCE)
+poll_slots = threading.BoundedSemaphore(MAX_POLLS)
 
 
 def dummy_check(password):
@@ -282,6 +346,7 @@ class Bridge:
         self.queues = {}      # pi_id -> [call, ...] waiting to be picked up by the Pi
         self.waiting = {}     # call_id -> {"event": Event, "resp": dict}
         self.cond = {}        # pi_id -> Condition, so the Pi's poll can sleep until work arrives
+        self.pollers = {}     # pi_id -> number of the newest poll; an older poll sees it change and ends
 
     def _cond(self, pi_id):
         """The wake-up signal for one Pi's waiting poll, created on first use. It shares the
@@ -290,7 +355,9 @@ class Bridge:
             return self.cond.setdefault(pi_id, threading.Condition(self.lock))
 
     def call(self, pi_id, payload):
-        """Browser side: queue a call for the Pi and wait for its reply."""
+        """Browser side: queue a call for the Pi and wait for its reply. A reply that arrives in the
+        moment between giving up and tidying away is still returned, so whoever called this always
+        receives (and must release) any large answer that was handed over."""
         call_id = secrets.token_hex(16)
         slot = {"event": threading.Event(), "resp": None, "pi": pi_id}
         cond = self._cond(pi_id)
@@ -298,19 +365,28 @@ class Bridge:
             self.waiting[call_id] = slot
             self.queues.setdefault(pi_id, []).append(dict(payload, id=call_id))
             cond.notify_all()
-        ok = slot["event"].wait(CALL_TIMEOUT)
+        slot["event"].wait(CALL_TIMEOUT)
         with self.lock:
             self.waiting.pop(call_id, None)
             if pi_id in self.queues:
                 self.queues[pi_id] = [c for c in self.queues[pi_id] if c["id"] != call_id]
-        return slot["resp"] if ok else None
+            return slot["resp"]          # after the pop above, respond() can no longer change it
 
     def poll(self, pi_id):
-        """Pi side: wait for the next call, or return None after POLL_TIMEOUT."""
+        """Pi side: wait for the next call, or return None after POLL_TIMEOUT.
+
+        Only one poll per Pi waits at a time: a new one ends the one before it (which returns None).
+        A real Pi polls one at a time, and an old poll left behind after a network drop would
+        otherwise hold a relay thread for nothing; it also means one token can't tie up many threads."""
         cond = self._cond(pi_id)
         deadline = time.time() + POLL_TIMEOUT
         with self.lock:
+            turn = self.pollers.get(pi_id, 0) + 1
+            self.pollers[pi_id] = turn
+            cond.notify_all()
             while True:
+                if self.pollers.get(pi_id) != turn:
+                    return None             # a newer poll from this Pi has taken over
                 q = self.queues.get(pi_id)
                 if q:
                     return q.pop(0)
@@ -326,17 +402,76 @@ class Bridge:
             return bool(slot) and slot["pi"] == pi_id
 
     def respond(self, pi_id, call_id, resp):
-        """Pi side: deliver the answer to the browser request waiting on `call_id`. An answer
-        to a call that has already timed out (or never existed) is dropped, and so is one from
-        a Pi the call wasn't sent to: one Pi can never answer for another."""
+        """Pi side: deliver the answer to the browser request waiting on `call_id`. True if it was
+        delivered. An answer to a call that has already timed out (or never existed) is dropped, and
+        so is one from a Pi the call wasn't sent to: one Pi can never answer for another. Only the
+        first answer to a call counts."""
         with self.lock:
             slot = self.waiting.get(call_id)
-            if slot and slot["pi"] == pi_id:
+            if slot and slot["pi"] == pi_id and slot["resp"] is None:
                 slot["resp"] = resp
                 slot["event"].set()
+                return True
+            return False
+
+    def forget(self, pi_id):
+        """Drop everything held for a Pi that has been removed, so removed Pis don't build up in
+        memory. A poll still waiting for it ends at once."""
+        with self.lock:
+            self.queues.pop(pi_id, None)
+            self.pollers.pop(pi_id, None)
+            cond = self.cond.pop(pi_id, None)
+            if cond:
+                cond.notify_all()
+
+
+class BigAnswers:
+    """Keeps count of the large Pi answers the relay is holding in memory, and refuses more than it
+    can afford.
+
+    Anyone can pair a 'Pi' of their own, and a large answer can be 16 MB. An answer is counted from
+    the moment it starts arriving until the browser has been sent it, or the call is given up, so the
+    time spent waiting for the browser to collect it counts too. Two limits: one large answer per
+    account at a time, across all its Pis (so one person, even with several Pis of their own, can't
+    take all the room), and BIG_ANSWER_BUDGET bytes across every account."""
+
+    def __init__(self, budget):
+        """Starts empty, able to hold `budget` bytes of large answers at once."""
+        self.cond = threading.Condition()
+        self.budget = budget
+        self.used = 0
+        self.held = {}          # owner (the account's user id) -> (ticket, size)
+
+    def take(self, owner, size, wait):
+        """Make room for an answer of `size` bytes from a Pi belonging to the account `owner`,
+        waiting up to `wait` seconds for it. Returns a ticket to hand to give_back() later, or None
+        if there is no room."""
+        deadline = time.time() + wait
+        with self.cond:
+            while owner in self.held or self.used + size > self.budget:
+                left = deadline - time.time()
+                if left <= 0 or size > self.budget:
+                    return None
+                self.cond.wait(left)
+            ticket = (owner, object())
+            self.held[owner] = (ticket, size)
+            self.used += size
+            return ticket
+
+    def give_back(self, ticket):
+        """Release the room a ticket holds. Harmless if called twice, or with None."""
+        if not ticket:
+            return
+        with self.cond:
+            held = self.held.get(ticket[0])
+            if held and held[0] is ticket:
+                del self.held[ticket[0]]
+                self.used -= held[1]
+                self.cond.notify_all()
 
 
 bridge = Bridge()
+big_answers = BigAnswers(BIG_ANSWER_BUDGET)
 
 
 # ------------------------------------------------------------------ small HTML pages
@@ -354,6 +489,7 @@ input{{width:100%;box-sizing:border-box;padding:10px 12px;border:1px solid #dfe5
 .muted{{color:#5d6b66;font-size:14px}}.err{{background:#fde8e6;color:#b42318;border-radius:10px;padding:10px 14px;margin:12px 0}}
 .dev{{display:flex;align-items:center;gap:12px;border:1px solid #dfe5e2;border-radius:12px;padding:14px;margin:10px 0;text-decoration:none;color:inherit}}
 .dev:hover{{border-color:#0f766e}}.dot{{width:10px;height:10px;border-radius:50%;background:#9aa9a3;flex:none}}.dot.on{{background:#0f766e}}
+.linkbtn{{background:none;border:0;padding:0;font:inherit;color:#5d6b66;font-size:14px;text-decoration:underline;cursor:pointer}}
 .row{{display:flex;gap:10px;align-items:center;justify-content:space-between;flex-wrap:wrap}}.code{{font:700 26px ui-monospace,Menlo,monospace;letter-spacing:3px;background:#e0f2ef;color:#0f766e;padding:10px 16px;border-radius:10px;display:inline-block}}
 a{{color:#0f766e}}</style></head><body><div class="wrap"><div class="brand">\U0001F6E1 QuietNet</div>{body}</div></body></html>"""
 
@@ -376,6 +512,8 @@ class Relay(BaseHTTPRequestHandler):
     there is no other check between a request and someone's home network."""
     server_version = "QuietNet"
     raw_body = None         # the body of the POST being handled; set by do_POST
+    ticket = None           # the room held in big_answers for a large answer being handled, if any
+    big_refused = False     # set when a large answer was turned away because there was no room for it
     timeout = 30            # drop a connection that stalls mid-request, so slow senders can't tie up threads
 
     def log_message(self, *a):
@@ -399,33 +537,142 @@ class Relay(BaseHTTPRequestHandler):
 
     # -- helpers --------------------------------------------------------
 
-    def read_body(self, cap=MAX_BODY):
-        """Read the request body from the connection: bytes, or None if its stated length is
-        nonsense or over `cap`. Called once per POST, by do_POST, which keeps the result in
-        self.raw_body for the handlers."""
+    def handle_one_request(self):
+        """Handle one request, but drop the connection if its first line and headers have not all
+        arrived within HEADER_SECONDS. Each connection holds one of the server's few places, and the
+        connection's own timeout only limits each wait for more data, so without this a sender
+        trickling a header byte every few seconds could hold a place for ever. The wait for the next
+        request on a kept-open connection counts too. The body has its own limit (read_body)."""
+        lock, state = threading.Lock(), {"done": False, "cut": False}
+
+        def too_slow():
+            """Shut the connection, unless the headers arrived just in time."""
+            with lock:
+                if state["done"]:
+                    return
+                state["done"] = state["cut"] = True
+                try:
+                    self.connection.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+
+        def headers_in():
+            """Stop the clock: the headers have arrived (or the request is over). True if the
+            clock had already run out and the connection was shut."""
+            with lock:
+                state["done"] = True
+            timer.cancel()
+            return state["cut"]
+
+        timer = threading.Timer(HEADER_SECONDS, too_slow)
+        timer.daemon = True
+        self.headers_in = headers_in
+        timer.start()
+        try:
+            super().handle_one_request()
+        finally:
+            headers_in()
+
+    def parse_request(self):
+        """Read the request's first line and headers as usual, then stop the header clock. If the
+        clock ran out while they were arriving, the headers read are cut short, so the request is
+        dropped unanswered rather than handled."""
+        ok = super().parse_request()
+        stop = getattr(self, "headers_in", None)
+        if stop and stop():
+            self.close_connection = True
+            return False
+        return ok
+
+    def body_length(self):
+        """The request body's stated length, or None if it is missing a number or negative."""
         try:
             n = int(self.headers.get("Content-Length") or 0)
         except ValueError:
             return None
-        if n < 0 or n > cap:
+        return n if n >= 0 else None
+
+    def read_body(self, cap=MAX_BODY, still_wanted=None):
+        """Read the request body from the connection: bytes, or None if its stated length is
+        nonsense or over `cap`, or if `still_wanted()` (checked as the body arrives) turns false.
+        Called once per POST, by do_POST, which keeps the result in self.raw_body for the handlers.
+
+        The whole body must arrive within BODY_SECONDS. The connection's own timeout only limits each
+        wait for more data, so without this a sender trickling one byte at a time could hold a
+        thread (and any room it took for a large answer) for hours. Too slow raises socket.timeout."""
+        n = self.body_length()
+        if n is None or n > cap:
             return None
-        return self.rfile.read(n)
+        deadline = time.time() + BODY_SECONDS
+        chunks, got = [], 0
+        try:
+            while got < n:
+                left = deadline - time.time()
+                if left <= 0:
+                    raise socket.timeout("the request took too long to arrive")
+                if still_wanted is not None and not still_wanted():
+                    self.close_connection = True        # the rest of the body is left unread
+                    return None
+                self.connection.settimeout(min(left, self.timeout))
+                chunk = self.rfile.read1(min(n - got, 65536))
+                if not chunk:
+                    raise ConnectionError("the connection closed before the whole request arrived")
+                chunks.append(chunk)
+                got += len(chunk)
+        finally:
+            try:
+                self.connection.settimeout(self.timeout)
+            except OSError:
+                pass
+        return b"".join(chunks)
 
     def read_big_answer(self):
         """Read a Pi's answer, allowing up to MAX_ANSWER - but only for a paired Pi answering a call
-        that is really waiting for it (named in the X-QuietNet-Call header), and only a couple at
-        once. Anyone can pair a Pi of their own, so without these checks anyone could make the relay
-        take in many 16 MB bodies at the same time and run it out of memory."""
+        that is really waiting for it (named in the X-QuietNet-Call header), and only when
+        big_answers has room for it. Anyone can pair a Pi of their own, so without these checks
+        anyone could make the relay take in many 16 MB bodies and run it out of memory.
+
+        The room taken is kept in self.ticket, and passes with the answer to the browser's request,
+        which gives it back once the answer is sent. If the browser stops waiting while the answer
+        is still arriving, reading stops and the room is given back at once."""
         row = self.agent()
         call_id = self.headers.get("X-QuietNet-Call", "")
-        if not (row and bridge.expects(row[0], call_id)):
+        n = self.body_length()
+        if not (row and bridge.expects(row[0], call_id)) or n is None or n <= MAX_BODY or n > MAX_ANSWER:
             return self.read_body()
-        if not big_answers.acquire(timeout=10):
-            return self.read_body()
+        ticket = big_answers.take(row[1], n, BIG_ANSWER_WAIT)       # one large answer per account
+        if not ticket:
+            self.big_refused = True
+            self.close_connection = True                # the body is left unread
+            return None
         try:
-            return self.read_body(MAX_ANSWER)
-        finally:
-            big_answers.release()
+            data = self.read_body(MAX_ANSWER, still_wanted=lambda: bridge.expects(row[0], call_id))
+        except BaseException:
+            big_answers.give_back(ticket)
+            raise
+        if data is None:
+            big_answers.give_back(ticket)
+        else:
+            self.ticket = ticket
+        return data
+
+    def source_address(self):
+        """The network address the request came from, for limits that count per caller.
+
+        Behind the host's proxy every connection comes from the proxy, so the address the proxy
+        adds to the end of X-Forwarded-For is used when there is one. (Earlier entries can be made
+        up by the sender, the last one can't.) IPv6 addresses are grouped by their first half, since
+        one home is usually handed a whole block of them. Each limit counted this way sits alongside
+        an overall limit, so a caller who fakes addresses gains nothing beyond that."""
+        forwarded = self.headers.get("X-Forwarded-For", "")
+        addr = forwarded.split(",")[-1].strip() if forwarded.strip() else self.client_address[0]
+        try:
+            ip = ipaddress.ip_address(addr)
+        except ValueError:
+            return addr[:64]
+        if ip.version == 6:
+            return str(ipaddress.ip_network("%s/64" % ip, strict=False))
+        return str(ip)
 
     def secure(self):
         """Did this request reach the host over HTTPS? (The host handles HTTPS and tells us.)"""
@@ -456,8 +703,32 @@ class Relay(BaseHTTPRequestHandler):
         self.set_cookie(make_session(uid))
         self.set_cookie(known_device_token(uid, pw_record), name="qn_known", seconds=KNOWN_DEVICE_DAYS * 86400)
 
+    def sign_out_form(self, label="Sign out", css="linkbtn"):
+        """A sign-out button: a form that posts to /logout with this session's sign-out token."""
+        token = sign_out_token(self.cookie("qn_session") or "")
+        return ('<form method="post" action="/logout" style="margin:0"><input type="hidden" name="token" value="%s">'
+                '<button class="%s" type="submit">%s</button></form>') % (
+            html.escape(token), html.escape(css), html.escape(label))
+
+    def sign_out_page(self):
+        """GET /logout: a page with a sign-out button, rather than signing out straight away, since
+        any website can send a browser to an address."""
+        if not self.user():
+            return self.redirect("/login")
+        return self.send_html('<div class="card"><h1>Sign out?</h1><p class="muted">You will need your password '
+                              'to sign in again.</p>%s<p class="muted" style="margin-top:16px"><a href="/">Back to '
+                              'your QuietNets</a></p></div>' % self.sign_out_form("Sign out", "btn"))
+
     def sign_out(self):
-        """End the session and forget that this browser signed in here (it may be a shared computer)."""
+        """POST /logout: end the session and forget that this browser signed in here (it may be a
+        shared computer). Only done when the form carries this session's sign-out token, so another
+        website can't sign you out; otherwise nothing is changed."""
+        session = self.cookie("qn_session")
+        token = self.body_form().get("token", "")
+        if not (session and self.user()):
+            return self.redirect("/login")
+        if not (token.isascii() and hmac.compare_digest(token, sign_out_token(session))):
+            return self.redirect("/")
         self.set_cookie("")
         self.set_cookie("", name="qn_known", seconds=0)
         return self.redirect("/login")
@@ -533,7 +804,7 @@ class Relay(BaseHTTPRequestHandler):
         if p in ("/login", "/signup"):
             return self.send_html(self.auth_form(p[1:]))
         if p == "/logout":
-            return self.sign_out()
+            return self.sign_out_page()
         if p == "/" :
             return self.home()
         self.send_error(404)
@@ -545,7 +816,11 @@ class Relay(BaseHTTPRequestHandler):
         Answering and closing while the sender's data is still unread makes some systems reset
         the connection, and the browser then never sees the answer."""
         p = urlparse(self.path).path
-        self.raw_body = self.read_big_answer() if p == "/agent/respond" else self.read_body()
+        try:
+            self.raw_body = self.read_big_answer() if p == "/agent/respond" else self.read_body()
+        except OSError:
+            self.close_connection = True        # too slow, or the sender went away: nothing to answer
+            return
         if p == "/agent/pair":
             return self.agent_pair()
         if p == "/agent/respond":
@@ -609,18 +884,34 @@ class Relay(BaseHTTPRequestHandler):
         email = email[:254]
         row = sql("SELECT id,pw FROM users WHERE email=?", (email,), one=True)
         trusted = bool(row) and is_known_device(self.cookie("qn_known"), row[0], row[1])
+        address = self.source_address()
         if trusted:
-            blocked = throttle.blocked("login-known:" + email, LOGIN_LIMIT_KNOWN_BROWSER)
+            blocked = (throttle.blocked("login-known:" + email, LOGIN_LIMIT_KNOWN_BROWSER)
+                       or throttle.blocked("login-known-tries:" + email, LOGIN_TRIES_KNOWN_BROWSER))
         else:
             blocked = (throttle.blocked("login:" + email, LOGIN_LIMIT_PER_EMAIL)
-                       or throttle.blocked("login", LOGIN_LIMIT_OVERALL))
+                       or throttle.blocked("login", LOGIN_LIMIT_OVERALL)
+                       or throttle.blocked("login-tries:" + email, LOGIN_TRIES_PER_EMAIL)
+                       or throttle.blocked("login-from:" + address, LOGIN_TRIES_PER_ADDRESS))
         if blocked:
             return self.send_html(self.auth_form("login", TOO_MANY), 429)
-        if row:
-            good = check_pw(pw, row[1])
+        # Every attempt counts here, right or wrong: checking a password costs real processor time,
+        # and anyone can make an account and sign in to it correctly over and over.
+        if trusted:
+            throttle.fail("login-known-tries:" + email)
         else:
-            dummy_check(pw)             # spend the same time as a real check, so unknown emails can't be spotted
-            good = False
+            throttle.fail("login-tries:" + email)
+            throttle.fail("login-from:" + address)
+        if not password_checks.acquire(timeout=PASSWORD_CHECK_WAIT):
+            return self.send_html(self.auth_form("login", "The relay is busy. Please try again in a moment."), 503)
+        try:
+            if row:
+                good = check_pw(pw, row[1])
+            else:
+                dummy_check(pw)         # spend the same time as a real check, so unknown emails can't be spotted
+                good = False
+        finally:
+            password_checks.release()
         if not good:
             if trusted:
                 throttle.fail("login-known:" + email)
@@ -664,16 +955,23 @@ class Relay(BaseHTTPRequestHandler):
                     <span style="flex:1"><b>%s</b><div class="muted">%s</div></span><span class="muted">Open &rsaquo;</span></a>""" % (
                     pid, "on" if online else "", html.escape(name), "Online" if online else "Offline")
         return self.send_html("""<div class="row"><h1 style="margin:0">Your QuietNets</h1>
-            <a class="muted" href="/logout">Sign out</a></div>%s
+            %s</div>%s
             <form method="post" action="/pis/new"><label>Add a QuietNet</label>
             <input name="name" placeholder="e.g. Home Pi" required>
-            <button class="btn" type="submit">Create pairing code</button></form>""" % (rows or '<p class="muted">No QuietNets yet.</p>'))
+            <button class="btn" type="submit">Create pairing code</button></form>""" % (
+            self.sign_out_form(), rows or '<p class="muted">No QuietNets yet.</p>'))
 
     def new_pi(self):
-        """Create a QuietNet entry for the signed-in user, with a fresh pairing code."""
+        """Create a QuietNet entry for the signed-in user, with a fresh pairing code. Each account
+        may have at most MAX_PIS_PER_ACCOUNT, so no one account can fill the relay's disk."""
         uid = self.user()
         if not uid:
             return self.redirect("/login")
+        if sql("SELECT COUNT(*) FROM pis WHERE user_id=?", (uid,), one=True)[0] >= MAX_PIS_PER_ACCOUNT:
+            return self.send_html('<div class="card"><h1>No room for another QuietNet</h1><p>This account already '
+                                  'has %d QuietNets, the most it can hold. Remove one before adding another.</p>'
+                                  '<p><a href="/">Back to your QuietNets</a></p></div>'
+                                  % int(MAX_PIS_PER_ACCOUNT), 403)
         name = (self.body_form().get("name", "").strip() or "My QuietNet")[:40]
         pid = secrets.token_hex(8)
         now = time.time()
@@ -684,64 +982,103 @@ class Relay(BaseHTTPRequestHandler):
     def delete_pi(self, pid):
         """Remove one of the signed-in user's QuietNets. Its token stops working at once."""
         uid = self.user()
-        if uid:
+        if uid and sql("SELECT 1 FROM pis WHERE id=? AND user_id=?", (pid, uid), one=True):
             sql("DELETE FROM pis WHERE id=? AND user_id=?", (pid, uid), commit=True)
+            bridge.forget(pid)
         self.redirect("/")
 
     # -- the agent (Pi) side -------------------------------------------
 
     def agent_pair(self):
         """A Pi presents a pairing code. If it is current and unused, mark the entry paired,
-        clear the code and hand back a new secret token. Wrong codes are counted and capped overall."""
+        clear the code and hand back a new secret token.
+
+        Wrong codes are counted per network address and, with a higher limit, overall, so one
+        stranger sending bad codes can't stop everyone else pairing. Successful pairings are counted
+        per account too, so an account can't pair, remove and pair again without end."""
         body = self.body_json()
         code = str(body.get("code", "")).strip().upper()
-        if throttle.blocked("pair", PAIR_LIMIT_OVERALL):
+        address = self.source_address()
+        if (throttle.blocked("pair-from:" + address, PAIR_LIMIT_PER_ADDRESS)
+                or throttle.blocked("pair", PAIR_LIMIT_OVERALL)):
             return self.send_json({"error": TOO_MANY}, 429)
-        row = code and sql("SELECT id FROM pis WHERE code=? AND paired=0 AND code_ts>?",
+        row = code and sql("SELECT id, user_id FROM pis WHERE code=? AND paired=0 AND code_ts>?",
                            (code, time.time() - PAIR_CODE_MINUTES * 60), one=True)
         if not row:
+            throttle.fail("pair-from:" + address)
             throttle.fail("pair")
             return self.send_json({"error": "That pairing code is wrong, already used, or has expired."}, 400)
+        if throttle.blocked("paired:%d" % row[1], PAIR_LIMIT_PER_ACCOUNT):
+            return self.send_json({"error": "This account has paired too many QuietNets today. "
+                                            "Please try again tomorrow."}, 429)
+        throttle.fail("paired:%d" % row[1])
         token = secrets.token_hex(24)
         sql("UPDATE pis SET paired=1, token=?, code='', last_seen=? WHERE id=?",
             (token, time.time(), row[0]), commit=True)
         self.send_json({"ok": True, "id": row[0], "token": token})
 
     def agent(self):
-        """The Pi row matching the token in the request header, or None."""
+        """The Pi matching the token in the request header, as (pi id, owner's user id), or None."""
         token = self.headers.get("X-QuietNet-Token", "")
         if not token:
             return None
-        return sql("SELECT id FROM pis WHERE token=? AND paired=1", (token,), one=True)
+        return sql("SELECT id, user_id FROM pis WHERE token=? AND paired=1", (token,), one=True)
 
     def agent_poll(self):
         """A Pi asks for work. Notes that it is alive, then waits (up to POLL_TIMEOUT seconds)
-        for a browser request to pass down. An empty object means 'nothing yet, ask again'."""
+        for a browser request to pass down. An empty object means 'nothing yet, ask again'.
+        At most MAX_POLLS wait at once, so waiting Pis can never take every thread from browsers;
+        beyond that the Pi is told the relay is busy, and tries again."""
         row = self.agent()
         if not row:
             return self.send_error(401)
         sql("UPDATE pis SET last_seen=? WHERE id=?", (time.time(), row[0]), commit=True)
-        call = bridge.poll(row[0])
+        if not poll_slots.acquire(blocking=False):
+            return self.send_json({"error": "The relay is busy. Try again shortly."}, 503)
+        try:
+            call = bridge.poll(row[0])
+        finally:
+            poll_slots.release()
         self.send_json(call or {})      # {} means "nothing to do"; a real call always carries an id
 
     def agent_respond(self):
         """A Pi returns the answer to a call. Only ordinary status codes are passed on. An answer
-        too big to read (see read_big_answer) is refused with 413."""
-        row = self.agent()
-        if not row:
-            return self.send_error(401)
-        if self.raw_body is None:
-            return self.send_error(413)
-        body = self.body_json()
+        too big to read (see read_big_answer) is refused with 413. A large answer turned away because
+        the relay is holding too many already is refused with 503, and the browser is told at once
+        rather than left waiting.
+
+        The answer is passed on as bytes, and the raw body and parsed copy are dropped straight
+        away, so only one copy of a large answer stays in memory while the browser collects it."""
+        ticket, self.ticket = self.ticket, None
         try:
-            status = int(body.get("status", 502))
-        except (TypeError, ValueError):
-            status = 502
-        if not 200 <= status <= 599:        # only ordinary answer codes are passed back to the browser
-            status = 502
-        text = body.get("body", "")
-        bridge.respond(row[0], str(body.get("id", "")), {"status": status, "body": text if isinstance(text, str) else ""})
-        self.send_json({"ok": True})
+            row = self.agent()
+            if not row:
+                return self.send_error(401)
+            if self.raw_body is None:
+                if self.big_refused:
+                    busy = json.dumps({"error": "Your QuietNet's answer was too large for the relay to pass on "
+                                                "right now. Please try again in a moment."}).encode()
+                    bridge.respond(row[0], self.headers.get("X-QuietNet-Call", ""), {"status": 503, "body": busy})
+                    return self.send_json({"error": "The relay is holding too many large answers. Try again shortly."}, 503)
+                return self.send_error(413)
+            body = self.body_json()
+            self.raw_body = None
+            try:
+                status = int(body.get("status", 502))
+            except (TypeError, ValueError):
+                status = 502
+            if not 200 <= status <= 599:        # only ordinary answer codes are passed back to the browser
+                status = 502
+            call_id = str(body.get("id", ""))
+            text = body.get("body", "")
+            body = None
+            data = text.encode() if isinstance(text, str) else b""
+            text = None
+            if bridge.respond(row[0], call_id, {"status": status, "body": data, "ticket": ticket}):
+                ticket = None                   # the browser's request now gives it back
+            self.send_json({"ok": True})
+        finally:
+            big_answers.give_back(ticket)
 
     # -- browser -> Pi relay -------------------------------------------
 
@@ -778,12 +1115,17 @@ class Relay(BaseHTTPRequestHandler):
         resp = bridge.call(pid, payload)
         if resp is None:
             return self.send_json({"error": "Your QuietNet didn't answer in time."}, 504)
-        data = (resp.get("body") or "").encode()
-        self.send_response(resp.get("status", 200))
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(data)))
-        self.end_headers()
-        self.wfile.write(data)
+        try:
+            data = resp.get("body") or b""
+            if isinstance(data, str):
+                data = data.encode()
+            self.send_response(resp.get("status", 200))
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+        finally:
+            big_answers.give_back(resp.get("ticket"))     # the answer has gone (or never will): free its room
 
     def serve_dashboard(self, pid, name):
         """Send the dashboard page, with two additions: a script telling it to send its API
@@ -795,9 +1137,11 @@ class Relay(BaseHTTPRequestHandler):
         inject = ('<script>window.QN_API_BASE=%s;</script>' % json.dumps("/pi/" + pid)
                   + '<style>#qnbar{position:sticky;top:0;z-index:50;background:#0f766e;color:#fff;'
                     'padding:8px 16px;font:600 14px -apple-system,sans-serif;display:flex;gap:14px;align-items:center}'
-                    '#qnbar a{color:#fff}</style>')
+                    '#qnbar a{color:#fff}#qnbar button{background:none;border:0;padding:0;color:#fff;'
+                    'font:inherit;text-decoration:underline;cursor:pointer}</style>')
         bar = ('<div id="qnbar"><a href="/">&lsaquo; My QuietNets</a>'
-               '<span style="flex:1">%s &mdash; remote</span><a href="/logout">Sign out</a></div>') % html.escape(name)
+               '<span style="flex:1">%s &mdash; remote</span>%s</div>') % (
+            html.escape(name), self.sign_out_form(css="qnsignout"))
         html_text = html_text.replace("<head>", "<head>" + inject, 1).replace("<body>", "<body>" + bar, 1)
         data = html_text.encode()
         self.send_response(200)
@@ -807,13 +1151,58 @@ class Relay(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
 
+class RelayServer(ThreadingHTTPServer):
+    """The web server: one thread per connection, but at most MAX_CONNECTIONS at once.
+
+    Without a cap, anyone could open thousands of slow connections and run the relay out of threads
+    or memory. A connection beyond the cap is answered at once with a short 'busy' reply and closed."""
+    daemon_threads = True
+
+    BUSY = (b"HTTP/1.0 503 Service Unavailable\r\nContent-Type: text/plain; charset=utf-8\r\n"
+            b"X-Frame-Options: DENY\r\nContent-Security-Policy: frame-ancestors 'none'\r\n"
+            b"X-Content-Type-Options: nosniff\r\nReferrer-Policy: no-referrer\r\nCache-Control: no-store\r\n"
+            b"Content-Length: 50\r\nConnection: close\r\n\r\n"
+            b"The relay is busy. Please try again in a moment.\r\n")
+
+    def __init__(self, address, handler, max_connections=None):
+        """Listen on `address`, allowing `max_connections` at once (MAX_CONNECTIONS if not given)."""
+        self.slots = threading.BoundedSemaphore(max_connections or MAX_CONNECTIONS)
+        super().__init__(address, handler)
+
+    def process_request(self, request, client_address):
+        """Start a thread for the connection if there is room, otherwise say 'busy' and close it."""
+        if not self.slots.acquire(blocking=False):
+            try:
+                request.settimeout(1)
+                request.sendall(self.BUSY)
+            except OSError:
+                pass
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self.slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        """Handle the connection in its thread, then free its place for the next."""
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self.slots.release()
+
+
 def main():
     """Open the database and serve until stopped."""
     init_db()
     if not DASHBOARD:
         print("Warning: dashboard file not found; remote dashboard pages won't render.")
+    warning = signup_warning()
+    if warning:
+        print(warning)
     print("QuietNet relay listening on port %d" % PORT)
-    ThreadingHTTPServer(("0.0.0.0", PORT), Relay).serve_forever()
+    RelayServer(("0.0.0.0", PORT), Relay).serve_forever()
 
 
 if __name__ == "__main__":

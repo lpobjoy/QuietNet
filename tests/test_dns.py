@@ -139,23 +139,128 @@ class AnsweringQueries(Base):
         server.answer_query(query("www.bbc.co.uk"), "127.0.0.1", fake_answer)
         self.assertEqual(drain_log()[0][1], "192.168.1.60")
 
-    def test_home_network_names_are_passed_on_but_not_recorded(self):
-        for name in ("printer.local", "nas.lan", "router.home", "box.internal", "1.1.168.192.in-addr.arpa"):
-            resp = server.answer_query(query(name), KID, fake_answer)
+    def ask(self, data, client=KID):
+        """Answer `data` for `client`, noting each server list the stand-in forwarder was given
+        (None meaning the usual public servers)."""
+        self.sent_to = []
+
+        def forwarder(d, servers=None):
+            """A pretend internet and router that answer everything."""
+            self.sent_to.append(servers)
+            return fake_answer(d)
+        return server.answer_query(data, client, forwarder)
+
+    def test_home_network_names_are_sent_to_the_router_not_the_internet(self):
+        server.S.router = "192.168.1.1"
+        for name in ("printer.local", "nas.lan", "router.home", "box.internal", "pi.home.arpa"):
+            resp = self.ask(query(name))
             self.assertEqual(resp[-4:], bytes([93, 184, 216, 34]), name)
+            self.assertEqual(self.sent_to, [[("192.168.1.1", 53)]], name)
+
+    def test_home_network_names_get_no_such_name_when_the_router_is_unknown(self):
+        resp = self.ask(query("printer.lan"))
+        self.assertEqual(resp[3] & 15, 3)                           # "no such name"
+        self.assertEqual(self.sent_to, [])
+
+    def test_reverse_lookups_of_private_addresses_go_to_the_router(self):
+        server.S.router = "192.168.1.1"
+        self.ask(query("23.1.168.192.in-addr.arpa", qtype=12))
+        self.assertEqual(self.sent_to, [[("192.168.1.1", 53)]])
+
+    def test_reverse_lookups_of_public_addresses_still_go_to_the_internet(self):
+        server.S.router = "192.168.1.1"
+        self.ask(query("8.8.8.8.in-addr.arpa", qtype=12))
+        self.assertEqual(self.sent_to, [None])
+
+    def test_home_network_names_are_not_recorded(self):
+        server.S.router = "192.168.1.1"
+        for name in ("printer.local", "1.1.168.192.in-addr.arpa"):
+            self.ask(query(name))
         self.assertEqual(drain_log(), [])
 
-    def test_home_network_names_still_work_during_the_kill_switch(self):
+    def test_a_home_network_name_from_the_router_itself_is_not_sent_back_to_it(self):
+        server.S.router = "192.168.1.1"
+        resp = self.ask(query("printer.lan"), client="192.168.1.1")
+        self.assertEqual(resp[3] & 15, 3)
+        self.assertEqual(self.sent_to, [])
+
+    def test_this_computer_is_never_used_as_the_router(self):
+        server.S.local_ip = "192.168.1.60"
+        server.S.router = "192.168.1.60"
+        self.assertIsNone(server.home_router())
+
+    def test_the_router_address_is_looked_up_once_and_remembered(self):
+        server.S.router_checked = None
+        with mock.patch.object(server.enforcer, "interface_and_gateway",
+                               return_value=("eth0", "192.168.1.254")) as look:
+            self.assertEqual(server.home_router(), "192.168.1.254")
+            self.assertEqual(server.home_router(), "192.168.1.254")
+        self.assertEqual(look.call_count, 1)
+
+    def test_which_reverse_lookups_count_as_private(self):
+        private = ("1.0.0.10.in-addr.arpa", "1.0.20.172.in-addr.arpa", "5.4.168.192.in-addr.arpa",
+                   "1.0.254.169.in-addr.arpa", "1.0.0.127.in-addr.arpa", "168.192.in-addr.arpa",
+                   "1.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.8.e.f.ip6.arpa",
+                   "1.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.d.f.ip6.arpa")
+        public = ("8.8.8.8.in-addr.arpa", "1.0.32.172.in-addr.arpa", "1.0.15.172.in-addr.arpa",
+                  "1.1.1.1.in-addr.arpa", "192.in-addr.arpa", "1.0.0.0.8.b.d.0.1.0.0.2.ip6.arpa",
+                  "1.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.c.e.f.ip6.arpa")
+        for name in private:
+            self.assertTrue(server.is_private_reverse(name), name)
+        for name in public:
+            self.assertFalse(server.is_private_reverse(name), name)
+
+    def test_home_network_names_are_answered_here_during_the_kill_switch(self):
+        server.S.router = "192.168.1.1"
         server.set_internet_off("all", True)
-        resp = server.answer_query(query("printer.local"), KID, fake_answer)
-        self.assertEqual(resp[-4:], bytes([93, 184, 216, 34]))
+        resp = self.ask(query("printer.local"))
+        self.assertEqual(resp[-4:], bytes(4))                       # the blocked answer
+        self.assertEqual(self.sent_to, [])
 
-    def test_a_packet_we_cannot_read_is_handed_on_untouched(self):
-        junk = b"\x12\x34not a dns packet"
-        seen = []
-        self.assertEqual(server.answer_query(junk, KID, lambda d: seen.append(d) or b"reply"), b"reply")
-        self.assertEqual(seen, [junk])
+    def test_names_with_odd_characters_are_not_passed_on_during_the_kill_switch(self):
+        server.set_internet_off("all", True)
+        high_byte = (b"\x42\x42\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00" + b"\x03a\xbcb\x06tunnel\x07example\x03com\x00"
+                     + b"\x00\x01\x00\x01")
+        for data in (query("ab+c.tunnel.example.com"), high_byte):
+            resp = self.ask(data)
+            self.assertEqual(resp[-4:], bytes(4))
+        self.assertEqual(self.sent_to, [])
+
+    def test_reverse_lookups_are_not_passed_on_while_a_devices_internet_is_off(self):
+        server.set_internet_off("device:" + KID, True)
+        self.ask(query("x.1.0.0.0.ip6.arpa"))
+        self.assertEqual(self.sent_to, [])
+
+    def test_odd_names_are_not_passed_on_during_an_all_internet_schedule(self):
+        self.schedule(start="00:00", end="23:59")
+        self.ask(query("evil.home"))
+        self.assertEqual(self.sent_to, [])
+
+    def test_odd_names_are_still_passed_on_when_the_internet_is_on(self):
+        resp = self.ask(query("ab+c.example.com"))
+        self.assertEqual(resp[-4:], bytes([93, 184, 216, 34]))
+        self.assertEqual(self.sent_to, [None])
+
+    def test_odd_names_from_this_computer_are_passed_on_during_the_kill_switch(self):
+        server.set_internet_off("all", True)
+        self.ask(query("ab+c.example.com"), client="127.0.0.1")
+        self.assertEqual(self.sent_to, [None])
+
+    def test_a_packet_we_cannot_read_gets_a_format_error_and_is_never_passed_on(self):
+        junk = b"\x12\x34\x01\x00 not a dns packet"
+        resp = self.ask(junk)
+        self.assertEqual(resp[:2], b"\x12\x34")                     # same id
+        self.assertEqual(resp[3] & 15, 1)                           # "format error"
+        self.assertEqual(self.sent_to, [])
         self.assertEqual(drain_log(), [])
+
+    def test_a_packet_too_short_for_a_header_gets_no_answer(self):
+        self.assertIsNone(self.ask(b"\x12\x34abc"))
+        self.assertEqual(self.sent_to, [])
+
+    def test_an_unreadable_reply_sent_to_us_gets_no_answer(self):
+        # Answering replies with errors could set two servers bouncing packets between them.
+        self.assertIsNone(self.ask(b"\x12\x34\x81\x80 not a dns packet"))
 
     def test_addresses_handed_out_are_remembered_for_the_enforcer(self):
         server.answer_query(query("www.bbc.co.uk"), KID, fake_answer)
@@ -492,6 +597,37 @@ class Limits(unittest.TestCase):
             with self.assertRaises(KeyboardInterrupt):
                 server.udp_server(sock)
         self.assertEqual(len(submitted), 2)                      # the rest were dropped, not queued
+
+    def test_one_device_cannot_take_more_than_its_share_of_udp_slots(self):
+        sock = mock.Mock()
+        greedy = [(query("n%d.example.com" % i), ("192.168.1.23", 5000 + i)) for i in range(5)]
+        other = [(query("www.bbc.co.uk"), ("192.168.1.40", 6000))]
+        sock.recvfrom.side_effect = greedy + other + [KeyboardInterrupt()]
+        submitted = []
+        pool = mock.Mock(submit=lambda fn, data, addr: submitted.append(addr[0]))
+        with mock.patch.object(server, "MAX_DNS_PER_DEVICE", 2), \
+                mock.patch.object(server, "ThreadPoolExecutor", lambda max_workers: pool):
+            with self.assertRaises(KeyboardInterrupt):
+                server.udp_server(sock)
+        self.assertEqual(submitted, ["192.168.1.23", "192.168.1.23", "192.168.1.40"])
+
+    def test_a_device_gets_its_share_back_once_its_lookups_are_answered(self):
+        sock = mock.Mock()
+        incoming = [(query("n%d.example.com" % i), ("192.168.1.23", 5000 + i)) for i in range(4)]
+        sock.recvfrom.side_effect = incoming + [KeyboardInterrupt()]
+        submitted = []
+
+        def run_now(fn, data, addr):
+            """Answer each lookup straight away, as if the pool had a free worker."""
+            submitted.append(addr)
+            fn(data, addr)
+        pool = mock.Mock(submit=run_now)
+        with mock.patch.object(server, "MAX_DNS_PER_DEVICE", 1), \
+                mock.patch.object(server, "answer_query", return_value=None), \
+                mock.patch.object(server, "ThreadPoolExecutor", lambda max_workers: pool):
+            with self.assertRaises(KeyboardInterrupt):
+                server.udp_server(sock)
+        self.assertEqual(len(submitted), 4)
 
 
 if __name__ == "__main__":
