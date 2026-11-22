@@ -80,6 +80,14 @@ class EnforcerCase(unittest.TestCase):
             p = mock.patch.object(enforcer, name, fake)
             p.start()
             self.addCleanup(p.stop)
+        # Which firewall tools are installed, as the enforcer would find them - never the real
+        # machine's: a Linux CI runner has nft and iptables, a Mac has neither, and the commands
+        # the enforcer sends depend on it. Tests that need a tool present say so with self.tools.
+        self.tools = set()
+        p = mock.patch.object(enforcer.shutil, "which",
+                              lambda tool: "/usr/sbin/" + tool if tool in self.tools else None)
+        p.start()
+        self.addCleanup(p.stop)
         p = mock.patch.object(enforcer.subprocess, "run", run)
         p.start()
         self.addCleanup(p.stop)
