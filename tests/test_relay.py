@@ -8,6 +8,7 @@ a throwaway data folder, and a pretend Pi answers its calls. Nothing leaves this
 """
 import http.client
 import json
+import socket
 import os
 import sys
 import tempfile
@@ -114,7 +115,7 @@ class RelayCase(unittest.TestCase):
             _, text, _ = pi.get("/agent/poll", headers={"X-QuietNet-Token": token})
             seen.update(json.loads(text))
             pi.post("/agent/respond", data={"id": seen.get("id"), "status": status, "body": body},
-                    headers={"X-QuietNet-Token": token})
+                    headers={"X-QuietNet-Token": token, "X-QuietNet-Call": str(seen.get("id"))})
 
         t = threading.Thread(target=work, daemon=True)
         t.start()
@@ -183,7 +184,7 @@ class BridgeLogic(unittest.TestCase):
         def pi():
             call = self.bridge.poll("pi-1")
             got.update(call)
-            self.bridge.respond(call["id"], {"status": 200, "body": "hello"})
+            self.bridge.respond("pi-1", call["id"], {"status": 200, "body": "hello"})
 
         t = threading.Thread(target=pi, daemon=True)
         t.start()
@@ -230,8 +231,23 @@ class BridgeLogic(unittest.TestCase):
         self.assertEqual(self.bridge.waiting, {})
 
     def test_an_answer_to_an_unknown_call_is_ignored(self):
-        self.bridge.respond("no-such-call", {"status": 200, "body": ""})   # must not raise
+        self.bridge.respond("pi-1", "no-such-call", {"status": 200, "body": ""})   # must not raise
         self.assertEqual(self.bridge.waiting, {})
+
+    def test_a_pi_cannot_answer_a_call_sent_to_another_pi(self):
+        got = {}
+
+        def pis():
+            call = self.bridge.poll("pi-1")
+            self.bridge.respond("pi-2", call["id"], {"status": 200, "body": "forged"})   # the wrong Pi
+            self.bridge.respond("pi-1", call["id"], {"status": 200, "body": "real"})
+            got["done"] = True
+
+        t = threading.Thread(target=pis, daemon=True)
+        t.start()
+        resp = self.bridge.call("pi-1", {"method": "GET", "path": "/api/status"})
+        t.join(5)
+        self.assertEqual(resp, {"status": 200, "body": "real"})
 
 
 # ------------------------------------------------------------------ accounts
@@ -575,6 +591,71 @@ class GuessLimits(RelayCase):
         self.assertEqual(status, 429)
         self.assertIn("Too many attempts", text)
 
+    def known_marker(self, email="lewis@example.com"):
+        """Sign in properly once and return the 'signed in here before' cookie it set."""
+        _, _, r = Browser(self.port).post("/login", form={"email": email, "password": PASSWORD})
+        for name, value in r.getheaders():
+            if name.lower() == "set-cookie" and value.startswith("qn_known="):
+                return value.split(";")[0]
+        self.fail("no qn_known cookie was set")
+
+    def test_a_browser_that_signed_in_before_is_not_locked_out_by_strangers(self):
+        self.signed_in()
+        marker = self.known_marker()
+        for _ in range(relay.LOGIN_LIMIT_PER_EMAIL[0]):
+            self.login()                                         # a stranger, guessing on purpose
+        self.assertEqual(self.login(password=PASSWORD)[0], 429)  # an unknown browser still has to wait...
+        status, _, _ = Browser(self.port).post("/login", form={"email": "lewis@example.com", "password": PASSWORD},
+                                               headers={"Cookie": marker})
+        self.assertEqual(status, 303)                            # ...but the owner's own browser gets in
+
+    def test_the_known_browser_marker_still_needs_the_right_password(self):
+        self.signed_in()
+        marker = self.known_marker()
+        status, text, _ = Browser(self.port).post("/login", form={"email": "lewis@example.com", "password": "wrong"},
+                                                  headers={"Cookie": marker})
+        self.assertEqual(status, 200)
+        self.assertIn("Wrong email or password", text)
+
+    def test_one_accounts_marker_does_not_help_with_another_account(self):
+        self.signed_in()
+        self.signed_in("hannah@example.com")
+        marker = self.known_marker()                             # lewis's
+        for _ in range(relay.LOGIN_LIMIT_PER_EMAIL[0]):
+            self.login("hannah@example.com")
+        status, _, _ = Browser(self.port).post("/login", form={"email": "hannah@example.com", "password": PASSWORD},
+                                               headers={"Cookie": marker})
+        self.assertEqual(status, 429)
+
+    def test_a_known_browser_has_its_own_cap_on_wrong_guesses(self):
+        self.signed_in()
+        marker = self.known_marker()
+        self.limit("LOGIN_LIMIT_KNOWN_BROWSER", (3, 600))
+        for _ in range(3):
+            Browser(self.port).post("/login", form={"email": "lewis@example.com", "password": "wrong"},
+                                    headers={"Cookie": marker})
+        status, _, _ = Browser(self.port).post("/login", form={"email": "lewis@example.com", "password": PASSWORD},
+                                               headers={"Cookie": marker})
+        self.assertEqual(status, 429)
+
+    def test_changing_the_password_makes_old_markers_useless(self):
+        self.signed_in()
+        marker = self.known_marker()
+        relay.sql("UPDATE users SET pw=? WHERE email=?", (relay.hash_pw("a new password", rounds=1000),
+                                                          "lewis@example.com"), commit=True)
+        for _ in range(relay.LOGIN_LIMIT_PER_EMAIL[0]):
+            self.login()
+        status, _, _ = Browser(self.port).post("/login", form={"email": "lewis@example.com", "password": "a new password"},
+                                               headers={"Cookie": marker})
+        self.assertEqual(status, 429)            # the old marker no longer lets it past the limit
+
+    def test_signing_out_forgets_the_browser(self):
+        b = self.signed_in()
+        _, _, r = b.get("/logout")
+        cleared = [v for k, v in r.getheaders() if k.lower() == "set-cookie" and v.startswith("qn_known=;")]
+        self.assertTrue(cleared)
+        self.assertIn("Max-Age=0", cleared[0])
+
     def test_one_accounts_lock_does_not_affect_another(self):
         self.signed_in()
         self.signed_in("hannah@example.com")
@@ -717,12 +798,55 @@ class SignupSwitch(RelayCase):
 class OversizedAndOddInput(RelayCase):
     API = {"X-QuietNet": "1"}
 
+    def test_a_connection_that_stalls_is_dropped(self):
+        # Otherwise anyone could tie up the relay's threads by sending a request very slowly.
+        self.addCleanup(setattr, relay.Relay, "timeout", relay.Relay.timeout)
+        relay.Relay.timeout = 0.5
+        with socket.create_connection(("127.0.0.1", self.port), timeout=5) as s:
+            s.sendall(b"POST /login HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\nemail=")
+            started = time.time()
+            try:
+                while s.recv(4096):
+                    pass
+            except OSError:
+                pass
+        self.assertLess(time.time() - started, 4)
+
     def test_an_oversized_body_is_not_read_or_relayed(self):
         b = self.signed_in()
         pid, token = self.paired_pi(b)
         big = {"domain": "x" * (relay.MAX_BODY + 1)}
         self.assertEqual(b.post("/pi/%s/api/block" % pid, data=big, headers=self.API)[0], 413)
         self.assertEqual(relay.bridge.queues.get(pid, []), [])
+
+    def test_a_paired_pi_may_send_back_a_large_answer(self):
+        # A week of a busy device's history is far bigger than the 64 KB limit on everything else.
+        b = self.signed_in()
+        pid, token = self.paired_pi(b)
+        big = json.dumps({"hosts": ["n%d.example.com" % i for i in range(20000)]})
+        self.assertGreater(len(big), relay.MAX_BODY)
+        t, _ = self.pretend_pi(token, body=big)
+        status, text, _ = b.get("/pi/%s/api/activity" % pid, headers=self.API)
+        t.join(5)
+        self.assertEqual(status, 200)
+        self.assertEqual(text, big)
+
+    def test_a_large_answer_is_only_read_for_a_call_that_is_waiting(self):
+        # Anyone can pair a Pi of their own, so a valid token alone mustn't open the 16 MB door.
+        b = self.signed_in()
+        pid, token = self.paired_pi(b)
+        payload = {"id": "not-a-real-call", "status": 200, "body": "x" * (relay.MAX_BODY + 1)}
+        try:
+            status = Browser(self.port).post("/agent/respond", data=payload,
+                                             headers={"X-QuietNet-Token": token, "X-QuietNet-Call": "not-a-real-call"})[0]
+        except OSError:
+            status = 413                         # refused before the upload finished: also a refusal
+        self.assertEqual(status, 413)
+
+    def test_a_stranger_cannot_send_a_large_answer(self):
+        payload = {"id": "x", "status": 200, "body": "x" * (relay.MAX_BODY + 1)}
+        status, _, _ = Browser(self.port).post("/agent/respond", data=payload, headers={"X-QuietNet-Token": "nope"})
+        self.assertEqual(status, 401)
 
     def test_an_oversized_form_is_treated_as_empty(self):
         status, text, _ = Browser(self.port).post(

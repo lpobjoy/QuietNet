@@ -2,9 +2,12 @@
 # It installs NOTHING from the internet: QuietNet uses only the Python standard library.
 FROM python:3.13-slim
 
-# The only system tool QuietNet needs: the kernel's own firewall, used by the
-# live-connection enforcer to drop blocked traffic. (No Python packages are installed.)
-RUN apt-get update && apt-get install -y --no-install-recommends nftables \
+# The only system tools QuietNet needs: the kernel's own firewall, used by the
+# live-connection enforcer to drop blocked traffic (nftables), and the older iptables
+# commands, used only to *read* the Pi's other firewall rules - Docker on some Pis keeps its
+# rules where nft can't see them, and steering into a firewall we can't see could cut a
+# device off. (No Python packages are installed.)
+RUN apt-get update && apt-get install -y --no-install-recommends nftables iptables \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -13,6 +16,8 @@ COPY static ./static
 
 # History and your rules live here. Mount a volume so they survive restarts.
 ENV QUIETNET_DATA=/data
+# Show messages in "docker logs" straight away rather than holding them back.
+ENV PYTHONUNBUFFERED=1
 VOLUME ["/data"]
 
 # 53 = the DNS filter devices point at; 8377 = the dashboard.

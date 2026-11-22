@@ -66,9 +66,18 @@ A normal block only stops a device *finding* an address. If a Disney+ stream is 
 When you turn on **Cut live connections** for a device (on that device's page), QuietNet — running on the Raspberry Pi — tells that device "I am the router", so the device's traffic flows through the Pi. The Pi forwards everything as normal **except** packets heading for an address that's blocked for that device, which it drops. So a blocked Disney+ stream dies within seconds, bedtime and the kill switch become instant for that device, and everything else it does is untouched.
 
 - **Raspberry Pi / Linux only.** It uses the Pi's network directly, so it needs the container's `NET_RAW` and `NET_ADMIN` privileges (already set in `docker-compose.yml`) or to run as root. On a Mac it simply reports itself off, and ordinary DNS blocking still applies.
-- **Opt-in per device.** It only ever touches devices you switch it on for, and it restores the network cleanly when switched off or stopped.
+- **One-time Pi setting.** The Pi must be allowed to pass traffic on, which a container can't switch on by itself. Run this once on the Pi:
+
+  ```bash
+  echo net.ipv4.ip_forward=1 | sudo tee /etc/sysctl.d/90-quietnet.conf && sudo sysctl --system
+  ```
+
+  If it's missing — or another firewall on the Pi (often Docker's own) would drop the traffic — QuietNet **won't steer** the device rather than cut it off, and the device's page says exactly what to run.
+- **Opt-in per device.** It only ever touches devices you switch it on for — never the router, the Pi itself, or anything outside your home network — and hands each device straight back to the router when you switch it off. If a different device later gets the same network number, it's left alone.
+- **Safe if stopped suddenly.** `docker stop`, a restart or a crash all end with devices handed back to the router: QuietNet notes what it changed, and puts it back first thing at its next start if it didn't get the chance.
 - **Works best when the device uses QuietNet for DNS** (the normal setup), because that's how QuietNet learns which addresses belong to Disney+, Fortnite and so on.
-- **It blocks by address.** If a blocked service shares an address with something else (big content networks sometimes do), that other thing can be affected too. Switching the enforcer off for the device removes all of this instantly.
+- **It cuts by address, for things you chose:** blocked services, schedules, the internet switch, the kill switch and addresses you blocked yourself. The advert list isn't enforced this way, because advert addresses are often shared with ordinary sites. If a blocked service shares an address with something else (big content networks sometimes do), that other thing can be affected too. Switching the enforcer off for the device removes all of this instantly.
+- **IPv4 only.** A device that also uses IPv6 can keep connections made that way; DNS blocking still applies to it.
 - Everyone on the network should know it's in use — it steers a device's traffic through the Pi.
 
 ## Reach it from anywhere (optional)
