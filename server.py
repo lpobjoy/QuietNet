@@ -53,6 +53,11 @@ COMMUNITY_FILE = os.path.join(DATA, "community_list.txt")
 COMMUNITY_URL = "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts"
 UPSTREAMS = [("1.1.1.1", 53), ("8.8.8.8", 53)]
 KEEP_DAYS = 30
+MAX_HISTORY_ROWS = 2_000_000   # history is also capped by size, so a chatty device can't fill the SD card
+MAX_DNS_WAITING = 256          # lookups being answered at once; beyond this new ones are dropped (devices retry)
+MAX_TCP_CLIENTS = 64           # DNS-over-TCP connections open at once
+TCP_DEADLINE = 8               # seconds a TCP client gets to send its whole question
+RESOLVED_HOURS = 6             # how long we remember which addresses a name pointed to
 MAX_BODY = 64 * 1024   # the largest request body the dashboard API will read; real ones are a few hundred bytes
 MAX_TTL = 120   # seconds a device may remember an answer, so new blocks and schedules bite within ~2 minutes
 CLOCK = re.compile(r"([01]\d|2[0-3]):[0-5]\d")
@@ -137,6 +142,7 @@ class State:
     svc_blocks = {}         # scope -> set of blocked service ids
     off = set()             # scopes whose internet is switched off
     enforced = set()        # device ips we actively enforce (cut live connections for)
+    enforced_mac = {}       # device ip -> its hardware address when enforcing was switched on ('' = not yet known)
     resolved = {}           # domain -> {ip: last-seen} : the addresses we've handed out
     dev_group = {}          # device ip -> group id
     group_names = {}        # group id -> name
@@ -208,7 +214,13 @@ def init_db():
     S.group_names = dict(sql("SELECT id, name FROM groups"))
     S.dev_group = dict(sql("SELECT ip, gid FROM device_group"))
     S.off = {r[0] for r in sql("SELECT scope FROM internet_off")}
-    S.enforced = {r[0] for r in sql("SELECT ip FROM enforced")}
+    try:
+        db.execute("ALTER TABLE enforced ADD COLUMN mac TEXT")    # added after 0.5; older databases lack it
+        db.commit()
+    except sqlite3.OperationalError:
+        pass                                                       # already there
+    S.enforced_mac = {ip: mac or "" for ip, mac in sql("SELECT ip, mac FROM enforced")}
+    S.enforced = set(S.enforced_mac)
     S.svc_blocks = {}
     for scope, service in sql("SELECT scope, service FROM service_blocks"):
         S.svc_blocks.setdefault(scope, set()).add(service)
@@ -233,8 +245,8 @@ def log_writer():
     """Background thread: move recorded lookups from the queue into the database.
 
     The DNS path only puts a tuple on log_q, so answering a lookup never waits for the disk.
-    This thread gathers a second's worth and saves them in one go. Once an hour it also deletes
-    history older than KEEP_DAYS."""
+    This thread gathers a second's worth and saves them in one go. Every ten minutes it also trims
+    the history (see prune_history)."""
     last_prune = 0
     while True:
         batch = [log_q.get()]
@@ -244,12 +256,36 @@ def log_writer():
         try:
             with db_lock:
                 db.executemany("INSERT INTO queries(ts,client,domain,blocked) VALUES(?,?,?,?)", batch)
-                if time.time() - last_prune > 3600:
-                    db.execute("DELETE FROM queries WHERE ts<?", (time.time() - KEEP_DAYS * 86400,))
-                    last_prune = time.time()
                 db.commit()
+            if time.time() - last_prune > 600:
+                prune_history()
+                last_prune = time.time()
         except sqlite3.Error as e:
             print("Could not save history:", e)
+
+
+PRUNE_BATCH = 5000      # rows deleted per step when trimming history
+
+
+def prune_history():
+    """Delete history older than KEEP_DAYS, and the oldest rows beyond MAX_HISTORY_ROWS - so one
+    device making endless made-up lookups can't fill the SD card.
+
+    Deletes PRUNE_BATCH rows at a time, letting go of db_lock between steps. The first trim after
+    an upgrade can mean millions of rows; done in one go on an SD card, that would hold the lock
+    for many seconds, and every DNS answer (which records addresses under the same lock) would
+    wait. Call it without holding db_lock."""
+    cutoff_ts = time.time() - KEEP_DAYS * 86400
+    while True:
+        with db_lock:
+            top = db.execute("SELECT MAX(id) FROM queries").fetchone()[0] or 0
+            n = db.execute("""DELETE FROM queries WHERE id IN (
+                                  SELECT id FROM queries WHERE ts<? OR id<=? ORDER BY id LIMIT ?)""",
+                           (cutoff_ts, top - MAX_HISTORY_ROWS, PRUNE_BATCH)).rowcount
+            db.commit()
+        if n < PRUNE_BATCH:
+            return
+        time.sleep(0.05)                     # give the DNS path a turn at the lock
 
 
 # ------------------------------------------------------------------ rules
@@ -565,8 +601,9 @@ def answer_ips(resp):
 
 def record_resolved(domain, resp):
     """Remember which addresses a name was just given, with the time. The enforcer uses
-    this to know which addresses to drop when a name is blocked. Capped at 4,000 names; when
-    full, the 1,000 least recently seen are forgotten."""
+    this to know which addresses to drop when a name is blocked. Addresses older than
+    RESOLVED_HOURS are forgotten, and at most 64 are kept per name (some names rotate through
+    hundreds). Capped at 4,000 names; when full, the 1,000 least recently seen are forgotten."""
     ips = answer_ips(resp)
     if not ips:
         return
@@ -575,27 +612,59 @@ def record_resolved(domain, resp):
         m = S.resolved.setdefault(domain, {})
         for ip in ips:
             m[ip] = now
+        for ip in [ip for ip, ts in m.items() if now - ts > RESOLVED_HOURS * 3600]:
+            del m[ip]
+        if len(m) > 64:
+            for ip in sorted(m, key=m.get)[:len(m) - 64]:
+                del m[ip]
         if len(S.resolved) > 4000:                     # keep memory bounded: drop the stalest names
-            for d in sorted(S.resolved, key=lambda d: max(S.resolved[d].values()))[:1000]:
+            for d in sorted(S.resolved, key=lambda d: max(S.resolved[d].values(), default=0))[:1000]:
                 S.resolved.pop(d, None)
+
+
+# Why a name is blocked -> whether the enforcer also cuts its addresses. The advert list is left
+# out: advert and tracker names often share addresses with ordinary sites (the same front doors
+# serve Google search and Google's adverts), so cutting by address would break those sites too.
+ENFORCE_WHY = ("you", "service", "schedule")
+
+
+def learn_enforced_mac(ip, mac):
+    """The enforcer has seen an enforced device's hardware address for the first time: remember it,
+    so that if the address is later handed to a different device, that device is left alone."""
+    with db_lock:
+        if ip in S.enforced and not S.enforced_mac.get(ip):
+            S.enforced_mac[ip] = mac
+            db.execute("UPDATE enforced SET mac=? WHERE ip=?", (mac, ip))
+            db.commit()
 
 
 def enforcement_plan():
     """What the enforcer should drop, per enforced device: reuses the normal rules.
-    {victim_ip: {"off": all-internet?, "ips": {addresses to drop}}}"""
-    if not S.enforced:
+    {victim_ip: {"off": all-internet?, "ips": {addresses to drop}, "mac": hardware address or ''}}
+
+    'off' covers the kill switch, the device's internet switch and an 'all internet' schedule.
+    Otherwise the addresses of names blocked by you, by a service block or by a schedule are cut.
+    Pausing advert blocking pauses it here too."""
+    with db_lock:                                      # copies: other threads change these while we work
+        victims = {ip: S.enforced_mac.get(ip, "") for ip in S.enforced}
+        resolved = {d: dict(m) for d, m in S.resolved.items()}
+    if not victims:
         return {}
     now = time.time()
+    paused = now < S.paused_until
     plan = {}
-    for victim in list(S.enforced):                    # a copy: the dashboard may change the set while we loop
-        if internet_off_for(victim) or "all" in S.off:
-            plan[victim] = {"off": True, "ips": set()}
+    for victim, mac in victims.items():
+        # A made-up name only comes back blocked for one of the 'everything' reasons.
+        blocked, why, _ = decision("quietnet.invalid", victim, paused)
+        if blocked and why in ("kill", "off", "schedule"):
+            plan[victim] = {"off": True, "ips": set(), "mac": mac}
             continue
         ips = set()
-        for domain, ipmap in list(S.resolved.items()):
-            if decision(domain, victim)[0]:
-                ips.update(ip for ip, ts in ipmap.items() if now - ts < 6 * 3600 and ":" not in ip)
-        plan[victim] = {"off": False, "ips": ips}
+        for domain, ipmap in resolved.items():
+            blocked, why, _ = decision(domain, victim, paused)
+            if blocked and why in ENFORCE_WHY:
+                ips.update(ip for ip, ts in ipmap.items() if now - ts < RESOLVED_HOURS * 3600 and ":" not in ip)
+        plan[victim] = {"off": False, "ips": ips, "mac": mac}
     return plan
 
 
@@ -656,11 +725,24 @@ def forward_udp(data):
                 s.send(data)
                 while True:
                     resp = s.recv(4096)
-                    if resp[:2] == data[:2]:
+                    if same_question(data, resp):
                         return resp
         except OSError:
             continue
     return None
+
+
+def same_question(query, resp):
+    """Is this reply an answer to this query: the same two-byte id and, when the query can be
+    read, the same question? Checking the question as well means a forged reply must also guess
+    exactly what was asked. Letter case is ignored, since some servers change it."""
+    if resp[:2] != query[:2]:
+        return False
+    q = parse_question(query)
+    if not q:
+        return True
+    end = q[2]
+    return len(resp) >= end and resp[12:end].lower() == query[12:end].lower()
 
 
 def forward_tcp(data):
@@ -677,10 +759,17 @@ def forward_tcp(data):
     return None
 
 
-def recv_exact(s, n):
-    """Read exactly n bytes from a connection, or raise ValueError if it closes first."""
+def recv_exact(s, n, deadline=None):
+    """Read exactly n bytes from a connection, or raise ValueError if it closes first - or, when a
+    deadline (a time.monotonic() value) is given, if the bytes haven't all arrived by then. The
+    deadline stops a client keeping a thread busy by sending one byte every few seconds."""
     buf = b""
     while len(buf) < n:
+        if deadline is not None:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                raise ValueError("too slow")
+            s.settimeout(left)
         chunk = s.recv(n - len(buf))
         if not chunk:
             raise ValueError("connection closed")
@@ -714,8 +803,12 @@ def answer_query(data, client, forwarder):
 
 def udp_server(sock):
     """Receive lookups on the UDP socket for ever, handing each to a pool of 64 worker
-    threads so that one slow upstream answer does not hold up the rest."""
+    threads so that one slow upstream answer does not hold up the rest. At most
+    MAX_DNS_WAITING are in hand at once; beyond that, new lookups are dropped rather than
+    queued without limit (a flood from one device, or the internet being down). Devices
+    simply ask again."""
     pool = ThreadPoolExecutor(max_workers=64)
+    slots = threading.BoundedSemaphore(MAX_DNS_WAITING)
 
     def work(data, addr):
         """Answer one lookup and send the reply back to the device that asked."""
@@ -725,24 +818,28 @@ def udp_server(sock):
                 sock.sendto(resp, addr)
         except Exception as e:
             print("Lookup problem:", e)
+        finally:
+            slots.release()
 
     while True:
         try:
             data, addr = sock.recvfrom(4096)
         except OSError:
             continue
-        pool.submit(work, data, addr)
+        if slots.acquire(blocking=False):
+            pool.submit(work, data, addr)
 
 
 class TCPHandler(socketserver.BaseRequestHandler):
     """Handles one DNS lookup that arrived over TCP (one lookup per connection)."""
     def handle(self):
         """Read the two-byte length and the question, answer it, send the reply the same way.
-        A connection that stalls for 5 seconds is dropped."""
+        The whole question must arrive within TCP_DEADLINE seconds."""
         try:
-            self.request.settimeout(5)
-            n = int.from_bytes(recv_exact(self.request, 2), "big")
-            data = recv_exact(self.request, n)
+            deadline = time.monotonic() + TCP_DEADLINE
+            n = int.from_bytes(recv_exact(self.request, 2, deadline), "big")
+            data = recv_exact(self.request, n, deadline)
+            self.request.settimeout(10)
             resp = answer_query(data, self.client_address[0], forward_tcp)
             if resp:
                 self.request.sendall(len(resp).to_bytes(2, "big") + resp)
@@ -751,9 +848,33 @@ class TCPHandler(socketserver.BaseRequestHandler):
 
 
 class TCPServer(socketserver.ThreadingTCPServer):
-    """The TCP side of the DNS filter: one short-lived thread per connection."""
+    """The TCP side of the DNS filter: one short-lived thread per connection, and at most
+    MAX_TCP_CLIENTS connections at once (more are turned away)."""
     allow_reuse_address = True
     daemon_threads = True
+
+    def __init__(self, *args, **kw):
+        """As usual, plus the count of connections in hand."""
+        self.slots = threading.BoundedSemaphore(MAX_TCP_CLIENTS)
+        super().__init__(*args, **kw)
+
+    def process_request(self, request, client_address):
+        """Take a slot for this connection, or close it straight away if there are none left."""
+        if not self.slots.acquire(blocking=False):
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            self.slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        """Handle the connection, then give its slot back."""
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self.slots.release()
 
 
 def start_dns(port):
@@ -1123,6 +1244,24 @@ class Web(BaseHTTPRequestHandler):
         self.send_error(403)
         return False
 
+    def json_from_our_page(self):
+        """True if a change request is JSON and, when the browser says which page sent it, that page
+        is on this computer.
+
+        The type must be exactly application/json (extra settings after a ';' are allowed). A
+        looser 'contains application/json' check let a hostile page send
+        'text/plain; application/json', which browsers treat as plain text and send to another
+        site without asking. Any localhost port is accepted as the sender, since an SSH tunnel to a
+        Pi may use a different one."""
+        ctype = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+        if ctype != "application/json":
+            return False
+        origin = self.headers.get("Origin")
+        if origin is None:
+            return True
+        o = urlparse(origin)
+        return o.scheme == "http" and o.hostname in ("localhost", "127.0.0.1")
+
     def send_json(self, obj, code=200):
         """Send `obj` as a JSON answer with the given status."""
         body = json.dumps(obj).encode()
@@ -1195,7 +1334,7 @@ class Web(BaseHTTPRequestHandler):
         raw = self.rfile.read(length) if 0 <= length <= MAX_BODY else None
         if not self.local_only():
             return
-        if "application/json" not in (self.headers.get("Content-Type") or ""):
+        if not self.json_from_our_page():
             return self.send_error(415)
         if raw is None:
             return self.send_error(413 if length > MAX_BODY else 400)
@@ -1207,6 +1346,8 @@ class Web(BaseHTTPRequestHandler):
             return self.send_error(400)
         try:
             self.handle_post(urlparse(self.path).path, body)
+            if ENF:
+                ENF.poke()                        # a rule may have changed: let the enforcer act on it now
         except (TypeError, ValueError, AttributeError, KeyError, sqlite3.Error):
             # A value of the wrong kind (a list where a number belongs, say) that a handler did not
             # expect. Nothing has been sent yet at this point, so answer with a clean refusal
@@ -1259,14 +1400,31 @@ class Web(BaseHTTPRequestHandler):
                 ip = str(ipaddress.IPv4Address(body["ip"]))
             except ValueError:
                 return self.send_error(400)
-            with db_lock:
-                if body.get("on"):
+            if body.get("on"):
+                # Only an ordinary device on the home network: never the router, this computer,
+                # or anything outside. (Without the enforcer, only the basic checks can be made.)
+                problem = (ENF.can_target(ip) if ENF and ENF.available()
+                           else enforcer.target_problem(ip, None, None, S.local_ip))
+                if problem:
+                    return self.send_json({"error": problem}, 400)
+                # Remember which device this is, so if the address is later given to a different
+                # device, that one isn't steered by mistake. The live table first: the last scan's
+                # record may be out of date. If neither knows yet, the enforcer fills it in later.
+                mac = neighbours().get(ip, "")
+                if not mac:
+                    row = sql("SELECT mac FROM seen WHERE ip=?", (ip,))
+                    mac = row[0][0] if row and row[0][0] else ""
+                with db_lock:
                     S.enforced.add(ip)
-                    db.execute("INSERT OR IGNORE INTO enforced VALUES(?)", (ip,))
-                else:
+                    S.enforced_mac[ip] = mac
+                    db.execute("INSERT OR REPLACE INTO enforced(ip, mac) VALUES(?,?)", (ip, mac))
+                    db.commit()
+            else:
+                with db_lock:
                     S.enforced.discard(ip)
+                    S.enforced_mac.pop(ip, None)
                     db.execute("DELETE FROM enforced WHERE ip=?", (ip,))
-                db.commit()
+                    db.commit()
             return self.send_json({"ok": True})
         if path == "/api/kill":             # the kill switch: stop the internet for every device
             set_internet_off("all", bool(body.get("on")))
@@ -1368,7 +1526,7 @@ def main():
     start_dns(args.dns_port)
 
     global ENF
-    ENF = enforcer.Enforcer(S.local_ip, enforcement_plan, neighbours)
+    ENF = enforcer.Enforcer(S.local_ip, enforcement_plan, neighbours, data_dir=DATA, learn_mac=learn_enforced_mac)
     ENF.start()
     global CA
     CA = cloud_agent.CloudAgent(args.web_port, DATA)

@@ -12,6 +12,7 @@ Listens on `127.0.0.1:8377`.
 
 - The `Host` header must be `localhost` or `127.0.0.1` (a port is allowed). Anything else gets `403`.
 - `POST` requests must have `Content-Type: application/json` (otherwise `415`) and a JSON body (unreadable JSON gets `400`).
+- A change must be sent as exactly `application/json` (a `; charset=…` is fine), or it gets `415`. If the browser sends an `Origin`, it must be `http://localhost` or `http://127.0.0.1` on any port, or it gets `415`.
 - A body larger than 64 KB gets `413`. A body that is JSON but not an object gets `400`.
 - Every answer carries `X-Frame-Options: DENY`, `Content-Security-Policy: frame-ancestors 'none'`, `X-Content-Type-Options: nosniff` and `Referrer-Policy: no-referrer`.
 - Successful changes return `{"ok": true}` unless noted. Refusals with a message return `400` and `{"error": "…"}`. Refusals of badly formed input return a bare `400`.
@@ -32,7 +33,7 @@ A **scope** is `all`, `group:<id>` or `device:<ip>`.
 | `GET /api/schedules` | All schedules, each with `"active"` (in force right now) |
 | `GET /api/controls?scope=<scope>` | Switches for one scope, and what it inherits. `400` if the scope is badly formed |
 | `GET /api/cloud` | Remote access state: `{"configured", "paired", "relay", "name", "state", "detail"}` |
-| `GET /api/enforcer` | `{"available", "reason", "active", "backend", "gateway"}` |
+| `GET /api/enforcer` | `{"available", "reason", "problem", "problems", "active", "backend", "gateway"}`. `problem` says why all steering is paused right now (forwarding off, or another firewall in the way or impossible to check), or `""`. `problems` is `{device address: text}` for devices left alone, e.g. because a different device now has the address |
 
 `/api/status`:
 
@@ -96,7 +97,7 @@ A **scope** is `all`, `group:<id>` or `device:<ip>`.
 | `POST /api/group-delete` | `{"id"}` | Also deletes the group's rules and schedules |
 | `POST /api/device-group` | `{"ip", "group"}` | An unknown or missing group removes the device from its group |
 | `POST /api/device-name` | `{"ip", "name"}` | Name cut to 40 characters |
-| `POST /api/enforce` | `{"ip", "on"}` | "Cut live connections" for one device. Must be a real IPv4 address, as text |
+| `POST /api/enforce` | `{"ip", "on"}` | "Cut live connections" for one device. Must be a real IPv4 address, as text (`400` otherwise). Switching on also refuses, with `400` and `{"error"}`, this computer and addresses that are never devices; when the enforcer is running it also refuses the router and addresses outside the home network. The device's hardware address is recorded so a different device later given the same address is left alone |
 | `POST /api/cloud` | `{"relay", "code"}` or `{"action": "forget"}` | Pair with a relay, or unpair |
 | `POST /api/scan` | `{}` | Starts a network scan in the background |
 | `POST /api/update-list` | `{}` | Starts the community list download in the background |
@@ -115,7 +116,7 @@ Schedule body:
 
 Listens on `$PORT` (default 8080). HTTPS is expected to be provided by the host.
 
-Every answer carries the same four protective headers as the dashboard API, plus `Cache-Control: no-store`. Bodies over 64 KB are not read: a form counts as empty, and a relayed call gets `413`.
+Every answer carries the same four protective headers as the dashboard API, plus `Cache-Control: no-store`. Bodies over 64 KB are not read: a form counts as empty, and a relayed call gets `413`. The one exception is `POST /agent/respond` from a paired Pi answering a call that is waiting for it (named in an `X-QuietNet-Call` header), which may be up to 16 MB; only two such uploads are read at once. A successful sign-in or sign-up also sets a `qn_known` cookie (one year), which gives that browser its own limit on wrong guesses for that account (20 in 15 minutes) instead of the shared ones. It is signed over the password record, so a new password voids it, and `/logout` removes it.
 
 Wrong guesses are limited. When a limit is reached the answer is `429` with "Too many attempts. Please wait a few minutes and try again."
 
@@ -162,6 +163,6 @@ Any other status and body are the Pi's own.
 | --- | --- | --- |
 | `POST /agent/pair` | `{"code"}` | `{"ok", "id", "token"}`, or `400` with `{"error"}`. A code works once and for 15 minutes. `429` after too many wrong codes |
 | `GET /agent/poll` | Header `X-QuietNet-Token` | Waits up to 25 seconds. `{}` if nothing to do, or `{"id", "method", "path", "body"?}`. `401` if the token is not recognised |
-| `POST /agent/respond` | Header `X-QuietNet-Token`; `{"id", "status", "body"}` | `{"ok": true}` |
+| `POST /agent/respond` | Headers `X-QuietNet-Token` and `X-QuietNet-Call` (the call id); `{"id", "status", "body"}`, up to 16 MB | `{"ok": true}`, or `413` if too big. An answer to a call that was sent to a different Pi is ignored |
 
 `body` in both directions is the JSON text as a string, passed through unchanged.

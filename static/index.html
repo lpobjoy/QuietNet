@@ -304,7 +304,8 @@ function enforceCard(d){
     <div style="flex:1;min-width:200px"><h2>Cut live connections${d.enforced ? '<span class="badge junk">On</span>' : ''}</h2>
     <div class="muted small">Normally a block only stops new connections. Turn this on and blocks, bedtimes and the kill switch
       also stop things that are <b>already running</b> on this device (like a Disney+ video mid-stream). QuietNet steers this
-      device through itself and drops only what's blocked for it. Takes a few seconds to bite.</div></div></div></div>`;
+      device through itself and drops only what's blocked for it. Takes a few seconds to bite.</div>
+    ${d.enforced && (e.problem || (e.problems || {})[d.ip]) ? `<p class="small" style="margin:10px 0 0;color:#b42318"><b>Not working yet:</b> ${esc(e.problem || e.problems[d.ip])}</p>` : ''}</div></div></div>`;
 }
 
 /* ---------- One device ---------- */

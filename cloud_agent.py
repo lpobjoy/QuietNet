@@ -19,6 +19,9 @@ import time
 import urllib.error
 import urllib.request
 
+MAX_AT_ONCE = 8                     # relayed requests handled at the same time
+MAX_ANSWER = 12 * 1024 * 1024       # largest answer sent up; the relay takes 16 MB, and JSON escaping adds some
+
 
 class CloudAgent:
     """The Pi's side of remote access. One instance, created by server.main().
@@ -35,6 +38,7 @@ class CloudAgent:
         self.state = "off"          # off | connecting | online | error
         self.detail = ""
         self._stop = threading.Event()
+        self._slots = threading.BoundedSemaphore(MAX_AT_ONCE)
         # Headless setup: environment variables win if the Pi isn't paired yet.
         env_relay = os.environ.get("QUIETNET_CLOUD", "").strip()
         if env_relay and not self.cfg.get("token"):
@@ -132,7 +136,11 @@ class CloudAgent:
                 call = self._http("GET", self.cfg["relay"] + "/agent/poll", None, timeout=35, token=True)
                 self.state, self.detail, backoff = "online", "", 1
                 if call and call.get("id"):
-                    self._handle(call)
+                    # Answer in the background and go straight back to listening, so the several
+                    # requests a dashboard page makes at once don't queue behind each other.
+                    # At most MAX_AT_ONCE are in hand; beyond that, wait for one to finish.
+                    self._slots.acquire()
+                    threading.Thread(target=self._handle_and_release, args=(call,), daemon=True).start()
             except urllib.error.HTTPError as e:
                 if e.code == 401:
                     self.state, self.detail = "error", "This Pi was unpaired on the relay. Pair it again."
@@ -146,12 +154,24 @@ class CloudAgent:
                 self._stop.wait(min(backoff, 30))
                 backoff = min(backoff * 2, 30)
 
+    def _handle_and_release(self, call):
+        """Handle one call, then free its slot for the next."""
+        try:
+            self._handle(call)
+        finally:
+            self._slots.release()
+
     def _handle(self, call):
-        """Run one relayed request against our own local dashboard and send the answer back."""
+        """Run one relayed request against our own local dashboard and send the answer back.
+        An answer too big for the relay to accept is replaced by a short message saying so, so the
+        browser hears straight away rather than waiting until it gives up."""
         status, body = self._local(call.get("method", "GET"), call.get("path", "/"), call.get("body"))
+        if len(body) > MAX_ANSWER:
+            status, body = 502, json.dumps({"error": "That's too much to send remotely. Try a shorter time range."})
         try:
             self._http("POST", self.cfg["relay"] + "/agent/respond",
-                       {"id": call["id"], "status": status, "body": body}, timeout=20, token=True)
+                       {"id": call["id"], "status": status, "body": body}, timeout=60, token=True,
+                       headers={"X-QuietNet-Call": str(call["id"])})
         except (urllib.error.URLError, urllib.error.HTTPError, socket.timeout, OSError):
             pass        # the browser's request will simply time out; no harm done
 
@@ -173,11 +193,12 @@ class CloudAgent:
         except (urllib.error.URLError, socket.timeout, OSError):
             return 502, '{"error":"The Pi could not answer."}'
 
-    def _http(self, method, url, obj, timeout, token=False):
+    def _http(self, method, url, obj, timeout, token=False, headers=None):
         """One JSON request to the relay; returns the decoded answer ({} if empty). Raises
-        urllib's errors for the caller to handle. token=True adds this Pi's token header."""
+        urllib's errors for the caller to handle. token=True adds this Pi's token header;
+        `headers` adds any others."""
         data = json.dumps(obj).encode() if obj is not None else None
-        headers = {"Content-Type": "application/json"}
+        headers = dict(headers or {}, **{"Content-Type": "application/json"})
         if token and self.cfg.get("token"):
             headers["X-QuietNet-Token"] = self.cfg["token"]
         req = urllib.request.Request(url, data=data, method=method, headers=headers)

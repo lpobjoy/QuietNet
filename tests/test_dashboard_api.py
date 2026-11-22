@@ -13,6 +13,7 @@ import threading
 import time
 import unittest
 from http.server import ThreadingHTTPServer
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from test_quietnet import ADULT, KID, Base, is_blocked, server
@@ -36,6 +37,11 @@ class Api(Base):
         for table in ("devices", "seen", "settings"):
             server.sql("DELETE FROM %s" % table, commit=True)
         server.S.junk_on, server.S.paused_until = True, 0
+        # A stand-in for the computer's neighbour table, so no test reads the real one.
+        self.neighbours_now = {}
+        p = mock.patch.object(server, "neighbours", lambda: dict(self.neighbours_now))
+        p.start()
+        self.addCleanup(p.stop)
 
     def call(self, method, path, body=None, host="localhost", ctype="application/json", raw=None):
         headers = {"Host": host}
@@ -95,6 +101,35 @@ class Guards(Api):
             status, _ = self.post("/api/kill", raw='{"on": true}', ctype=ctype)
             self.assertEqual(status, 415, ctype)
         self.assertNotIn("all", server.S.off)
+
+    def test_plain_text_that_mentions_json_in_its_type_is_refused(self):
+        # Browsers send 'text/plain; application/json' from any page without asking first,
+        # so a check that only looked for the words 'application/json' could be fooled.
+        for ctype in ("text/plain; application/json", "text/plain;application/json", "application/jsonx"):
+            self.assertEqual(self.post("/api/kill", raw='{"on": true}', ctype=ctype)[0], 415, ctype)
+        self.assertNotIn("all", server.S.off)
+
+    def test_json_with_a_charset_is_accepted(self):
+        self.assertEqual(self.post("/api/kill", raw='{"on": false}', ctype="application/json; charset=utf-8")[0], 200)
+
+    def changed_from(self, origin):
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+        try:
+            conn.request("POST", "/api/kill", body='{"on": true}',
+                         headers={"Host": "localhost", "Content-Type": "application/json", "Origin": origin})
+            return conn.getresponse().status
+        finally:
+            conn.close()
+
+    def test_a_change_sent_by_another_website_is_refused(self):
+        self.assertEqual(self.changed_from("https://evil.example"), 415)
+        self.assertEqual(self.changed_from("null"), 415)
+        self.assertNotIn("all", server.S.off)
+
+    def test_a_change_sent_from_this_computer_on_any_port_is_accepted(self):
+        # An SSH tunnel to a Pi may put the dashboard on a different local port.
+        self.assertEqual(self.changed_from("http://localhost:9000"), 200)
+        server.set_internet_off("all", False)
 
     def test_unreadable_json_is_refused(self):
         self.assertEqual(self.post("/api/kill", raw="{not json")[0], 400)
@@ -519,6 +554,39 @@ class EnforceAndCloud(Api):
                    "192.168.1.23\n192.168.1.24", None, "999.999.999.999", "192.168.1.256", 3232235799, ["192.168.1.23"]):
             self.assertEqual(self.post("/api/enforce", {"ip": ip, "on": True})[0], 400, ip)
         self.assertEqual(server.S.enforced, set())
+
+    def test_this_computer_cannot_be_enforced(self):
+        self.addCleanup(setattr, server.S, "local_ip", server.S.local_ip)
+        server.S.local_ip = "192.168.1.60"
+        status, out = self.post("/api/enforce", {"ip": "192.168.1.60", "on": True})
+        self.assertEqual(status, 400)
+        self.assertIn("router or itself", out["error"])
+
+    def test_the_router_and_other_networks_are_refused_when_the_enforcer_knows_the_network(self):
+        real = server.ENF
+        server.ENF = mock.Mock(available=lambda: True, can_target=lambda ip: "QuietNet can't steer the router or itself.")
+        try:
+            status, out = self.post("/api/enforce", {"ip": "192.168.1.254", "on": True})
+        finally:
+            server.ENF = real
+        self.assertEqual((status, out["error"]), (400, "QuietNet can't steer the router or itself."))
+        self.assertEqual(server.S.enforced, set())
+
+    def test_enforcing_remembers_which_device_it_is_from_the_live_table_first(self):
+        server.sql("INSERT INTO seen(ip,mac,host,ts) VALUES(?,?,?,?)", (KID, "aa:aa:aa:aa:aa:01", "", 0), commit=True)
+        self.neighbours_now = {KID: "bb:bb:bb:bb:bb:02"}                 # the old scan is out of date
+        self.ok("/api/enforce", {"ip": KID, "on": True})
+        self.assertEqual(server.S.enforced_mac[KID], "bb:bb:bb:bb:bb:02")
+        server.init_db()
+        self.assertEqual(server.S.enforced_mac[KID], "bb:bb:bb:bb:bb:02")    # kept across a restart
+
+    def test_an_unknown_hardware_address_is_filled_in_when_first_seen(self):
+        self.ok("/api/enforce", {"ip": KID, "on": True})
+        self.assertEqual(server.S.enforced_mac[KID], "")
+        server.learn_enforced_mac(KID, "cc:cc:cc:cc:cc:03")
+        server.learn_enforced_mac(KID, "dd:dd:dd:dd:dd:04")                 # only the first is kept
+        server.init_db()
+        self.assertEqual(server.S.enforced_mac[KID], "cc:cc:cc:cc:cc:03")
 
     def test_remote_access_reports_off_when_the_link_is_not_running(self):
         real = server.CA

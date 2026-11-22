@@ -9,8 +9,10 @@ import socket
 import struct
 import sys
 import tempfile
+import threading
 import time
 import unittest
+from unittest import mock
 
 os.environ["QUIETNET_DATA"] = tempfile.mkdtemp(prefix="quietnet-test-")
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -321,6 +323,104 @@ class EnforcementPlan(Base):
     def test_no_enforced_devices_means_empty_plan(self):
         server.S.enforced = set()
         self.assertEqual(server.enforcement_plan(), {})
+
+    def test_advert_list_addresses_are_not_cut_by_address(self):
+        # Advert names often share addresses with ordinary sites, so they stay a DNS-only block.
+        server.record_resolved("ads.doubleclick.net", self._answer("ads.doubleclick.net", "142.250.1.1"))
+        self.assertTrue(server.decision("ads.doubleclick.net", KID)[0])
+        server.S.enforced = {KID}
+        self.assertNotIn("142.250.1.1", server.enforcement_plan()[KID]["ips"])
+
+    def test_an_all_internet_schedule_is_a_full_cut(self):
+        body = {"name": "Bedtime", "scope": "device:" + KID, "days": [0, 1, 2, 3, 4, 5, 6],
+                "start": "00:00", "end": "23:59", "off": True, "services": []}
+        self.assertIsNone(server.save_schedule(body))
+        server.S.sched_cache = (0.0, [])
+        server.S.enforced = {KID}
+        self.assertTrue(server.enforcement_plan()[KID]["off"])
+
+    def test_pausing_also_pauses_your_own_blocks_in_the_plan(self):
+        server.block("example.org")
+        server.record_resolved("example.org", self._answer("example.org", "198.51.100.7"))
+        server.S.enforced = {KID}
+        self.assertIn("198.51.100.7", server.enforcement_plan()[KID]["ips"])
+        server.S.paused_until = time.time() + 600
+        self.assertNotIn("198.51.100.7", server.enforcement_plan()[KID]["ips"])
+
+    def test_the_plan_says_which_device_it_means(self):
+        server.S.enforced, server.S.enforced_mac = {KID}, {KID: "aa:bb:cc:dd:ee:ff"}
+        self.assertEqual(server.enforcement_plan()[KID]["mac"], "aa:bb:cc:dd:ee:ff")
+
+    def test_addresses_a_name_no_longer_uses_are_forgotten(self):
+        server.record_resolved("x.example.com", self._answer("x.example.com", "198.51.100.1"))
+        server.S.resolved["x.example.com"]["198.51.100.1"] = time.time() - 7 * 3600
+        server.record_resolved("x.example.com", self._answer("x.example.com", "198.51.100.2"))
+        self.assertEqual(set(server.S.resolved["x.example.com"]), {"198.51.100.2"})
+
+
+class HistoryLimits(Base):
+    def fill(self, rows, ts=None):
+        now = time.time()
+        server.sql("DELETE FROM queries", commit=True)
+        with server.db_lock:
+            server.db.executemany("INSERT INTO queries(ts,client,domain,blocked) VALUES(?,?,?,0)",
+                                  [(ts or now, KID, "n%d.example.com" % i) for i in range(rows)])
+            server.db.commit()
+
+    def test_history_is_capped_by_size_as_well_as_age(self):
+        self.fill(50)
+        with mock.patch.object(server, "MAX_HISTORY_ROWS", 20):
+            server.prune_history()
+        names = [r[0] for r in server.sql("SELECT domain FROM queries ORDER BY id")]
+        self.assertEqual(len(names), 20)
+        self.assertEqual(names[-1], "n49.example.com")              # the newest are the ones kept
+
+    def test_old_history_is_deleted(self):
+        self.fill(10, ts=time.time() - (server.KEEP_DAYS + 1) * 86400)
+        server.prune_history()
+        self.assertEqual(server.sql("SELECT COUNT(*) FROM queries")[0][0], 0)
+
+    def test_a_big_trim_lets_go_of_the_lock_between_steps(self):
+        # So DNS answers, which need the same lock, aren't held up behind millions of deletions.
+        self.fill(50)
+        steps = []
+
+        def lock_free_for_another_thread(seconds):
+            got = []
+
+            def other():                                # db_lock is re-entrant, so ask from another thread
+                ok = server.db_lock.acquire(blocking=False)
+                got.append(ok)
+                if ok:
+                    server.db_lock.release()
+            t = threading.Thread(target=other)
+            t.start()
+            t.join()
+            steps.append(got[0])
+        with mock.patch.object(server, "MAX_HISTORY_ROWS", 5), mock.patch.object(server, "PRUNE_BATCH", 10), \
+                mock.patch.object(server.time, "sleep", lock_free_for_another_thread):
+            server.prune_history()
+        self.assertGreaterEqual(len(steps), 4)                      # 45 rows in steps of 10
+        self.assertTrue(all(steps))                                 # the lock was free at every pause
+        self.assertEqual(server.sql("SELECT COUNT(*) FROM queries")[0][0], 5)
+
+    def test_an_older_database_gains_the_hardware_address_column(self):
+        server.db.execute("DROP TABLE enforced")
+        server.db.execute("CREATE TABLE enforced(ip TEXT PRIMARY KEY)")      # as 0.5 made it
+        server.db.execute("INSERT INTO enforced VALUES(?)", (KID,))
+        server.db.commit()
+        server.init_db()
+        self.assertEqual(server.S.enforced, {KID})
+        self.assertEqual(server.S.enforced_mac, {KID: ""})
+
+    def test_at_most_64_addresses_are_kept_per_name(self):
+        for i in range(80):
+            server.record_resolved("cdn.example.com", EnforcementPlan._answer(self, "cdn.example.com", "198.51.100.%d" % i))
+            server.S.resolved["cdn.example.com"]["198.51.100.%d" % i] = time.time() - 80 + i
+        kept = server.S.resolved["cdn.example.com"]
+        self.assertEqual(len(kept), 64)
+        self.assertIn("198.51.100.79", kept)                         # the newest are the ones kept
+        self.assertNotIn("198.51.100.0", kept)
 
 
 if __name__ == "__main__":

@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+Third review (the enforcer, the relay and the DNS filter), with an independent check of the fixes and a live test of the enforcer between two containers:
+- **Fixed: the enforcer could cut a device off by mistake.** It now won't steer a device when the Pi isn't passing traffic on, or when another firewall (often Docker's) would drop it, and the device page says what to run on the Pi. It never steers the router, the Pi itself or another network, and leaves an address alone if a different device now has it.
+- **Fixed: devices weren't always handed back.** A device switched off is handed back at once. After a crash or `docker kill`, the next start undoes what was left behind, using notes the enforcer keeps as it works. "Hand back" messages now come from the Pi's own hardware address (Wi-Fi was dropping them).
+- **Fixed: a steered device slipped back to the router for a moment every half-minute.** The enforcer now answers its "who is the router?" questions itself. Measured: once settled, nothing got through in 60 to 146 seconds. Changes saved on the dashboard reach the enforcer at once rather than at its next two-second check. Still open: up to about three seconds of traffic can get through just after the kill switch is turned on (known issue 45).
+- **Fixed: a plain-text request could pass the dashboard's JSON check** (`text/plain; application/json`). The type must now be exact, and changes sent from another website are refused. Works through an SSH tunnel on any port.
+- **Fixed: strangers could lock the owner out of the relay** by guessing wrongly on purpose. A browser that has signed in before is let through (with the right password).
+- **Fixed: longer remote history views failed** after 30 seconds: the relay's 64 KB limit applied to the Pi's answers. A paired Pi may now send up to 16 MB.
+- **Faster remote dashboard:** the Pi handles up to eight relayed calls at once. A Pi can only answer calls sent to it.
+- **DNS:** floods of lookups and slow TCP clients can no longer pile up; answers must repeat the question; history is capped by size as well as age.
+- **Enforcer:** the advert list is no longer cut by address (it shares addresses with ordinary sites); pausing applies to the enforcer too; `iptables` waits for its lock and retries; kernel settings are read through `/proc/sys`, so they work in the slim container.
+- **Containers:** `docker logs` shows output straight away; the compose file explains the one-time forwarding setting; the Pi image includes the `iptables` commands, used only to read the Pi's other firewall rules.
+- An independent review of these changes found eleven more points, all fixed: the firewall check now fails closed; a flood of forged ARP questions can't start unlimited threads; `iptables` rules are reloaded after an outside flush; the "signed in before" marker has its own cap, is voided by a password change and removed at sign-out; only a call that is really waiting can bring a 16 MB answer; history is trimmed in small steps; one device's problem is shown only on that device's page; the enforcer tests no longer read the real network.
+
 Second review (security, dependencies, efficiency):
 - **Fixed: enforcer rules piled up.** Reloading the firewall table added to the old rules, so a device switched off and back on stayed cut off until QuietNet restarted. Each load now replaces the table.
 - **Fixed: the dashboard could be shown inside another website** and its buttons clicked by trickery. Both web servers now forbid that.

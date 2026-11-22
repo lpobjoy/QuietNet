@@ -12,6 +12,7 @@ import socket
 import struct
 import sys
 import threading
+import time
 import unittest
 from unittest import mock
 
@@ -312,6 +313,31 @@ class Forwarding(unittest.TestCase):
             resp = server.forward_udp(query("www.bbc.co.uk"))
         self.assertEqual(resp[-4:], bytes([93, 184, 216, 34]))
 
+    def test_an_answer_to_a_different_question_is_ignored(self):
+        # Right id, but answering some other name: someone guessing, or a muddled server.
+        upstream = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        upstream.bind(("127.0.0.1", 0))
+        self.addCleanup(upstream.close)
+
+        def serve():
+            try:
+                data, addr = upstream.recvfrom(4096)
+            except OSError:
+                return
+            other = fake_answer(data[:2] + query("evil.example.net")[2:])
+            upstream.sendto(other[:-4] + bytes([6, 6, 6, 6]), addr)
+            upstream.sendto(fake_answer(data), addr)
+
+        threading.Thread(target=serve, daemon=True).start()
+        with mock.patch.object(server, "UPSTREAMS", [upstream.getsockname()]):
+            resp = server.forward_udp(query("www.bbc.co.uk"))
+        self.assertEqual(resp[-4:], bytes([93, 184, 216, 34]))
+
+    def test_an_answer_that_only_changes_letter_case_is_accepted(self):
+        q = query("www.bbc.co.uk")
+        resp = fake_answer(q[:12] + q[12:].replace(b"bbc", b"BbC"))
+        self.assertTrue(server.same_question(q, resp))
+
     def test_the_spare_server_is_used_when_the_first_is_silent(self):
         silent = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         silent.bind(("127.0.0.1", 0))
@@ -430,6 +456,42 @@ class LiveFilter(Base):
         with mock.patch.object(server, "forward_udp", return_value=None):
             resp = self.ask_udp("www.bbc.co.uk")
         self.assertEqual(resp[3] & 15, 2)                                # "server failure"
+
+
+class Limits(unittest.TestCase):
+    """Floods and slow clients can't pile up threads or memory without limit."""
+
+    def test_a_tcp_client_that_trickles_its_question_is_dropped(self):
+        a, b = socket.socketpair()
+        self.addCleanup(a.close)
+        self.addCleanup(b.close)
+        b.sendall(b"\x00")                                       # half the length, then nothing more
+        start = time.monotonic()
+        with self.assertRaises((ValueError, OSError)):
+            server.recv_exact(a, 2, deadline=time.monotonic() + 0.3)
+        self.assertLess(time.monotonic() - start, 2)
+
+    def test_tcp_connections_beyond_the_limit_are_turned_away(self):
+        srv = server.TCPServer(("127.0.0.1", 0), server.TCPHandler)
+        self.addCleanup(srv.server_close)
+        srv.slots = threading.BoundedSemaphore(1)
+        srv.slots.acquire()                                      # the only slot is taken
+        closed = []
+        srv.shutdown_request = closed.append
+        srv.process_request("conn", ("192.168.1.23", 5000))
+        self.assertEqual(closed, ["conn"])
+
+    def test_udp_lookups_beyond_the_limit_are_dropped_not_queued(self):
+        sock = mock.Mock()
+        incoming = [(query("n%d.example.com" % i), ("192.168.1.23", 5000 + i)) for i in range(5)]
+        sock.recvfrom.side_effect = incoming + [KeyboardInterrupt()]
+        submitted = []
+        pool = mock.Mock(submit=lambda fn, data, addr: submitted.append(addr))
+        with mock.patch.object(server, "MAX_DNS_WAITING", 2), \
+                mock.patch.object(server, "ThreadPoolExecutor", lambda max_workers: pool):
+            with self.assertRaises(KeyboardInterrupt):
+                server.udp_server(sock)
+        self.assertEqual(len(submitted), 2)                      # the rest were dropped, not queued
 
 
 if __name__ == "__main__":

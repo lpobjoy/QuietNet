@@ -50,6 +50,8 @@ CALL_TIMEOUT = 30          # how long a browser request waits for the Pi to answ
 POLL_TIMEOUT = 25          # how long the Pi's long-poll waits before returning empty
 OFFLINE_AFTER = 40         # a Pi not seen for this many seconds is treated as offline
 MAX_BODY = 64 * 1024       # the largest request body the relay will read; real ones are a few hundred bytes
+MAX_ANSWER = 16 * 1024 * 1024   # ...except a paired Pi's answers, which can be large (a week of a busy device's history)
+KNOWN_DEVICE_DAYS = 365    # how long a browser is remembered as having signed in to an account before
 PAIR_CODE_MINUTES = 15     # how long a pairing code stays valid after it is shown
 # Who may create an account, set with the QUIETNET_SIGNUP environment variable:
 #   open   - anyone who finds the address (the default)
@@ -59,6 +61,8 @@ SIGNUP = os.environ.get("QUIETNET_SIGNUP", "open").strip().lower()
 # Limits on wrong guesses: (how many failures, within how many seconds). See Throttle below.
 LOGIN_LIMIT_PER_EMAIL = (5, 15 * 60)
 LOGIN_LIMIT_OVERALL = (60, 5 * 60)
+LOGIN_LIMIT_KNOWN_BROWSER = (20, 15 * 60)   # a browser that signed in before has its own, looser cap
+MAX_BIG_ANSWERS_AT_ONCE = 2                 # large Pi answers being read at the same time
 PAIR_LIMIT_OVERALL = (20, 10 * 60)
 SIGNUP_LIMIT_OVERALL = (10, 60 * 60)
 EMAIL_RE = re.compile(r"[^@\s]+@[^@\s]+\.[^@\s]+")
@@ -238,6 +242,27 @@ def signup_allowed():
 _DUMMY_PW = None
 
 
+def known_device_token(uid, pw_record):
+    """A long-lived signed marker for a browser that has signed in to this account before.
+
+    The limits on wrong guesses would otherwise let a stranger who knows your email keep you
+    locked out, just by getting the password wrong on purpose. A browser carrying this marker gets
+    its own, looser limit instead of the shared ones (it still needs the right password). The marker
+    can only be had by signing in successfully, so it is no help to someone guessing. It is signed
+    over the account's password record too, so changing the password makes every old marker
+    useless; and signing out removes it from that browser."""
+    msg = b"known-device.%d.%s" % (uid, pw_record.encode())
+    return "%d.%s" % (uid, hmac.new(SECRET, msg, hashlib.sha256).hexdigest()[:32])
+
+
+def is_known_device(value, uid, pw_record):
+    """True if `value` (the qn_known cookie) is the marker for this account and its current password."""
+    return bool(value) and hmac.compare_digest(value, known_device_token(uid, pw_record))
+
+
+big_answers = threading.BoundedSemaphore(MAX_BIG_ANSWERS_AT_ONCE)
+
+
 def dummy_check(password):
     """Do the work of checking a password without any account to check it against."""
     global _DUMMY_PW
@@ -266,8 +291,8 @@ class Bridge:
 
     def call(self, pi_id, payload):
         """Browser side: queue a call for the Pi and wait for its reply."""
-        call_id = secrets.token_hex(8)
-        slot = {"event": threading.Event(), "resp": None}
+        call_id = secrets.token_hex(16)
+        slot = {"event": threading.Event(), "resp": None, "pi": pi_id}
         cond = self._cond(pi_id)
         with self.lock:
             self.waiting[call_id] = slot
@@ -294,12 +319,19 @@ class Bridge:
                     return None
                 cond.wait(remaining)
 
-    def respond(self, call_id, resp):
-        """Pi side: deliver the answer to the browser request waiting on `call_id`. An answer
-        to a call that has already timed out (or never existed) is dropped."""
+    def expects(self, pi_id, call_id):
+        """Is a browser request waiting for this Pi to answer `call_id`?"""
         with self.lock:
             slot = self.waiting.get(call_id)
-            if slot:
+            return bool(slot) and slot["pi"] == pi_id
+
+    def respond(self, pi_id, call_id, resp):
+        """Pi side: deliver the answer to the browser request waiting on `call_id`. An answer
+        to a call that has already timed out (or never existed) is dropped, and so is one from
+        a Pi the call wasn't sent to: one Pi can never answer for another."""
+        with self.lock:
+            slot = self.waiting.get(call_id)
+            if slot and slot["pi"] == pi_id:
                 slot["resp"] = resp
                 slot["event"].set()
 
@@ -344,6 +376,7 @@ class Relay(BaseHTTPRequestHandler):
     there is no other check between a request and someone's home network."""
     server_version = "QuietNet"
     raw_body = None         # the body of the POST being handled; set by do_POST
+    timeout = 30            # drop a connection that stalls mid-request, so slow senders can't tie up threads
 
     def log_message(self, *a):
         """Say nothing: the host keeps its own request log."""
@@ -366,45 +399,81 @@ class Relay(BaseHTTPRequestHandler):
 
     # -- helpers --------------------------------------------------------
 
-    def read_body(self):
+    def read_body(self, cap=MAX_BODY):
         """Read the request body from the connection: bytes, or None if its stated length is
-        nonsense or over MAX_BODY. Called once per POST, by do_POST, which keeps the result in
+        nonsense or over `cap`. Called once per POST, by do_POST, which keeps the result in
         self.raw_body for the handlers."""
         try:
             n = int(self.headers.get("Content-Length") or 0)
         except ValueError:
             return None
-        if n < 0 or n > MAX_BODY:
+        if n < 0 or n > cap:
             return None
         return self.rfile.read(n)
+
+    def read_big_answer(self):
+        """Read a Pi's answer, allowing up to MAX_ANSWER - but only for a paired Pi answering a call
+        that is really waiting for it (named in the X-QuietNet-Call header), and only a couple at
+        once. Anyone can pair a Pi of their own, so without these checks anyone could make the relay
+        take in many 16 MB bodies at the same time and run it out of memory."""
+        row = self.agent()
+        call_id = self.headers.get("X-QuietNet-Call", "")
+        if not (row and bridge.expects(row[0], call_id)):
+            return self.read_body()
+        if not big_answers.acquire(timeout=10):
+            return self.read_body()
+        try:
+            return self.read_body(MAX_ANSWER)
+        finally:
+            big_answers.release()
 
     def secure(self):
         """Did this request reach the host over HTTPS? (The host handles HTTPS and tells us.)"""
         return self.headers.get("X-Forwarded-Proto", "http") == "https"
 
+    def cookie(self, name):
+        """The value of one cookie the browser sent, or None."""
+        m = re.search(r"(?:^|;\s*)%s=([^;]+)" % re.escape(name), self.headers.get("Cookie", ""))
+        return m.group(1) if m else None
+
     def user(self):
         """The signed-in user's id, read from the session cookie, or None."""
-        cookie = self.headers.get("Cookie", "")
-        m = re.search(r"qn_session=([^;]+)", cookie)
-        return read_session(m.group(1)) if m else None
+        token = self.cookie("qn_session")
+        return read_session(token) if token else None
 
-    def set_cookie(self, token):
-        """Queue a session cookie to go out with this answer. An empty token signs out.
+    def set_cookie(self, token, name="qn_session", seconds=SESSION_HOURS * 3600):
+        """Queue a cookie to go out with this answer. An empty session token signs out.
         HttpOnly keeps page scripts from reading it; SameSite=Lax keeps other sites from sending it
         with their own form posts; Secure is added whenever the request came over HTTPS."""
-        flags = "HttpOnly; SameSite=Lax; Path=/; Max-Age=%d" % (SESSION_HOURS * 3600)
+        flags = "HttpOnly; SameSite=Lax; Path=/; Max-Age=%d" % seconds
         if self.secure():
             flags += "; Secure"
-        self._cookie = "qn_session=%s; %s" % (token, flags)
+        self._cookies = getattr(self, "_cookies", []) + ["%s=%s; %s" % (name, token, flags)]
+
+    def signed_in_as(self, uid):
+        """Queue the cookies for a successful sign-in: the session, and the 'signed in here before' marker."""
+        pw_record = sql("SELECT pw FROM users WHERE id=?", (uid,), one=True)[0]
+        self.set_cookie(make_session(uid))
+        self.set_cookie(known_device_token(uid, pw_record), name="qn_known", seconds=KNOWN_DEVICE_DAYS * 86400)
+
+    def sign_out(self):
+        """End the session and forget that this browser signed in here (it may be a shared computer)."""
+        self.set_cookie("")
+        self.set_cookie("", name="qn_known", seconds=0)
+        return self.redirect("/login")
+
+    def send_cookies(self):
+        """Add every queued cookie to the answer being sent."""
+        for c in getattr(self, "_cookies", []):
+            self.send_header("Set-Cookie", c)
 
     def send_html(self, body, code=200):
-        """Send a page (the fragment is wrapped in the site layout), with any queued cookie."""
+        """Send a page (the fragment is wrapped in the site layout), with any queued cookies."""
         data = page(body).encode()
         self.send_response(code)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(data)))
-        if getattr(self, "_cookie", None):
-            self.send_header("Set-Cookie", self._cookie)
+        self.send_cookies()
         self.end_headers()
         self.wfile.write(data)
 
@@ -418,11 +487,10 @@ class Relay(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def redirect(self, to):
-        """Send the browser to another page, with any queued cookie."""
+        """Send the browser to another page, with any queued cookies."""
         self.send_response(303)
         self.send_header("Location", to)
-        if getattr(self, "_cookie", None):
-            self.send_header("Set-Cookie", self._cookie)
+        self.send_cookies()
         self.end_headers()
 
     def body_json(self):
@@ -465,8 +533,7 @@ class Relay(BaseHTTPRequestHandler):
         if p in ("/login", "/signup"):
             return self.send_html(self.auth_form(p[1:]))
         if p == "/logout":
-            self.set_cookie("")
-            return self.redirect("/login")
+            return self.sign_out()
         if p == "/" :
             return self.home()
         self.send_error(404)
@@ -477,8 +544,8 @@ class Relay(BaseHTTPRequestHandler):
         The body is read here, first, whichever handler runs and even if it will be refused.
         Answering and closing while the sender's data is still unread makes some systems reset
         the connection, and the browser then never sees the answer."""
-        self.raw_body = self.read_body()
         p = urlparse(self.path).path
+        self.raw_body = self.read_big_answer() if p == "/agent/respond" else self.read_body()
         if p == "/agent/pair":
             return self.agent_pair()
         if p == "/agent/respond":
@@ -490,8 +557,7 @@ class Relay(BaseHTTPRequestHandler):
         if p == "/signup":
             return self.do_signup()
         if p == "/logout":
-            self.set_cookie("")
-            return self.redirect("/login")
+            return self.sign_out()
         if p == "/pis/new":
             return self.new_pi()
         if p.startswith("/pis/") and p.endswith("/delete"):
@@ -530,29 +596,41 @@ class Relay(BaseHTTPRequestHandler):
         throttle.fail("signup")         # every new account counts towards the hourly limit
         sql("INSERT INTO users(email,pw,created) VALUES(?,?,?)", (email, hash_pw(pw), time.time()), commit=True)
         uid = sql("SELECT id FROM users WHERE email=?", (email,), one=True)[0]
-        self.set_cookie(make_session(uid))
+        self.signed_in_as(uid)
         self.redirect("/")
 
     def do_login(self):
         """Check an email and password and sign in. Wrong guesses are counted, per account
-        and overall, and an unknown email is made to take as long as a wrong password."""
+        and overall, and an unknown email is made to take as long as a wrong password.
+        A browser that has signed in to this account before is let past the limits (see
+        known_device_token), so strangers can't lock the owner out by guessing on purpose."""
         f = self.body_form()
         email, pw = f.get("email", "").strip().lower(), f.get("password", "")
         email = email[:254]
-        if throttle.blocked("login:" + email, LOGIN_LIMIT_PER_EMAIL) or throttle.blocked("login", LOGIN_LIMIT_OVERALL):
-            return self.send_html(self.auth_form("login", TOO_MANY), 429)
         row = sql("SELECT id,pw FROM users WHERE email=?", (email,), one=True)
+        trusted = bool(row) and is_known_device(self.cookie("qn_known"), row[0], row[1])
+        if trusted:
+            blocked = throttle.blocked("login-known:" + email, LOGIN_LIMIT_KNOWN_BROWSER)
+        else:
+            blocked = (throttle.blocked("login:" + email, LOGIN_LIMIT_PER_EMAIL)
+                       or throttle.blocked("login", LOGIN_LIMIT_OVERALL))
+        if blocked:
+            return self.send_html(self.auth_form("login", TOO_MANY), 429)
         if row:
             good = check_pw(pw, row[1])
         else:
             dummy_check(pw)             # spend the same time as a real check, so unknown emails can't be spotted
             good = False
         if not good:
-            throttle.fail("login:" + email)
-            throttle.fail("login")
+            if trusted:
+                throttle.fail("login-known:" + email)
+            else:
+                throttle.fail("login:" + email)
+                throttle.fail("login")
             return self.send_html(self.auth_form("login", "Wrong email or password."))
         throttle.clear("login:" + email)
-        self.set_cookie(make_session(row[0]))
+        throttle.clear("login-known:" + email)
+        self.signed_in_as(row[0])
         self.redirect("/")
 
     # -- device list / pairing -----------------------------------------
@@ -647,10 +725,13 @@ class Relay(BaseHTTPRequestHandler):
         self.send_json(call or {})      # {} means "nothing to do"; a real call always carries an id
 
     def agent_respond(self):
-        """A Pi returns the answer to a call. Only ordinary status codes are passed on."""
+        """A Pi returns the answer to a call. Only ordinary status codes are passed on. An answer
+        too big to read (see read_big_answer) is refused with 413."""
         row = self.agent()
         if not row:
             return self.send_error(401)
+        if self.raw_body is None:
+            return self.send_error(413)
         body = self.body_json()
         try:
             status = int(body.get("status", 502))
@@ -659,7 +740,7 @@ class Relay(BaseHTTPRequestHandler):
         if not 200 <= status <= 599:        # only ordinary answer codes are passed back to the browser
             status = 502
         text = body.get("body", "")
-        bridge.respond(str(body.get("id", "")), {"status": status, "body": text if isinstance(text, str) else ""})
+        bridge.respond(row[0], str(body.get("id", "")), {"status": status, "body": text if isinstance(text, str) else ""})
         self.send_json({"ok": True})
 
     # -- browser -> Pi relay -------------------------------------------

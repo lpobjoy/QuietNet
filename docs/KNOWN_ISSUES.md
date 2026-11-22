@@ -1,6 +1,6 @@
 # Known issues
 
-Two reviews have been made: of version 0.5 on 21 November 2026, and a second, deeper pass the same day covering security, the software QuietNet depends on, and efficiency. This file lists what is still open, then what has been fixed.
+Two reviews have been made: of version 0.5 on 21 November 2026, and a second, deeper pass the same day covering security, the software QuietNet depends on, and efficiency. A third, on 22 November, looked at the enforcer, the relay and the DNS filter, followed by an independent check of its fixes and a live test of the enforcer between two containers. This file lists what is still open, then what has been fixed.
 
 The numbers are referred to from tests and other documents. Keep them stable.
 
@@ -8,15 +8,21 @@ The numbers are referred to from tests and other documents. Keep them stable.
 
 ### 4. With Docker installed, an enforced device may lose all internet
 
-Docker sets the host's rule for forwarded traffic to "drop unless allowed". The enforcer's own table accepts forwarded traffic, but an accept in one table does not override a drop in another. A steered device's traffic would then be dropped by Docker's rule, cutting the device off completely where only the blocked addresses were meant to go.
+Docker sets the host's rule for forwarded traffic to "drop unless allowed". An accept in the enforcer's own table does not override a drop in another, so a steered device would be cut off completely.
 
-This could not be tested in review. To check: enforce a device, block nothing for it, and see whether it can still browse.
+**Now handled (22 November):** before steering, the enforcer asks every firewall tool present whether another firewall would drop passed-on traffic. If one would, it does not steer, and the device page says what to run on the Pi (`sudo iptables -I DOCKER-USER -i eth0 -o eth0 -j ACCEPT`). Once that accept is in place the check clears and steering starts. This was confirmed in a two-container test with a Docker-style "drop" rule loaded: refused with the advice shown; the advice followed; steering started within 30 seconds and the device kept its internet. QuietNet does not add the accept itself, since that changes the owner's firewall.
 
-**Fix if confirmed:** add an explicit accept for the home network's forwarded traffic in Docker's `DOCKER-USER` chain while the enforcer is active, and remove it on teardown.
+**Still to check on a real Pi with Docker:** that the check spots Docker's real rules there, and that the advice clears it.
 
 ### 15. The firewall reload fix needs confirming on a Pi
 
-Issue 15 (below, under Fixed) was confirmed and fixed against the real `nft` tool in a test machine, but not with real devices. To check: enforce a device, switch its internet off, confirm it is cut off, switch it back on, and confirm it recovers within a few seconds without restarting QuietNet.
+Issue 15 (below, under Fixed) was confirmed against the real `nft` tool. On 22 November it was also confirmed with real steering between two containers: a steered device was cut off by the kill switch, and recovered within a few seconds of it being switched off, without restarting QuietNet. What remains is the same check with real devices on a real Pi.
+
+### 45. The kill switch can let a little traffic through at first
+
+In the two-container test, a steered device that was already settled sometimes got about one to three seconds of traffic through just after the kill switch was turned on. After that, nothing got through in 60 to 100 seconds of trying. The DNS block applies at once, so this only affects connections that were already open.
+
+**Still to check on a real Pi:** how long the gap is with real devices (phones and TVs answer ARP differently from Linux). It is not being tuned further for now.
 
 ## Open: design decisions for the owner
 
@@ -45,9 +51,9 @@ iCloud Private Relay, Android's Private DNS setting, and browsers with "secure D
 
 Anyone who can open `http://localhost:8377` on the QuietNet computer controls it: another account on the same machine, or anyone with an SSH login. This is by design for a single-owner home machine. It matters if the Pi is shared.
 
-### 19. Limits on guessing are simple by design
+### 19. Limits on guessing are kept in memory
 
-The relay's limits are kept in memory, so they reset when it restarts. The per-account limit (five wrong passwords in fifteen minutes) means a stranger who knows your email can keep you locked out by guessing wrongly on purpose. For a self-hosted relay with one owner this is a fair trade; a public service would want something finer.
+The relay's limits reset when it restarts. (The lock-out half of this issue is fixed: see below.)
 
 ## Open: smaller security points
 
@@ -75,18 +81,6 @@ The Pi container needs network rights that are simplest to hold as root. The rel
 QuietNet keeps no memory of answers. Because it also cuts every answer's lifetime to 120 seconds, devices ask again often, and each ask is a round trip to 1.1.1.1. On a busy home network that adds delay and traffic.
 
 **Fix:** keep answers in memory for their (shortened) lifetime, keyed by name and record type, and clear the memory whenever a rule changes.
-
-### 23. The remote dashboard is slower than it needs to be
-
-Each refresh of the dashboard makes three to six API calls. Through the relay each one is a separate round trip, and the Pi handles them one at a time: it asks the relay for work, does one call, answers, and asks again. On a slow link the page lags.
-
-**Fix:** let the Pi take several waiting calls per poll and answer them together, or add one combined "everything this tab needs" call.
-
-### 24. A flood of lookups queues without limit
-
-The UDP listener hands every lookup to a pool of 64 workers. If lookups arrive faster than they can be answered (a misbehaving device, or the upstream servers being unreachable), the waiting list grows without bound.
-
-**Fix:** drop new lookups when more than a few hundred are waiting. Devices retry on their own.
 
 ### 12. Minor
 
@@ -117,6 +111,34 @@ The Python security fixes published during 2026 were checked against the modules
 This check used the published release notes. It is not a scan of the built image, which needs a tool such as `docker scout` or `trivy` run against the image itself.
 
 ## Fixed
+
+### In the third review (22 November)
+
+| # | What was wrong | Fix |
+| --- | --- | --- |
+| 25 | **A plain-text request could pass the dashboard's JSON check.** The check looked for the words `application/json` anywhere in the type, so a hostile page could send `text/plain; application/json`, which browsers send to another site without asking | The type must be exactly `application/json`; and a change whose browser-reported sender is not on this computer is refused |
+| 19 | **A stranger could keep the owner locked out of the relay** by guessing wrongly on purpose; the overall limit could even lock everyone out | A browser that has signed in before carries a signed marker and gets its own limit instead of the shared ones (it still needs the right password). The marker is voided by a password change and removed at sign-out |
+| 26 | **A Pi's large answers were refused by the relay.** The 64 KB limit applied to them too, so a busy device's longer history hung for 30 seconds and then failed | A paired Pi may answer a waiting call with up to 16 MB, two at a time (so self-paired "Pis" can't flood the relay's memory); anything bigger is replaced on the Pi by a short message |
+| 23 | **The remote dashboard was slow**: the Pi handled relayed calls one at a time | Up to eight at once |
+| 27 | **A Pi could answer a call meant for another Pi**, if it knew the call's id | Each call remembers which Pi it was sent to |
+| 24 | **A flood of lookups queued without limit**; a TCP client could hold a thread for ever by sending a byte every few seconds; history had no size limit | At most 256 lookups in hand; at most 64 TCP connections, 8 seconds each; history capped at two million rows; stalled relay connections dropped after 30 seconds |
+| 28 | **A forged DNS answer only had to guess the id** (once it came from the right address) | It must also repeat the question asked |
+| 29 | **A crash or `docker kill` left devices steered at the Pi** and the kernel settings changed, with nothing to undo them | What is changed is written down as it happens, and undone at the next start (even if the enforcer can't run then) |
+| 30 | **A device switched off from enforcing wasn't handed back** until it forgot the Pi by itself; with the last device, forwarding was switched off under it, cutting it off meanwhile | Handed back at once; forwarding stays on until every device has been handed back |
+| 31 | **Steering went ahead even when forwarding couldn't be switched on**, as in a container, cutting the device off | Forwarding is read back; if it's off, nothing is steered and the device page says what to run on the Pi |
+| 32 | **"Hand back" messages claimed to come from the router's hardware address**, which Wi-Fi drops and network switches mis-learn | They come from the Pi's own |
+| 33 | **The router, the Pi itself or another network's addresses could be enforced** | Refused by the dashboard and skipped by the enforcer |
+| 34 | **If an address passed to a different device, that device was steered** | Enforcing remembers the device's hardware address and leaves any other alone, saying so on the device page |
+| 35 | **A steered device slipped back to the router for up to two seconds every half-minute** (each time it re-asked, the router's answer won) | The enforcer answers those questions itself, at once and again after Linux's one-second lock; measured: nothing got through in 146 seconds |
+| 36 | **`iptables` failures went unnoticed**: commands didn't wait for the firewall lock, a failed rule was treated as loaded, and a removed jump was never put back | Waits for the lock; reloads until every command works; re-checks the jump every tick |
+| 37 | **Advert-list addresses were cut by address**, which also cuts ordinary sites sharing them; pausing didn't pause the enforcer | The advert list stays a DNS-only block; pausing applies to the enforcer too |
+| 38 | **The kernel settings couldn't be read or changed in the slim container**, which has no `sysctl` tool | Read and written through `/proc/sys` directly |
+| 39 | **`docker logs` showed nothing** until much later, because output was held back | Output is sent at once |
+| 40 | **The check for other firewalls trusted what it couldn't see**: a listing that failed counted as "all clear", and the container had no tool to read `iptables-legacy` rules | It fails closed, and the image includes the `iptables` commands for reading |
+| 41 | **A flood of forged "who is the router?" questions could start unlimited threads** | One sending thread; repeat questions restart a device's plan instead of adding to it |
+| 42 | **After something flushed `iptables`, QuietNet put its jump back but not its rules** | The chain's contents are checked too, and reloaded when needed |
+| 43 | **The first history trim after upgrading could hold up DNS answers for many seconds** | Trimmed 5,000 rows at a time, letting go of the lock between steps |
+| 44 | **The enforcer tests read the real machine's network**, so on a Pi or Linux runner about 20 of them failed | The tests use a fixed stand-in network |
 
 ### In the second review
 

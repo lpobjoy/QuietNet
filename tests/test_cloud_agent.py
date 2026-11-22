@@ -274,6 +274,36 @@ class RunLoop(AgentCase):
         self.assertEqual(json.loads(PretendDashboard.requests[0]["body"]), {"on": True})
         self.assertEqual(set(PretendRelay.seen_tokens), {PretendRelay.token})      # every call carried the token
 
+    def test_a_slow_call_does_not_hold_up_the_next_one(self):
+        # A dashboard page makes several calls at once; they shouldn't queue behind each other.
+        a = self.agent()
+        a.pair(self.relay_url, PretendRelay.good_code)
+        release = threading.Event()
+        self.addCleanup(release.set)
+
+        def local(method, path, body):
+            if path == "/api/slow":
+                release.wait(5)
+            return 200, json.dumps({"path": path})
+        a._local = local
+        PretendRelay.calls = [{"id": "slow", "method": "GET", "path": "/api/slow"},
+                              {"id": "quick", "method": "GET", "path": "/api/quick"}]
+        self.run_until(a, lambda: any(x["id"] == "quick" for x in PretendRelay.answers))
+        self.assertNotIn("slow", [x["id"] for x in PretendRelay.answers])     # still waiting, yet quick got through
+        release.set()
+        deadline = time.time() + 5                     # let the slow one finish before the next test starts
+        while "slow" not in [x["id"] for x in PretendRelay.answers] and time.time() < deadline:
+            time.sleep(0.02)
+
+    def test_an_answer_too_big_to_relay_is_replaced_by_a_short_message(self):
+        a = self.agent()
+        a.pair(self.relay_url, PretendRelay.good_code)
+        a._local = lambda method, path, body: (200, "x" * (cloud_agent.MAX_ANSWER + 1))
+        PretendRelay.calls = [{"id": "big", "method": "GET", "path": "/api/activity"}]
+        self.run_until(a, lambda: PretendRelay.answers)
+        self.assertEqual(PretendRelay.answers[0]["status"], 502)
+        self.assertIn("too much to send remotely", PretendRelay.answers[0]["body"])
+
     def test_it_reports_online_once_the_relay_answers(self):
         a = self.agent()
         a.pair(self.relay_url, PretendRelay.good_code)
