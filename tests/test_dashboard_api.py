@@ -460,6 +460,7 @@ class Devices(Api):
 
     def test_a_device_that_tried_another_dns_service_is_flagged_in_the_device_list(self):
         self.log(KID, "www.bbc.co.uk")
+        server.set_service_block("device:" + KID, "tiktok", True)
         server.answer_query(query("dns.google"), KID, lambda d: None)
         d = self.get("/api/devices")[1][0]
         self.assertGreater(d["other_dns"], time.time() - 60)
@@ -470,9 +471,23 @@ class Devices(Api):
 
     def test_a_dns_service_lookup_is_flagged_in_the_devices_activity(self):
         self.log(KID, "abc.dns.nextdns.io", blocked=1)
+        server.set_service_block("device:" + KID, "tiktok", True)
         g = self.get("/api/activity?ip=%s&hours=24" % KID)[1][0]
         self.assertTrue(g["other_dns"])
         self.assertEqual((g["hosts"][0]["b"], g["hosts"][0]["why"]), (True, "other_dns"))
+
+    def test_a_dns_service_lookup_is_not_flagged_for_a_device_with_no_rules(self):
+        self.log(KID, "abc.dns.nextdns.io")
+        g = self.get("/api/activity?ip=%s&hours=24" % KID)[1][0]
+        self.assertFalse(g["other_dns"])
+
+    def test_the_other_dns_switch_is_saved_and_shown_in_the_status(self):
+        self.ok("/api/other-dns-switch", {"on": True})
+        self.assertTrue(self.get("/api/status")[1]["other_dns_all"])
+        server.init_db()
+        self.assertTrue(server.S.other_dns_all)
+        self.ok("/api/other-dns-switch", {"on": False})
+        self.assertFalse(server.S.other_dns_all)
 
     def test_ordinary_activity_is_not_flagged_as_another_dns_service(self):
         self.log(KID, "www.bbc.co.uk")

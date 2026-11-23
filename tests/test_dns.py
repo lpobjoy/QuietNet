@@ -441,10 +441,12 @@ class NetworkDnsSignals(Base):
 
 class OtherDnsServices(Base):
     """Names of other DNS services (secure DNS in a browser, Private DNS on a phone) are blocked for
-    every device, so it falls back to ordinary DNS and comes to QuietNet (known issue 8)."""
+    devices the owner controls, or every device if the owner chooses, so they fall back to
+    ordinary DNS and come to QuietNet (known issue 8). KID has a rule of its own; ADULT has none."""
 
     def setUp(self):
         super().setUp()
+        server.set_service_block("device:" + KID, "tiktok", True)
         drain_log()
         self.asked = []
 
@@ -467,7 +469,25 @@ class OtherDnsServices(Base):
                      "chrome.cloudflare-dns.com", "doh.dns.sb", "dns.controld.com", "freedns.controld.com"):
             self.assertIn(name, server.OTHER_DNS_SERVICES)
 
-    def test_a_dns_service_is_blocked_for_a_device_with_no_rules(self):
+    def test_a_dns_service_gets_a_real_answer_for_a_device_with_no_rules_of_its_own(self):
+        self.assertEqual(self.ask("dns.google", client=ADULT)[-4:], bytes([93, 184, 216, 34]))
+        self.assertNotIn(ADULT, server.S.other_dns)
+
+    def test_a_dns_service_is_blocked_for_every_device_when_the_owner_chooses(self):
+        server.S.other_dns_all = True
+        self.assertEqual(self.ask("dns.google", client=ADULT)[-4:], bytes(4))
+
+    def test_a_dns_service_is_blocked_for_a_device_in_a_group(self):
+        server.S.group_names[7] = "Kids"
+        server.S.dev_group[ADULT] = 7
+        self.assertEqual(self.ask("dns.google", client=ADULT)[-4:], bytes(4))
+
+    def test_a_dns_service_is_blocked_for_a_device_with_live_cut_on(self):
+        server.S.enforced.add(ADULT)
+        self.assertEqual(self.ask("dns.google", client=ADULT)[-4:], bytes(4))
+
+    def test_a_dns_service_is_blocked_for_a_device_with_its_own_schedule(self):
+        self.schedule(scope="device:" + ADULT)
         self.assertEqual(self.ask("dns.google", client=ADULT)[-4:], bytes(4))
 
     def test_a_name_beneath_a_dns_service_is_blocked(self):
@@ -958,6 +978,13 @@ def rdnss(lifetime, *addresses):
     return bytes([25, 1 + 2 * len(addresses), 0, 0]) + struct.pack(">I", lifetime) + body
 
 
+def prefix(valid, network):
+    """An address range option (type 3) handing out `network` for `valid` seconds."""
+    net = server.ipaddress.IPv6Network(network)
+    return (bytes([3, 4, net.prefixlen, 0xC0]) + struct.pack(">III", valid, valid, 0)
+            + net.network_address.packed)
+
+
 class RouterAnnouncements(Base):
     """The router's IPv6 announcements, read to spot it telling devices to use its own IPv6 DNS
     server. Nothing here opens a real socket: the listener is handed stand-ins."""
@@ -965,10 +992,12 @@ class RouterAnnouncements(Base):
     HUB = "fe80::1"
     PI = "2001:db8:1:2::60"
 
-    def listen(self, packets, sock=None):
-        """Run the listener over these (data, source) packets, then stop it."""
+    def listen(self, packets, sock=None, hops=255):
+        """Run the listener over these (data, source) packets, each arriving with this hop limit
+        (None: the system noted none), then stop it."""
         sock = sock or mock.Mock()
-        sock.recvfrom.side_effect = list(packets) + [KeyboardInterrupt()]
+        extra = [] if hops is None else [(server.socket.IPPROTO_IPV6, server.IPV6_HOPLIMIT, struct.pack("=i", hops))]
+        sock.recvmsg.side_effect = [(data, extra, 0, source) for data, source in packets] + [KeyboardInterrupt()]
         with self.assertRaises(KeyboardInterrupt):
             server.router_advert_listener(sock)
 
@@ -1068,6 +1097,46 @@ class RouterAnnouncements(Base):
         self.assertIn(self.HUB, server.S.router_v6_dns)
         self.assertIsNotNone(server.S.ra_heard)
 
+    def test_the_listener_ignores_announcements_whose_hop_limit_is_not_255(self):
+        self.listen([(router_advert(rdnss(600, self.HUB)), ("fe80::1%wlan0", 0, 0, 3))], hops=64)
+        self.assertEqual((server.S.router_v6_dns, server.S.ra_heard), ({}, None))
+
+    def test_the_listener_accepts_announcements_when_the_system_gives_no_hop_limit(self):
+        self.listen([(router_advert(rdnss(600, self.HUB)), ("fe80::1%wlan0", 0, 0, 3))], hops=None)
+        self.assertIn(self.HUB, server.S.router_v6_dns)
+
+    def test_the_socket_asks_for_each_announcements_hop_limit(self):
+        sock = mock.Mock()
+        with mock.patch.object(server.os.path, "exists", return_value=True), \
+                mock.patch.object(server.socket, "socket", return_value=sock):
+            self.assertIs(server.open_ra_socket(), sock)
+        sock.setsockopt.assert_any_call(server.socket.IPPROTO_IPV6, server.IPV6_RECVHOPLIMIT, 1)
+
+    def test_an_announcement_with_router_lifetime_zero_does_not_mean_the_network_has_ipv6(self):
+        thread_router = bytearray(router_advert(prefix(0xFFFFFFFF, "fd11:22:33:44::/64")))
+        thread_router[6:8] = bytes(2)                               # "not a router for you"
+        self.listen([(bytes(thread_router), ("fe80::9%wlan0", 0, 0, 3))])
+        self.assertIsNone(server.S.ra_heard)
+        self.assertEqual(server.S.router_prefixes, {})
+        self.assertFalse(server.ipv6_dns_view()["in_use"])
+
+    def test_a_real_routers_address_range_is_remembered(self):
+        self.listen([(router_advert(prefix(7200, "fd00:1::/64")), ("fe80::1%wlan0", 0, 0, 3))])
+        self.assertIn(server.ipaddress.IPv6Network("fd00:1::/64"), server.S.router_prefixes)
+
+    def test_a_range_announced_with_router_lifetime_zero_is_read(self):
+        found = server.read_router_advert(router_advert(prefix(600, "fd11::/64")))
+        self.assertEqual(found["prefixes"], [(server.ipaddress.IPv6Network("fd11::/64"), 600)])
+        self.assertEqual(found["lifetime"], 1800)
+
+    def test_a_unique_local_address_outside_every_announced_range_is_not_given_to_devices(self):
+        text = "\tinet6 fd11:22:33:44::60 prefixlen 64 autoconf secured\n"
+        with mock.patch.object(server.os.path, "exists", lambda p: False), \
+                mock.patch.object(server.subprocess, "run", return_value=mock.Mock(stdout=text)):
+            self.assertEqual(server.own_ipv6([server.ipaddress.IPv6Network("fd00:1::/64")])[2], "")
+            self.assertEqual(server.own_ipv6([server.ipaddress.IPv6Network("fd11:22:33:44::/64")])[2],
+                             "fd11:22:33:44::60")
+
     def test_the_listener_ignores_announcements_not_from_a_link_local_address(self):
         self.listen([(router_advert(rdnss(600, "2001:db8::53")), ("2001:db8::99", 0, 0, 0))])
         self.assertEqual(server.S.router_v6_dns, {})
@@ -1091,7 +1160,7 @@ class RouterAnnouncements(Base):
 
     def test_the_listener_stops_quietly_when_the_socket_fails(self):
         sock = mock.Mock()
-        sock.recvfrom.side_effect = OSError("network gone")
+        sock.recvmsg.side_effect = OSError("network gone")
         with mock.patch("builtins.print"):
             server.router_advert_listener(sock)                    # returns, does not raise
         self.assertFalse(server.S.ra_listening)
@@ -1114,7 +1183,7 @@ class RouterAnnouncements(Base):
         with mock.patch.object(server.os.path, "exists", return_value=True), \
                 mock.patch.object(server.socket, "socket", return_value=sock):
             self.assertIs(server.open_ra_socket(), sock)
-        level, option, value = sock.setsockopt.call_args[0]
+        level, option, value = sock.setsockopt.call_args_list[0][0]
         words = struct.unpack("=8I", value)
         self.assertEqual(words[4], 0xFFFFFFFF & ~(1 << 6))         # 134 = 4 * 32 + 6: the one type let through
         self.assertTrue(all(w == 0xFFFFFFFF for i, w in enumerate(words) if i != 4))

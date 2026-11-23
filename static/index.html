@@ -890,6 +890,7 @@ function viewHome(){
         ${st.community && !st.community.installed ? '<button class="btn link" data-act="tab" data-tab="rules">Get the full list</button>' : ''}</p></div>
       <label class="switch"><input type="checkbox" id="junkSwitch" ${st.junk_on ? 'checked' : ''} aria-label="Block known adverts and trackers automatically"><span></span></label>
     </div>
+    ${otherDnsSwitch(st)}
     <div class="home-stats">
       <div class="stat"><b>${num(today.total)}</b><span>requests in the last 24 hours</span></div>
       <div class="stat"><b>${num(today.blocked)}</b><span>blocked</span></div>
@@ -904,6 +905,17 @@ function viewHome(){
   ${tiles ? `<div class="thead" aria-hidden="true"><span>Device</span><span>Today</span><span></span></div><div class="tiles">${tiles}</div>` : `<div class="card empty">
     <p><b>No devices yet.</b></p><p>QuietNet can only see devices that have been pointed at it.</p>
     <button class="btn primary" data-act="tab" data-tab="setup">Show me how to set up a device</button></div>`}`;
+}
+
+// The household setting "Stop every device using another DNS service". st.other_dns_all is true or
+// false. Off, only devices with rules of their own (or a group, or "cut live connections") are kept
+// away from other DNS services, because a device set up to use one strictly loses all names.
+function otherDnsSwitch(st){
+  return `<div class="row"><div class="grow"><h2>Stop every device using another DNS service</h2>
+    <p class="meta">Devices with rules of their own are always stopped from using another DNS service (such as Google's or
+      Cloudflare's) to get round QuietNet. Turn this on to stop every device. A phone or computer set to use one of those
+      services, rather than "automatic", will then have no internet at home until its setting is changed.</p></div>
+    <label class="switch"><input type="checkbox" id="otherDnsSwitch" ${st.other_dns_all ? 'checked' : ''} aria-label="Stop every device using another DNS service"><span></span></label></div>`;
 }
 
 /* ---------- Another firewall in the way ---------- */
@@ -926,12 +938,27 @@ function firewallNotice(){
 // A device with rules went quiet just as a new private-address device appeared: it may be the same
 // phone or tablet with a new private Wi-Fi address. st.device_notices comes from refresh_devices on
 // the Pi. On the home page every notice is shown; on a device's page (ip given) only those about it.
+// n.same marks a device with a new private address at the very number the rules are kept under:
+// the rules still apply to it, and the owner says whether it is the same device.
 function movedNotices(ip){
   const list = ((S.status || {}).device_notices || []).filter(n => !ip || n.to === ip);
-  return list.map(n => `<div class="notice warn"><b>A device with rules (${esc(n.name)}) has gone quiet and a new device appeared</b>
+  return list.map(n => n.same
+    ? `<div class="notice warn"><b>A device with a new private Wi-Fi address now has the number ${esc(n.to)}</b>,
+    which ${esc(n.name)} had. It may be the same device, so its rules still apply. Is it ${esc(n.name)}?
+    <button class="btn primary" data-act="moverules" data-from="${esc(n.from)}" data-to="${esc(n.to)}">Yes, it's the same device</button>
+    <button class="btn" data-act="notsame" data-ip="${esc(n.to)}">No, it's a different device</button>
+    ${ip ? '' : `<button class="btn link" data-act="open" data-ip="${esc(n.to)}">Open it</button>`}</div>`
+    : `<div class="notice warn"><b>A device with rules (${esc(n.name)}) has gone quiet and a new device appeared</b>
     at ${esc(n.to)}. It may be the same one with a new private Wi-Fi address.
     <button class="btn primary" data-act="moverules" data-from="${esc(n.from)}" data-to="${esc(n.to)}">Move the rules to this device</button>
     ${ip ? '' : `<button class="btn link" data-act="open" data-ip="${esc(n.to)}">Open it</button>`}</div>`).join('');
+}
+// The warning on a device's page (rules paused, not moved, or behind a range extender). A paused
+// address offers "It's the same device", for a device that changed its hardware address.
+function deviceWarning(d){
+  if(!d.warning) return '';
+  return `<div class="notice warn">${esc(d.warning)}${d.paused
+    ? ` <button class="btn" data-act="moverules" data-from="${esc(d.ip)}" data-to="${esc(d.ip)}">It's the same device</button>` : ''}</div>`;
 }
 // What QuietNet did by itself to devices' rules in the last week (moved, paused, new-device group).
 function deviceEvents(){
@@ -1037,7 +1064,7 @@ function viewDevice(){
     ${S.groups.length ? '' : '<button class="btn link" data-act="tab" data-tab="groups">Create a group</button>'}</div>
   ${d.last ? '' : `<div class="notice warn"><b>This device isn't using QuietNet yet</b>, so nothing can be seen or blocked for it.
     <button class="btn link" data-act="tab" data-tab="setup">Show me how to set it up</button></div>`}
-  ${d.warning ? `<div class="notice warn">${esc(d.warning)}</div>` : ''}
+  ${deviceWarning(d)}
   ${movedNotices(d.ip)}
   ${otherDnsNotice(d)}
   ${controls('device:' + S.device, 'this device')}
@@ -1451,11 +1478,16 @@ const actions = {
   },
   // Put a device into the open group (data-in="1") or take it out (data-in="").
   async moverules(d){
-    const yes = await ask({title:'Move the rules to this device?', ok:'Move the rules',
-      text:'Its name, group, blocks, schedules and "cut live connections" move from ' + d.from + ' to ' + d.to + '. The history stays where it was.'});
+    const yes = await ask(d.from === d.to
+      ? {title:'Is this the same device?', ok:'Yes, the same device',
+         text:'The rules kept for ' + d.from + ' will belong to the device that has that number now, and apply to it.'}
+      : {title:'Move the rules to this device?', ok:'Move the rules',
+         text:'Its name, group, blocks, schedules and "cut live connections" move from ' + d.from + ' to ' + d.to + '. The history stays where it was.'});
     if(!yes) return;
     await api('/api/move-rules', {from:d.from, to:d.to}).catch(oops); refresh(true);
   },
+  // "No, it's a different device": the rules are paused and kept for the device they belong to.
+  async notsame(d){ await api('/api/different-device', {ip:d.ip}).catch(oops); refresh(true); },
   async member(d){ await api('/api/device-group', {ip:d.ip, group:d.in ? S.group : null}).catch(oops); refresh(true); },
   open(d){ S.device = d.ip; S.activity = []; S.activityKey = ''; S.open.clear(); S.search = ''; S.filter = 'all'; S.svcOpen = false; refresh(true); },
   back(){ S.device = null; refresh(true); },
@@ -1517,6 +1549,7 @@ document.addEventListener('click', e => {
 document.addEventListener('change', async e => {
   if(e.target.name === 'qnTheme'){ setTheme(e.target.value); return; }   // a look only: nothing is sent anywhere
   if(e.target.id === 'junkSwitch'){ await api('/api/junk-switch', {on:e.target.checked}).catch(oops); refresh(); }
+  if(e.target.id === 'otherDnsSwitch'){ await api('/api/other-dns-switch', {on:e.target.checked}).catch(oops); refresh(); }
   if(e.target.id === 'enforceSwitch'){ await api('/api/enforce', {ip:S.device, on:e.target.checked}).catch(oops); refresh(true); }
   if(e.target.id === 'netSwitch'){ await api('/api/internet', {scope:e.target.dataset.scope, off:!e.target.checked}).catch(oops); refresh(true); }
   if(e.target.id === 'newGroupSel'){ await api('/api/new-device-group', {group:e.target.value ? +e.target.value : null}).catch(oops); e.target.blur(); refresh(true); }

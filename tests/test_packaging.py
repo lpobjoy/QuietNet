@@ -456,6 +456,92 @@ class DashboardSharedAddresses(unittest.TestCase):
         self.assertIn("addresses are shared with sites this device is allowed, so those connections are left to the name block", self.note)
 
 
+class DashboardDeviceMoves(unittest.TestCase):
+    """The dashboard's parts for devices that change address and for other DNS services: the
+    "may be the same device" notices, recent changes to devices, the new-device group picker, the
+    device badges and warning, and the other-DNS notice and switch. Device names, addresses and
+    event notes come from the household network, so each must be escaped. Reads the page's
+    script only; nothing is run in a browser."""
+
+    @classmethod
+    def setUpClass(cls):
+        page = read("static", "index.html")
+        cls.notices = page[page.index("function movedNotices("):page.index("function deviceWarning(")]
+        cls.warning = page[page.index("function deviceWarning("):page.index("// What QuietNet did by itself")]
+        cls.events = page[page.index("function deviceEvents("):page.index("/* ---------- One device")]
+        cls.picker = page[page.index("function newDeviceCard("):page.index("function viewGroup(")]
+        cls.other = page[page.index("function otherDnsNotice("):page.index("// Blocked things whose addresses")]
+        cls.switch = page[page.index("function otherDnsSwitch("):page.index("/* ---------- Another firewall in the way")]
+        cls.home = page[page.index("function viewHome(){"):page.index("// The household setting \"Stop every device")]
+        cls.device = page[page.index("function viewDevice("):page.index("/* ---------- Groups")]
+        cls.page = page
+
+    def test_the_notices_are_on_the_home_page_and_the_device_page(self):
+        self.assertIn("${movedNotices(null)}", self.home)
+        self.assertIn("${movedNotices(d.ip)}", self.device)
+
+    def test_the_notices_come_from_the_status_and_a_device_page_shows_only_its_own(self):
+        self.assertIn("((S.status || {}).device_notices || []).filter(n => !ip || n.to === ip)", self.notices)
+
+    def test_the_notices_escape_the_name_and_both_addresses(self):
+        self.assertIn("${esc(n.name)}", self.notices)
+        self.assertIn('data-from="${esc(n.from)}" data-to="${esc(n.to)}"', self.notices)
+        self.assertIn('data-ip="${esc(n.to)}"', self.notices)
+        self.assertNotIn("${n.", self.notices)
+
+    def test_the_move_notice_offers_to_move_the_rules(self):
+        self.assertIn('data-act="moverules"', self.notices)
+        self.assertIn("Move the rules to this device", self.notices)
+
+    def test_the_same_number_notice_asks_whether_it_is_the_same_device(self):
+        self.assertIn("n.same", self.notices)
+        self.assertIn("Yes, it's the same device", self.notices)
+        self.assertIn('data-act="notsame"', self.notices)
+
+    def test_the_different_device_answer_is_sent_to_the_pi(self):
+        self.assertIn("api('/api/different-device', {ip:d.ip})", self.page)
+
+    def test_the_device_warning_is_shown_only_when_there_is_one_and_is_escaped(self):
+        self.assertIn("if(!d.warning) return '';", self.warning)
+        self.assertIn("${esc(d.warning)}", self.warning)
+        self.assertIn("${deviceWarning(d)}", self.device)
+
+    def test_a_paused_device_can_be_confirmed_as_the_same_device_from_its_warning(self):
+        self.assertIn("d.paused", self.warning)
+        self.assertIn('data-from="${esc(d.ip)}" data-to="${esc(d.ip)}"', self.warning)
+
+    def test_recent_changes_are_on_the_home_page_only_when_there_are_some(self):
+        self.assertIn("${deviceEvents()}", self.home)
+        self.assertIn("if(!ev.length) return '';", self.events)
+
+    def test_recent_changes_escape_the_note_and_the_time(self):
+        self.assertIn("${esc(e.text)} · ${esc(ago(e.ts))}", self.events)
+
+    def test_the_new_device_group_picker_escapes_group_ids_and_names(self):
+        self.assertIn('<option value="${esc(g.id)}"', self.picker)
+        self.assertIn("${esc(g.name)}</option>", self.picker)
+        self.assertIn("(S.status || {}).new_device_group", self.picker)
+
+    def test_the_rules_paused_badge_shows_only_for_a_paused_device(self):
+        self.assertIn("${d.paused ? '<span class=\"badge warn\">Rules paused</span>' : ''}", self.home)
+
+    def test_the_other_dns_badge_shows_only_for_a_device_that_tried(self):
+        self.assertIn("${d.other_dns ? '<span class=\"badge warn\">Tried another DNS service</span>' : ''}", self.home)
+
+    def test_the_other_dns_notice_shows_only_when_the_device_tried_and_escapes_the_time(self):
+        self.assertIn("if(!d.other_dns && !S.activity.some(g => g.other_dns)) return '';", self.other)
+        self.assertIn("esc(ago(d.other_dns))", self.other)
+        self.assertIn("${otherDnsNotice(d)}", self.device)
+
+    def test_the_other_dns_switch_is_on_the_home_page_and_follows_the_status(self):
+        self.assertIn("${otherDnsSwitch(st)}", self.home)
+        self.assertIn("st.other_dns_all ? 'checked' : ''", self.switch)
+        self.assertIn("api('/api/other-dns-switch', {on:e.target.checked})", self.page)
+
+    def test_the_other_dns_switch_says_what_it_can_cut_off(self):
+        self.assertIn("will then have no internet at home until its setting is changed", self.switch)
+
+
 class DashboardThemes(unittest.TestCase):
     """The dashboard has three looks (calm, household, control), picked under Appearance and kept
     in the qn_theme cookie. These checks read the page; nothing is run in a browser."""

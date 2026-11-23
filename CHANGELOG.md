@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+Second check of the robustness review's fixes (23 November). Each is in `docs/KNOWN_ISSUES.md`, "Faults in the robustness review's fixes":
+- Two devices that swap addresses each keep their own rules (they used to swap rules). A device whose rules can't be moved to its new address has them applied there, live cut included, until the owner sorts it out.
+- Rules move onto an address left with only a name or a departed visitor's group; a moved device no longer inherits the visitors' group.
+- A device that changes its private Wi-Fi address but gets the same number back keeps its rules, and the owner is asked "Is it the same device?" (new `POST /api/different-device`; `POST /api/move-rules` with one address twice means "yes"). A paused device's page offers "It's the same device".
+- A device never seen before at a paused address gets the new-device group.
+- The neighbour table is read with `ip -4 neigh`, so a stale entry at a device's old address no longer holds its rules back.
+- A Wi-Fi range extender showing every device behind it with its own hardware address is recognised, and rules no longer jump between the devices behind it.
+- The record of hardware addresses is capped (30 days, 5,000 addresses) and only the ones on the network now are looked up.
+- Other DNS services are blocked only for devices the owner controls, unless the new home-page switch "Stop every device using another DNS service" is on (`POST /api/other-dns-switch`, `other_dns_all` in the status), so phones set to use one strictly keep working.
+- YouTube's, Netflix's and Twitch's video servers are always cut by address, even when an allowed download name shares them.
+- Router announcements must arrive with a hop limit of 255; only those from a real router (lifetime above 0) count as the network having IPv6, or decide which unique-local address devices are given.
+- Dashboard page tests for the device-move notices, recent device changes, the new-device group picker, the badges, the device warning and the other-DNS notice and switch. A wrong "below" in KNOWN_ISSUES corrected.
+
 Robustness review (23 November): six faults found in a review of whether the blocker can be relied on were fixed (the entries below, from "IPv6 and Cut live connections" to "The router's own IPv6 DNS server"). Docs brought up to date with them:
 - `docs/KNOWN_ISSUES.md` has a new "Found in the robustness review" table under Fixed, and a new open issue 93 listing the ways round QuietNet that remain: devices not steered can still use another DNS server by its address, secure DNS set up by address alone, VPNs, IPv6 connections opened before a cut, and no redirect with `iptables`. Issues 4, 5, 8 and 79 say what is fixed and what still needs checking on a real Pi.
 - `docs/ARCHITECTURE.md` shows the enforcer's whole `nft` table, with the new `dns_redirect` chain, and lists the router announcement listener and the IPv6 watcher among the background threads, the new limits among the fixed values, and the new defences in the security table.

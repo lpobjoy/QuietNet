@@ -51,8 +51,10 @@ class Base(unittest.TestCase):
             server.init_db()
             server.load_lists()
         for table in ("blocked", "allowed", "groups", "device_group", "service_blocks",
-                      "internet_off", "schedules", "queries", "enforced", "device_mac", "known_macs", "events"):
+                      "internet_off", "schedules", "queries", "enforced", "device_mac", "known_macs", "events",
+                      "shared_macs"):
             server.sql("DELETE FROM %s" % table, commit=True)
+        server.sql("DELETE FROM settings WHERE key='other_dns_all'", commit=True)
         server.init_db()
         server.S.junk_on, server.S.paused_until = True, 0
         server.S.enforced, server.S.resolved = set(), {}
@@ -62,6 +64,7 @@ class Base(unittest.TestCase):
         server.S.v6_own, server.S.v6_prefixes, server.S.v6_devices = set(), [], {}
         # Nothing heard from the router about IPv6, and no IPv6 address to give devices.
         server.S.v6_dns, server.S.router_v6_dns, server.S.ra_heard = "", {}, None
+        server.S.router_prefixes = {}
         server.S.other_dns = {}
         server.S.shared_left, server.S.plan_cache = {}, {}
 
@@ -429,6 +432,12 @@ class EnforcementPlan(Base):
 
     def test_an_address_only_blocked_names_use_is_dropped(self):
         self._youtube_blocked_for_the_kid()
+        self.assertIn("173.194.0.5", server.enforcement_plan()[KID]["ips"])
+
+    def test_a_video_server_address_shared_with_an_allowed_download_name_is_still_dropped(self):
+        # Google's caches serve YouTube video and Chrome or Play downloads (gvt1.com) from one address.
+        self._youtube_blocked_for_the_kid()
+        server.record_resolved("r3---sn-aiglln7e.gvt1.com", self._answer("r3---sn-aiglln7e.gvt1.com", "173.194.0.5"))
         self.assertIn("173.194.0.5", server.enforcement_plan()[KID]["ips"])
 
     def test_a_shared_address_is_still_dropped_when_the_allowed_name_is_blocked_elsewhere(self):
