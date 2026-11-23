@@ -16,9 +16,28 @@ It uses only the Python standard library.
 
    **Upgrading a relay set up before this default changed:** existing accounts are kept and can still sign in, but new sign-ups stop once any account exists. If you relied on the old default to let others sign up, add `QUIETNET_SIGNUP=open`. Everyone will need to sign in again once after the upgrade, because the session cookie changed.
 6. Open the Railway URL, create your account, sign in with it, and choose **Add a QuietNet** to get a
-   pairing code. Enter that code (and the Railway URL) on the Pi's own QuietNet page
-   under **Remote access**. The code works once and for 15 minutes; reload the page for a new one.
-   One account can hold up to 10 QuietNets and pair up to 20 a day.
+   pairing code. For a new Pi, the page shows one line to run on it, which installs QuietNet and
+   pairs it in one go. For a Pi already running QuietNet, enter the code (and the Railway URL) on
+   the Pi's own QuietNet page under **Remote access**. The code works once and for 15 minutes;
+   reload the page for a new one. One account can hold up to 10 QuietNets and pair up to 20 a day.
+
+## The install line on the home page
+
+The line looks like
+`curl -fsSL https://raw.githubusercontent.com/lpobjoy/QuietNet/main/install.sh | sh -s -- --relay https://your-relay.up.railway.app --code A1B2-C3D4`.
+Two settings shape it, and on Railway neither is usually needed:
+
+- `QUIETNET_RELAY_URL`: this relay's public web address, such as `https://relay.example.com`
+  (`http://` only for `localhost` or `127.0.0.1`, see below). If it is unset or not usable, the relay uses `https://` plus Railway's `RAILWAY_PUBLIC_DOMAIN`, and failing that
+  `https://` plus the address the browser asked for. Set it if you use your own domain, or if the
+  line shows the wrong address. Each of these is used only if it is a plain address (letters,
+  digits, dots, dashes and an optional port), since the line is pasted into a shell; if none is,
+  the line shows `https://your-relay-address` with a note to replace it.
+- `QUIETNET_INSTALL_URL`: where the line fetches `install.sh` from. The default is the copy on
+  GitHub's `main` branch. Point it at a copy you have checked, or a tagged release, if you would
+  rather not have new Pis run whatever is on `main` (see known issue 86 in `docs/KNOWN_ISSUES.md`).
+
+The relay never fetches the installer itself; only the Pi does.
 
 ## Limits
 
@@ -41,7 +60,13 @@ The container starts as root, because Railway's volume is owned by root. Before 
 PORT=8080 python3 cloud/relay.py
 ```
 
-Then pair a local Pi agent against `http://localhost:8080`. Plain `http://` is accepted only for `localhost`, `127.0.0.1` and `::1`; a relay on any other computer must use `https://`.
+Then pair a local Pi agent against `http://localhost:8080`. The install line on the home page will
+guess `https://localhost:8080`, which is wrong for a local relay, so start it with
+`QUIETNET_RELAY_URL=http://localhost:8080` as well. Plain `http://` is accepted only for a relay on
+the same computer: the install line and `install.sh` take it for `localhost` and `127.0.0.1` (written
+in small letters), and the Pi's own dashboard also for `::1`. A `QUIETNET_RELAY_URL` starting
+`http://` with any other host is ignored, and the line falls back to the addresses above. A relay on
+any other computer must use `https://`.
 
 ## What it stores
 

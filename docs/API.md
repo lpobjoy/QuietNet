@@ -158,7 +158,7 @@ A network address is the last entry of `X-Forwarded-For` (added by the host's pr
 | `POST /login` | Form fields `email`, `password`. `503` "The relay is busy" if four passwords are already being checked and none finishes within 5 seconds |
 | `GET /logout` | A "Sign out?" page with a button. Changes nothing. Redirects to `/login` if not signed in |
 | `POST /logout` | Form field `token`, the sign-out token in the page's sign-out button (made from the session cookie and the relay's secret). With the right token, signs the account out everywhere (every session cookie made for it so far, in any browser, stops working), clears both cookies and redirects to `/login`. Without it, changes nothing and redirects to `/` (or to `/login` if not signed in) |
-| `GET /` | Your QuietNets, with pairing codes for those not yet paired. A code older than 15 minutes is replaced when this page is opened |
+| `GET /` | Your QuietNets, with pairing codes for those not yet paired. A code older than 15 minutes is replaced when this page is opened. Each waiting QuietNet also shows the one-line install command with this relay's address and the code (the address from `QUIETNET_RELAY_URL`, `RAILWAY_PUBLIC_DOMAIN` or the `Host` header, used only if it is a plain address; otherwise a placeholder to replace) |
 | `POST /pis/new` | Form field `name`. Creates a QuietNet and a pairing code. `403` with a page saying so when the account already has 10 QuietNets, paired or waiting |
 | `POST /pis/<id>/delete` | Removes one of your QuietNets. Its Pi is locked out at once |
 | `GET /pi/<id>/` | The dashboard page, set to call this Pi |

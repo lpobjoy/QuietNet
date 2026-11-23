@@ -21,7 +21,9 @@ A home network filter. Devices point their DNS at it; it records what they look 
 | `cloud/relay.py` | The relay: accounts, pairing, the browser-to-Pi bridge. Deployed on its own; must not import the other programs |
 | `static/index.html` | The dashboard. One file, served by both the Pi and the relay. Its script opens with notes for editors |
 | `services.json`, `junk_domains.txt` | Data: blockable services and the built-in advert list |
+| `install.sh` | The one-line installer for a Pi. Plain POSIX `sh` (dash, busybox ash, bash); everything in functions, only the last line runs; every value checked before use. Notes for editors at the top |
 | `tests/` | One file per part. `test_quietnet.py` holds the shared helpers |
+| `tests/test_installer.py` | Runs `install.sh` against stand-in commands; never real Docker, the network or the real `/etc` |
 
 ## Before you finish any change
 

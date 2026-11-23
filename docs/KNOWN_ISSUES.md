@@ -1,6 +1,6 @@
 # Known issues
 
-Two reviews have been made: of version 0.5 on 21 November 2026, and a second, deeper pass the same day covering security, the software QuietNet depends on, and efficiency. A third, on 22 November, looked at the enforcer, the relay and the DNS filter, followed by an independent check of its fixes and a live test of the enforcer between two containers. A fourth, also on 22 November, looked again at every part (the DNS filter, the database, the relay, the Pi's link to it, the enforcer's firewall check, the dashboard page and the packaging) and fixed 32 points. On 23 November the open issues themselves were worked through: nine were closed (6, 8, 19, 20, 22, 80, 81, 82 and 83), five were narrowed (5, 7, 12, 21 and 78, each now stating only what is left), and one new point was found while checking the fixes (84). An independent check of those fixes the same day found eleven more faults in them, all fixed (see "Faults in the 23 November fixes" under Fixed), and closed 84. This file lists what is still open, then what has been fixed.
+Two reviews have been made: of version 0.5 on 21 November 2026, and a second, deeper pass the same day covering security, the software QuietNet depends on, and efficiency. A third, on 22 November, looked at the enforcer, the relay and the DNS filter, followed by an independent check of its fixes and a live test of the enforcer between two containers. A fourth, also on 22 November, looked again at every part (the DNS filter, the database, the relay, the Pi's link to it, the enforcer's firewall check, the dashboard page and the packaging) and fixed 32 points. On 23 November the open issues themselves were worked through: nine were closed (6, 8, 19, 20, 22, 80, 81, 82 and 83), five were narrowed (5, 7, 12, 21 and 78, each now stating only what is left), and one new point was found while checking the fixes (84). An independent check of those fixes the same day found eleven more faults in them, all fixed (see "Faults in the 23 November fixes" under Fixed), and closed 84. Later on 23 November a one-line installer was added; its open points are 85 to 88. This file lists what is still open, then what has been fixed.
 
 The numbers are referred to from tests and other documents. Keep them stable.
 
@@ -47,6 +47,32 @@ These could only be checked with stand-ins here:
 - **The relay giving up root on Railway (added 23 November).** After a redeploy the log should say "Running as user 65534, group 65534, not root." Sign-up and sign-in should still save to `/data`, and an existing root-owned `relay.db` (with its `-wal` and `-shm` files) should be handed over and keep working. If Railway refuses the change of owner, the log shows the "still running as root" warning instead.
 - **Row spacing on old Safari (added 23 November).** The dashboard spaces rows with margins where flex `gap` is ignored. This has not been seen on a real Safari before 14.1.
 
+### 85. The one-line installer has not been run on a real Pi
+
+`install.sh` (added 23 November) has only been run against stand-in commands, under dash and bash on a Mac and in a Debian container, and by hand under busybox ash in an Alpine container with no network. It has never installed real Docker, built the real image, or changed a real system's settings. **Still to check** (the steps are in [Testing](TESTING.md#checking-the-installer-on-a-real-pi)):
+
+- Docker's own install script on Raspberry Pi OS, 64-bit and 32-bit. Docker has been winding down 32-bit Arm support, so on 32-bit Pi OS it may fail; the installer then points to Docker's own install guides for Debian and Ubuntu, which have not been followed on a Pi either. Also on the newest Pi OS and Debian release (Trixie).
+- Switching off systemd-resolved's listener on Ubuntu, and that the Pi's own lookups still work after `/etc/resolv.conf` is re-pointed.
+- The column layout of `ss -lntup` on each system, which the port 53 check reads.
+- `sudo` asking for a password at the start of a piped install (and again if a long build outlasts sudo's 15-minute memory), sudo refusing a user not allowed to use it, and `ssh` without `-t`, the Pi's address in the closing message, and pairing appearing on the relay within a minute.
+- That `--uninstall` and a re-run behave as the tests expect with real Docker Compose (project name, volume name, `down --rmi local`).
+
+### 86. The installer runs whatever is on GitHub's main branch, unsigned
+
+The one line fetches `install.sh` from GitHub's `main` branch, and the installer downloads QuietNet from `main` (or `--ref`). Both go over HTTPS, but nothing checks a signature or a known checksum. So anyone who can push to `main` on GitHub, or who takes over the GitHub account, controls what every newly installed or updated Pi runs, as root and with network rights. The relay's install line shows `main` too, unless the relay owner sets `QUIETNET_INSTALL_URL`.
+
+**Possible fixes:** protect `main` (required reviews, no direct pushes) and turn on two-factor sign-in for the account; publish tagged releases and have the relay's line and the installer use a tag rather than `main`; or sign releases and check the signature (hard with the standard library and plain `sh` alone). Until then, a cautious owner can read `install.sh` before running it, or pin `--ref` to a tag they have checked.
+
+### 87. The installer depends on get.docker.com
+
+When Docker is missing (and the person agrees), the installer downloads `https://get.docker.com` and runs it as root. That is Docker's own published script, but QuietNet does not control it: if it changes, breaks, drops a system (as with 32-bit Arm), or is tampered with, the install fails or runs something unexpected. Nothing checks it either. People who would rather not can install Docker themselves first (from their system's packages or Docker's instructions), and the installer then skips this step.
+
+### 88. Pairing again with the installer, and the code kept by Docker
+
+- `--relay` and `--code` on a re-run pair only a Pi that isn't paired yet. `cloud_agent.py` ignores `QUIETNET_CLOUD` and `QUIETNET_PAIR` once it holds a key, so the installer can't move a paired Pi to a new relay or account; that still needs **Unlink** on the Pi's Remote access card first. The installer's closing message says so.
+- The pairing code is never written to a file, but Docker keeps it in the container's settings (`docker inspect quietnet` shows `QUIETNET_PAIR`) until the next run without `--code`. It has already been used or has expired by then, so it is of no use to anyone, but it is visible.
+- Uninstalling says how to remove the systemd-resolved settings file, but does not point `/etc/resolv.conf` back at `stub-resolv.conf`. Lookups keep working either way.
+
 ## Open: design decisions for the owner
 
 ### 5. IPv6: the enforcer, and devices known by two addresses
@@ -91,6 +117,8 @@ QuietNet uses **no third-party Python packages**, so there is no package list to
 | Debian packages, including `nftables` | Pi container | Installed fresh at build time |
 | Python 3.9 from Apple | macOS, via `Start QuietNet.command` | Python 3.9 is past the end of its upstream support. Apple maintains its own copy on its own timetable |
 | StevenBlack hosts list | Downloaded on request | Data only. Each line is checked before use and nothing in it is executed |
+| Docker's install script (`get.docker.com`) | Run by `install.sh` as root, only when Docker is missing and the person agrees | Not checked; see issue 87 |
+| QuietNet's own code on GitHub (`main`) | Fetched by the one-line install and by every update through it | Not signed; see issue 86 |
 
 The Python security fixes published during 2026 were checked against the modules QuietNet uses (`http.server`, `urllib`, `sqlite3`, `socket`, `ssl` as a client, `hashlib`, `hmac`, `json`, `subprocess`, `webbrowser`). Those found:
 
