@@ -1,6 +1,6 @@
 # QuietNet runs anywhere Docker does - a Raspberry Pi, a NAS, a spare PC.
 # It installs NOTHING from the internet: QuietNet uses only the Python standard library.
-FROM python:3.13-slim
+FROM python:3.15-slim
 
 # The only system tools QuietNet needs: the kernel's own firewall, used by the
 # live-connection enforcer to drop blocked traffic (nftables), and the older iptables
