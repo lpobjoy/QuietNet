@@ -1,6 +1,6 @@
 # Known issues
 
-Two reviews have been made: of version 0.5 on 21 November 2026, and a second, deeper pass the same day covering security, the software QuietNet depends on, and efficiency. A third, on 22 November, looked at the enforcer, the relay and the DNS filter, followed by an independent check of its fixes and a live test of the enforcer between two containers. A fourth, also on 22 November, looked again at every part (the DNS filter, the database, the relay, the Pi's link to it, the enforcer's firewall check, the dashboard page and the packaging) and fixed 32 points. This file lists what is still open, then what has been fixed.
+Two reviews have been made: of version 0.5 on 21 November 2026, and a second, deeper pass the same day covering security, the software QuietNet depends on, and efficiency. A third, on 22 November, looked at the enforcer, the relay and the DNS filter, followed by an independent check of its fixes and a live test of the enforcer between two containers. A fourth, also on 22 November, looked again at every part (the DNS filter, the database, the relay, the Pi's link to it, the enforcer's firewall check, the dashboard page and the packaging) and fixed 32 points. On 23 November the open issues themselves were worked through: nine were closed (6, 8, 19, 20, 22, 80, 81, 82 and 83), five were narrowed (5, 7, 12, 21 and 78, each now stating only what is left), and one new point was found while checking the fixes (84). An independent check of those fixes the same day found eleven more faults in them, all fixed (see "Faults in the 23 November fixes" under Fixed), and closed 84. This file lists what is still open, then what has been fixed.
 
 The numbers are referred to from tests and other documents. Keep them stable.
 
@@ -28,14 +28,14 @@ In the two-container test, a steered device that was already settled sometimes g
 
 ### 78. Home-network names sent to the router
 
-Since the fourth review, names such as `printer.lan` or `nas.home`, and reverse lookups of home addresses, go to the home router instead of 1.1.1.1 (fixed issue 48). Two gaps remain:
+Since the fourth review, names such as `printer.lan` or `nas.home`, and reverse lookups of home addresses, go to the home router instead of 1.1.1.1 (fixed issue 48). On 23 November the two gaps left in the code were closed:
 
-- QuietNet will not send a name back to the router if the router itself asked. But a router set up to send its own lookups to QuietNet through another route could still make the two ask each other in turn.
-- Single-word names (a plain `nas`, with no ending) still go to the public servers. Some routers answer those for home devices.
+- Single-word names (a plain `nas`, with no ending) now go to the home router too, or get "no such name" if the router isn't known. They never go to the public servers. The exception is a question about a single word with one of the record types used to check DNS signatures (NS, SOA, DS, RRSIG, NSEC, DNSKEY, NSEC3): that is a device checking signatures asking about a top-level name such as `com`, and it goes to the internet as before. Answering it "no such name" would make that device reject every `.com` name.
+- If the same question (name and type) arrives while QuietNet is still waiting on the router for it, the answer is "server failure" rather than a second ask, so a router set up to send its lookups back to QuietNet can't make the two ask each other for ever. Two devices asking for the very same home name at the very same moment also get "server failure"; they simply ask again.
 
-**Still to check on a real Pi:** that home names resolve through a real router, and that the device name hints work when the Pi uses itself for DNS.
+**Still to check on a real Pi:** that home names, single-word names included, resolve through a real router, and that the device name hints work when the Pi uses itself for DNS.
 
-### 79. Other fourth-review changes that need a real Pi or host
+### 79. Other changes that need a real Pi or host
 
 These could only be checked with stand-ins here:
 
@@ -43,95 +43,43 @@ These could only be checked with stand-ins here:
 - **This computer's address changing.** When the Pi's address changes, the enforcer is told the new one. Check that its own-address rules follow within a minute.
 - **A Pi with `iptables` but no `nft`.** With nothing enforced, no `iptables` commands should run each tick.
 - **The relay behind Railway.** Limits per network address read the last entry of the `X-Forwarded-For` header. Check that Railway's proxy adds it there (rather than replacing the header) and that there is only one proxy in front. If every caller looks the same, the per-address limit behaves like the old shared one.
+- **DNS over IPv6 (added 23 November).** On a home network with IPv6, check that the log does not say IPv6 listening failed, that the router actually gives devices the Pi's IPv6 address for DNS, and that such devices' lookups appear on the dashboard under their IPv4 address (matched through `ip -6 neigh`, which the rebuilt image now includes). Check that a lookup from a public IPv6 address outside the home range gets no answer, and that with a device switched off, its IPv6 lookups are blocked or refused.
+- **The relay giving up root on Railway (added 23 November).** After a redeploy the log should say "Running as user 65534, group 65534, not root." Sign-up and sign-in should still save to `/data`, and an existing root-owned `relay.db` (with its `-wal` and `-shm` files) should be handed over and keep working. If Railway refuses the change of owner, the log shows the "still running as root" warning instead.
+- **Row spacing on old Safari (added 23 November).** The dashboard spaces rows with margins where flex `gap` is ignored. This has not been seen on a real Safari before 14.1.
 
 ## Open: design decisions for the owner
 
-### 5. IPv4 only
+### 5. IPv6: the enforcer, and devices known by two addresses
 
-The DNS filter listens on IPv4 addresses only, and the enforcer steers and drops IPv4 only. On a home network with IPv6:
+On 23 November the DNS half was fixed: the filter now also listens on IPv6 (`::`, same port, UDP and TCP), so a device given an IPv6 DNS server by the router is filtered too. If the computer has no IPv6, or the port can't be opened, it says so and carries on with IPv4. An IPv4 device reaching it over IPv6 (`::ffff:192.168.1.23`) is filed under its IPv4 address. The device page now says that "Cut live connections" works on IPv4 only. What remains:
 
-- a device given an IPv6 DNS server by the router will use that and skip QuietNet;
-- an enforced device keeps any connection it made over IPv6.
-
-**Fix:** listen for DNS on IPv6 as well. For the enforcer, either steer IPv6 too (neighbour advertisements in place of ARP) or state the limit on the device page.
-
-### 6. Sign-up on the relay is open unless you close it
-
-Anyone who finds the relay's address can create an account. Accounts cannot see each other's Pis, so this exposes nothing, but it is an open door on a public server. A setting now exists to close it: `QUIETNET_SIGNUP=first` allows only the first account, and `closed` allows none. The default is still `open`, so that existing set-ups behave as before. Since the fourth review, a misspelt value (anything other than `open`, `first` or `closed`) closes sign-up and is warned about at start-up, rather than leaving it open.
-
-**Recommended:** set `QUIETNET_SIGNUP=first` on Railway. Consider making it the default.
-
-### 8. Devices that bring their own phone book
-
-iCloud Private Relay, Android's Private DNS setting, and browsers with "secure DNS" switched on send lookups past QuietNet.
-
-**Fix:** two widely used signals close most of it. Block `mask.icloud.com` and `mask-h2.icloud.com`, which makes Apple devices switch Private Relay off for that network. Answer "no such name" for `use-application-dns.net`, which makes Firefox use the network's DNS.
+- **The enforcer steers and drops IPv4 only.** An enforced device keeps any connection it made over IPv6. Steering IPv6 would need neighbour advertisements in place of ARP.
+- **A device asking from a real IPv6 address is matched to its IPv4 address by hardware address**, using the IPv6 neighbour table and the IPv4 devices from the last scan and the neighbour table, looked at again every minute. Matched, it is filed under its IPv4 address and all its rules apply. If it can't be matched (a new temporary address in its first minute, or a device QuietNet has never seen over IPv4) and any rule names a particular device or group, the answer is "refused", and the device asks QuietNet's IPv4 address instead. A device given only an IPv6 DNS server, and never seen by QuietNet over IPv4, would get no answers at all while such rules exist. With no device or group rules, an unmatched device is answered and shows up apart from its IPv4 address. Before this was fixed (later on 23 November), the IPv6 listener was a way round device rules: a child's phone asking from its IPv6 address got real answers during its group's bedtime.
+- On the Pi, matching needs the `ip` tool (`iproute2`, now in the image). Without it nothing is matched, so with device rules in place every IPv6 lookup from a real IPv6 address is refused.
 
 ### 18. The local dashboard has no password
 
 Anyone who can open `http://localhost:8377` on the QuietNet computer controls it: another account on the same machine, or anyone with an SSH login. This is by design for a single-owner home machine. It matters if the Pi is shared.
 
-### 19. Limits on guessing are kept in memory
-
-The relay's limits reset when it restarts. (The lock-out half of this issue is fixed: see below.)
-
 ## Open: smaller security points
 
 ### 7. Relay
 
-- Signing out clears the cookie in the browser, but a copied cookie stays valid for its full 14 days. The only way to end every session is to delete the `secret` row in `relay.db`.
-- Pi tokens are stored as plain text in `relay.db`. Storing a hash would mean a leaked database could not be used to pose as a Pi. The data folder is now private to its owner, which narrows this.
-- The sign-in form carries no one-time token, so another site could sign a visitor in to the attacker's own account ("login forgery"). The visitor would see the attacker's QuietNets, not their own. Low risk.
-- The sign-up form says when an email already has an account. Low risk for a single-owner relay.
+Four of the six points were fixed on 23 November (see below). Still open:
+
 - The overall cap on wrong pairing codes was raised from 20 to 200 in 10 minutes, now that each network address has its own cap of 20. Codes are 32 bits, so someone guessing without stop has about a 1 in 400 chance a year of hitting a given live code, against about 1 in 4,000 before. Judged acceptable; the owner may want to confirm.
 - The relay's room for large answers (48 MB) counts each answer's stated size. While one is being read, memory briefly reaches two to three times that size.
+- The guard against login forgery relies on the browser's `Sec-Fetch-Site` header. Browsers that don't send it (for example Safari before 16.4) are still exposed. Closing that fully would need a one-time form token tied to a cookie set before sign-in. Low risk: the visitor would see the attacker's QuietNets, not their own.
 
-### 80. TCP lookups have no per-device share
+### 21. The Pi container runs as the root user
 
-Since the fourth review, one device can hold at most 16 of the 256 places for lookups over UDP (fixed issue 49). Lookups over TCP still share 64 connections across the house with no per-device share, so one device could fill them. TCP is used only for large answers, so ordinary lookups are not affected.
+Since 23 November the relay gives up root at start-up (see below). The Pi container still runs as root: it needs network rights (raw sockets, the firewall, kernel settings) that are simplest to hold as root.
 
-### 81. The community list download can fail on a Mac with Python from python.org
-
-That Python has no certificate list of its own until "Install Certificates.command" is run. The Pi's link to the relay now borrows the system's list in that case (fixed issue 69), but the community advert list download in `server.py` does not, so it fails with a certificate error.
-
-**Fix:** use `cloud_agent.tls_context()` for the download too.
-
-### 20. A relay address beginning `http://` is accepted
-
-The Pi will pair with a relay over plain HTTP if given such an address. Over the internet that would send the Pi's token unprotected. An address typed without a scheme gets `https://`, so this needs a deliberate `http://`. It is left in for running a relay on the same machine during development.
-
-**Fix:** refuse `http://` unless the host is `localhost` or `127.0.0.1`.
-
-### 21. Both containers run as the root user
-
-The Pi container needs network rights that are simplest to hold as root. The relay does not need them, but Railway mounts its storage volume owned by root, so an unprivileged relay could not write its database without extra set-up.
-
-## Open: efficiency
-
-### 22. Every allowed lookup goes to the internet
-
-QuietNet keeps no memory of answers. Because it also cuts every answer's lifetime to 120 seconds, devices ask again often, and each ask is a round trip to 1.1.1.1. On a busy home network that adds delay and traffic.
-
-**Fix:** keep answers in memory for their (shortened) lifetime, keyed by name and record type, and clear the memory whenever a rule changes.
-
-### 82. Dashboard reads still hold the database lock
-
-Since the fourth review, DNS answers never wait for the database (fixed issue 50). But clearing the history, and the dashboard's own history questions, still hold the database lock while they run, so they can hold up other dashboard calls and the history writer for a moment.
-
-**Fix:** a second, read-only database connection for the dashboard's questions.
-
-### 83. A device's activity list is sent in full every 30 seconds
-
-Since the fourth review, the dashboard fetches an open device's activity list every 30 seconds rather than every 4 (fixed issue 73). The server has no way to say "nothing has changed", so each fetch still sends the whole list, which for a busy device over a week is large, especially through the relay.
-
-**Fix:** let the page send back a marker of the last change it saw, and answer "unchanged" when nothing is new; or cap the names listed per company.
+## Open: minor
 
 ### 12. Minor
 
-- The README and the comment at the top of `server.py` say blocked lookups are answered "that doesn't exist". They are answered with the address `0.0.0.0`, which devices treat the same way.
 - The enforcer drops addresses handed out in the last six hours. A service that moves to new addresses is covered as soon as the device looks them up through QuietNet.
-- On Safari before 14.1, rows of buttons and labels sit closer together than intended (the page uses flex `gap`, which those versions ignore). Nothing breaks or disappears.
-- When a network is too big to scan in full, the scan covers the 1,024 addresses around this computer and the API says so (`capped`), but the dashboard page does not yet tell the person.
 
 ## Software QuietNet depends on
 
@@ -157,6 +105,39 @@ The Python security fixes published during 2026 were checked against the modules
 This check used the published release notes. It is not a scan of the built image, which needs a tool such as `docker scout` or `trivy` run against the image itself.
 
 ## Fixed
+
+### Faults in the 23 November fixes
+
+An independent check of the 23 November fixes found these. All were fixed the same day.
+
+| # | Problem | What was done |
+| --- | --- | --- |
+| 5 | **The new IPv6 listener was a way round device rules.** Rules are kept by IPv4 address, so a device asking from its own IPv6 address escaped its internet switch, its group, its blocked services and its group's schedules | IPv6 neighbours are matched to IPv4 devices by hardware address every minute (`refresh_ipv6_view`), and matched lookups are filed under the IPv4 address. An unmatched one is refused while any device or group rule exists, so the device falls back to IPv4. This computer's own IPv6 addresses now count as this computer |
+| 5 | **The IPv6 listener answered anyone.** A public IPv6 address can be reached from the internet unless the router's firewall stops it, which would make QuietNet an open resolver | Only `::1`, link-local, unique-local and public addresses inside the home network's own ranges are answered over IPv6, on UDP and TCP; anything else gets no answer (`v6_source_allowed`) |
+| 22 | **The answer memory counted answers, not bytes.** TCP answers can be 64 KB, so one device could pin hundreds of megabytes; and a big remembered answer could be given over UDP to a device that had asked for less | Answers over 4,096 bytes are not remembered. Over UDP, a remembered answer is only given if it fits the size the device asked for (512 bytes, or its settings record's size) |
+| 84 | **Remembered answers ignored what the question asked of them.** An unchecked answer fetched for a device that turned signature checking off (the "CD" flag) could be given to every other device | Remembered answers are filed by whether the question had a settings record, whether it asked for signatures, and the CD flag as well (`cache_key`) |
+| 78 | **Single-word names included top-level names such as `com`**, so a device checking DNS signatures got "no such name" for `com` and rejected every `.com` answer | Single words asked with a signature-checking record type go to the internet |
+| 83 | **A new community list of the same size didn't change the activity marker**, and didn't refresh the enforcer's plan or the answer memory | Installing a downloaded list counts as a rule change (`rules_changed`) |
+| 82 | **Clearing a busy device's history could outlast the relay's 30-second wait** now that it goes in steps | One device's clear runs in the background and the call answers at once |
+| 21 | **Handing over the relay's data folder followed links**, so a compromised relay could leave a link to a system file for the next start, as root, to hand over; and a refused change of user crashed with a raw error | Only `relay.db` and its companion files are handed over, only when each is a plain file, and links are never followed. A refused change of user, or a user number too big for the system, stops the relay with a plain message |
+| 7 | **A session cookie with an enormous user number crashed the request** (the number was too big for the database) | Such a cookie counts as signed out |
+| 6 | **Two sign-ups at once on a new relay could both get in** despite "first account only" | In `first` mode the account is added only if there are still none, in the same database statement |
+
+### Open issues closed (23 November)
+
+| # | Problem | What was done |
+| --- | --- | --- |
+| 6 | **Sign-up on the relay was open unless you closed it**, so anyone who found the address could make an account | `QUIETNET_SIGNUP` now defaults to `first`: only the first account can be created. `open` and `closed` can still be chosen, and a misspelt value still closes sign-up. The start-up log says which setting is in force. A relay that already has accounts keeps them, but nobody new can sign up unless the owner sets `QUIETNET_SIGNUP=open` |
+| 7 (four of six points) | **Relay sessions, tokens and forms:** signing out left a copied cookie valid for 14 days; Pi tokens were stored as plain text; another site could sign a visitor in to the attacker's account; the sign-up form said when an email already had an account | Signing out (and any change to the password record) ends every session for that account, in every browser: the cookie is now `user.number.expiry.signature`, and signing out bumps the number. Pi tokens are stored as a SHA-256 hash; tokens in an existing database are hashed at start-up and paired Pis keep working. Forms sent from another website (`Sec-Fetch-Site` of `cross-site` or `same-site`) are refused. Sign-up gives the same answer whether or not the email has an account, and no longer signs you in. The other two points stay open under issue 7 |
+| 8 | **Devices that bring their own phone book** (Firefox's secure DNS, iCloud Private Relay) sent lookups past QuietNet | `use-application-dns.net` gets "no such name", so Firefox uses the network's DNS; `mask.icloud.com` and `mask-h2.icloud.com` are blocked, so Apple devices switch Private Relay off for the network. This applies to every device, paused or not, whatever the rules say, and these lookups show as blocked in history so the owner can see who tried. Android's Private DNS setting has no such signal and is not covered |
+| 19 | **The relay's limits on guessing were kept in memory** and reset when it restarted | They are also kept in `relay.db` (a `throttle` table) and read back at start-up, dropping anything older than a day. At most 1,000 times are kept per name |
+| 20 | **A relay address beginning `http://` was accepted**, which would send the Pi's token unprotected | Refused, before anything is sent, unless the host is `localhost`, `127.0.0.1` or `::1`. A Pi already paired with such an address by an older version never contacts it, and its Remote access card says to pair again with `https://` |
+| 22 | **Every allowed lookup went to the internet** | Answers are kept in memory for their (shortened) lifetime, up to 5,000 of them, and cleared on any rule change. The rules are always checked for the asking device first, so a block bites on the very next lookup. Failures, empty replies, cut-short answers and home-router answers are not kept |
+| 80 | **TCP lookups had no per-device share** | One device may hold at most 8 of the 64 TCP connections; more are closed at once |
+| 81 | **The community list download could fail on a Mac** with Python from python.org | It uses the same secure-connection settings as the relay link, which borrow the system's certificate list when Python has none. Certificates are still always checked |
+| 82 | **Dashboard reads held the database lock** | History questions (today's totals, the device list's history, the activity list) use a second, read-only connection with its own lock. Clearing one device's history goes 5,000 rows at a time, letting go of the lock between steps. Reads of the small tables (rules, devices, the scan's findings) still use the main lock; they are quick |
+| 83 | **A device's activity list was sent in full every 30 seconds** | Each answer carries a marker; the page sends it back with the next request, and gets "unchanged" without the list when nothing has changed. Calls without the marker get the plain list as before |
+| 12 (three of four points) | The README and `server.py` said blocked lookups were answered "that doesn't exist"; flex rows sat too close on Safari before 14.1; the dashboard didn't say when a scan was cut short | Both now say blocked names get the address `0.0.0.0` (or `::`). Where flex `gap` is ignored the page spaces rows with margins. The Devices page says when only the addresses nearest this computer were checked |
 
 ### In the fourth review (22 November)
 
@@ -185,7 +166,7 @@ This check used the published release notes. It is not a scan of the built image
 | 66 | **A relay cookie with non-English letters dropped the connection** | It counts as signed out |
 | 67 | **A misspelt `QUIETNET_SIGNUP` left sign-up open** | Any value other than `open`, `first` or `closed` closes it, with a warning at start-up |
 | 68 | **The Pi's link to the relay could stop for good after an unexpected error**, such as a cut-off answer during a relay restart, until the container was restarted | Every error is caught; the link tries again after 1 second, then longer, up to 30, and the Remote access card says what happened |
-| 69 | **On a Mac with Python from python.org, pairing failed certificate checks**, and the message said the relay couldn't be reached | If Python has no certificate list, it borrows the system's own. If none is found, the message names "Install Certificates.command". Checks are never switched off. (The list download still has this fault: issue 81) |
+| 69 | **On a Mac with Python from python.org, pairing failed certificate checks**, and the message said the relay couldn't be reached | If Python has no certificate list, it borrows the system's own. If none is found, the message names "Install Certificates.command". Checks are never switched off. (The list download had the same fault until 23 November: issue 81) |
 | 70 | **An accept in one firewall table hid a reject in another**, so with Docker and firewalld a device could be steered and lose its internet | Every table's forwarding chain is judged on its own |
 | 71 | **The firewall advice was always Docker's command**, which does nothing for firewalld, or for ufw without Docker | The advice suits the firewall in the way, and every one in the way is listed with its own command |
 | 72 | **With only `iptables`, three commands ran every two seconds** even with no device enforced | Nothing runs until a device is enforced; leftover rules are still emptied, including when the firewall lock was busy at start-up |

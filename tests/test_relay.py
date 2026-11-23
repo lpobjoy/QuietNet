@@ -10,12 +10,14 @@ import http.client
 import json
 import re
 import socket
+import stat
 import os
 import sys
 import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 from http.server import ThreadingHTTPServer
 from urllib.parse import urlencode
 
@@ -87,7 +89,9 @@ class RelayCase(unittest.TestCase):
             relay.bridge.waiting.clear()
             relay.bridge.pollers.clear()
         relay.throttle.failures.clear()
+        relay.sql("DELETE FROM throttle", commit=True)
         self.limit("big_answers", relay.BigAnswers(relay.BIG_ANSWER_BUDGET))
+        self.limit("SIGNUP", "open")        # most tests make several accounts; SignupSwitch tests the others
 
     def limit(self, name, value):
         """Change one of the relay's limits for the length of a test."""
@@ -95,11 +99,21 @@ class RelayCase(unittest.TestCase):
         setattr(relay, name, value)
 
     def signed_in(self, email="lewis@example.com"):
+        """Create an account and sign in to it, as a person would. Returns the signed-in browser."""
         b = Browser(self.port)
-        status, _, r = b.post("/signup", form={"email": email, "password": PASSWORD})
+        status, text, _ = b.post("/signup", form={"email": email, "password": PASSWORD})
+        self.assertEqual(status, 200)
+        self.assertIn("Now sign in", text)
+        status, _, r = b.post("/login", form={"email": email, "password": PASSWORD})
         self.assertEqual(status, 303)
         self.assertEqual(r.getheader("Location"), "/")
         return b
+
+    def make_account(self, email="lewis@example.com"):
+        """Add an account straight to the database (quickly) and return its user id."""
+        relay.sql("INSERT INTO users(email,pw,created) VALUES(?,?,?)",
+                  (email, relay.hash_pw(PASSWORD, rounds=1000), time.time()), commit=True)
+        return relay.sql("SELECT id FROM users WHERE email=?", (email,), one=True)[0]
 
     def sign_out(self, browser, page="/"):
         """Press the sign-out button on a page, as the browser would: post its form, token and all."""
@@ -156,24 +170,61 @@ class Passwords(unittest.TestCase):
 
 class Sessions(RelayCase):
     def test_a_fresh_session_names_its_user(self):
-        self.assertEqual(relay.read_session(relay.make_session(7)), 7)
+        uid = self.make_account()
+        self.assertEqual(relay.read_session(relay.make_session(uid)), uid)
 
     def test_changing_the_user_number_breaks_the_signature(self):
-        uid, exp, sig = relay.make_session(7).split(".")
-        self.assertIsNone(relay.read_session("8.%s.%s" % (exp, sig)))
+        uid = self.make_account()
+        other = self.make_account("hannah@example.com")
+        _, gen, exp, sig = relay.make_session(uid).split(".")
+        self.assertIsNone(relay.read_session("%d.%s.%s.%s" % (other, gen, exp, sig)))
 
     def test_extending_the_expiry_breaks_the_signature(self):
-        uid, exp, sig = relay.make_session(7).split(".")
-        self.assertIsNone(relay.read_session("%s.%d.%s" % (uid, int(exp) + 999999, sig)))
+        uid, gen, exp, sig = relay.make_session(self.make_account()).split(".")
+        self.assertIsNone(relay.read_session("%s.%s.%d.%s" % (uid, gen, int(exp) + 999999, sig)))
 
     def test_an_expired_session_is_refused(self):
+        uid = self.make_account()
         real = relay.SESSION_HOURS
         relay.SESSION_HOURS = -1
         try:
-            old = relay.make_session(7)
+            old = relay.make_session(uid)
         finally:
             relay.SESSION_HOURS = real
         self.assertIsNone(relay.read_session(old))
+
+    def test_a_session_from_before_signing_out_everywhere_is_refused(self):
+        uid = self.make_account()
+        old = relay.make_session(uid)
+        relay.end_sessions(uid)
+        self.assertIsNone(relay.read_session(old))
+
+    def test_a_session_made_after_signing_out_everywhere_works(self):
+        uid = self.make_account()
+        relay.end_sessions(uid)
+        self.assertEqual(relay.read_session(relay.make_session(uid)), uid)
+
+    def test_changing_the_password_ends_every_session(self):
+        uid = self.make_account()
+        old = relay.make_session(uid)
+        relay.sql("UPDATE users SET pw=? WHERE id=?", (relay.hash_pw("a new password", rounds=1000), uid), commit=True)
+        self.assertIsNone(relay.read_session(old))
+
+    def test_a_cookie_made_before_session_numbers_counts_as_signed_out(self):
+        # The old form was 'user.expiry.signature'; it must be refused quietly, not cause an error.
+        uid = self.make_account()
+        old_style = "%d.9999999999.%s" % (uid, "0" * 32)
+        self.assertIsNone(relay.read_session(old_style))
+        b = Browser(self.port)
+        b.cookie = "qn_session=" + old_style
+        status, _, r = b.get("/")
+        self.assertEqual((status, r.getheader("Location")), (303, "/login"))
+
+    def test_a_session_for_a_removed_account_is_refused(self):
+        uid = self.make_account()
+        cookie = relay.make_session(uid)
+        relay.sql("DELETE FROM users WHERE id=?", (uid,), commit=True)
+        self.assertIsNone(relay.read_session(cookie))
 
     def test_rubbish_cookies_are_refused(self):
         for cookie in ("", "7", "7.9999999999", "a.b.c", "7.9999999999.deadbeef", "....", None):
@@ -269,11 +320,18 @@ class Accounts(RelayCase):
         status, _, r = Browser(self.port).get("/")
         self.assertEqual((status, r.getheader("Location")), (303, "/login"))
 
-    def test_signing_up_signs_you_in(self):
+    def test_after_signing_up_you_can_sign_in(self):
         b = self.signed_in()
         status, text, _ = b.get("/")
         self.assertEqual(status, 200)
         self.assertIn("Your QuietNets", text)
+
+    def test_signing_up_does_not_sign_you_in_by_itself(self):
+        b = Browser(self.port)
+        status, text, r = b.post("/signup", form={"email": "a@example.com", "password": PASSWORD})
+        self.assertEqual(status, 200)
+        self.assertIsNone(r.getheader("Set-Cookie"))
+        self.assertEqual(relay.sql("SELECT email FROM users"), [("a@example.com",)])
 
     def test_the_session_cookie_is_hidden_from_page_scripts(self):
         b = self.signed_in()
@@ -281,17 +339,24 @@ class Accounts(RelayCase):
         self.assertIn("SameSite=Lax", b.cookie_flags)
 
     def test_the_cookie_is_marked_secure_behind_https(self):
+        self.make_account("a@example.com")
         b = Browser(self.port)
-        b.post("/signup", form={"email": "a@example.com", "password": PASSWORD},
+        b.post("/login", form={"email": "a@example.com", "password": PASSWORD},
                headers={"X-Forwarded-Proto": "https"})
         self.assertIn("Secure", b.cookie_flags)
 
     def test_the_same_email_cannot_sign_up_twice(self):
         self.signed_in()
-        status, text, _ = Browser(self.port).post("/signup", form={"email": "LEWIS@example.com", "password": PASSWORD})
-        self.assertEqual(status, 200)
-        self.assertIn("already has an account", text)
-        self.assertEqual(relay.sql("SELECT COUNT(*) FROM users", one=True)[0], 1)
+        record = relay.sql("SELECT pw FROM users", one=True)[0]
+        Browser(self.port).post("/signup", form={"email": "LEWIS@example.com", "password": "another password"})
+        self.assertEqual(relay.sql("SELECT pw FROM users"), [(record,)])     # one account, password unchanged
+
+    def test_sign_up_gives_the_same_answer_whether_or_not_the_email_has_an_account(self):
+        self.make_account("lewis@example.com")
+        taken = Browser(self.port).post("/signup", form={"email": "lewis@example.com", "password": PASSWORD})
+        new = Browser(self.port).post("/signup", form={"email": "hannah@example.com", "password": PASSWORD})
+        self.assertEqual((taken[0], taken[1]), (new[0], new[1]))
+        self.assertNotIn("already has an account", taken[1])
 
     def test_weak_or_malformed_sign_ups_are_refused(self):
         for form in ({"email": "a@example.com", "password": "short"},
@@ -320,6 +385,47 @@ class Accounts(RelayCase):
         self.sign_out(b)
         status, _, r = b.get("/")
         self.assertEqual((status, r.getheader("Location")), (303, "/login"))
+
+    def test_signing_out_ends_a_copy_of_the_cookie_too(self):
+        b = self.signed_in()
+        copy = Browser(self.port)
+        copy.cookie = b.cookie
+        self.sign_out(b)
+        self.assertEqual(copy.get("/")[0], 303)
+
+    def test_signing_out_ends_the_sessions_in_other_browsers(self):
+        laptop = self.signed_in()
+        phone = Browser(self.port)
+        phone.post("/login", form={"email": "lewis@example.com", "password": PASSWORD})
+        self.sign_out(laptop)
+        self.assertEqual(phone.get("/")[0], 303)
+
+    def test_a_sign_in_sent_from_another_website_is_refused(self):
+        self.make_account()
+        b = Browser(self.port)
+        status, text, r = b.post("/login", form={"email": "lewis@example.com", "password": PASSWORD},
+                                 headers={"Sec-Fetch-Site": "cross-site"})
+        self.assertEqual(status, 403)
+        self.assertIn("another website", text)
+        self.assertIsNone(r.getheader("Set-Cookie"))
+
+    def test_a_sign_in_from_the_relays_own_page_works(self):
+        self.make_account()
+        status, _, _ = Browser(self.port).post("/login", form={"email": "lewis@example.com", "password": PASSWORD},
+                                               headers={"Sec-Fetch-Site": "same-origin"})
+        self.assertEqual(status, 303)
+
+    def test_a_sign_up_sent_from_another_website_is_refused(self):
+        status, _, _ = Browser(self.port).post("/signup", form={"email": "a@example.com", "password": PASSWORD},
+                                               headers={"Sec-Fetch-Site": "cross-site"})
+        self.assertEqual(status, 403)
+        self.assertEqual(relay.sql("SELECT COUNT(*) FROM users", one=True)[0], 0)
+
+    def test_adding_a_quietnet_from_another_website_is_refused(self):
+        b = self.signed_in()
+        status, _, _ = b.post("/pis/new", form={"name": "Theirs"}, headers={"Sec-Fetch-Site": "same-site"})
+        self.assertEqual(status, 403)
+        self.assertEqual(relay.sql("SELECT COUNT(*) FROM pis", one=True)[0], 0)
 
     def test_the_sign_out_button_on_the_remote_dashboard_works(self):
         b = self.signed_in()
@@ -355,7 +461,7 @@ class Accounts(RelayCase):
     def test_a_forged_cookie_does_not_sign_you_in(self):
         self.signed_in()
         b = Browser(self.port)
-        b.cookie = "qn_session=1.9999999999.%s" % ("0" * 32)
+        b.cookie = "qn_session=1.0.9999999999.%s" % ("0" * 32)
         self.assertEqual(b.get("/")[0], 303)
 
     def test_unknown_pages_are_not_found(self):
@@ -796,7 +902,8 @@ class PairingCodeExpiry(RelayCase):
         try:
             relay.DATA = folder
             relay.init_db()
-            self.assertEqual(relay.sql("SELECT id, token, paired, code_ts FROM pis"), [("abc", "tok", 1, 0)])
+            self.assertEqual(relay.sql("SELECT id, token, paired, code_ts FROM pis"),
+                             [("abc", relay.token_record("tok"), 1, 0)])
             relay.init_db()                                   # starting a second time must not fail
             relay.db.close()
         finally:
@@ -807,9 +914,20 @@ class SignupSwitch(RelayCase):
     def signup(self, email):
         return Browser(self.port).post("/signup", form={"email": email, "password": PASSWORD})
 
-    def test_open_by_default(self):
-        self.assertEqual(relay.SIGNUP, "open")
+    def test_only_the_first_account_by_default(self):
+        self.assertEqual(relay.read_signup_setting({}), "first")
+        self.assertEqual(relay.read_signup_setting({"QUIETNET_SIGNUP": ""}), "first")
+
+    def test_open_can_still_be_chosen(self):
+        self.assertEqual(relay.read_signup_setting({"QUIETNET_SIGNUP": " Open "}), "open")
+        self.limit("SIGNUP", "open")
         self.assertIn("Create an account", Browser(self.port).get("/login")[1])
+
+    def test_the_start_up_log_says_which_sign_up_setting_is_in_force(self):
+        for mode, words in (("first", "first account only"), ("open", "open"), ("closed", "closed"),
+                            ("frist", "closed")):
+            self.limit("SIGNUP", mode)
+            self.assertIn(words, relay.signup_status(), mode)
 
     def test_closed_means_nobody_can_create_an_account(self):
         self.limit("SIGNUP", "closed")
@@ -822,10 +940,26 @@ class SignupSwitch(RelayCase):
 
     def test_first_lets_in_one_account_then_shuts_the_door(self):
         self.limit("SIGNUP", "first")
-        self.assertEqual(self.signup("lewis@example.com")[0], 303)
+        self.assertEqual(self.signup("lewis@example.com")[0], 200)
         self.assertEqual(self.signup("stranger@example.com")[0], 403)
         self.assertEqual(relay.sql("SELECT email FROM users"), [("lewis@example.com",)])
         self.assertNotIn("Create an account", Browser(self.port).get("/login")[1])
+
+    def test_a_second_sign_up_that_passed_the_check_before_the_first_finished_makes_no_account(self):
+        self.limit("SIGNUP", "first")
+        real_hash = relay.hash_pw
+
+        def someone_else_signs_up_meanwhile(password, *a, **kw):
+            """Another sign-up finishes while this one is still working out its password record."""
+            relay.sql("INSERT INTO users(email,pw,created) VALUES(?,?,?)",
+                      ("lewis@example.com", real_hash("another password"), time.time()), commit=True)
+            return real_hash(password, *a, **kw)
+
+        with mock.patch.object(relay, "hash_pw", someone_else_signs_up_meanwhile):
+            status, text, _ = self.signup("stranger@example.com")
+        self.assertEqual(status, 200)
+        self.assertIn("Thank you", text)
+        self.assertEqual(relay.sql("SELECT email FROM users"), [("lewis@example.com",)])
 
     def test_existing_accounts_can_still_sign_in_when_sign_up_is_closed(self):
         self.signed_in()
@@ -918,6 +1052,16 @@ class OddCookies(RelayCase):
     def test_a_session_cookie_with_non_ascii_letters_is_not_valid(self):
         self.assertIsNone(relay.read_session("\xc3\xa9.9999999999.%s" % ("0" * 32)))
         self.assertIsNone(relay.read_session("1.9999999999.\xc3\xa9"))
+
+    def test_a_session_cookie_with_an_enormous_user_number_counts_as_signed_out(self):
+        self.assertIsNone(relay.read_session("99999999999999999999999.0.9999999999.abc"))
+        self.assertIsNone(relay.read_session("1.99999999999999999999999.9999999999.abc"))
+
+    def test_an_enormous_user_number_in_a_cookie_gets_the_signed_out_answer(self):
+        b = Browser(self.port)
+        b.cookie = "qn_session=99999999999999999999999.0.9999999999.abc"
+        status, _, r = b.get("/")
+        self.assertEqual((status, r.getheader("Location")), (303, "/login"))
 
     def test_a_non_ascii_session_cookie_gets_the_signed_out_answer(self):
         # Another site on the same domain could set such a cookie; the relay must still answer.
@@ -1073,7 +1217,7 @@ class SignInCost(RelayCase):
         return Browser(self.port).post("/login", form={"email": email, "password": password}, headers=headers)
 
     def test_signing_in_correctly_over_and_over_is_capped(self):
-        self.signed_in()
+        self.make_account()
         self.limit("LOGIN_TRIES_PER_EMAIL", (3, 600))
         for _ in range(3):
             self.assertEqual(self.login()[0], 303)
@@ -1331,6 +1475,253 @@ class BigAnswersOverTheWire(RelayCase):
         pi.join(6)
         self.assertEqual(most["used"], 1000000)
         self.assertTrue(freed)
+
+
+# ------------------------------------------------------------------ Pi tokens are stored hashed
+
+class TokenStorage(RelayCase):
+    def test_the_pis_token_is_not_stored_as_plain_text(self):
+        pid, token = self.paired_pi(self.signed_in())
+        stored = relay.sql("SELECT token FROM pis WHERE id=?", (pid,), one=True)[0]
+        self.assertNotIn(token, stored)
+        self.assertEqual(stored, relay.token_record(token))
+
+    def test_a_paired_pi_still_gets_in_with_its_token(self):
+        pid, token = self.paired_pi(self.signed_in())
+        self.limit("POLL_TIMEOUT", 0.05)
+        self.assertEqual(Browser(self.port).get("/agent/poll", headers={"X-QuietNet-Token": token})[0], 200)
+
+    def test_the_stored_record_does_not_work_as_a_token(self):
+        pid, token = self.paired_pi(self.signed_in())
+        stored = relay.sql("SELECT token FROM pis WHERE id=?", (pid,), one=True)[0]
+        self.assertEqual(Browser(self.port).get("/agent/poll", headers={"X-QuietNet-Token": stored})[0], 401)
+
+    def old_database(self, token):
+        """A relay.db from before tokens were hashed, holding one paired Pi with a plain-text token."""
+        import sqlite3
+        folder = tempfile.mkdtemp(prefix="quietnet-relay-old-")
+        old = sqlite3.connect(os.path.join(folder, "relay.db"))
+        old.executescript("""
+            CREATE TABLE users(id INTEGER PRIMARY KEY, email TEXT UNIQUE, pw TEXT, created REAL);
+            CREATE TABLE pis(id TEXT PRIMARY KEY, user_id INTEGER, name TEXT, token TEXT,
+                code TEXT, paired INTEGER, created REAL, last_seen REAL, code_ts REAL DEFAULT 0);
+            CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT);
+        """)
+        old.execute("INSERT INTO pis VALUES('abc', 1, 'Home Pi', ?, '', 1, 1.0, 2.0, 0)", (token,))
+        old.commit()
+        old.close()
+        return folder
+
+    def start_on(self, folder):
+        """Point the relay at another data folder and start it there, putting things back afterwards."""
+        keep = (relay.db, relay.SECRET, relay.DATA)
+
+        def put_back():
+            relay.db.close()
+            relay.db, relay.SECRET, relay.DATA = keep
+        self.addCleanup(put_back)
+        relay.DATA = folder
+        relay.init_db()
+
+    def test_plain_text_tokens_in_an_old_database_are_hashed_at_start_up(self):
+        self.start_on(self.old_database("a" * 48))
+        self.assertEqual(relay.sql("SELECT token FROM pis", one=True)[0], relay.token_record("a" * 48))
+
+    def test_starting_again_does_not_hash_a_token_twice(self):
+        self.start_on(self.old_database("a" * 48))
+        relay.init_db()
+        self.assertEqual(relay.sql("SELECT token FROM pis", one=True)[0], relay.token_record("a" * 48))
+
+    def test_a_pi_paired_before_the_change_still_gets_in(self):
+        self.start_on(self.old_database("b" * 48))
+        self.limit("POLL_TIMEOUT", 0.05)
+        relay.sql("UPDATE pis SET last_seen=?", (time.time(),), commit=True)
+        self.assertEqual(Browser(self.port).get("/agent/poll", headers={"X-QuietNet-Token": "b" * 48})[0], 200)
+
+
+# ------------------------------------------------------------------ limits survive a restart
+
+class LimitsSurviveARestart(RelayCase):
+    def test_failures_are_still_counted_after_a_restart(self):
+        before = relay.Throttle(persist=True)
+        for _ in range(3):
+            before.fail("x")
+        after = relay.Throttle(persist=True)
+        after.load()
+        self.assertTrue(after.blocked("x", (3, 60)))
+
+    def test_a_cleared_name_stays_cleared_after_a_restart(self):
+        before = relay.Throttle(persist=True)
+        before.fail("x")
+        before.clear("x")
+        after = relay.Throttle(persist=True)
+        after.load()
+        self.assertFalse(after.blocked("x", (1, 60)))
+
+    def test_failures_too_old_to_count_are_dropped_at_start_up(self):
+        relay.sql("INSERT INTO throttle(name, times) VALUES('x', ?)",
+                  (json.dumps([time.time() - relay.Throttle.KEEP_SECONDS - 60]),), commit=True)
+        relay.Throttle(persist=True).load()
+        self.assertEqual(relay.sql("SELECT name FROM throttle"), [])
+
+    def test_damaged_stored_failures_are_ignored(self):
+        relay.sql("INSERT INTO throttle(name, times) VALUES('x', 'not a list')", commit=True)
+        t = relay.Throttle(persist=True)
+        t.load()
+        self.assertFalse(t.blocked("x", (1, 60)))
+
+    def test_a_locked_account_is_still_locked_after_a_restart(self):
+        self.signed_in()
+        for _ in range(relay.LOGIN_LIMIT_PER_EMAIL[0]):
+            Browser(self.port).post("/login", form={"email": "lewis@example.com", "password": "wrong password"})
+        restarted = relay.Throttle(persist=True)
+        restarted.load()
+        self.limit("throttle", restarted)
+        status, _, _ = Browser(self.port).post("/login", form={"email": "lewis@example.com", "password": PASSWORD})
+        self.assertEqual(status, 429)
+
+    def test_the_times_kept_for_one_name_are_bounded(self):
+        t = relay.Throttle(persist=True)
+        for _ in range(relay.Throttle.MAX_TIMES + 10):
+            t.fail("x")
+        stored = json.loads(relay.sql("SELECT times FROM throttle WHERE name='x'", one=True)[0])
+        self.assertEqual((len(t.failures["x"]), len(stored)), (relay.Throttle.MAX_TIMES, relay.Throttle.MAX_TIMES))
+
+    def test_names_forgotten_under_a_flood_are_removed_from_the_database_too(self):
+        self.limit_throttle_names(4)
+        t = relay.Throttle(persist=True)
+        for i in range(6):
+            t.fail("n%d" % i)
+        self.assertEqual(relay.sql("SELECT COUNT(*) FROM throttle", one=True)[0], len(t.failures))
+
+    def limit_throttle_names(self, most):
+        """Make Throttle remember at most `most` names for the length of a test."""
+        self.addCleanup(setattr, relay.Throttle, "MAX_NAMES", relay.Throttle.MAX_NAMES)
+        relay.Throttle.MAX_NAMES = most
+
+
+# ------------------------------------------------------------------ not running as root
+
+class StandInSystem:
+    """Stands in for the os module's user and file-owner calls, recording what was asked of it."""
+
+    def __init__(self, euid=0, files=("relay.db",), chown_fails=False, links=(), fail_on=None):
+        self.euid, self.uid, self.files, self.chown_fails = euid, euid, list(files), chown_fails
+        self.links, self.fail_on = set(links), fail_on   # names that are links; a call that raises
+        self.calls = []
+
+    def geteuid(self):
+        return self.euid
+
+    def getuid(self):
+        return self.uid
+
+    def listdir(self, folder):
+        return list(self.files)
+
+    def lstat(self, path):
+        name = os.path.basename(path)
+        if name in self.links:
+            return os.stat_result((stat.S_IFLNK | 0o777, 0, 0, 1, 0, 0, 0, 0, 0, 0))
+        if name in self.files:
+            return os.stat_result((stat.S_IFREG | 0o600, 0, 0, 1, 0, 0, 0, 0, 0, 0))
+        raise FileNotFoundError(path)
+
+    def chown(self, path, uid, gid, follow_symlinks=True):
+        if self.chown_fails:
+            raise PermissionError("not allowed")
+        self.calls.append(("chown", path, uid, gid))
+        if follow_symlinks:
+            self.calls.append(("followed links", path))
+
+    def setgroups(self, groups):
+        if self.fail_on == "setgroups":
+            raise PermissionError("not allowed in this container")
+        self.calls.append(("setgroups", groups))
+
+    def setgid(self, gid):
+        if self.fail_on == "setgid":
+            raise PermissionError("not allowed in this container")
+        self.calls.append(("setgid", gid))
+
+    def setuid(self, uid):
+        self.calls.append(("setuid", uid))
+        self.euid = self.uid = uid
+
+
+class NotRoot(unittest.TestCase):
+    def test_started_as_root_it_becomes_nobody(self):
+        system = StandInSystem()
+        relay.drop_privileges("/data", "", system)
+        self.assertEqual((system.euid, system.uid), (65534, 65534))
+        self.assertIn(("setgid", 65534), system.calls)
+
+    def test_the_data_folder_and_its_files_are_handed_over_first(self):
+        system = StandInSystem(files=["relay.db", "relay.db-wal"])
+        relay.drop_privileges("/data", "", system)
+        self.assertEqual(system.calls[:3], [("chown", "/data", 65534, 65534),
+                                            ("chown", os.path.join("/data", "relay.db"), 65534, 65534),
+                                            ("chown", os.path.join("/data", "relay.db-wal"), 65534, 65534)])
+
+    def test_extra_groups_and_the_group_are_dropped_before_the_user(self):
+        system = StandInSystem()
+        relay.drop_privileges("/data", "", system)
+        order = [c[0] for c in system.calls if c[0] != "chown"]
+        self.assertEqual(order, ["setgroups", "setgid", "setuid"])
+        self.assertIn(("setgroups", []), system.calls)
+
+    def test_quietnet_run_as_chooses_the_user_and_group(self):
+        system = StandInSystem()
+        relay.drop_privileges("/data", "1000:1001", system)
+        self.assertIn(("setgid", 1001), system.calls)
+        self.assertEqual(system.euid, 1000)
+
+    def test_an_unreadable_run_as_setting_falls_back_to_nobody_with_a_warning(self):
+        system = StandInSystem()
+        note = relay.drop_privileges("/data", "lewis", system)
+        self.assertEqual(system.euid, 65534)
+        self.assertIn("Warning", note)
+
+    def test_an_ordinary_user_changes_nothing(self):
+        system = StandInSystem(euid=501)
+        self.assertIsNone(relay.drop_privileges("/data", "", system))
+        self.assertEqual(system.calls, [])
+
+    def test_if_the_folder_cannot_be_handed_over_it_stays_root_and_says_so(self):
+        system = StandInSystem(chown_fails=True)
+        note = relay.drop_privileges("/data", "", system)
+        self.assertEqual(system.euid, 0)
+        self.assertIn("still running as root", note)
+
+    def test_a_link_in_the_data_folder_is_not_followed_when_handing_it_over(self):
+        system = StandInSystem(files=["relay.db"], links=["relay.db-wal"])
+        relay.drop_privileges("/data", "", system)
+        handed = [c[1] for c in system.calls if c[0] == "chown"]
+        self.assertEqual(handed, ["/data", os.path.join("/data", "relay.db")])
+        self.assertNotIn("followed links", [c[0] for c in system.calls])
+
+    def test_only_the_relays_own_files_are_handed_over(self):
+        system = StandInSystem(files=["relay.db", "passwd"])
+        relay.drop_privileges("/data", "", system)
+        self.assertNotIn(("chown", os.path.join("/data", "passwd"), 65534, 65534), system.calls)
+
+    def test_a_refused_change_of_group_stops_the_relay_with_a_plain_message(self):
+        system = StandInSystem(fail_on="setgid")
+        with self.assertRaises(SystemExit) as caught:
+            relay.drop_privileges("/data", "", system)
+        self.assertIn("could not stop running as root", str(caught.exception))
+        self.assertIn("QUIETNET_RUN_AS", str(caught.exception))
+
+    def test_a_user_number_too_big_for_the_system_is_not_accepted(self):
+        self.assertIsNone(relay.run_as_ids("99999999999:1"))
+        self.assertIsNone(relay.run_as_ids("1:4294967295"))
+        self.assertEqual(relay.run_as_ids("4294967294:1"), (4294967294, 1))
+
+    def test_it_refuses_to_carry_on_if_root_could_not_be_given_up(self):
+        system = StandInSystem()
+        system.setuid = lambda uid: None            # pretends to work but changes nothing
+        with self.assertRaises(SystemExit):
+            relay.drop_privileges("/data", "", system)
 
 
 if __name__ == "__main__":

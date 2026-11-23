@@ -2,6 +2,29 @@
 
 ## Unreleased
 
+Known issues closed (23 November; nine closed, five narrowed, see `docs/KNOWN_ISSUES.md`):
+- **Changed: the relay now allows only the first account by default** (`QUIETNET_SIGNUP` defaults to `first`, was `open`). A relay that already has accounts keeps them and they can still sign in, but nobody new can sign up unless you set `QUIETNET_SIGNUP=open`. The start-up log says which setting is in force (issue 6).
+- **Changed: signing out of the relay now signs you out everywhere**, in every browser and any copied cookie. The session cookie has a new form, so **everyone signed in to the relay before the upgrade will need to sign in again** once (issue 7).
+- **Fixed: Firefox's secure DNS and iCloud Private Relay could take lookups past QuietNet.** QuietNet now gives the answers that tell them to use the network's DNS; these lookups show as blocked in history (issue 8).
+- **Fixed: devices given an IPv6 DNS address skipped QuietNet.** The filter now also listens on IPv6, and carries on with IPv4 alone if it can't. The device page now says that "Cut live connections" works on IPv4 only (issue 5; IPv6 steering is still open).
+- **Fixed: a relay address starting with `http://` was accepted**, which would send the Pi's key unprotected. It is refused unless the relay is on the same computer (`localhost`, `127.0.0.1`, `::1`). A Pi already paired over `http://` to another computer stops connecting and asks to be paired again with `https://` (issue 20).
+- **Relay hardening:** Pi tokens are stored only as a hash (existing ones are converted at start-up; no re-pairing needed); forms sent from another website are refused, which stops login forgery in current browsers; sign-up no longer says whether an email already has an account, and no longer signs you in, so sign in after creating your account; limits on guessing survive a restart; the relay gives up root at start-up and runs as `nobody` (or `QUIETNET_RUN_AS=uid:gid`) after taking over its data folder (issues 7, 19, 21).
+- **Faster: answers are remembered** for their (shortened) lifetime, so repeat lookups don't go to the internet each time. Rules are still checked for every lookup first, and any rule change clears the memory (issue 22).
+- **Faster dashboard:** history questions use a read-only database connection of their own, so they never hold up rule changes or the history writer; clearing a busy device's history goes in steps; an open device's activity list is only sent again when it has changed (issues 82, 83).
+- **Home names:** single-word names such as `nas` go to the home router, never the internet; a router that sends lookups back to QuietNet can't make the two ask each other for ever (issue 78).
+- **Fair shares:** one device may hold at most 8 of the 64 TCP lookup connections (issue 80).
+- **Mac:** the community list download works with Python from python.org without "Install Certificates.command" (issue 81).
+- **Smaller:** the Devices page says when a scan covered only part of a large network; rows are spaced properly on Safari before 14.1; the README and `server.py` now say blocked names get the address `0.0.0.0` (issue 12).
+- New point found while checking: remembered answers don't take each device's extended DNS settings into account (issue 84, minor). Fixed the same day (below).
+
+Faults in those fixes, found by an independent check and fixed the same day:
+- **Fixed: a device asking from its own IPv6 address escaped its device and group rules.** Its IPv6 address is now matched to its IPv4 address by hardware address; if it can't be matched while device or group rules exist, it is refused and asks over IPv4 instead. The Pi image now includes `iproute2` for this, so **rebuild the Pi container** (issue 5).
+- **Fixed: over IPv6 the filter answered anyone on the internet** whose router firewall let them through. It now answers home addresses only (issue 5).
+- **Fixed: remembered answers** could use a lot of memory (answers over 4 KB are no longer kept), could be too big for the device asking over UDP, and could hand an unchecked answer fetched for one device to the others (issues 22, 84).
+- **Fixed: devices that check DNS signatures failed every `.com` lookup** when the router was unknown, because `com` was treated as a home name (issue 78).
+- **Fixed:** a new community list of the same size now refreshes open activity pages; clearing one device's history answers at once and carries on in the background (issues 82, 83).
+- **Relay:** handing over the data folder never follows links and touches only the relay's own files; a refused change of user stops the relay with a plain message; a forged session cookie with a huge number no longer crashes the request; two sign-ups at once on a new relay can't both get in (issues 6, 7, 21).
+
 Fourth review (every part looked at again; 32 points fixed, known issues 46 to 77):
 - **Fixed: the kill switch, internet-off and whole-house bedtimes also cut off QuietNet's own computer**, so a Pi lost its link to the relay and couldn't be switched back on from outside. Its own lookups are now exempt from these (ordinary blocks still apply). The dashboard no longer shows it as switched off, and refuses to switch it off.
 - **Fixed: names that skip the checks could get out while a device's internet was off.** Home-network names, reverse lookups and names with odd characters now get the blocked answer then, and a packet QuietNet can't read is never passed on.
@@ -18,7 +41,7 @@ Fourth review (every part looked at again; 32 points fixed, known issues 46 to 7
 - **Dashboard:** works again on Safari 12 to 14.0 (it stuck on "Starting…", and dialogs were off-screen); the four-second refresh no longer overlaps, pauses in a background tab, and fetches an open device's activity every 30 seconds.
 - **Network scan:** covers the real size of the home network, up to 1,024 addresses; it no longer holds up the database while waiting for names; the Pi's own address is picked up when the network comes up or changes.
 - **Mac:** pairing works with Python from python.org (it borrows the system's certificates), and the message names "Install Certificates.command" if needed. The launcher no longer runs Apple's Python stand-in a second time, and says how to get Python.
-- Still open from this review: issues 78 to 83 (home names and the router, real-Pi checks, TCP per-device share, the list download on python.org Python, dashboard reads holding the database lock, the activity list sent in full).
+- Left open by this review: issues 78 to 83 (home names and the router, real-Pi checks, TCP per-device share, the list download on python.org Python, dashboard reads holding the database lock, the activity list sent in full). All but the real-Pi checks were fixed on 23 November (above).
 
 Third review (the enforcer, the relay and the DNS filter), with an independent check of the fixes and a live test of the enforcer between two containers:
 - **Fixed: the enforcer could cut a device off by mistake.** It now won't steer a device when the Pi isn't passing traffic on, or when another firewall (often Docker's) would drop it, and the device page says what to run on the Pi. It never steers the router, the Pi itself or another network, and leaves an address alone if a different device now has it.

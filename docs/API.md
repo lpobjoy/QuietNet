@@ -26,7 +26,7 @@ A **scope** is `all`, `group:<id>` or `device:<ip>`.
 | `GET /` | The dashboard page |
 | `GET /api/status` | See below |
 | `GET /api/devices` | List of devices, most recently active first |
-| `GET /api/activity?ip=<ip>&hours=<n>` | What one device contacted, grouped by company. `hours` defaults to 24, limited to 0.1–720 |
+| `GET /api/activity?ip=<ip>&hours=<n>&since=<marker>` | What one device contacted, grouped by company. `hours` defaults to 24, limited to 0.1–720. `since` is optional: see below |
 | `GET /api/rules` | `{"blocked": [...], "allowed": [...]}`, each item `{"d", "ts", "owner"}` |
 | `GET /api/services` | The service catalogue: `[{"id", "name", "cat"}]` |
 | `GET /api/groups` | `[{"id", "name", "off", "members", "services"}]` |
@@ -69,6 +69,14 @@ A **scope** is `all`, `group:<id>` or `device:<ip>`.
  "hosts": [{"d": "www.bbc.co.uk", "n": 2, "nb": 0, "last": 1795000000.0, "v": "ok", "b": false, "why": null, "svc": ""}]}
 ```
 
+**The `since` marker.** Without `since`, the answer is the plain list of items above, as it always was. With `since` (send it empty, `since=`, the first time), the answer is an object:
+
+```json
+{"unchanged": false, "marker": "3f9a0c1b2d4e5f6a7b8c9d0e", "groups": [ ...the same list... ]}
+```
+
+Sending that `marker` back as `since` with the same `ip` and `hours` gets `{"unchanged": true, "marker": "<the same>"}`, without the list, when nothing has changed: no new lookup for the device, nothing leaving the time window or cleared, and no change to the rules, the pause, the advert switch, the schedules in force or the advert lists. A wrong or out-of-date marker simply gets the full answer with the current marker. The marker is 24 hex characters and should be treated as opaque: store it and send it back, never read anything into it. It only means something for the same `ip` and `hours`.
+
 For QuietNet's own computer, `kill`, `off` and `schedule` never appear: it is exempt from them (see [How QuietNet works](ARCHITECTURE.md#the-order-rules-are-checked-in)).
 
 `v` is the label: `ok`, `suspect` (possibly junk, shown for a person to judge, never blocked on its own) or `junk` (on the advert list). `b` is whether it is blocked for this device now, `why` is the reason code (`kill`, `off`, `schedule`, `you`, `allowed`, `service`, `list`), and `svc` names the service or schedule responsible.
@@ -102,10 +110,10 @@ For QuietNet's own computer, `kill`, `off` and `schedule` never appear: it is ex
 | `POST /api/device-group` | `{"ip", "group"}` | An unknown or missing group removes the device from its group |
 | `POST /api/device-name` | `{"ip", "name"}` | Name cut to 40 characters |
 | `POST /api/enforce` | `{"ip", "on"}` | "Cut live connections" for one device. Must be a real IPv4 address, as text (`400` otherwise). Switching on also refuses, with `400` and `{"error"}`, this computer and addresses that are never devices; when the enforcer is running it also refuses the router and addresses outside the home network. The device's hardware address is recorded so a different device later given the same address is left alone |
-| `POST /api/cloud` | `{"relay", "code"}` or `{"action": "forget"}` | Pair with a relay, or unpair |
+| `POST /api/cloud` | `{"relay", "code"}` or `{"action": "forget"}` | Pair with a relay, or unpair. A relay address starting `http://` is refused, with nothing sent, unless the host is `localhost`, `127.0.0.1` or `::1`: `400` with `{"error": "That relay address starts with http://, which would send this Pi's key unprotected. Use an address starting with https:// instead."}` |
 | `POST /api/scan` | `{}` | Starts a network scan in the background. Returns what it will cover: `{"ok": true, "network": "192.168.4.0/22", "addresses": 1022, "capped": false}` |
 | `POST /api/update-list` | `{}` | Starts the community list download in the background |
-| `POST /api/clear-history` | `{"ip"?}` | One device's history, or everyone's |
+| `POST /api/clear-history` | `{"ip"?}` | One device's history, or everyone's. Everyone's is cleared before the answer. One device's is cleared in the background, 5,000 rows at a time, and the answer comes at once, so its page may briefly show part of it while the clear runs |
 
 Schedule body:
 
@@ -122,7 +130,7 @@ Listens on `$PORT` (default 8080). HTTPS is expected to be provided by the host.
 
 Every answer carries the same four protective headers as the dashboard API, plus `Cache-Control: no-store`. Bodies over 64 KB are not read: a form counts as empty, and a relayed call gets `413`. The one exception is `POST /agent/respond` from a paired Pi answering a call that is waiting for it (named in an `X-QuietNet-Call` header), which may be up to 16 MB (see that call below). A body must arrive within 30 seconds; one that trickles in more slowly is dropped without an answer.
 
-When the relay already has 300 connections open, any further request gets `503` with the plain text "The relay is busy. Please try again in a moment." and the connection is closed. A successful sign-in or sign-up also sets a `qn_known` cookie (one year), which gives that browser its own limit on wrong guesses for that account (20 in 15 minutes) instead of the shared ones. It is signed over the password record, so a new password voids it, and `/logout` removes it.
+When the relay already has 300 connections open, any further request gets `503` with the plain text "The relay is busy. Please try again in a moment." and the connection is closed. A successful sign-in also sets a `qn_known` cookie (one year), which gives that browser its own limit on wrong guesses for that account (20 in 15 minutes) instead of the shared ones. It is signed over the password record, so a new password voids it, and `/logout` removes it.
 
 Guesses are limited. When a limit is reached the answer is `429` with "Too many attempts. Please wait a few minutes and try again."
 
@@ -145,18 +153,20 @@ A network address is the last entry of `X-Forwarded-For` (added by the host's pr
 | Request | Does |
 | --- | --- |
 | `GET /healthz` | `{"ok": true}` |
-| `GET /login`, `GET /signup` | The forms |
-| `POST /signup` | Form fields `email`, `password` (8 characters or more). Signs in and redirects to `/`. `403` when sign-up is switched off (`QUIETNET_SIGNUP`) |
+| `GET /login`, `GET /signup` | The forms. The sign-in form links to sign-up only while sign-up is allowed |
+| `POST /signup` | Form fields `email`, `password` (8 characters or more). Creates the account if the email is new, then answers `200` with the sign-in form and the note "Thank you. Now sign in with that email and password. If the email already had an account, use that account's password." The answer is the same, and takes as long, if the email already has an account, which is left untouched. It does not sign you in. Every try counts towards the limit of 10 an hour. `403` when sign-up is switched off (`QUIETNET_SIGNUP`, which defaults to `first`: only while no account exists) |
 | `POST /login` | Form fields `email`, `password`. `503` "The relay is busy" if four passwords are already being checked and none finishes within 5 seconds |
 | `GET /logout` | A "Sign out?" page with a button. Changes nothing. Redirects to `/login` if not signed in |
-| `POST /logout` | Form field `token`, the sign-out token in the page's sign-out button (made from the session cookie and the relay's secret). With the right token, clears both cookies and redirects to `/login`. Without it, changes nothing and redirects to `/` (or to `/login` if not signed in) |
+| `POST /logout` | Form field `token`, the sign-out token in the page's sign-out button (made from the session cookie and the relay's secret). With the right token, signs the account out everywhere (every session cookie made for it so far, in any browser, stops working), clears both cookies and redirects to `/login`. Without it, changes nothing and redirects to `/` (or to `/login` if not signed in) |
 | `GET /` | Your QuietNets, with pairing codes for those not yet paired. A code older than 15 minutes is replaced when this page is opened |
 | `POST /pis/new` | Form field `name`. Creates a QuietNet and a pairing code. `403` with a page saying so when the account already has 10 QuietNets, paired or waiting |
 | `POST /pis/<id>/delete` | Removes one of your QuietNets. Its Pi is locked out at once |
 | `GET /pi/<id>/` | The dashboard page, set to call this Pi |
 | `GET` or `POST /pi/<id>/api/…` | Passed to the Pi. Needs the header `X-QuietNet: 1` |
 
-The session cookie is `qn_session`, valid for 14 days, `HttpOnly` and `SameSite=Lax`, and `Secure` when the request arrived over HTTPS.
+**Forms from another website.** `POST /login`, `/signup`, `/logout`, `/pis/new` and `/pis/<id>/delete` are refused with `403` when the request's `Sec-Fetch-Site` header is `cross-site` or `same-site`, with the message "That form was sent from another website, so it was refused. Open this relay's own page and try again." (on the sign-in form for `/login` and `/signup`, on a short "Refused" page for the others). Requests without the header are handled as usual. This does not apply to `/pi/…` or `/agent/…`.
+
+The session cookie is `qn_session`, valid for 14 days, `HttpOnly` and `SameSite=Lax`, and `Secure` when the request arrived over HTTPS. Its value is `user.number.expiry.signature`; a cookie from before session numbers (three parts) counts as signed out.
 
 Relayed calls can fail in these ways:
 
@@ -175,7 +185,7 @@ Any other status and body are the Pi's own.
 
 | Request | Body or header | Returns |
 | --- | --- | --- |
-| `POST /agent/pair` | `{"code"}` | `{"ok", "id", "token"}`, or `400` with `{"error"}` if the code is wrong, used or expired. A code works once and for 15 minutes. `429` after too many wrong codes (from this network address or overall), or when the account has paired too many QuietNets today; the code is not used up |
+| `POST /agent/pair` | `{"code"}` | `{"ok", "id", "token"}` (the only time the token is sent; the relay keeps only its hash), or `400` with `{"error"}` if the code is wrong, used or expired. A code works once and for 15 minutes. `429` after too many wrong codes (from this network address or overall), or when the account has paired too many QuietNets today; the code is not used up |
 | `GET /agent/poll` | Header `X-QuietNet-Token` | Waits up to 25 seconds. `{}` if nothing to do, or `{"id", "method", "path", "body"?}`. A Pi has one poll waiting at a time: a new one ends the older one, which returns `{}`. `401` if the token is not recognised. `503` with `{"error"}` when 150 Pis are already waiting |
 | `POST /agent/respond` | Headers `X-QuietNet-Token` and `X-QuietNet-Call` (the call id); `{"id", "status", "body"}`, up to 16 MB | `{"ok": true}`, or `413` if too big. An answer to a call that was sent to a different Pi is ignored, as is a second answer to the same call. An answer over 64 KB needs room: one at a time per account (across all its Pis) and 48 MB across every account. If none comes within 10 seconds, the answer is `503` and the waiting browser gets `503` at once |
 

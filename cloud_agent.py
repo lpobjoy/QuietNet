@@ -20,6 +20,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from urllib.parse import urlsplit
 
 MAX_AT_ONCE = 8                     # relayed requests handled at the same time
 MAX_ANSWER = 12 * 1024 * 1024       # largest answer sent up; the relay takes 16 MB, and JSON escaping adds some
@@ -35,6 +36,13 @@ SYSTEM_CA_FILES = (
     "/etc/ssl/ca-bundle.pem",                            # openSUSE
 )
 
+# Hosts a relay may be reached on over plain http://, for running a relay on the same computer
+# while developing. Anywhere else the token would cross the network unprotected.
+LOCAL_HOSTS = ("localhost", "127.0.0.1", "::1")
+
+INSECURE_HELP = ("That relay address starts with http://, which would send this Pi's key unprotected. "
+                 "Use an address starting with https:// instead.")
+
 CERT_HELP = ("The relay's security certificate couldn't be checked. If you installed Python from "
              "python.org on a Mac, open its folder in Applications, double-click "
              "'Install Certificates.command', then restart QuietNet. Otherwise check the relay address.")
@@ -44,7 +52,11 @@ _tls_lock = threading.Lock()
 
 
 def tls_context():
-    """The settings used for secure (https) calls to the relay, made once and reused.
+    """The settings used for secure (https) calls, made once and shared by every thread.
+
+    Used for calls to the relay, and safe for any other https download (server.py uses it for the
+    community advert list): it holds no relay-specific settings, and the host name being called
+    is always checked against its certificate.
 
     Starts from Python's defaults, which always check the certificate and the host name. If Python
     has no trusted certificate authorities loaded (the case for python.org's Mac builds until
@@ -65,6 +77,20 @@ def tls_context():
                             continue
             _tls = ctx
         return _tls
+
+
+def insecure_relay(relay):
+    """True when `relay` is a plain http:// address on another computer, which QuietNet refuses.
+
+    http:// is allowed only for localhost, 127.0.0.1 and ::1 (a relay on this same computer, for
+    development). Any other scheme or host is judged by the caller; https:// is always allowed."""
+    if not relay.lower().startswith("http://"):
+        return False
+    try:
+        host = urlsplit(relay).hostname or ""
+    except ValueError:
+        return True
+    return host.lower() not in LOCAL_HOSTS
 
 
 def is_cert_error(e):
@@ -143,10 +169,13 @@ class CloudAgent:
         """Do the work of pair(). Returns (message, final): message is None on success; final is
         True when trying the same code again cannot help, because the relay refused the code
         itself (wrong, used or expired). A busy relay (429), a relay fault, an unreachable relay
-        or an unreadable answer are not final."""
+        or an unreadable answer are not final. A plain http:// address on another computer is
+        refused before anything is sent, and is final."""
         relay = (relay or self.cfg.get("relay", "")).strip().rstrip("/")
-        if not relay.startswith(("http://", "https://")):
+        if not relay.lower().startswith(("http://", "https://")):
             relay = "https://" + relay
+        if insecure_relay(relay):
+            return INSECURE_HELP, True
         try:
             resp = self._http("POST", relay + "/agent/pair", {"code": str(code).strip().upper()}, timeout=20)
         except urllib.error.HTTPError as e:
@@ -222,7 +251,11 @@ class CloudAgent:
         pairing is kept and the loop waits before retrying: 5 seconds after a relay error, and 1, 2,
         4 ... up to 30 seconds while the relay cannot be reached or something unexpected goes wrong.
         Nothing is allowed to end the loop except stop(), because on a Pi with no screen the relay
-        is the only way in."""
+        is the only way in.
+
+        A saved plain http:// relay address on another computer (possible from an older version)
+        is never contacted, so the token is not sent unprotected; the dashboard says to pair again
+        with https://."""
         backoff = 1
         while not self._stop.is_set():
             try:
@@ -236,6 +269,10 @@ class CloudAgent:
                         self._stop.wait(2)
                     continue
                 self._pending_code = ""          # paired, by the code or by hand
+                if insecure_relay(self.cfg["relay"]):
+                    self.state, self.detail = "error", INSECURE_HELP
+                    self._stop.wait(2)
+                    continue
                 self.state = "connecting" if self.state != "online" else self.state
                 call = self._http("GET", self.cfg["relay"] + "/agent/poll", None, timeout=35, token=True)
                 self.state, self.detail, backoff = "online", "", 1

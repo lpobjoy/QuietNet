@@ -58,6 +58,8 @@ class Base(unittest.TestCase):
         server.S.enforced, server.S.resolved = set(), {}
         # No home router, and never look one up: the routing table is the real machine's.
         server.S.router, server.S.router_checked = "", float("inf")
+        # No IPv6 view of the real machine: nothing matched, no home range, no own addresses.
+        server.S.v6_own, server.S.v6_prefixes, server.S.v6_devices = set(), [], {}
 
     def schedule(self, **kw):
         body = {"name": "Bedtime", "scope": "device:" + KID, "days": [0, 1, 2, 3, 4, 5, 6],

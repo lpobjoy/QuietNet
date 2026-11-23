@@ -139,6 +139,21 @@ class AnsweringQueries(Base):
         server.answer_query(query("www.bbc.co.uk"), "127.0.0.1", fake_answer)
         self.assertEqual(drain_log()[0][1], "192.168.1.60")
 
+    def test_an_ipv4_device_asking_over_ipv6_is_filed_under_its_ipv4_address(self):
+        server.answer_query(query("www.bbc.co.uk"), "::ffff:" + KID, fake_answer)
+        self.assertEqual(drain_log()[0][1], KID)
+
+    def test_lookups_from_this_computer_over_ipv6_are_filed_under_its_network_address(self):
+        server.S.local_ip = "192.168.1.60"
+        server.answer_query(query("www.bbc.co.uk"), "::1", fake_answer)
+        self.assertEqual(drain_log()[0][1], "192.168.1.60")
+
+    def test_an_ipv6_zone_suffix_is_not_part_of_a_devices_address(self):
+        self.assertEqual(server.device_address("fe80::1%eth0"), "fe80::1")
+
+    def test_an_ordinary_ipv6_address_is_kept_as_it_is(self):
+        self.assertEqual(server.device_address("2001:db8::23"), "2001:db8::23")
+
     def ask(self, data, client=KID):
         """Answer `data` for `client`, noting each server list the stand-in forwarder was given
         (None meaning the usual public servers)."""
@@ -183,6 +198,47 @@ class AnsweringQueries(Base):
         resp = self.ask(query("printer.lan"), client="192.168.1.1")
         self.assertEqual(resp[3] & 15, 3)
         self.assertEqual(self.sent_to, [])
+
+    def test_single_word_names_are_sent_to_the_router_not_the_internet(self):
+        server.S.router = "192.168.1.1"
+        resp = self.ask(query("nas"))
+        self.assertEqual(resp[-4:], bytes([93, 184, 216, 34]))
+        self.assertEqual(self.sent_to, [[("192.168.1.1", 53)]])
+
+    def test_single_word_names_never_go_to_the_internet_when_the_router_is_unknown(self):
+        resp = self.ask(query("nas"))
+        self.assertEqual(resp[3] & 15, 3)                           # "no such name"
+        self.assertEqual(self.sent_to, [])
+
+    def test_a_signature_lookup_for_a_top_level_name_is_not_answered_no_such_name(self):
+        resp = self.ask(query("com", qtype=43))                     # DS, asked by devices that check signatures
+        self.assertNotEqual(resp[3] & 15, 3)
+        self.assertEqual(self.sent_to, [None])                      # the internet, not the router
+
+    def test_an_address_lookup_for_a_single_word_still_counts_as_a_home_name(self):
+        self.assertTrue(server.is_home_name("nas", 1))
+        self.assertFalse(server.is_home_name("com", 48))
+
+    def test_a_question_already_waiting_on_the_router_gets_server_failure_not_a_second_ask(self):
+        # A router that sends the lookup straight back to QuietNet: the second ask must stop there.
+        server.S.router = "192.168.1.1"
+        inner, asked = [], []
+
+        def router_that_asks_back(d, servers=None):
+            """Pass the question back to QuietNet, as a badly set-up router would."""
+            asked.append(servers)
+            if len(asked) == 1:
+                inner.append(server.answer_query(d, "192.168.1.2", router_that_asks_back))
+            return fake_answer(d)
+        server.answer_query(query("nas.lan"), KID, router_that_asks_back)
+        self.assertEqual(len(asked), 1)
+        self.assertEqual(inner[0][3] & 15, 2)                       # "server failure"
+
+    def test_the_same_home_name_can_be_asked_again_once_the_router_has_answered(self):
+        server.S.router = "192.168.1.1"
+        self.ask(query("nas.lan"))
+        self.ask(query("nas.lan"))
+        self.assertEqual(self.sent_to, [[("192.168.1.1", 53)]])
 
     def test_this_computer_is_never_used_as_the_router(self):
         server.S.local_ip = "192.168.1.60"
@@ -338,6 +394,371 @@ class Helpers(Base):
             self.assertIsNone(server.SCOPE.fullmatch(bad), bad)
 
 
+class NetworkDnsSignals(Base):
+    """The names devices look up to ask whether to keep using the network's DNS (known issue 8)."""
+
+    def setUp(self):
+        super().setUp()
+        drain_log()
+        self.asked = []
+
+    def ask(self, name, client=KID, qtype=1):
+        """Answer a lookup, noting anything that reached the pretend internet."""
+        return server.answer_query(query(name, qtype), client,
+                                   lambda d: self.asked.append(d) or fake_answer(d))
+
+    def test_firefox_is_told_its_secure_dns_signal_name_does_not_exist(self):
+        resp = self.ask("use-application-dns.net")
+        self.assertEqual(resp[3] & 15, 3)                           # "no such name"
+        self.assertEqual(self.asked, [])
+
+    def test_firefox_signal_name_does_not_exist_even_while_blocking_is_paused(self):
+        server.S.paused_until = time.time() + 600
+        self.assertEqual(self.ask("use-application-dns.net")[3] & 15, 3)
+
+    def test_apple_private_relay_signal_names_are_blocked(self):
+        for name in ("mask.icloud.com", "mask-h2.icloud.com"):
+            self.assertEqual(self.ask(name)[-4:], bytes(4), name)
+        self.assertEqual(self.asked, [])
+
+    def test_apple_private_relay_signal_names_stay_blocked_while_blocking_is_paused(self):
+        server.S.paused_until = time.time() + 600
+        self.assertEqual(self.ask("mask.icloud.com", client=ADULT)[-4:], bytes(4))
+
+    def test_apple_private_relay_signal_names_stay_blocked_even_if_icloud_is_always_allowed(self):
+        server.unblock("icloud.com")
+        self.assertEqual(self.ask("mask-h2.icloud.com")[-4:], bytes(4))
+
+    def test_signal_lookups_are_written_down_as_blocked(self):
+        self.ask("use-application-dns.net")
+        self.ask("mask.icloud.com")
+        log = [(client, name, blocked) for ts, client, name, blocked in drain_log()]
+        self.assertEqual(log, [(KID, "use-application-dns.net", 1), (KID, "mask.icloud.com", 1)])
+
+    def test_other_icloud_names_are_not_affected(self):
+        self.assertEqual(self.ask("www.icloud.com")[-4:], bytes([93, 184, 216, 34]))
+
+
+class RememberedAnswers(Base):
+    """Answers kept in memory for their shortened lifetime (known issue 22)."""
+
+    def setUp(self):
+        super().setUp()
+        self.asked = []
+
+    def internet(self, d):
+        """A pretend internet that notes each question it is asked."""
+        self.asked.append(d)
+        return fake_answer(d)
+
+    def ask(self, name, client=KID, qid=0x4242):
+        """Answer a lookup with the given id."""
+        data = struct.pack(">H", qid) + query(name)[2:]
+        return server.answer_query(data, client, self.internet)
+
+    def test_a_second_identical_lookup_does_not_go_to_the_internet(self):
+        first = self.ask("www.bbc.co.uk")
+        second = self.ask("www.bbc.co.uk")
+        self.assertEqual(len(self.asked), 1)
+        self.assertEqual(second[-4:], first[-4:])
+
+    def test_a_remembered_answer_carries_the_askers_own_id(self):
+        self.ask("www.bbc.co.uk", qid=0x1111)
+        resp = self.ask("www.bbc.co.uk", qid=0x2222)
+        self.assertEqual(resp[:2], b"\x22\x22")
+
+    def test_a_remembered_answer_keeps_the_letter_case_the_device_asked_with(self):
+        self.ask("www.bbc.co.uk")
+        resp = self.ask("WWW.BBC.co.uk")
+        self.assertIn(b"WWW\x03BBC", resp)
+        self.assertEqual(len(self.asked), 1)
+
+    def test_a_rule_change_forgets_remembered_answers(self):
+        self.ask("www.bbc.co.uk")
+        server.block("example.com")
+        self.ask("www.bbc.co.uk")
+        self.assertEqual(len(self.asked), 2)
+
+    def test_an_answer_past_its_lifetime_is_fetched_again(self):
+        self.ask("www.bbc.co.uk")
+        later = time.monotonic() + server.MAX_TTL + 1
+        clock = mock.Mock(wraps=time)
+        clock.monotonic.return_value = later
+        with mock.patch.object(server, "time", clock):
+            self.ask("www.bbc.co.uk")
+        self.assertEqual(len(self.asked), 2)
+
+    def test_a_remembered_answers_lifetime_counts_down(self):
+        self.ask("www.bbc.co.uk")
+        clock = mock.Mock(wraps=time)
+        clock.monotonic.return_value = time.monotonic() + 30
+        with mock.patch.object(server, "time", clock):
+            resp = self.ask("www.bbc.co.uk")
+        self.assertLessEqual(struct.unpack(">I", resp[-10:-6])[0], server.MAX_TTL - 29)
+
+    def test_a_device_whose_rules_block_a_name_is_not_given_the_remembered_answer(self):
+        self.ask("www.disneyplus.com", client=ADULT)
+        server.S.svc_blocks["device:" + KID] = {"disneyplus"}       # in memory only, so nothing is forgotten
+        self.addCleanup(server.S.svc_blocks.pop, "device:" + KID, None)
+        self.assertEqual(self.ask("www.disneyplus.com", client=KID)[-4:], bytes(4))
+
+    def test_a_failure_from_the_internet_is_not_remembered(self):
+        def failing(d):
+            """A pretend internet that says 'server failure'."""
+            self.asked.append(d)
+            return server.reply(d, server.parse_question(d)[2], 2)
+        for _ in range(2):
+            server.answer_query(query("www.bbc.co.uk"), KID, failing)
+        self.assertEqual(len(self.asked), 2)
+
+    def test_no_answer_from_the_internet_is_not_remembered(self):
+        server.answer_query(query("www.bbc.co.uk"), KID, lambda d: None)
+        self.ask("www.bbc.co.uk")
+        self.assertEqual(len(self.asked), 1)
+
+    def test_lookups_of_different_record_types_are_remembered_apart(self):
+        self.ask("www.bbc.co.uk")
+        server.answer_query(query("www.bbc.co.uk", qtype=28), KID, self.internet)
+        self.assertEqual(len(self.asked), 2)
+
+    def test_the_memory_of_answers_is_capped_and_the_oldest_dropped(self):
+        with mock.patch.object(server, "MAX_CACHED_ANSWERS", 2):
+            for name in ("a.example.com", "b.example.com", "c.example.com"):
+                self.ask(name)
+            self.assertEqual([k[0] for k in server.answer_cache], ["b.example.com", "c.example.com"])
+
+    # ----- what the question asked of the answer, and answer sizes
+
+    @staticmethod
+    def with_settings(name, size=1232, signatures=False, no_checking=False):
+        """A question carrying a settings record (type 41) with the given UDP size and signature flag."""
+        data = bytearray(query(name))
+        data[11] = 1                                            # one extra record
+        if no_checking:
+            data[3] |= 0x10
+        flags = 0x8000 if signatures else 0
+        return bytes(data) + b"\x00" + struct.pack(">HHBBHH", 41, size, 0, 0, flags, 0)
+
+    def plain_internet(self, d):
+        """A pretend internet that answers the question alone (leaving out any settings record)."""
+        self.asked.append(d)
+        qend = server.parse_question(d)[2]
+        head = d[:2] + b"\x81\x80\x00\x01\x00\x01\x00\x00\x00\x00"
+        return head + d[12:qend] + b"\xc0\x0c\x00\x01\x00\x01" + struct.pack(">IH", 300, 4) + bytes([1, 2, 3, 4])
+
+    @staticmethod
+    def big_answer(data, size):
+        """An answer to `data` with one text record, padded to about `size` bytes."""
+        qend = server.parse_question(data)[2]
+        head = data[:2] + b"\x81\x80\x00\x01\x00\x01\x00\x00\x00\x00"
+        text = b"x" * (size - qend - 12)
+        return head + data[12:qend] + b"\xc0\x0c\x00\x10\x00\x01" + struct.pack(">IH", 300, len(text)) + text
+
+    def test_an_answer_over_the_size_limit_is_not_remembered(self):
+        data = query("big.example.com", qtype=16)
+        key = server.cache_key(data, server.parse_question(data))
+        server.remember_answer(key, self.big_answer(data, server.MAX_CACHED_SIZE + 100))
+        self.assertNotIn(key, server.answer_cache)
+
+    def test_an_answer_within_the_size_limit_is_remembered(self):
+        data = query("big.example.com", qtype=16)
+        key = server.cache_key(data, server.parse_question(data))
+        server.remember_answer(key, self.big_answer(data, 2000))
+        self.assertIn(key, server.answer_cache)
+
+    def test_a_remembered_answer_bigger_than_the_askers_stated_size_is_not_given_over_udp(self):
+        data = self.with_settings("big.example.com", size=1232)
+        q = server.parse_question(data)
+        key = server.cache_key(data, q)
+        server.remember_answer(key, self.big_answer(data[:q[2]], 1500))
+        self.assertIsNone(server.cached_answer(data, key, q[2]))
+
+    def test_a_remembered_answer_within_the_askers_stated_size_is_given_over_udp(self):
+        data = self.with_settings("big.example.com", size=4096)
+        q = server.parse_question(data)
+        key = server.cache_key(data, q)
+        server.remember_answer(key, self.big_answer(data[:q[2]], 1500))
+        self.assertIsNotNone(server.cached_answer(data, key, q[2]))
+
+    def test_a_big_remembered_answer_is_given_over_tcp_whatever_size_was_stated(self):
+        data = query("big.example.com")
+        q = server.parse_question(data)
+        key = server.cache_key(data, q)
+        server.remember_answer(key, self.big_answer(data, 1500))
+        self.assertIsNotNone(server.cached_answer(data, key, q[2], over_tcp=True))
+
+    def test_the_size_and_signature_flag_are_read_from_the_settings_record(self):
+        data = self.with_settings("www.bbc.co.uk", size=1400, signatures=True)
+        self.assertEqual(server.question_settings(data, server.parse_question(data)[2]), (True, 1400, True))
+        plain = query("www.bbc.co.uk")
+        self.assertEqual(server.question_settings(plain, server.parse_question(plain)[2]), (False, 512, False))
+
+    def test_a_lookup_with_checking_turned_off_is_not_served_the_ordinary_remembered_answer(self):
+        server.answer_query(query("www.bbc.co.uk"), KID, self.plain_internet)
+        unchecked = bytearray(query("www.bbc.co.uk"))
+        unchecked[3] |= 0x10
+        server.answer_query(bytes(unchecked), KID, self.plain_internet)
+        self.assertEqual(len(self.asked), 2)
+
+    def test_an_answer_fetched_with_checking_turned_off_is_not_served_to_an_ordinary_lookup(self):
+        unchecked = bytearray(query("www.bbc.co.uk"))
+        unchecked[3] |= 0x10
+        server.answer_query(bytes(unchecked), KID, self.plain_internet)
+        server.answer_query(query("www.bbc.co.uk"), ADULT, self.plain_internet)
+        self.assertEqual(len(self.asked), 2)
+
+    def test_lookups_with_and_without_a_settings_record_are_remembered_apart(self):
+        server.answer_query(query("www.bbc.co.uk"), KID, self.plain_internet)
+        server.answer_query(self.with_settings("www.bbc.co.uk"), KID, self.plain_internet)
+        self.assertEqual(len(self.asked), 2)
+
+    def test_lookups_asking_and_not_asking_for_signatures_are_remembered_apart(self):
+        server.answer_query(self.with_settings("www.bbc.co.uk"), KID, self.plain_internet)
+        server.answer_query(self.with_settings("www.bbc.co.uk", signatures=True), KID, self.plain_internet)
+        self.assertEqual(len(self.asked), 2)
+
+    def test_the_same_kind_of_lookup_with_a_settings_record_is_answered_from_memory(self):
+        server.answer_query(self.with_settings("www.bbc.co.uk"), KID, self.plain_internet)
+        server.answer_query(self.with_settings("www.bbc.co.uk"), ADULT, self.plain_internet)
+        self.assertEqual(len(self.asked), 1)
+
+    def test_a_remembered_answer_still_counts_towards_the_enforcers_addresses(self):
+        self.ask("www.bbc.co.uk")
+        server.S.resolved = {}
+        self.ask("www.bbc.co.uk")
+        self.assertIn("93.184.216.34", server.S.resolved["www.bbc.co.uk"])
+
+
+class LookupsOverIPv6(Base):
+    """Devices asking from their own IPv6 address, and strangers on the internet (known issue 5)."""
+
+    PHONE_V6 = "fd00::abcd"
+
+    def setUp(self):
+        super().setUp()
+        drain_log()
+
+    def answer(self, client, name="www.bbc.co.uk"):
+        """Answer one lookup from `client` with a pretend internet."""
+        return server.answer_query(query(name), client, fake_answer)
+
+    def test_a_device_switched_off_by_its_ipv4_address_is_refused_from_an_ipv6_address_that_cannot_be_matched(self):
+        server.set_internet_off("device:" + KID, True)
+        self.assertEqual(self.answer(self.PHONE_V6)[3] & 15, 5)        # "refused": it asks over IPv4 instead
+
+    def test_a_device_switched_off_by_its_ipv4_address_gets_the_blocked_answer_from_its_matched_ipv6_address(self):
+        server.set_internet_off("device:" + KID, True)
+        server.S.v6_devices = {self.PHONE_V6: KID}
+        self.assertEqual(self.answer(self.PHONE_V6)[-4:], bytes(4))
+
+    def test_a_matched_ipv6_lookup_is_filed_under_the_devices_ipv4_address(self):
+        server.S.v6_devices = {self.PHONE_V6: KID}
+        self.answer(self.PHONE_V6)
+        self.assertEqual(drain_log()[0][1], KID)
+
+    def test_a_bedtime_schedule_for_one_device_makes_unmatched_ipv6_lookups_refused(self):
+        self.schedule(scope="device:" + ADULT)
+        self.assertEqual(self.answer(self.PHONE_V6)[3] & 15, 5)
+
+    def test_an_unmatched_ipv6_device_is_answered_as_itself_when_no_rule_names_a_device_or_group(self):
+        server.set_service_block("all", "youtube", True)
+        self.addCleanup(server.set_service_block, "all", "youtube", False)
+        self.assertEqual(self.answer(self.PHONE_V6)[-4:], bytes([93, 184, 216, 34]))
+        self.assertEqual(drain_log()[0][1], self.PHONE_V6)
+
+    def test_this_computers_own_ipv6_address_counts_as_this_computer(self):
+        server.S.local_ip = "192.168.1.60"
+        server.S.v6_own = {"2001:db8:1:2::60"}
+        self.answer("2001:db8:1:2::60")
+        self.assertEqual(drain_log()[0][1], "192.168.1.60")
+
+    def test_home_only_ipv6_addresses_may_ask(self):
+        for host in ("::1", "fe80::1%eth0", "fd12:3456::1", "fc00::5", "::ffff:192.168.1.23"):
+            self.assertTrue(server.v6_source_allowed(host), host)
+
+    def test_a_public_ipv6_address_inside_the_home_range_may_ask(self):
+        server.S.v6_prefixes = [server.ipaddress.IPv6Network("2001:db8:1:2::/64")]
+        self.assertTrue(server.v6_source_allowed("2001:db8:1:2::99"))
+
+    def test_a_public_ipv6_address_outside_the_home_range_may_not_ask(self):
+        server.S.v6_prefixes = [server.ipaddress.IPv6Network("2001:db8:1:2::/64")]
+        self.assertFalse(server.v6_source_allowed("2001:db8:9:9::1"))
+        self.assertFalse(server.v6_source_allowed("::ffff:8.8.8.8"))
+
+    def test_a_lookup_from_a_public_address_outside_the_home_range_gets_no_reply(self):
+        server.S.v6_prefixes = [server.ipaddress.IPv6Network("2001:db8:1:2::/64")]
+        sock = mock.Mock(family=socket.AF_INET6)
+        sock.recvfrom.side_effect = [(query("www.bbc.co.uk"), ("2001:db8:9:9::1", 5000, 0, 0)), KeyboardInterrupt()]
+        submitted = []
+        pool = mock.Mock(submit=lambda fn, data, addr: submitted.append(addr))
+        with mock.patch.object(server, "ThreadPoolExecutor", lambda max_workers: pool):
+            with self.assertRaises(KeyboardInterrupt):
+                server.udp_server(sock)
+        self.assertEqual(submitted, [])
+        sock.sendto.assert_not_called()
+
+    def test_a_lookup_from_inside_the_home_range_is_taken_on_the_ipv6_listener(self):
+        sock = mock.Mock(family=socket.AF_INET6)
+        sock.recvfrom.side_effect = [(query("www.bbc.co.uk"), ("fe80::1", 5000, 0, 2)), KeyboardInterrupt()]
+        submitted = []
+        pool = mock.Mock(submit=lambda fn, data, addr: submitted.append(addr))
+        with mock.patch.object(server, "ThreadPoolExecutor", lambda max_workers: pool):
+            with self.assertRaises(KeyboardInterrupt):
+                server.udp_server(sock)
+        self.assertEqual(len(submitted), 1)
+
+    def test_a_tcp_connection_from_outside_the_home_range_is_turned_away(self):
+        server.S.v6_prefixes = [server.ipaddress.IPv6Network("2001:db8:1:2::/64")]
+        self.assertFalse(server.TCPServer6.verify_request(None, "conn", ("2001:db8:9:9::1", 5000, 0, 0)))
+        self.assertTrue(server.TCPServer6.verify_request(None, "conn", ("2001:db8:1:2::5", 5000, 0, 0)))
+
+    def test_ipv6_neighbours_are_matched_to_ipv4_devices_by_hardware_address(self):
+        with mock.patch.object(server, "own_ipv6", return_value=(set(), [])), \
+                mock.patch.object(server, "neighbours", return_value={KID: "aa:bb:cc:dd:ee:01"}), \
+                mock.patch.object(server, "ipv6_neighbours",
+                                  return_value={self.PHONE_V6: "aa:bb:cc:dd:ee:01", "fd00::2": "aa:bb:cc:dd:ee:99"}):
+            server.refresh_ipv6_view()
+        self.assertEqual(server.S.v6_devices, {self.PHONE_V6: KID})
+
+    def test_a_device_known_only_from_the_last_scan_is_matched_to_its_ipv6_address(self):
+        server.sql("INSERT OR REPLACE INTO seen(ip,mac,host,ts) VALUES(?,?,?,?)",
+                   (KID, "aa:bb:cc:dd:ee:01", "", time.time()), commit=True)
+        self.addCleanup(server.sql, "DELETE FROM seen WHERE ip=?", (KID,), True)
+        with mock.patch.object(server, "own_ipv6", return_value=(set(), [])), \
+                mock.patch.object(server, "neighbours", return_value={}), \
+                mock.patch.object(server, "ipv6_neighbours", return_value={self.PHONE_V6: "aa:bb:cc:dd:ee:01"}):
+            server.refresh_ipv6_view()
+        self.assertEqual(server.S.v6_devices, {self.PHONE_V6: KID})
+
+    def test_the_linux_ipv6_neighbour_table_is_read(self):
+        text = ("fe80::1 dev eth0 lladdr aa:bb:cc:dd:ee:01 router REACHABLE\n"
+                "fd00::ABCD dev eth0 lladdr aa:bb:cc:dd:ee:02 STALE\n"
+                "fd00::3 dev eth0 FAILED\n")
+        with mock.patch.object(server.os.path, "exists", lambda p: p == "/proc/net/if_inet6"), \
+                mock.patch.object(server.subprocess, "run", return_value=mock.Mock(stdout=text)):
+            found = server.ipv6_neighbours()
+        self.assertEqual(found, {"fe80::1": "aa:bb:cc:dd:ee:01", "fd00::abcd": "aa:bb:cc:dd:ee:02"})
+
+    def test_the_mac_ipv6_neighbour_table_is_read(self):
+        text = ("Neighbor                        Linklayer Address  Netif Expire    St Flgs Prbs\n"
+                "fe80::1%en0                     0:11:22:33:44:55   en0   23h59m58s S  R\n"
+                "fd00::9                         (incomplete)       en0   expired   N\n")
+        with mock.patch.object(server.os.path, "exists", lambda p: False), \
+                mock.patch.object(server.subprocess, "run", return_value=mock.Mock(stdout=text)):
+            found = server.ipv6_neighbours()
+        self.assertEqual(found, {"fe80::1": "00:11:22:33:44:55"})
+
+    def test_this_computers_public_ipv6_range_is_worked_out_from_its_own_addresses(self):
+        text = ("\tinet6 fe80::1%lo0 prefixlen 64 scopeid 0x1\n"
+                "\tinet6 2001:db8:1:2::60 prefixlen 128 dynamic\n"
+                "\tinet6 fd00::60 prefixlen 64 autoconf\n")
+        with mock.patch.object(server.os.path, "exists", lambda p: False), \
+                mock.patch.object(server.subprocess, "run", return_value=mock.Mock(stdout=text)):
+            own, ranges = server.own_ipv6()
+        self.assertEqual(own, {"fe80::1", "2001:db8:1:2::60", "fd00::60"})
+        self.assertEqual(ranges, [server.ipaddress.IPv6Network("2001:db8:1:2::/64")])
+
+
 class CommunityList(Base):
     def setUp(self):
         super().setUp()
@@ -360,6 +781,18 @@ class CommunityList(Base):
         with open(server.COMMUNITY_FILE) as f:
             self.assertEqual(len(f.read().split()), 1200)
 
+    def test_a_new_community_list_of_the_same_size_changes_the_activity_marker(self):
+        self.download("\n".join("0.0.0.0 old%d.example.net" % i for i in range(1200)))
+        before = server.activity_marker("192.168.1.23", 24, 0)
+        self.download("\n".join("0.0.0.0 new%d.example.net" % i for i in range(1200)))
+        self.assertNotEqual(server.activity_marker("192.168.1.23", 24, 0), before)
+
+    def test_a_new_community_list_forgets_remembered_answers(self):
+        with server.answer_cache_lock:
+            server.answer_cache[("x.example.net", 1, 1)] = (time.monotonic() + 60, time.monotonic(), b"")
+        self.download("\n".join("0.0.0.0 t%d.example.net" % i for i in range(1200)))
+        self.assertNotIn(("x.example.net", 1, 1), server.answer_cache)
+
     def test_a_suspiciously_short_list_is_refused_and_the_old_one_kept(self):
         server.S.junk_community = {"kept.example.net"}
         self.download("\n".join("0.0.0.0 t%d.example.net" % i for i in range(50)))
@@ -367,6 +800,15 @@ class CommunityList(Base):
         self.assertIn("incomplete", server.S.list_error)
         self.assertEqual(server.S.junk_community, {"kept.example.net"})
         self.assertFalse(os.path.exists(server.COMMUNITY_FILE))
+
+    def test_the_download_uses_the_shared_secure_connection_settings(self):
+        settings = object()
+        page = mock.MagicMock()
+        page.__enter__.return_value.read.return_value = b""
+        with mock.patch.object(server.cloud_agent, "tls_context", return_value=settings), \
+                mock.patch.object(server.urllib.request, "urlopen", return_value=page) as opened:
+            server.update_community_list()
+        self.assertIs(opened.call_args[1]["context"], settings)
 
     def test_a_failed_download_is_reported_and_the_old_list_kept(self):
         server.S.junk_community = {"kept.example.net"}
@@ -510,7 +952,8 @@ class LiveFilter(Base):
             s.bind(("0.0.0.0", 0))
             cls.port = s.getsockname()[1]
         server.S.dns_error = None
-        server.start_dns(cls.port)
+        with mock.patch.object(server, "ipv6_watcher", lambda: None):     # never read the real machine's IPv6 setup
+            server.start_dns(cls.port)
         if server.S.dns_error:
             raise unittest.SkipTest("could not open a port for the filter: %s" % server.S.dns_error)
 
@@ -557,6 +1000,14 @@ class LiveFilter(Base):
         server.set_service_block("all", "youtube", True)
         self.assertEqual(self.ask_udp("www.youtube.com")[-4:], bytes(4))
 
+    def test_lookups_are_also_answered_over_ipv6(self):
+        if not server.S.dns_ipv6:
+            self.skipTest("this computer could not listen on IPv6")
+        with socket.socket(socket.AF_INET6, socket.SOCK_DGRAM) as s:
+            s.settimeout(5)
+            s.sendto(query("ads.doubleclick.net"), ("::1", self.port))
+            self.assertEqual(s.recvfrom(4096)[0][-4:], bytes(4))
+
     def test_when_the_internet_does_not_answer_the_device_is_told_so(self):
         with mock.patch.object(server, "forward_udp", return_value=None):
             resp = self.ask_udp("www.bbc.co.uk")
@@ -585,6 +1036,46 @@ class Limits(unittest.TestCase):
         srv.shutdown_request = closed.append
         srv.process_request("conn", ("192.168.1.23", 5000))
         self.assertEqual(closed, ["conn"])
+
+    def test_one_device_cannot_take_more_than_its_share_of_tcp_connections(self):
+        srv = server.TCPServer(("127.0.0.1", 0), server.TCPHandler)
+        self.addCleanup(srv.server_close)
+        with mock.patch.object(server, "MAX_TCP_PER_DEVICE", 2):
+            taken = [srv.take_slot(("192.168.1.23", 5000 + i)) for i in range(3)]
+            other = srv.take_slot(("192.168.1.40", 6000))
+        self.assertEqual(taken, [True, True, False])
+        self.assertTrue(other)
+
+    def test_a_device_gets_its_tcp_share_back_once_a_connection_is_finished(self):
+        srv = server.TCPServer(("127.0.0.1", 0), server.TCPHandler)
+        self.addCleanup(srv.server_close)
+        with mock.patch.object(server, "MAX_TCP_PER_DEVICE", 1):
+            self.assertTrue(srv.take_slot(("192.168.1.23", 5000)))
+            srv.give_slot_back(("192.168.1.23", 5000))
+            self.assertTrue(srv.take_slot(("192.168.1.23", 5001)))
+
+    def test_a_tcp_connection_turned_away_for_its_device_share_is_closed(self):
+        srv = server.TCPServer(("127.0.0.1", 0), server.TCPHandler)
+        self.addCleanup(srv.server_close)
+        closed = []
+        srv.shutdown_request = closed.append
+        with mock.patch.object(server, "MAX_TCP_PER_DEVICE", 0):
+            srv.process_request("conn", ("192.168.1.23", 5000))
+        self.assertEqual(closed, ["conn"])
+
+    def test_an_ipv4_device_over_ipv6_shares_its_tcp_share_with_itself_over_ipv4(self):
+        srv = server.TCPServer(("127.0.0.1", 0), server.TCPHandler)
+        self.addCleanup(srv.server_close)
+        with mock.patch.object(server, "MAX_TCP_PER_DEVICE", 1):
+            self.assertTrue(srv.take_slot(("192.168.1.23", 5000)))
+            self.assertFalse(srv.take_slot(("::ffff:192.168.1.23", 5001, 0, 0)))
+
+    def test_failing_to_listen_on_ipv6_does_not_stop_the_filter(self):
+        server.S.dns_error = None
+        with mock.patch.object(server.socket, "socket", side_effect=OSError("no IPv6 here")), \
+                mock.patch("builtins.print"):
+            self.assertFalse(server.start_dns6(53))
+        self.assertIsNone(server.S.dns_error)
 
     def test_udp_lookups_beyond_the_limit_are_dropped_not_queued(self):
         sock = mock.Mock()

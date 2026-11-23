@@ -5,11 +5,14 @@ How it works: this program acts as the "phone book" (DNS server) for any device
 you point at it. Every time a device wants to reach an address (for example
 ads.example.com) it asks QuietNet first. QuietNet writes the request down,
 and either passes it on to the real internet phone book or, if the address is
-blocked, answers "that doesn't exist".
+blocked, answers with the address 0.0.0.0 (or :: for an IPv6 address), which
+devices treat as "can't be reached".
 
 No extra software is needed - just Python 3.
 """
 import argparse
+import collections
+import hashlib
 import ipaddress
 import json
 import os
@@ -57,6 +60,8 @@ MAX_HISTORY_ROWS = 2_000_000   # history is also capped by size, so a chatty dev
 MAX_DNS_WAITING = 256          # lookups being answered at once; beyond this new ones are dropped (devices retry)
 MAX_DNS_PER_DEVICE = 16        # of those, how many one device may have in hand, so one device can't take them all
 MAX_TCP_CLIENTS = 64           # DNS-over-TCP connections open at once
+MAX_TCP_PER_DEVICE = 8         # of those, how many one device may hold, so one device can't take them all
+MAX_CACHED_ANSWERS = 5000      # answers kept in memory to save a trip to the internet; oldest go first
 TCP_DEADLINE = 8               # seconds a TCP client gets to send its whole question
 RESOLVED_HOURS = 6             # how long we remember which addresses a name pointed to
 MAX_BODY = 64 * 1024   # the largest request body the dashboard API will read; real ones are a few hundred bytes
@@ -66,10 +71,27 @@ VALID_NAME = re.compile(r"[a-z0-9_-]+(\.[a-z0-9_-]+)+")
 IGNORED_ENDINGS = (".arpa", ".local", ".lan", ".home", ".internal")
 # Names only the home router can answer. They are sent to it, never to the public servers.
 HOME_ENDINGS = (".local", ".lan", ".home", ".internal", ".home.arpa")
+# Names that devices look up to ask "does this network want me to use its own DNS?". Answering them
+# this way keeps those devices' lookups coming to QuietNet (known issue 8):
+#  - Firefox switches off its built-in "secure DNS" if this name does not exist.
+#  - Apple devices switch off iCloud Private Relay for the network if these names are blocked.
+NO_SUCH_NAME_SIGNALS = ("use-application-dns.net",)
+BLOCKED_SIGNALS = ("mask.icloud.com", "mask-h2.icloud.com")
 ROUTER_RECHECK = 300           # seconds between looks at which router this computer uses
+IPV6_RECHECK = 60              # seconds between looks at this computer's IPv6 addresses and its IPv6 neighbours
+MAX_CACHED_SIZE = 4096         # bytes; a bigger answer is never remembered (it would tie up memory)
+# Record types a device that checks DNS signatures itself asks about a bare top-level name such as
+# 'com' (NS, SOA, DS, RRSIG, NSEC, DNSKEY, NSEC3). These go to the internet, not the home router.
+SIGNATURE_TYPES = (2, 6, 43, 46, 47, 48, 50)
+# IPv6 addresses that can only come from the home network: this computer, link-local, unique-local.
+HOME_ONLY_V6 = [ipaddress.IPv6Network(n) for n in ("::1/128", "fe80::/10", "fc00::/7")]
 # The system's own tool for listing network neighbours. Look in the usual places
 # because the program isn't always started with those folders on its search path.
 ARP = next((p for p in ("/usr/sbin/arp", "/sbin/arp", "/usr/bin/arp") if os.path.exists(p)), "arp")
+# The same for IPv6 neighbours: `ip` on Linux, `ndp` on a Mac. And `ifconfig`, for a Mac's own addresses.
+IP_TOOL = next((p for p in ("/usr/sbin/ip", "/sbin/ip", "/usr/bin/ip", "/bin/ip") if os.path.exists(p)), "ip")
+NDP = next((p for p in ("/usr/sbin/ndp", "/sbin/ndp") if os.path.exists(p)), "ndp")
+IFCONFIG = next((p for p in ("/sbin/ifconfig", "/usr/sbin/ifconfig") if os.path.exists(p)), "ifconfig")
 SCOPE = re.compile(r"all|device:[0-9a-f.:]{3,45}|group:\d+")
 
 # Words that often appear in advert / tracking addresses. These are only
@@ -137,6 +159,7 @@ class State:
     paused_until = 0.0
     dns_error = None
     dns_port = 53
+    dns_ipv6 = False        # also listening for lookups over IPv6?
     local_ip = "127.0.0.1"
     list_state = "idle"     # idle | downloading | error
     list_error = ""
@@ -160,6 +183,9 @@ class State:
     plan_cache = {}         # see enforcement_plan
     router = ""           # the home router's address, for home-network names ('' = not known)
     router_checked = None   # when (time.monotonic()) the router's address was last looked up
+    v6_own = set()          # this computer's own IPv6 addresses (see refresh_ipv6_view)
+    v6_prefixes = []        # the home network's public IPv6 ranges, from this computer's own addresses
+    v6_devices = {}         # a device's IPv6 address -> its IPv4 address, matched by hardware address
 
 
 S = State()
@@ -167,15 +193,38 @@ ENF = None
 CA = None
 db = None
 db_lock = threading.RLock()
+# A second, read-only connection for the dashboard's questions about the history, with its own
+# lock. The write-ahead log lets it read while the main connection writes, so a slow history
+# question never holds up the history writer, a rule change or another dashboard call waiting
+# for db_lock. One connection is used by one thread at a time, hence the lock.
+read_db = None
+read_lock = threading.Lock()
 # S.resolved has a small lock of its own, not db_lock: every allowed lookup records its addresses
 # there before the answer goes back, and it must never wait behind a slow database query.
 resolved_lock = threading.Lock()
 log_q = queue.Queue()
+# Answers from the internet kept for their (shortened) lifetime, so a name asked for again soon is
+# answered here without a round trip. (name, record type, class) -> (expires, stored, reply bytes),
+# both times from time.monotonic(). Oldest first, so the oldest is the one dropped when full.
+# It has its own small lock, for the same reason as resolved_lock.
+answer_cache = collections.OrderedDict()
+answer_cache_lock = threading.Lock()
+# Questions QuietNet is waiting on the home router for, as (name, record type) -> how many. Used to
+# spot a router that sends lookups back here, so the two can't ask each other for ever.
+router_waiting = {}
+router_waiting_lock = threading.Lock()
+# The thread clearing one device's history, started by the last POST /api/clear-history that named
+# a device (None before any). Kept so the tests can wait for it to finish.
+last_clear = None
 
 
 def rules_changed():
-    """Note that a rule has changed, so the enforcer's remembered plan is worked out afresh."""
+    """Note that a rule has changed, so the enforcer's remembered plan is worked out afresh, and
+    forget every remembered answer. (Blocking is decided afresh for every lookup before the
+    remembered answers are looked at, so this is a precaution, not what makes a block bite.)"""
     S.rules_version += 1
+    with answer_cache_lock:
+        answer_cache.clear()
 
 
 # ------------------------------------------------------------------ database
@@ -188,6 +237,24 @@ def sql(statement, args=(), commit=False):
         if commit:
             db.commit()
         return rows
+
+
+def read_sql(statement, args=()):
+    """Run one question about the history on the read-only connection and return all its rows.
+    Holds read_lock, never db_lock. It sees everything the main connection has saved (committed)."""
+    with read_lock:
+        return read_db.execute(statement, args).fetchall()
+
+
+def open_read_db():
+    """Open (or reopen) the read-only connection used by read_sql. 'query_only' makes the
+    database itself refuse any change sent through it."""
+    global read_db
+    with read_lock:
+        if read_db is not None:
+            read_db.close()
+        read_db = sqlite3.connect(os.path.join(DATA, "quietnet.db"), check_same_thread=False)
+        read_db.execute("PRAGMA query_only=1")
 
 
 def init_db():
@@ -245,6 +312,7 @@ def init_db():
     load_schedules()
     S.junk_on = get_setting("junk_on", "1") == "1"
     S.paused_until = float(get_setting("paused_until", "0"))
+    open_read_db()                  # after the tables exist, so it never sees a half-made database
     rules_changed()
 
 
@@ -311,6 +379,33 @@ def prune_history():
             if n < PRUNE_BATCH:
                 break
             time.sleep(0.05)                 # give the dashboard and the history writer a turn at the lock
+
+
+# One step of clearing a device's history: up to a number of its rows at or below a row number,
+# found through q_client_ts.
+CLEAR_DEVICE_SQL = ("DELETE FROM queries WHERE id IN "
+                    "(SELECT id FROM queries WHERE client=? AND id<=? LIMIT ?)")
+
+
+def clear_history(ip=None):
+    """Delete one device's history, or everyone's when `ip` is empty.
+
+    Everyone's is one statement, which the database does quickly by emptying the table. One
+    device's is deleted PRUNE_BATCH rows at a time, letting go of db_lock between steps as
+    prune_history does, so clearing a busy device's month of history does not hold up the history
+    writer or other dashboard calls. Only rows already there when the clear began are deleted.
+    Call it without holding db_lock."""
+    if not ip:
+        sql("DELETE FROM queries", commit=True)
+        return
+    top = sql("SELECT MAX(id) FROM queries")[0][0] or 0
+    while True:
+        with db_lock:
+            n = db.execute(CLEAR_DEVICE_SQL, (str(ip), top, PRUNE_BATCH)).rowcount
+            db.commit()
+        if n < PRUNE_BATCH:
+            break
+        time.sleep(0.05)                     # give the history writer and the dashboard a turn at the lock
 
 
 def oldest_to_drop():
@@ -564,7 +659,10 @@ def update_community_list():
     S.list_state, S.list_error = "downloading", ""
     try:
         req = urllib.request.Request(COMMUNITY_URL, headers={"User-Agent": "QuietNet"})
-        with urllib.request.urlopen(req, timeout=45) as r:
+        # The same secure-connection settings as the relay link: they add the system's certificate
+        # list when Python has none of its own (python.org's Python on a Mac), and still check
+        # every certificate.
+        with urllib.request.urlopen(req, timeout=45, context=cloud_agent.tls_context()) as r:
             text = r.read().decode("utf-8", "ignore")
         found = set()
         for line in text.splitlines():
@@ -578,6 +676,7 @@ def update_community_list():
             f.write("\n".join(sorted(found)))
         S.junk_community = found
         count_junk()
+        rules_changed()            # block decisions may differ even if the list is the same size
         S.list_state = "idle"
     except Exception as e:
         S.list_state, S.list_error = "error", str(e)
@@ -761,19 +860,19 @@ def enforcement_plan():
     return plan
 
 
-def cap_ttls(resp, limit=MAX_TTL):
-    """Shorten how long a device may remember an answer.
-
-    Without this a device can keep using an address for hours after it has been
-    blocked, which would make bedtime schedules and the kill switch very slow to bite."""
+def ttl_positions(resp):
+    """Where each record's lifetime ("how long it may be remembered", four bytes) sits in a DNS
+    answer, leaving out the settings record (type 41), which has no real lifetime. Returns a list
+    of byte offsets, or None if the packet can't be read exactly from start to end. Used to shorten
+    lifetimes (cap_ttls) and to age remembered answers (cached_answer), both of which rewrite the
+    packet and so must not guess."""
     try:
-        buf = bytearray(resp)
+        buf = resp
         counts = [int.from_bytes(buf[i:i + 2], "big") for i in (4, 6, 8, 10)]
 
         def skip_name(pos):
             """Step past one encoded name starting at `pos`; return the position just after it.
-            Unlike the copy in answer_ips, this one refuses reserved label types, because cap_ttls
-            rewrites the packet and must not guess."""
+            Unlike the copy in answer_ips, this one refuses reserved label types."""
             while True:
                 n = buf[pos]
                 if n == 0:
@@ -784,24 +883,133 @@ def cap_ttls(resp, limit=MAX_TTL):
                     raise ValueError("reserved label byte")
                 pos += 1 + n
 
-        pos = 12
+        pos, out = 12, []
         for _ in range(counts[0]):
             pos = skip_name(pos) + 4
         for _ in range(sum(counts[1:])):
             pos = skip_name(pos)
             if pos + 10 > len(buf):
                 raise ValueError("record header runs off the end")
-            rtype = int.from_bytes(buf[pos:pos + 2], "big")
-            if rtype != 41 and int.from_bytes(buf[pos + 4:pos + 8], "big") > limit:   # 41 = settings record, not an answer
-                buf[pos + 4:pos + 8] = limit.to_bytes(4, "big")
+            if int.from_bytes(buf[pos:pos + 2], "big") != 41:
+                out.append(pos + 4)
             pos += 10 + int.from_bytes(buf[pos + 8:pos + 10], "big")
-        # Only trust the rewrite if every record lined up and we landed exactly at the end.
-        # Anything else means we misread the packet, so hand back the untouched original.
-        if pos != len(buf):
-            return resp
-        return bytes(buf)
+        # Only trust the reading if every record lined up and we landed exactly at the end.
+        return out if pos == len(buf) else None
     except (IndexError, ValueError):
+        return None
+
+
+def cap_ttls(resp, limit=MAX_TTL):
+    """Shorten how long a device may remember an answer.
+
+    Without this a device can keep using an address for hours after it has been
+    blocked, which would make bedtime schedules and the kill switch very slow to bite."""
+    where = ttl_positions(resp)
+    if where is None:                 # misread packet: hand back the untouched original
         return resp
+    buf = bytearray(resp)
+    for at in where:
+        if int.from_bytes(buf[at:at + 4], "big") > limit:
+            buf[at:at + 4] = limit.to_bytes(4, "big")
+    return bytes(buf)
+
+
+def question_settings(data, qend):
+    """What a question says about the answer it can take, from its settings record (type 41, also
+    called OPT) if it carries one. Returns (has the record, the largest UDP answer it accepts,
+    whether it asks for signature records). A question with no readable settings record can take
+    512 bytes over UDP and asks for no signatures. `qend` is where the question ends."""
+    try:
+        counts = [int.from_bytes(data[i:i + 2], "big") for i in (6, 8, 10)]
+        pos = qend
+        for _ in range(sum(counts)):
+            while data[pos] != 0:                 # step past the record's name
+                if data[pos] & 0xC0 == 0xC0:
+                    pos += 1
+                    break
+                pos += 1 + data[pos]
+            pos += 1
+            if pos + 10 > len(data):
+                break
+            if int.from_bytes(data[pos:pos + 2], "big") == 41:
+                size = int.from_bytes(data[pos + 2:pos + 4], "big")
+                wants_signatures = bool(data[pos + 6] & 0x80)   # the 'DO' flag
+                return True, max(512, size), wants_signatures
+            pos += 10 + int.from_bytes(data[pos + 8:pos + 10], "big")
+    except IndexError:
+        pass
+    return False, 512, False
+
+
+def cache_key(data, q):
+    """What a remembered answer is filed under: the name asked about (lower case), the record type,
+    the class, and what the question asked of the answer - whether it carried a settings record,
+    whether that asked for signature records, and whether it asked the server not to check
+    signatures (the 'CD' flag). The internet's answer depends on all three, so an answer given to
+    one kind of question is never handed to another: in particular, an unchecked answer fetched for
+    a device that turned checking off is never given to a device that relies on it. `q` is
+    parse_question(data)."""
+    name, qtype, qend = q
+    has_settings, _, wants_signatures = question_settings(data, qend)
+    no_checking = bool(data[3] & 0x10)
+    return (name, qtype, int.from_bytes(data[qend - 2:qend], "big"), has_settings, wants_signatures,
+            no_checking)
+
+
+def remember_answer(key, resp, now=None):
+    """Keep an answer from the internet in memory for as long as it may be remembered: the shortest
+    lifetime of any record in it (already cut to MAX_TTL by cap_ttls). Only good answers are kept -
+    'found' or 'no such name' - never failures, cut-short answers or answers with no lifetime to go
+    by. Blocked answers never come here: they are made by QuietNet, not fetched. Nor do answers
+    over MAX_CACHED_SIZE bytes (a TCP answer can be 64 KB), so the memory used stays small. When
+    full, the oldest answer is dropped."""
+    if len(resp) < 12 or len(resp) > MAX_CACHED_SIZE:
+        return
+    if resp[2] & 0x02 or (resp[3] & 15) not in (0, 3):   # 0x02: cut short, ask over TCP
+        return
+    where = ttl_positions(resp)
+    if not where:
+        return
+    life = min(min(int.from_bytes(resp[at:at + 4], "big") for at in where), MAX_TTL)
+    if life <= 0:
+        return
+    now = time.monotonic() if now is None else now
+    with answer_cache_lock:
+        answer_cache.pop(key, None)
+        answer_cache[key] = (now + life, now, bytes(resp))
+        while len(answer_cache) > MAX_CACHED_ANSWERS:
+            answer_cache.popitem(last=False)
+
+
+def cached_answer(data, key, qend, now=None, over_tcp=False):
+    """A remembered answer to this question, made ready for the device that asked, or None.
+
+    The id and the question are copied from the device's own packet (some devices change the
+    letter case of names, and check it comes back the same), and every record's lifetime is reduced
+    by the time it has already spent in memory. Over UDP, an answer bigger than the device said it
+    can take (512 bytes, or the size in its settings record) is not given; the answer is None, and
+    the question goes to the internet as usual, which tells the device to ask over TCP."""
+    now = time.monotonic() if now is None else now
+    with answer_cache_lock:
+        entry = answer_cache.get(key)
+        if entry and entry[0] <= now:
+            del answer_cache[key]
+            entry = None
+    if not entry:
+        return None
+    expires, stored, resp = entry
+    if not over_tcp and len(resp) > question_settings(data, qend)[1]:
+        return None
+    if resp[12:qend].lower() != data[12:qend].lower():
+        return None
+    where = ttl_positions(resp)
+    if where is None:
+        return None
+    gone = int(now - stored)
+    buf = bytearray(data[:2] + resp[2:12] + data[12:qend] + resp[qend:])
+    for at in where:
+        buf[at:at + 4] = max(0, int.from_bytes(buf[at:at + 4], "big") - gone).to_bytes(4, "big")
+    return bytes(buf)
 
 
 def forward_udp(data, servers=None):
@@ -899,10 +1107,16 @@ def is_private_reverse(name):
     return False
 
 
-def is_home_name(name):
+def is_home_name(name, qtype=None):
     """Is this a name only the home network can answer: .local, .lan, .home, .internal,
-    .home.arpa, or a reverse lookup of a private address?"""
-    return name.endswith(HOME_ENDINGS) or is_private_reverse(name)
+    .home.arpa, a single word with no dot (such as 'nas', which some routers answer for home
+    devices), or a reverse lookup of a private address?
+
+    A single word asked about with one of SIGNATURE_TYPES is not: that is a device checking DNS
+    signatures asking about a top-level name such as 'com', which only the internet can answer.
+    Answering it 'no such name' would make that device reject every name under it."""
+    single_word = name != "" and "." not in name and qtype not in SIGNATURE_TYPES
+    return name.endswith(HOME_ENDINGS) or single_word or is_private_reverse(name)
 
 
 def home_router():
@@ -924,34 +1138,87 @@ def home_router():
 def ask_router(data, client, qend, forwarder):
     """Answer a home-network name by asking the home router. If the router isn't known, or the
     question came from the router itself (asking it back would go round in circles), the answer
-    is 'no such name'. If the router doesn't answer, 'server failure'."""
+    is 'no such name'. If the router doesn't answer, 'server failure'.
+
+    A router set up to pass lookups back to QuietNet by another route would still go round in
+    circles, each asking the other. So if the same question (name and type) arrives while QuietNet
+    is already waiting on the router for it, the answer is 'server failure' rather than asking
+    again. (Two devices asking the very same home name at the very same moment also get this; they
+    simply ask again.)"""
     router = home_router()
     if not router or client == router:
         return reply(data, qend, 3)
-    resp = forwarder(data, servers=[(router, 53)])
+    q = parse_question(data)
+    key = (q[0], q[1])
+    with router_waiting_lock:
+        if router_waiting.get(key):
+            return reply(data, qend, 2)
+        router_waiting[key] = 1
+    try:
+        resp = forwarder(data, servers=[(router, 53)])
+    finally:
+        with router_waiting_lock:
+            router_waiting.pop(key, None)
     return cap_ttls(resp) if resp else reply(data, qend, 2)
 
 
-def answer_query(data, client, forwarder):
+def device_address(host):
+    """The address a device is known by, from the address its lookup came from. A lookup that
+    arrives on the IPv6 listener from an IPv4 device shows up as '::ffff:192.168.1.23'; that is
+    the same device as '192.168.1.23', so it is filed under that. A zone suffix ('%eth0', which
+    says which network card a home-only IPv6 address was seen on) is dropped. '::1' (this computer)
+    and everything else is left as it is."""
+    if not host:
+        return host
+    host = host.split("%", 1)[0]
+    if host[:7].lower() == "::ffff:" and "." in host:
+        try:
+            return str(ipaddress.IPv4Address(host[7:]))
+        except ValueError:
+            return host
+    return host
+
+
+def answer_query(data, client, forwarder, over_tcp=False):
     """The whole life of one lookup: read it, decide, record it, answer it.
 
-    `forwarder` is forward_udp or forward_tcp (or a stand-in, in tests). Returns the reply bytes,
-    or None when nothing should be sent back.
+    `forwarder` is forward_udp or forward_tcp (or a stand-in, in tests); `over_tcp` says the
+    question came over TCP, where an answer may be any size. Returns the reply bytes, or None when
+    nothing should be sent back.
     The steps are described in docs/ARCHITECTURE.md under 'What happens to one lookup'."""
     q = parse_question(data)
     if not q:
         return unreadable_reply(data)
     name, qtype, qend = q
     loggable = bool(VALID_NAME.fullmatch(name)) and not name.endswith(IGNORED_ENDINGS)
-    if client in ("127.0.0.1", "::1"):
+    client = device_address(client)
+    if client in ("127.0.0.1", "::1") or client in S.v6_own:
         client = S.local_ip
+    elif client and ":" in client:
+        # A device asking from its own IPv6 address. Rules are set on IPv4 addresses, so file it
+        # under its IPv4 address if it can be matched. If not, and any rule applies to particular
+        # devices or groups, refuse: the device then asks QuietNet's IPv4 address instead, where
+        # its own rules are known, rather than slip past them over IPv6.
+        mapped = S.v6_devices.get(client)
+        if mapped:
+            client = mapped
+        elif device_rules_exist():
+            return reply(data, qend, 5)
+    if name in NO_SUCH_NAME_SIGNALS or name in BLOCKED_SIGNALS:
+        # The 'use the network's DNS' signals (see NO_SUCH_NAME_SIGNALS): the same answer for every
+        # device, paused or not, whatever the rules say. They are written to the history as blocked,
+        # because they were, so the owner can see which devices tried to bypass QuietNet.
+        log_q.put((time.time(), client, name, 1))
+        if name in NO_SUCH_NAME_SIGNALS:
+            return reply(data, qend, 3)
+        return blocked_reply(data, qtype, qend)
     if not loggable:
         # Names that skip the checks: odd characters, home-network endings, reverse lookups.
         # If this device's internet is off they get the blocked answer, so they can't be used
         # to tunnel out. Otherwise home-network names go to the router, the rest to the internet.
         if internet_cut(client):
             return blocked_reply(data, qtype, qend)
-        if is_home_name(name):
+        if is_home_name(name, qtype):
             return ask_router(data, client, qend, forwarder)
         resp = forwarder(data)
         return cap_ttls(resp) if resp else reply(data, qend, 2)
@@ -959,10 +1226,20 @@ def answer_query(data, client, forwarder):
     log_q.put((time.time(), client, name, 1 if blocked else 0))
     if blocked:
         return blocked_reply(data, qtype, qend)
-    resp = forwarder(data)
+    # Only now, with the device's own rules already checked, may a remembered answer stand in for
+    # the trip to the internet.
+    key = cache_key(data, q)
+    resp = cached_answer(data, key, qend, over_tcp=over_tcp)
     if resp:
         record_resolved(name, resp)
-    return cap_ttls(resp) if resp else reply(data, qend, 2)
+        return resp
+    resp = forwarder(data)
+    if not resp:
+        return reply(data, qend, 2)
+    record_resolved(name, resp)
+    resp = cap_ttls(resp)
+    remember_answer(key, resp)
+    return resp
 
 
 def udp_server(sock):
@@ -971,14 +1248,17 @@ def udp_server(sock):
     MAX_DNS_WAITING are in hand at once, and at most MAX_DNS_PER_DEVICE from any one device;
     beyond that, new lookups are dropped rather than queued without limit (a flood from one
     device, or the internet being down). The per-device share means one busy or broken device
-    can't use up every slot and stop everyone else's lookups. Devices simply ask again."""
+    can't use up every slot and stop everyone else's lookups. Devices simply ask again.
+    On the IPv6 socket, lookups from outside the home network are dropped unanswered."""
     pool = ThreadPoolExecutor(max_workers=64)
     slots = threading.BoundedSemaphore(MAX_DNS_WAITING)
+    on_ipv6 = sock.family == socket.AF_INET6
     in_hand = {}                    # device address -> lookups of its being answered now
     in_hand_lock = threading.Lock()
 
     def work(data, addr):
         """Answer one lookup and send the reply back to the device that asked."""
+        who = device_address(addr[0])
         try:
             resp = answer_query(data, addr[0], forward_udp)
             if resp:
@@ -987,11 +1267,11 @@ def udp_server(sock):
             print("Lookup problem:", e)
         finally:
             with in_hand_lock:
-                left = in_hand.get(addr[0], 1) - 1
+                left = in_hand.get(who, 1) - 1
                 if left > 0:
-                    in_hand[addr[0]] = left
+                    in_hand[who] = left
                 else:
-                    in_hand.pop(addr[0], None)
+                    in_hand.pop(who, None)
             slots.release()
 
     while True:
@@ -999,11 +1279,14 @@ def udp_server(sock):
             data, addr = sock.recvfrom(4096)
         except OSError:
             continue
+        if on_ipv6 and not v6_source_allowed(addr[0]):
+            continue                        # from outside the home: no answer at all (see v6_source_allowed)
+        who = device_address(addr[0])
         with in_hand_lock:
-            mine = in_hand.get(addr[0], 0)
+            mine = in_hand.get(who, 0)
             if mine >= MAX_DNS_PER_DEVICE or not slots.acquire(blocking=False):
                 continue
-            in_hand[addr[0]] = mine + 1
+            in_hand[who] = mine + 1
         pool.submit(work, data, addr)
 
 
@@ -1017,7 +1300,7 @@ class TCPHandler(socketserver.BaseRequestHandler):
             n = int.from_bytes(recv_exact(self.request, 2, deadline), "big")
             data = recv_exact(self.request, n, deadline)
             self.request.settimeout(10)
-            resp = answer_query(data, self.client_address[0], forward_tcp)
+            resp = answer_query(data, self.client_address[0], forward_tcp, over_tcp=True)
             if resp:
                 self.request.sendall(len(resp).to_bytes(2, "big") + resp)
         except (OSError, ValueError):
@@ -1025,25 +1308,50 @@ class TCPHandler(socketserver.BaseRequestHandler):
 
 
 class TCPServer(socketserver.ThreadingTCPServer):
-    """The TCP side of the DNS filter: one short-lived thread per connection, and at most
-    MAX_TCP_CLIENTS connections at once (more are turned away)."""
+    """The TCP side of the DNS filter: one short-lived thread per connection, at most
+    MAX_TCP_CLIENTS connections at once, and at most MAX_TCP_PER_DEVICE from any one device, so one
+    device can't take every connection and shut everyone else out (more are turned away)."""
     allow_reuse_address = True
     daemon_threads = True
 
     def __init__(self, *args, **kw):
-        """As usual, plus the count of connections in hand."""
+        """As usual, plus the count of connections in hand, in all and for each device."""
         self.slots = threading.BoundedSemaphore(MAX_TCP_CLIENTS)
+        self.in_hand = {}                   # device address -> its connections open now
+        self.in_hand_lock = threading.Lock()
         super().__init__(*args, **kw)
+
+    def take_slot(self, client_address):
+        """Take one of this device's connections and one of the house's, or return False if
+        either has none left."""
+        who = device_address(client_address[0])
+        with self.in_hand_lock:
+            mine = self.in_hand.get(who, 0)
+            if mine >= MAX_TCP_PER_DEVICE or not self.slots.acquire(blocking=False):
+                return False
+            self.in_hand[who] = mine + 1
+        return True
+
+    def give_slot_back(self, client_address):
+        """Hand back what take_slot took, once a connection is finished with."""
+        who = device_address(client_address[0])
+        with self.in_hand_lock:
+            left = self.in_hand.get(who, 1) - 1
+            if left > 0:
+                self.in_hand[who] = left
+            else:
+                self.in_hand.pop(who, None)
+        self.slots.release()
 
     def process_request(self, request, client_address):
         """Take a slot for this connection, or close it straight away if there are none left."""
-        if not self.slots.acquire(blocking=False):
+        if not self.take_slot(client_address):
             self.shutdown_request(request)
             return
         try:
             super().process_request(request, client_address)
         except Exception:
-            self.slots.release()
+            self.give_slot_back(client_address)
             raise
 
     def process_request_thread(self, request, client_address):
@@ -1051,13 +1359,29 @@ class TCPServer(socketserver.ThreadingTCPServer):
         try:
             super().process_request_thread(request, client_address)
         finally:
-            self.slots.release()
+            self.give_slot_back(client_address)
+
+
+class TCPServer6(TCPServer):
+    """The same TCP listener on IPv6. It takes IPv6 only, leaving IPv4 to the ordinary listener on
+    the same port (otherwise the two would clash on some systems)."""
+    address_family = socket.AF_INET6
+
+    def server_bind(self):
+        """Ask for IPv6 only, then open the port as usual."""
+        self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+        super().server_bind()
+
+    def verify_request(self, request, client_address):
+        """Take connections from the home network only (see v6_source_allowed); others are closed."""
+        return v6_source_allowed(client_address[0])
 
 
 def start_dns(port):
-    """Open the DNS port for UDP and TCP and start serving. If the port cannot be opened
-    (usually because something else is using it) the reason is kept in S.dns_error for the
-    dashboard to show, and the rest of QuietNet carries on."""
+    """Open the DNS port for UDP and TCP and start serving, on IPv4 and, where this computer has
+    it, IPv6 (start_dns6). If the IPv4 port cannot be opened (usually because something else is
+    using it) the reason is kept in S.dns_error for the dashboard to show, and the rest of
+    QuietNet carries on."""
     S.dns_port = port
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -1070,6 +1394,62 @@ def start_dns(port):
         return
     threading.Thread(target=udp_server, args=(sock,), daemon=True).start()
     threading.Thread(target=tcp.serve_forever, daemon=True).start()
+    start_dns6(port)
+
+
+def start_dns6(port):
+    """Also listen for lookups over IPv6, on the same port, for devices the router has told to use
+    an IPv6 address for DNS. Optional: if this computer has no IPv6, or the port can't be opened on
+    it, the reason is printed and QuietNet carries on with IPv4 alone. Returns True if listening."""
+    if not socket.has_ipv6 or not hasattr(socket, "IPV6_V6ONLY"):
+        print("This computer has no IPv6, so the filter listens on IPv4 only.")
+        return False
+    sock = None
+    try:
+        sock = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind(("::", port))
+        tcp = TCPServer6(("::", port), TCPHandler)
+    except OSError as e:
+        if sock is not None:
+            sock.close()
+        print("Could not listen for lookups over IPv6 on port %d (%s). IPv4 lookups still work." % (port, e))
+        return False
+    threading.Thread(target=ipv6_watcher, daemon=True).start()
+    threading.Thread(target=udp_server, args=(sock,), daemon=True).start()
+    threading.Thread(target=tcp.serve_forever, daemon=True).start()
+    S.dns_ipv6 = True
+    return True
+
+
+def v6_source_allowed(host):
+    """May a lookup from this address be answered on the IPv6 listener?
+
+    Over IPv4 the router's address sharing keeps the internet away from the filter. Over IPv6 this
+    computer's public address can be reached directly, and only the router's own firewall (which
+    some routers ship switched off) stops strangers using QuietNet. So only these are answered:
+    this computer (::1), link-local (fe80::/10) and unique-local (fc00::/7) addresses, IPv4 home
+    addresses written the IPv6 way, and public addresses inside the home network's own ranges
+    (S.v6_prefixes, read from this computer's own addresses). Anything else gets no answer."""
+    try:
+        addr = ipaddress.ip_address(host.split("%", 1)[0])
+    except (ValueError, AttributeError):
+        return False
+    if addr.version == 4:
+        return True
+    if addr.ipv4_mapped is not None:
+        return addr.ipv4_mapped.is_private
+    return any(addr in net for net in HOME_ONLY_V6) or any(addr in net for net in S.v6_prefixes)
+
+
+def device_rules_exist():
+    """Are there any rules that apply to particular devices or groups rather than the whole house:
+    an internet switch, a blocked service or an enabled schedule? Used to decide whether an IPv6
+    lookup that can't be matched to a device must be refused (see answer_query)."""
+    return (any(sc != "all" for sc in S.off)
+            or any(sc != "all" and ids for sc, ids in S.svc_blocks.items())
+            or any(x["scope"] != "all" for x in S.schedules if x["enabled"]))
 
 
 # ------------------------------------------------------------------ helpers
@@ -1138,12 +1518,105 @@ def neighbours():
         for line in text.splitlines():
             m = re.search(r"\((\d+\.\d+\.\d+\.\d+)\) at ([0-9a-fA-F:]{11,17})", line)
             if m:
-                mac = ":".join(part.zfill(2) for part in m.group(2).lower().split(":"))
+                mac = tidy_mac(m.group(2))
                 if mac != "ff:ff:ff:ff:ff:ff":
                     out[m.group(1)] = mac
     except (OSError, ValueError):
         pass
     return out
+
+
+def tidy_mac(text):
+    """A hardware address in the usual form: lower case, two digits per part ('0:1b:...' -> '00:1b:...')."""
+    return ":".join(part.zfill(2) for part in text.lower().split(":"))
+
+
+def own_ipv6():
+    """This computer's own IPv6 addresses, and the public ranges of the home network they belong to.
+    Returns (set of addresses, list of networks). Link-local and unique-local addresses are counted as
+    this computer's but give no range (any such address is from the home network anyway). A range
+    narrower than /64 is widened to /64, since home networks are /64 and an address handed out on its
+    own often shows as /128. Read from /proc/net/if_inet6 on Linux and from `ifconfig` elsewhere."""
+    found = []                                  # (address text, prefix length)
+    if os.path.exists("/proc/net/if_inet6"):
+        try:
+            with open("/proc/net/if_inet6") as f:
+                for line in f:
+                    cols = line.split()
+                    if len(cols) >= 3 and len(cols[0]) == 32:
+                        text = ":".join(cols[0][i:i + 4] for i in range(0, 32, 4))
+                        found.append((text, int(cols[2], 16)))
+        except (OSError, ValueError):
+            pass
+    else:
+        try:
+            text = subprocess.run([IFCONFIG, "-a"], capture_output=True, text=True, timeout=10).stdout
+            for m in re.finditer(r"inet6 ([0-9a-fA-F:]+)(?:%\S+)? prefixlen (\d+)", text):
+                found.append((m.group(1), int(m.group(2))))
+        except (OSError, ValueError, subprocess.SubprocessError):
+            pass
+    own, ranges = set(), []
+    for text, length in found:
+        try:
+            addr = ipaddress.IPv6Address(text)
+        except ValueError:
+            continue
+        own.add(str(addr))
+        if not (addr.is_multicast or addr.is_unspecified or any(addr in net for net in HOME_ONLY_V6)):
+            net = ipaddress.IPv6Network("%s/%d" % (addr, min(length, 64)), strict=False)
+            if net not in ranges:
+                ranges.append(net)
+    return own, ranges
+
+
+def ipv6_neighbours():
+    """The devices this computer has recently talked to over IPv6: {IPv6 address: hardware address}.
+    From `ip -6 neigh` on Linux and `ndp -an` on a Mac. Empty if neither tool can be run."""
+    out = {}
+    if os.path.exists("/proc/net/if_inet6"):
+        command, pattern = [IP_TOOL, "-6", "neigh", "show"], r"^([0-9a-fA-F:]+)\s.*\blladdr ([0-9a-fA-F:]{11,17})\b"
+    else:
+        command, pattern = [NDP, "-an"], r"^([0-9a-fA-F:]+)(?:%\S+)?\s+([0-9a-fA-F]{1,2}(?::[0-9a-fA-F]{1,2}){5})\s"
+    try:
+        text = subprocess.run(command, capture_output=True, text=True, timeout=10).stdout
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return out
+    for line in text.splitlines():
+        m = re.match(pattern, line.strip())
+        if not m:
+            continue
+        try:
+            out[str(ipaddress.IPv6Address(m.group(1)))] = tidy_mac(m.group(2))
+        except ValueError:
+            continue
+    return out
+
+
+def refresh_ipv6_view():
+    """Look again at this computer's IPv6 addresses and ranges (for v6_source_allowed and 'this
+    computer'), and match each IPv6 neighbour to an IPv4 device with the same hardware address,
+    so a device's IPv6 lookups come under its IPv4 rules (see answer_query). IPv4 devices come from
+    the last network scan (the 'seen' table, oldest first) and then the current neighbour table,
+    which is fresher and so wins."""
+    own, ranges = own_ipv6()
+    by_mac = {}
+    if db is not None:
+        for ip, mac in sql("SELECT ip, mac FROM seen WHERE mac != '' ORDER BY ts"):
+            by_mac[mac] = ip
+    by_mac.update({mac: ip for ip, mac in neighbours().items()})
+    matched = {addr: by_mac[mac] for addr, mac in ipv6_neighbours().items() if mac in by_mac}
+    S.v6_own, S.v6_prefixes, S.v6_devices = own, ranges, matched
+
+
+def ipv6_watcher():
+    """Background thread, started when the filter listens on IPv6: keep the IPv6 view up to date,
+    looking again every IPV6_RECHECK seconds. Done here, never on a lookup, because it runs tools."""
+    while True:
+        try:
+            refresh_ipv6_view()
+        except Exception as e:
+            print("Could not check this computer's IPv6 addresses:", e, flush=True)
+        time.sleep(IPV6_RECHECK)
 
 
 def hint_refresher():
@@ -1276,7 +1749,7 @@ def scan_network():
 def api_status():
     """GET /api/status: the summary shown at the top of every dashboard page."""
     now = time.time()
-    total, blocked = sql("SELECT COUNT(*), COALESCE(SUM(blocked),0) FROM queries WHERE ts>?", (now - 86400,))[0]
+    total, blocked = read_sql("SELECT COUNT(*), COALESCE(SUM(blocked),0) FROM queries WHERE ts>?", (now - 86400,))[0]
     return {
         "ip": S.local_ip, "dns_ok": S.dns_error is None, "dns_error": S.dns_error, "dns_port": S.dns_port,
         "paused_for": max(0, int(S.paused_until - now)), "junk_on": S.junk_on,
@@ -1320,9 +1793,9 @@ def api_devices():
 
     # Two small questions, each answered straight from an index, in place of one that read every
     # row of up to 30 days of history on every dashboard refresh.
-    for ip, last in sql(LAST_SEEN_SQL):
+    for ip, last in read_sql(LAST_SEEN_SQL):
         entry(ip)["last"] = last
-    for ip, n, nb in sql("""SELECT client, COUNT(*), COALESCE(SUM(blocked), 0) FROM queries INDEXED BY q_ts
+    for ip, n, nb in read_sql("""SELECT client, COUNT(*), COALESCE(SUM(blocked), 0) FROM queries INDEXED BY q_ts
                             WHERE ts>? GROUP BY client""", (since,)):
         entry(ip).update(n=n, nb=nb)
     for ip, mac, host, ts in sql("SELECT ip, mac, host, ts FROM seen"):
@@ -1334,11 +1807,46 @@ def api_devices():
     return sorted(out.values(), key=lambda d: (-d["last"], [int(x) if x.isdigit() else 0 for x in d["ip"].split(".")]))
 
 
-def api_activity(ip, hours):
+# The two cheap questions behind an activity marker (see activity_marker). Each is answered by
+# one step into the q_client_ts index: the device's newest entry, and its oldest inside the window.
+NEWEST_FOR_DEVICE_SQL = "SELECT id, ts FROM queries WHERE client=? ORDER BY ts DESC, id DESC LIMIT 1"
+OLDEST_IN_WINDOW_SQL = "SELECT MIN(ts) FROM queries WHERE client=? AND ts>?"
+
+
+def activity_marker(ip, hours, since):
+    """A short code that changes whenever one device's activity list could have changed: a new
+    lookup (its newest entry), an old one leaving the window or being cleared (its oldest entry
+    inside the window), or anything that changes a block decision or label (the rules version,
+    the pause, the advert switch, the schedules in force, the advert lists). The page sends it back
+    and is told "unchanged" without the list being built again. It reveals nothing on its own."""
+    newest = read_sql(NEWEST_FOR_DEVICE_SQL, (ip,))
+    oldest = read_sql(OLDEST_IN_WINDOW_SQL, (ip, since))[0][0]
+    parts = (ip, float(hours), newest[0] if newest else None, oldest, S.rules_version,
+             time.time() < S.paused_until, S.junk_on, tuple(sorted(x["id"] for x in active_schedules())),
+             S.junk_count, len(S.junk_community))
+    return hashlib.sha256(repr(parts).encode()).hexdigest()[:24]
+
+
+def api_activity(ip, hours, seen=None):
     """GET /api/activity: what one device looked up in the last `hours`, grouped by owner
-    (see base_of), with the label and the current block decision for every name and group."""
+    (see base_of), with the label and the current block decision for every name and group.
+
+    Without `seen` the answer is the list itself, as it always was. With `seen` (the request's
+    'since' parameter: the marker from the last answer, or empty the first time) the answer is
+    {"unchanged": false, "marker": ..., "groups": the list}, or just
+    {"unchanged": true, "marker": ...} when the marker still matches and the list is not built."""
     since = time.time() - hours * 3600
-    rows = sql("""SELECT domain, COUNT(*), MAX(ts), SUM(blocked) FROM queries
+    if seen is not None:
+        marker = activity_marker(ip, hours, since)
+        if seen == marker:
+            return {"unchanged": True, "marker": marker}
+        return {"unchanged": False, "marker": marker, "groups": activity_groups(ip, since)}
+    return activity_groups(ip, since)
+
+
+def activity_groups(ip, since):
+    """The activity list for one device since a time: see api_activity."""
+    rows = read_sql("""SELECT domain, COUNT(*), MAX(ts), SUM(blocked) FROM queries
                   WHERE client=? AND ts>? GROUP BY domain""", (ip, since))
     groups = {}
     for domain, n, last, nb in rows:
@@ -1579,7 +2087,9 @@ class Web(BaseHTTPRequestHandler):
                 hours = min(max(float(qs.get("hours", ["24"])[0]), 0.1), KEEP_DAYS * 24)
             except ValueError:
                 hours = 24
-            self.send_json(api_activity(qs.get("ip", [""])[0], hours))
+            # 'since' may be sent empty (the first ask), and parse_qs drops empty values unless told not to.
+            seen = parse_qs(url.query, keep_blank_values=True).get("since", [None])[0]
+            self.send_json(api_activity(qs.get("ip", [""])[0], hours, seen))
         elif url.path == "/api/rules":
             self.send_json(api_rules())
         elif url.path == "/api/services":
@@ -1787,9 +2297,13 @@ class Web(BaseHTTPRequestHandler):
         if path == "/api/clear-history":
             ip = body.get("ip")
             if ip:
-                sql("DELETE FROM queries WHERE client=?", (str(ip),), commit=True)
+                # One device's history goes in steps, which can take a while for a busy device; long
+                # enough, through the relay, to run past its 30-second wait. So answer at once.
+                global last_clear
+                last_clear = threading.Thread(target=clear_history, args=(ip,), daemon=True)
+                last_clear.start()
             else:
-                sql("DELETE FROM queries", commit=True)
+                clear_history()                   # everyone's is one quick statement
             return self.send_json({"ok": True})
         self.send_error(404)
 

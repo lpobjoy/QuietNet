@@ -115,6 +115,11 @@ class Containers(unittest.TestCase):
         lines = [l for l in read("cloud", "Dockerfile").splitlines() if l.strip().upper().startswith("VOLUME")]
         self.assertEqual(lines, [])
 
+    def test_the_relay_container_starts_as_root_so_it_can_take_over_the_volume(self):
+        # Railway's volume belongs to root; relay.py hands it to an ordinary user and drops root itself.
+        lines = [l for l in read("cloud", "Dockerfile").splitlines() if l.strip().upper().startswith("USER")]
+        self.assertEqual(lines, [])
+
     def test_railway_is_pointed_at_the_relay_container(self):
         cfg = json.loads(read("railway.json"))
         self.assertEqual(cfg["build"]["dockerfilePath"], "cloud/Dockerfile")
@@ -139,6 +144,11 @@ class Containers(unittest.TestCase):
         # Without them the container can only run on UTC, and schedules fire at the wrong hour.
         install = [l for l in read("Dockerfile").splitlines() if "apt-get install" in l]
         self.assertTrue(any("tzdata" in l for l in install))
+
+    def test_the_pi_container_installs_the_tool_that_reads_ipv6_neighbours(self):
+        # Without `ip`, devices asking over IPv6 can't be matched to their rules and are refused.
+        install = [l for l in read("Dockerfile").splitlines() if "apt-get install" in l]
+        self.assertTrue(any("iproute2" in l for l in install))
 
     def test_compose_shares_the_pis_time_zone_with_the_container(self):
         self.assertIn("- /etc/localtime:/etc/localtime:ro", read("docker-compose.yml"))
@@ -306,6 +316,30 @@ class DashboardContract(unittest.TestCase):
 
     def test_the_timed_refresh_fetches_the_activity_list_less_often(self):
         self.assertIn("tick && Date.now() - activityAt < ACTIVITY_EVERY", self.page)
+
+    def test_the_activity_refresh_sends_back_the_last_marker(self):
+        self.assertIn("&since=${encodeURIComponent(since)}", self.page)
+        self.assertIn("S.activityKey === key ? S.activityMark : ''", self.page)
+
+    def test_an_unchanged_activity_answer_keeps_the_list_shown(self):
+        self.assertIn("if(!(x.unchanged && since)) S.activity = x.groups || [];", self.page)
+
+    def test_opening_a_device_forgets_the_last_activity_marker(self):
+        opener = self.page[self.page.index("open(d){"):]
+        self.assertIn("S.activityKey = ''", opener[:opener.index("\n")])
+
+    def test_the_page_says_when_a_scan_covered_only_part_of_the_network(self):
+        self.assertIn("st.scan.capped", self.page)
+        self.assertIn("Your network is large, so only the ${num(st.scan.addresses)} addresses", self.page)
+
+    def test_the_page_spaces_flex_rows_with_margins_where_gap_is_ignored(self):
+        self.assertIn("document.documentElement.className += ' nogap'", self.page)
+        self.assertIn(".nogap .row>*", self.page)
+
+    def test_the_enforcer_card_says_it_works_on_ipv4_only(self):
+        card = self.page[self.page.index("function enforceCard"):]
+        card = card[:card.index("\nfunction ")]
+        self.assertIn("It works on IPv4 only", card)
 
 
 class Readme(unittest.TestCase):

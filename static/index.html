@@ -95,6 +95,14 @@ label.check:first-of-type{border-top:0} label.check input{width:20px;height:20px
 input[type=time]{border:1px solid var(--line);background:var(--card);border-radius:10px;padding:8px 12px}
 .daychips{display:flex;gap:6px;flex-wrap:wrap;margin:6px 0}
 [hidden]{display:none!important}
+/* Safari before 14.1 ignores 'gap' on flex rows. The script adds 'nogap' to the page when the
+   browser cannot do it, and these margins space the rows out instead. */
+.nogap header>*,.nogap .logo>*,.nogap nav>*,.nogap .banner.warn>*,.nogap .row>*,.nogap .controls>*,
+.nogap .item .top>*,.nogap label.check>*,.nogap .banner.flex>*,.nogap .daychips>*{margin-right:10px}
+.nogap header>:last-child,.nogap .logo>:last-child,.nogap nav>:last-child,.nogap .banner.warn>:last-child,
+.nogap .row>:last-child,.nogap .controls>:last-child,.nogap .item .top>:last-child,.nogap label.check>:last-child,
+.nogap .banner.flex>:last-child,.nogap .daychips>:last-child{margin-right:0}
+.nogap .row>*,.nogap .controls>*,.nogap .daychips>*,.nogap .banner.warn>*,.nogap .banner.flex>*{margin-top:3px;margin-bottom:3px}
 @media (max-width:560px){.stats{grid-template-columns:1fr}.item .top{flex-wrap:wrap}.item .info{flex-basis:100%}}
 </style>
 </head>
@@ -149,7 +157,7 @@ input[type=time]{border:1px solid var(--line);background:var(--card);border-radi
    in lower case with no attributes (and do not spell them out in comments like this one). Keep the X-QuietNet header in api(): the relay
    refuses calls without it. tests/test_packaging.py checks these. */
 const S = {tab:'home', device:null, hours:24, filter:'all', search:'', sort:'n', open:new Set(),
-           status:null, devices:[], activity:[], rules:null,
+           status:null, devices:[], activity:[], activityKey:'', activityMark:'', rules:null,
            services:[], groups:[], ctl:{}, group:null, svcOpen:false, schedules:[], edit:null, cloud:null};
 const $ = id => document.getElementById(id);
 const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -288,6 +296,8 @@ function viewHome(){
   <div class="row"><div style="flex:1;min-width:200px"><h2>Your devices</h2>
     <p class="muted">Pick a device to see what it has been talking to, or to block things for it.</p></div>
     <button class="btn" data-act="scan" ${scanning ? 'disabled' : ''}>${scanning ? 'Looking… (about 10 seconds)' : 'Find devices on my network'}</button></div>
+  ${st.scan && st.scan.capped ? `<p class="muted small" style="margin:0 0 12px">Your network is large, so only the ${num(st.scan.addresses)} addresses nearest this computer ${scanning ? 'are being' : 'were'} checked.
+    Devices further away appear here once they use QuietNet.</p>` : ''}
   ${cards ? `<div class="devices">${cards}</div>` : `<div class="card empty">
     <p><b>No devices yet.</b></p><p>QuietNet can only see devices that have been pointed at it.</p>
     <button class="btn primary" data-act="tab" data-tab="setup">Show me how to set up a device</button></div>`}`;
@@ -304,7 +314,8 @@ function enforceCard(d){
     <div style="flex:1;min-width:200px"><h2>Cut live connections${d.enforced ? '<span class="badge junk">On</span>' : ''}</h2>
     <div class="muted small">Normally a block only stops new connections. Turn this on and blocks, bedtimes and the kill switch
       also stop things that are <b>already running</b> on this device (like a Disney+ video mid-stream). QuietNet steers this
-      device through itself and drops only what's blocked for it. Takes a few seconds to bite.</div>
+      device through itself and drops only what's blocked for it. Takes a few seconds to bite.
+      It works on IPv4 only, so a connection this device already has over IPv6 is not cut.</div>
     ${d.enforced && (e.problem || (e.problems || {})[d.ip]) ? `<p class="small" style="margin:10px 0 0;color:#b42318"><b>Not working yet:</b> ${esc(e.problem || e.problems[d.ip])}</p>` : ''}</div></div></div>`;
 }
 
@@ -593,10 +604,20 @@ async function refresh(hard, tick){
     if(S.tab === 'groups' && S.group) jobs.push(ctl('group:' + S.group));
     if(S.tab === 'rules') jobs.push(ctl('all'));
     if(S.tab === 'home' && S.device && !(tick && Date.now() - activityAt < ACTIVITY_EVERY)){
-      const dev = S.device, hours = S.hours;
-      jobs.push(api(`/api/activity?ip=${encodeURIComponent(dev)}&hours=${hours}`).then(x => {
+      // The server gives a marker with each list. Sending it back gets {"unchanged": true} when
+      // nothing has changed since, so the list is not sent again. A marker only counts for the
+      // device and time period it came with, so any other pair asks with an empty one.
+      const dev = S.device, hours = S.hours, key = dev + '|' + hours;
+      const since = S.activityKey === key ? S.activityMark : '';
+      jobs.push(api(`/api/activity?ip=${encodeURIComponent(dev)}&hours=${hours}&since=${encodeURIComponent(since)}`).then(x => {
         // Ignore a late answer for a device or time period the person has since moved away from.
-        if(S.device === dev && S.hours === hours){ S.activity = x; activityAt = Date.now(); }
+        if(S.device !== dev || S.hours !== hours) return;
+        if(Array.isArray(x)){ S.activity = x; S.activityKey = ''; }     // an older Pi sends the plain list
+        else{
+          if(!(x.unchanged && since)) S.activity = x.groups || [];       // unchanged: keep what is shown
+          S.activityKey = key; S.activityMark = String(x.marker || '');
+        }
+        activityAt = Date.now();
       }));
     }
     if(S.tab === 'rules') jobs.push(api('/api/rules').then(x => S.rules = x));
@@ -662,7 +683,7 @@ const actions = {
     if(!yes) return;
     await api('/api/group-delete', {id:S.group}).catch(oops); S.group = null; refresh(true);
   },
-  open(d){ S.device = d.ip; S.activity = []; S.open.clear(); S.search = ''; S.filter = 'all'; S.svcOpen = false; refresh(true); },
+  open(d){ S.device = d.ip; S.activity = []; S.activityKey = ''; S.open.clear(); S.search = ''; S.filter = 'all'; S.svcOpen = false; refresh(true); },
   back(){ S.device = null; refresh(true); },
   filter(d){ S.filter = d.f; render(); },
   expand(d){ S.open.has(d.b) ? S.open.delete(d.b) : S.open.add(d.b); drawList(); },
@@ -737,6 +758,17 @@ document.addEventListener('input', e => {
 });
 document.addEventListener('keydown', e => { if(e.key === 'Enter' && e.target.id === 'addBox') actions.add(); });
 
+// Safari before 14.1 ignores 'gap' on flex rows. A one-pixel gap between two empty boxes stacked
+// in a column makes the column one pixel tall only where it works; elsewhere add 'nogap' so the
+// margin-based spacing in the style sheet takes over.
+(function(){
+  const box = document.createElement('div');
+  box.style.cssText = 'display:flex;flex-direction:column;row-gap:1px;position:absolute;visibility:hidden';
+  box.appendChild(document.createElement('div')); box.appendChild(document.createElement('div'));
+  document.body.appendChild(box);
+  if(box.scrollHeight !== 1) document.documentElement.className += ' nogap';
+  document.body.removeChild(box);
+})();
 refresh(true);
 // No timed refresh while a dialog is open, while the tab is in the background, or while the last
 // refresh is still running (a slow Pi or relay would otherwise pile requests up).

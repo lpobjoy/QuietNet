@@ -189,6 +189,51 @@ class Setup(AgentCase):
         a.pair("my-relay.up.railway.app", "AB12-CD34")
         self.assertEqual(asked, ["https://my-relay.up.railway.app/agent/pair"])
 
+    def pair_asking(self, relay):
+        """Pair with `relay` through a stand-in for the network; returns (message, addresses asked)."""
+        a = self.agent()
+        asked = []
+        a._http = lambda method, url, obj, timeout, token=False: asked.append(url) or {"token": "x"}
+        return a.pair(relay, "AB12-CD34"), asked
+
+    def test_a_plain_http_relay_on_another_computer_is_refused(self):
+        message, asked = self.pair_asking("http://my-relay.up.railway.app")
+        self.assertEqual(asked, [])
+        self.assertIn("https://", message)
+
+    def test_a_refused_plain_http_relay_saves_nothing(self):
+        self.pair_asking("http://my-relay.up.railway.app")
+        self.assertFalse(os.path.exists(os.path.join(self.data, "cloud.json")))
+
+    def test_a_plain_http_relay_is_refused_whatever_the_capital_letters(self):
+        message, asked = self.pair_asking("HTTP://my-relay.up.railway.app")
+        self.assertEqual(asked, [])
+        self.assertIn("https://", message)
+
+    def test_a_host_name_that_only_starts_with_localhost_is_refused_over_http(self):
+        message, asked = self.pair_asking("http://localhost.example.com")
+        self.assertEqual(asked, [])
+
+    def test_plain_http_is_allowed_for_a_relay_named_localhost(self):
+        message, asked = self.pair_asking("http://localhost:8080")
+        self.assertIsNone(message)
+        self.assertEqual(asked, ["http://localhost:8080/agent/pair"])
+
+    def test_plain_http_is_allowed_for_a_relay_at_127_0_0_1(self):
+        message, asked = self.pair_asking("http://127.0.0.1:8080")
+        self.assertIsNone(message)
+        self.assertEqual(asked, ["http://127.0.0.1:8080/agent/pair"])
+
+    def test_plain_http_is_allowed_for_a_relay_at_the_ipv6_loopback_address(self):
+        message, asked = self.pair_asking("http://[::1]:8080")
+        self.assertIsNone(message)
+        self.assertEqual(asked, ["http://[::1]:8080/agent/pair"])
+
+    def test_an_https_relay_on_another_computer_is_allowed(self):
+        message, asked = self.pair_asking("https://my-relay.up.railway.app")
+        self.assertIsNone(message)
+        self.assertEqual(asked, ["https://my-relay.up.railway.app/agent/pair"])
+
     def test_a_wrong_code_gives_the_relays_own_message_and_saves_nothing(self):
         a = self.agent()
         self.assertEqual(a.pair(self.relay_url, "0000-0000"), "That pairing code is wrong or already used.")
@@ -341,6 +386,25 @@ def cert_failure():
     return urllib.error.URLError(ssl.SSLCertVerificationError(1, "certificate verify failed"))
 
 
+class InsecureSavedRelay(AgentCase):
+    """A plain http:// relay on another computer saved by an older version is never contacted."""
+
+    def test_a_saved_plain_http_relay_is_not_sent_the_token(self):
+        a = self.agent()
+        a.cfg = {"relay": "http://relay.example", "token": "kept"}
+        asked = []
+        a._http = lambda *args, **kwargs: asked.append(args) or {}
+        self.run_until(a, lambda: a.state == "error")
+        self.assertEqual(asked, [])
+
+    def test_a_saved_plain_http_relay_tells_the_person_to_use_https(self):
+        a = self.agent()
+        a.cfg = {"relay": "http://relay.example", "token": "kept"}
+        a._http = lambda *args, **kwargs: {}
+        self.run_until(a, lambda: a.state == "error")
+        self.assertIn("https://", a.detail)
+
+
 class LinkSurvives(AgentCase):
     """The link thread must keep going whatever the relay sends."""
 
@@ -348,7 +412,7 @@ class LinkSurvives(AgentCase):
         """An agent paired to a stand-in relay whose poll answers come from `answers` in turn:
         an exception is raised, anything else is returned. After the list runs out it returns {}."""
         a = self.agent()
-        a.cfg = {"relay": "http://relay.invalid", "token": "kept"}
+        a.cfg = {"relay": "https://relay.invalid", "token": "kept"}
         answers = list(answers)
         self.polls = 0
 
@@ -390,7 +454,7 @@ class LinkSurvives(AgentCase):
 
     def test_a_garbled_reply_while_sending_an_answer_is_ignored(self):
         a = self.agent()
-        a.cfg = {"relay": "http://relay.invalid", "token": "kept"}
+        a.cfg = {"relay": "https://relay.invalid", "token": "kept"}
         a._local = lambda method, path, body: (200, "{}")
 
         def fake_http(*args, **kwargs):
@@ -432,6 +496,24 @@ class Certificates(AgentCase):
         self.assertEqual(ctx.verify_mode, ssl.CERT_REQUIRED)
         self.assertTrue(ctx.check_hostname)
 
+    def test_the_checked_settings_are_made_once_and_shared(self):
+        self.assertIs(cloud_agent.tls_context(), cloud_agent.tls_context())
+
+    def test_the_checked_settings_are_shared_safely_between_threads(self):
+        made, seen = [], []
+        real = cloud_agent.ssl.create_default_context
+
+        def counting():
+            made.append(1)
+            return real()
+        with mock.patch.object(cloud_agent.ssl, "create_default_context", counting):
+            threads = [threading.Thread(target=lambda: seen.append(cloud_agent.tls_context())) for _ in range(8)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(5)
+        self.assertEqual((len(made), len(set(map(id, seen)))), (1, 1))
+
     def test_secure_relay_calls_use_the_checked_settings(self):
         seen = {}
 
@@ -467,7 +549,7 @@ class HeadlessPairingRetry(AgentCase):
 
     def agent_with_answers(self, answers):
         """An unpaired agent set up from the environment, whose pairing calls get `answers` in turn."""
-        os.environ["QUIETNET_CLOUD"] = "http://relay.invalid"
+        os.environ["QUIETNET_CLOUD"] = "https://relay.invalid"
         os.environ["QUIETNET_PAIR"] = "AB12-CD34"
         a = self.agent()
         answers = list(answers)
@@ -489,14 +571,23 @@ class HeadlessPairingRetry(AgentCase):
     def busy(self):
         """The relay's answer when too many wrong codes have been tried lately."""
         import io
-        return urllib.error.HTTPError("http://relay.invalid/agent/pair", 429, "Too Many Requests", {},
+        return urllib.error.HTTPError("https://relay.invalid/agent/pair", 429, "Too Many Requests", {},
                                       io.BytesIO(b'{"error": "Too many attempts."}'))
 
     def refused(self):
         """The relay's answer to a wrong, used or expired code."""
         import io
-        return urllib.error.HTTPError("http://relay.invalid/agent/pair", 400, "Bad Request", {},
+        return urllib.error.HTTPError("https://relay.invalid/agent/pair", 400, "Bad Request", {},
                                       io.BytesIO(b'{"error": "That pairing code is wrong."}'))
+
+    def test_a_headless_plain_http_relay_on_another_computer_is_not_tried_again(self):
+        os.environ["QUIETNET_CLOUD"] = "http://relay.example"
+        a = self.agent_with_answers([])
+        a.cfg["relay"] = "http://relay.example"
+        a.start()
+        a._next_pair_try = 0
+        a._retry_pairing()
+        self.assertEqual((self.tries, a._pending_code), (0, ""))
 
     def test_a_busy_relay_is_tried_again_until_pairing_works(self):
         a = self.agent_with_answers([self.busy(), {"token": "new", "id": "pi-1"}])
