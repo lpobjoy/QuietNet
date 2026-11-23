@@ -187,6 +187,21 @@ function groupName(id){ return (S.groups.find(g => g.id === id) || {}).name || '
 function deviceName(d){
   return d.name || (d.this_computer ? 'This computer' : (d.hint || 'Unnamed device'));
 }
+// Is the name shown for this device one the network suggested, rather than one someone gave it?
+function suggested(d){ return !d.name && !d.this_computer && !!d.hint; }
+// The muted lines under a device's name when nobody has named it yet: where the suggested name came
+// from, with a "Use this name" control, and what the device said it is (or a note about it).
+// `inCard` is true on the device list, where each card is already a button: a button can't hold
+// another, so there the control is a span that the click listener still finds by its data-act.
+function suggestionLines(d, inCard){
+  if(d.name || d.this_computer) return '';
+  const via = d.hint_source === 'router' ? 'the router' : d.hint_source;
+  const use = inCard
+    ? `<span class="btn link" role="button" data-act="usehint" data-ip="${esc(d.ip)}">Use this name</span>`
+    : `<button class="btn link" data-act="usehint" data-ip="${esc(d.ip)}">Use this name</button>`;
+  return (suggested(d) ? `<div class="muted small">Suggested name${via ? ', found through ' + esc(via) : ''} ${use}</div>` : '')
+    + (d.hint_detail ? `<div class="muted small">${esc(d.hint_detail)}</div>` : '');
+}
 
 /* ---------- pop-up questions ---------- */
 function ask({title, text, input, ok='OK', danger=false, cancel='Cancel'}){
@@ -271,6 +286,7 @@ function viewHome(){
     <button class="card device" data-act="open" data-ip="${esc(d.ip)}">
       <div class="name">${esc(deviceName(d))}</div>
       <div class="muted small">${esc(d.ip)}${d.hint && d.name ? ' · ' + esc(d.hint) : ''}${d.mac ? ' · ' + esc(d.mac) : ''}</div>
+      ${suggestionLines(d, true)}
       <div class="small" style="margin-top:8px">${d.last
         ? `${num(d.n)} requests today · <b>${num(d.nb)} blocked</b> · active ${ago(d.last)}`
         : '<span class="muted">Not using QuietNet yet</span>'}</div>
@@ -366,7 +382,8 @@ function viewDevice(){
   <button class="btn link" data-act="back">← All devices</button>
   <div class="row" style="margin:6px 0 2px"><h1>${esc(deviceName(d))}</h1>
     <button class="btn link" data-act="rename">Rename</button></div>
-  <div class="muted">${esc(d.ip)}${d.hint ? ' · ' + esc(d.hint) : ''}${d.mac ? ' · ' + esc(d.mac) : ''}</div>
+  <div class="muted">${esc(d.ip)}${d.hint && !suggested(d) ? ' · ' + esc(d.hint) : ''}${d.mac ? ' · ' + esc(d.mac) : ''}</div>
+  ${suggestionLines(d, false)}
   <div class="row" style="margin:10px 0 14px"><label for="groupSel">Group:</label>
     <select id="groupSel"><option value="">None</option>${S.groups.map(g =>
       `<option value="${esc(g.id)}" ${d.group === g.id ? 'selected' : ''}>${esc(g.name)}</option>`).join('')}</select>
@@ -707,6 +724,11 @@ const actions = {
     const name = await ask({title:'Name this device', text:'For example "Living room TV" or "Sam\'s iPad".', input:d.name || '', ok:'Save'});
     if(name === null) return;
     await api('/api/device-name', {ip:S.device, name}).catch(oops); refresh(true);
+  },
+  async usehint({ip}){
+    const d = S.devices.find(x => x.ip === ip);
+    if(!d || !d.hint) return;
+    await api('/api/device-name', {ip, name:d.hint}).catch(oops); refresh(true);
   },
   async clear(){
     const yes = await ask({title:'Forget this device\'s history?', ok:'Forget it', danger:true,

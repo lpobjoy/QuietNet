@@ -18,7 +18,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 import server  # noqa: E402
 
-LOCAL_MODULES = {"server", "enforcer", "cloud_agent", "relay"}
+LOCAL_MODULES = {"server", "names", "enforcer", "cloud_agent", "relay"}
 
 
 def read(*parts):
@@ -47,7 +47,7 @@ def copied_into(dockerfile):
 
 
 class StandardLibraryOnly(unittest.TestCase):
-    PROGRAMS = ["server.py", "enforcer.py", "cloud_agent.py", os.path.join("cloud", "relay.py")]
+    PROGRAMS = ["server.py", "names.py", "enforcer.py", "cloud_agent.py", os.path.join("cloud", "relay.py")]
 
     @unittest.skipUnless(hasattr(sys, "stdlib_module_names"), "needs Python 3.10 or newer to list the standard library")
     def test_nothing_outside_python_itself_is_imported(self):
@@ -101,7 +101,7 @@ class Containers(unittest.TestCase):
         self.assertEqual(needed - copied_into("Dockerfile"), set())
 
     def test_the_pi_container_includes_the_data_files_and_dashboard(self):
-        self.assertLessEqual({"server.py", "enforcer.py", "services.json", "junk_domains.txt", "static"},
+        self.assertLessEqual({"server.py", "names.py", "enforcer.py", "services.json", "junk_domains.txt", "static"},
                              copied_into("Dockerfile"))
 
     def test_the_pi_container_has_the_firewall_tool_the_enforcer_uses(self):
@@ -350,7 +350,7 @@ class Readme(unittest.TestCase):
 
     def test_every_top_level_file_is_listed_in_the_readme(self):
         readme = read("README.md")
-        for name in ("server.py", "enforcer.py", "cloud_agent.py", "services.json", "junk_domains.txt",
+        for name in ("server.py", "names.py", "enforcer.py", "cloud_agent.py", "services.json", "junk_domains.txt",
                      "Start QuietNet.command", "Dockerfile", "docker-compose.yml", "static/index.html"):
             self.assertIn("`%s`" % name, readme, name)
 

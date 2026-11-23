@@ -471,6 +471,36 @@ class Devices(Api):
         d = self.get("/api/devices")[1][0]
         self.assertEqual((d["ip"], d["mac"], d["hint"], d["n"], d["last"]), (ADULT, "aa:bb:cc:dd:ee:ff", "laptop", 0, 0))
 
+    def test_a_suggested_name_comes_with_where_it_was_found_and_the_model(self):
+        self.log(KID, "www.bbc.co.uk")
+        self.addCleanup(setattr, server.S, "hints", {})
+        server.S.hints = {KID: {"name": "Lewis's MacBook Pro", "source": "Bonjour", "detail": "Model: MacBookPro18,3"}}
+        d = self.get("/api/devices")[1][0]
+        self.assertEqual((d["hint"], d["hint_source"], d["hint_detail"]), ("Lewis's MacBook Pro", "Bonjour", "Model: MacBookPro18,3"))
+
+    def test_a_name_found_by_a_scan_is_marked_as_coming_from_the_router(self):
+        server.sql("INSERT INTO seen(ip,mac,host,ts) VALUES(?,?,?,?)", (ADULT, "00:1b:63:00:00:01", "Lewiss-iPad", time.time()),
+                   commit=True)
+        d = self.get("/api/devices")[1][0]
+        self.assertEqual((d["hint"], d["hint_source"], d["hint_detail"]), ("Lewiss iPad", "router", ""))
+
+    def test_a_name_found_now_beats_one_remembered_from_a_scan(self):
+        server.sql("INSERT INTO seen(ip,mac,host,ts) VALUES(?,?,?,?)", (ADULT, "", "old-name", time.time()), commit=True)
+        self.addCleanup(setattr, server.S, "hints", {})
+        server.S.hints = {ADULT: {"name": "Den TV", "source": "UPnP", "detail": ""}}
+        d = self.get("/api/devices")[1][0]
+        self.assertEqual((d["hint"], d["hint_source"]), ("Den TV", "UPnP"))
+
+    def test_an_unnamed_device_with_a_private_wifi_address_is_noted_as_probably_a_phone_or_laptop(self):
+        server.sql("INSERT INTO seen(ip,mac,host,ts) VALUES(?,?,?,?)", (ADULT, "da:a1:19:00:00:01", "", time.time()), commit=True)
+        d = self.get("/api/devices")[1][0]
+        self.assertEqual((d["hint"], d["hint_detail"]), ("", "Private Wi-Fi address, so probably a phone, tablet or laptop"))
+
+    def test_a_device_with_no_suggestion_has_empty_suggestion_fields(self):
+        self.log(KID, "www.bbc.co.uk")
+        d = self.get("/api/devices")[1][0]
+        self.assertEqual((d["hint"], d["hint_source"], d["hint_detail"]), ("", "", ""))
+
     def test_most_recently_active_devices_come_first(self):
         self.log(KID, "www.bbc.co.uk", ago=500)
         self.log(ADULT, "www.bbc.co.uk", ago=5)
@@ -792,6 +822,13 @@ class Scanning(Api):
         server.reverse_name = name_of
         self.scan()
         self.assertTrue(free and all(free))
+
+    def test_a_finished_scan_asks_for_device_names_straight_away(self):
+        self.neighbours_now = {"192.168.5.37": "aa:aa:aa:aa:aa:01"}
+        server.NAMES_WANTED.clear()
+        self.addCleanup(server.NAMES_WANTED.clear)
+        self.scan()
+        self.assertTrue(server.NAMES_WANTED.is_set())
 
     def test_the_scan_answer_says_when_the_network_was_too_big_to_scan_in_full(self):
         self.subnet = server.ipaddress.IPv4Network("192.168.0.0/16")

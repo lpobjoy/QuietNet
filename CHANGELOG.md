@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+Device names (23 November):
+- **New: QuietNet suggests a name for most devices** instead of "Unnamed device". It asks the devices themselves, in the ways they already answer: Bonjour (Apple devices, printers, TVs, speakers, Linux), the Windows network (Windows PCs, network drives), UPnP (TVs, Sonos, consoles, routers), the names devices give when they join the network (DHCP, on a Pi only) and, as before, the router. The new `names.py` does this; **rebuild the Pi container** to include it.
+- The Devices page shows a suggestion marked as one, with where it came from and a **Use this name** button. A model or maker the device reported, or "Private Wi-Fi address, so probably a phone, tablet or laptop", shows under an unnamed device.
+- `/api/devices` items have two new fields, `hint_source` and `hint_detail`; `hint` is now tidied for people (`Lewiss-iPhone.local` becomes `Lewiss iPhone`).
+- **The Pi now sends small name questions on the home network every two minutes and listens on UDP ports 5353 and 67** (known issue 89). `--no-device-names` turns this off.
+- Everything heard is treated as untrusted: every packet reader is bounded, UPnP descriptions are fetched only from the device's own address with size and time limits, and a round of asking never takes much more than 5 seconds.
+
 One-line install for a Pi (23 November):
 - The relay's pages no longer show an emoji beside the QuietNet name, and a test keeps emoji out of the relay and the dashboard.
 - **New: `install.sh`, a one-line installer** for Raspberry Pi OS and other Debian or Ubuntu style Linux: `curl -fsSL https://raw.githubusercontent.com/lpobjoy/QuietNet/main/install.sh | sh`. It offers to install Docker (with Docker's own script), downloads QuietNet into `/opt/quietnet`, offers to free port 53 from systemd-resolved, switches on traffic forwarding for "Cut live connections", builds and starts the container (Compose project `quietnet`), and says what to set in the router. `--relay` and `--code` pair it with your relay in the same step. Running it again updates in place, keeping history and rules in the `quietnet_quietnet-data` volume; `--uninstall` removes it and keeps them. Starting by hand with `docker compose up -d` still works.
