@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+Robustness review (23 November): six faults found in a review of whether the blocker can be relied on were fixed (the entries below, from "IPv6 and Cut live connections" to "The router's own IPv6 DNS server"). Docs brought up to date with them:
+- `docs/KNOWN_ISSUES.md` has a new "Found in the robustness review" table under Fixed, and a new open issue 93 listing the ways round QuietNet that remain: devices not steered can still use another DNS server by its address, secure DNS set up by address alone, VPNs, IPv6 connections opened before a cut, and no redirect with `iptables`. Issues 4, 5, 8 and 79 say what is fixed and what still needs checking on a real Pi.
+- `docs/ARCHITECTURE.md` shows the enforcer's whole `nft` table, with the new `dns_redirect` chain, and lists the router announcement listener and the IPv6 watcher among the background threads, the new limits among the fixed values, and the new defences in the security table.
+- `docs/TESTING.md` has manual Pi checks for each fix, and the new `test_device_moves.py`.
+- The README says what "Set up a device" now asks for on a network with IPv6, and what still gets round the DNS redirect.
+
 IPv6 and "Cut live connections" (23 November):
 - **Fixed: on BT's default IPv6, "Cut live connections" missed most streams and app connections,** because it only steers IPv4. A device with it on now gets "no records" when it looks up IPv6 addresses (and for HTTPS and SVCB lookups, which can carry IPv6 hints), so its apps connect over IPv4 through the Pi. Other devices are unaffected. The device's card says, when the network has IPv6, that IPv6 connections can't be cut directly and that ones it already had may carry on for a short while. New `in_use` in the `ipv6` part of `GET /api/status`. The README no longer calls the cut instant.
 - **New: the home page says when another firewall on the Pi stops "Cut live connections" for every device,** with the command to run, that it lasts until the next restart and, for Docker's firewall, that re-running the install command sets it up permanently. New `firewall` in `GET /api/enforcer` and in `enforcer` in `GET /api/status`.

@@ -31,15 +31,15 @@ flowchart LR
 
 | File | Lines | Job |
 | --- | --- | --- |
-| `server.py` | ~2,400 | DNS filter, rules engine, network scan, dashboard web server, start-up |
-| `names.py` | ~900 | Finds names for the devices on the home network (see [Device names](#device-names)) |
-| `enforcer.py` | ~880 | Steers a chosen device's traffic through the Pi and drops what is blocked |
+| `server.py` | ~3,100 | DNS filter, rules engine, network scan, dashboard web server, start-up |
+| `names.py` | ~1,080 | Finds names for the devices on the home network (see [Device names](#device-names)) |
+| `enforcer.py` | ~980 | Steers a chosen device's traffic through the Pi and drops what is blocked |
 | `cloud_agent.py` | ~370 | Holds an outbound connection to the relay and runs relayed requests locally |
 | `cloud/relay.py` | ~1,960 | The relay: accounts, pairing codes (and the install command shown with them), and the bridge between browser and Pi |
-| `static/index.html` | ~1,450 | The dashboard: one page, no build step, no outside scripts; its three looks are in its one style sheet |
+| `static/index.html` | ~1,560 | The dashboard: one page, no build step, no outside scripts; its three looks are in its one style sheet |
 | `services.json` | | The apps and services that can be blocked, and the addresses each uses |
 | `junk_domains.txt` | | The built-in advert and tracker list |
-| `install.sh` | ~700 | The one-line installer for a Pi: installs Docker if asked, downloads QuietNet, starts and pairs it (see [The installer](#the-installer)) |
+| `install.sh` | ~860 | The one-line installer for a Pi: installs Docker if asked, downloads QuietNet, starts and pairs it (see [The installer](#the-installer)) |
 
 Everything uses the Python standard library only. A test enforces this (`tests/test_packaging.py`).
 
@@ -99,6 +99,8 @@ A device's name and rules are kept under its IP address, and follow the device b
 
 Checks 1 to 3 never apply to QuietNet's own computer (`is_this_computer()`: `127.0.0.1`, `::1` and its network address). Its lookups are its link to the relay, its clock and its list downloads; cutting them would mean a Pi under the kill switch could not be switched back on from outside. Checks 4 to 7 apply to it as to any device. The dashboard agrees: its device list never shows this computer as switched off (`internet_off_for()`), and `POST /api/internet` refuses to switch this computer's internet off, since it would have no effect. Checks 1 to 3 live in one place, `internet_cut()`, which `decision()` calls first.
 
+Three answers sit outside this table, in `answer_query()`, and did not change it: the "use the network's DNS" signals and the other DNS services (step 3 of "What happens to one lookup") are answered before `decision()` is asked, for every device whatever its rules; and a device with "Cut live connections" on gets "no records" for IPv6 address lookups after `decision()` has allowed the name (step 7). Which rules `decision()` sees for a device also depends on whether they are paused because a different device now has its address (see "Scopes" below).
+
 Points that follow from this order:
 
 - **Step 4 walks from the most specific name upward.** For `a.b.example.com` it checks `a.b.example.com`, then `b.example.com`, then `example.com`. The first block or allow found wins, so an allow on `safe.example.com` beats a block on `example.com`.
@@ -115,7 +117,7 @@ A rule applies to one of three scopes, written as text:
 - `group:<id>`: a named group of devices
 - `device:<ip>`: one device
 
-A device is subject to all three at once: `all`, its own, and its group's (a device is in at most one group). Deleting a group deletes its service blocks, its internet switch and its schedules.
+A device is subject to all three at once: `all`, its own, and its group's (a device is in at most one group). Deleting a group deletes its service blocks, its internet switch and its schedules, and sets "New devices go into group" back to none if it named that group. The one exception: an address whose rules are paused because a different device now has it (`S.paused_ips`, below) is subject to `all` only (`scopes_for()`), until the device the rules belong to comes back.
 
 ### When a device changes address
 
@@ -148,6 +150,29 @@ Every two seconds, and at once whenever a change is saved on the dashboard (`Enf
    **Shared addresses.** Big services answer many names from the same front doors: `youtube.com`, Google search, Classroom, Docs and Gmail all come from Google's, and Cloudflare, Fastly and Akamai each carry many unrelated sites. Dropping such an address would cut sites the device is allowed. So `enforcement_plan()` does not drop an address a blocked name was given if, in the same six hours, a name that device is allowed was given the same address (by QuietNet, to any device). The blocked name is still blocked by DNS, so new connections to it fail; only the address-level cut of a connection already open is left out. Addresses that only blocked names use, such as YouTube's video servers (`googlevideo.com`), are still dropped. With each name's remembered answer the plan keeps which enforced devices it is cut for and which it is allowed for (a name blocked by the advert list is neither). It then collects the addresses about to be dropped and makes one pass over the remembered names (`S.resolved`, at most 4,000 names of 64 addresses each), checking each against that set, so the address-to-names view is worked out from the name-to-addresses one each time and never stored. This all happens in the plan, every two seconds, never in `decision()`. A device cut off entirely (internet off, the kill switch, an "all internet" schedule) is unaffected: everything is dropped. How many addresses were spared, and for what (up to five service names, or the blocked names themselves), is kept per enforced device in `S.shared_left` and shown on the device page.
 
    For every steered device, whatever its plan, the `nft` table also stops it using another DNS server (known issue 8). Ordinary DNS (UDP and TCP port 53) it sends to any address but the Pi, such as 8.8.8.8 or the router, is redirected to the Pi's own address and the port QuietNet answers on (`dns_redirect`, a `nat` chain on the `prerouting` hook, priority -100), so the household's rules apply to it; the answers go back looking as if they came from the server the device asked. Private DNS and DNS over QUIC (TCP and UDP port 853) are dropped, so the device falls back to ordinary DNS. Only traffic arriving from steered devices is matched: the Pi's own lookups (including those it sends to the router for home-network names) never pass the `prerouting` step, and the router and the Pi are never steered. The redirect is left out while the Pi only knows itself as `127.0.0.1`, or if QuietNet couldn't open its DNS port. Every address and the port are checked (`ipaddress`, and 1 to 65535) before they go into the text; a bad one is refused with an error. The table is replaced in one step as before, and deleting it on shutdown or after a crash removes the redirect with everything else. With `iptables` (only when `nft` is missing; the Pi image has `nft`) port 853 is dropped too, but ordinary DNS is **not** redirected: that would need rules kept in a second `iptables` table and cleared alongside the first, and `status()["dns_redirect"]` is `false` to say so.
+
+   The whole `nft` text for two steered devices, one with its internet off and one with YouTube blocked, with the Pi at 192.168.1.60 answering on port 53, looks like this (`nft_ruleset()`):
+
+   ```
+   table inet quietnet
+   delete table inet quietnet
+   table inet quietnet {
+     chain forward {
+       type filter hook forward priority -150; policy accept;
+       ip saddr { 192.168.1.23, 192.168.1.54 } tcp dport 853 drop
+       ip saddr { 192.168.1.23, 192.168.1.54 } udp dport 853 drop
+       ip saddr 192.168.1.23 ip daddr != 192.168.1.60 drop
+       ip saddr 192.168.1.54 ip daddr { 142.250.1.1, 142.250.1.2 } drop
+     }
+     chain dns_redirect {
+       type nat hook prerouting priority -100; policy accept;
+       ip saddr { 192.168.1.23, 192.168.1.54 } ip daddr != 192.168.1.60 udp dport 53 dnat ip to 192.168.1.60:53
+       ip saddr { 192.168.1.23, 192.168.1.54 } ip daddr != 192.168.1.60 tcp dport 53 dnat ip to 192.168.1.60:53
+     }
+   }
+   ```
+
+   The first two lines make sure there is a table to delete and delete it, so the third defines it afresh; `nft` applies the text as one step. The `forward` chain only ever drops (its policy is accept), so traffic that matches nothing passes as normal. The `dns_redirect` chain is left out when nobody is steered, when there is no port to send to, or while the Pi only knows itself as `127.0.0.1`. Shutdown and crash recovery run `nft delete table inet quietnet`, which removes both chains.
 4. **Steers the device.** It sends the device an ARP message saying "the router's address is at the Pi's hardware address". The device then sends its outgoing traffic to the Pi. The message is repeated every tick because devices forget it. It only steers a device whose hardware address matches the one recorded when enforcing was switched on (filled in the first time it is seen, if it wasn't known then).
 
 Between ticks, it listens for a steered device asking "who is the router?". It answers at once, again within a third of a second, and again at about 1.0, 1.1 and 1.6 seconds (`ANSWER_AT`). One thread sends all these answers; a device that asks again before its answers have gone out just has its plan restarted, so a flood of questions (which anyone on the network could forge) costs one entry per steered device, not a thread per question. A device believes the most recent answer, but Linux ignores a second answer for about a second after the first, so if the real router answered first, only the later answers stick. Without them the device would go straight to the router for up to two seconds after every question. In a two-container test, a device that had been cut off for a while got nothing through in 60 to 146 seconds of trying. In the first few seconds after the kill switch is turned on, though, up to about three seconds of traffic can still get through (known issue 45).
@@ -265,7 +290,7 @@ curl -fsSL https://raw.githubusercontent.com/lpobjoy/QuietNet/main/install.sh | 
 | Another site signing a visitor in to the attacker's account (login forgery), or posting the relay's other forms | A form post whose `Sec-Fetch-Site` header is `cross-site` or `same-site` is refused with `403`; pages can't change or remove that header. Applies to `/login`, `/signup`, `/logout`, `/pis/new` and `/pis/<id>/delete`. Requests without the header (older browsers such as Safari before 16.4, and programs) are let through, so those browsers are still exposed to login forgery (known issue 7) | `Relay.from_another_site` |
 | A copy of `relay.db` used to pose as someone's Pi | Pi tokens are stored only as a SHA-256 hash; a token stored as plain text by an older version is hashed at start-up | `token_record`, `hash_old_tokens`, `Relay.agent` |
 | Finding out who has an account | Sign-up gives the same answer, and takes as long, whether or not the email already has one; an unknown email at sign-in takes as long to refuse as a wrong password | `Relay.do_signup`, `Relay.do_login` |
-| A hostile value reaching the firewall | `/api/enforce` accepts only a real IPv4 address; addresses to drop come from parsed DNS answers | `Web.handle_post`, `answer_ips` |
+| A hostile value reaching the firewall | `/api/enforce` and `/api/move-rules` accept only real IPv4 addresses; addresses to drop come from parsed DNS answers; the firewall text itself checks every device address and the Pi's own through `ipaddress.IPv4Address`, and the redirect port must be a whole number from 1 to 65535, refusing anything else with an error | `Web.handle_post`, `answer_ips`, `enforcer._checked_ipv4`, `enforcer._redirect_target` |
 | Text injected into the dashboard | The page escapes every value it inserts, ids and counts included, with `esc()` or `num()`; the relay escapes Pi names | `static/index.html`, `relay.py` |
 | Guessing passwords or pairing codes | Wrong guesses are counted and capped, per account and overall; wrong pairing codes per network address (20 in 10 minutes) and overall (200), so one stranger can't stop everyone pairing; the counts are kept in `relay.db`, so restarting the relay doesn't reset them; pairing codes last 15 minutes; an unknown email takes as long to refuse as a wrong password | `Throttle`, `Relay.do_login`, `Relay.agent_pair` |
 | Keeping the relay busy checking passwords | Every sign-in counts, right or wrong: 30 per account and 60 per network address in 15 minutes (a browser that signed in before has its own cap of 30 and skips the per-address one). At most four passwords are checked at once; a sign-in that waits 5 seconds for a turn is told the relay is busy | `Relay.do_login`, `PASSWORD_CHECKS_AT_ONCE` |
@@ -275,7 +300,9 @@ curl -fsSL https://raw.githubusercontent.com/lpobjoy/QuietNet/main/install.sh | 
 | Floods of lookups or slow connections | At most 256 lookups in hand, and 16 from any one device (more are dropped; devices retry); at most 64 TCP connections, 8 from any one device, each with 8 seconds to send its question; relay connections that stall for 30 seconds are dropped; history capped at two million rows, trimmed 5,000 rows at a time so the trim never holds up DNS answers | `udp_server`, `TCPServer.take_slot`, `recv_exact`, `Relay.timeout`, `prune_history` |
 | Using names the filter doesn't check to get data out while a device's internet is off | Unchecked names (home endings, reverse lookups, odd characters) get the blocked answer while internet is off; unreadable packets are never passed on | `answer_query`, `internet_cut`, `unreadable_reply` |
 | Home-network names reaching public servers | Home names, single-word names and reverse lookups of private addresses go only to the home router; a question already waiting on the router gets "server failure" rather than a second ask, so the two can't loop | `is_home_name`, `ask_router` |
-| Devices taking their lookups past QuietNet | Firefox's secure-DNS signal name gets "no such name" and Apple's Private Relay names are blocked, for every device, whatever the rules | `NO_SUCH_NAME_SIGNALS`, `BLOCKED_SIGNALS`, `answer_query` |
+| Devices taking their lookups past QuietNet | Firefox's secure-DNS signal name gets "no such name", Apple's Private Relay names and the well-known encrypted DNS services are blocked, for every device, whatever the rules, and a device that tries one is flagged. For steered devices, ordinary DNS to any other server is redirected to QuietNet and port 853 is dropped. Not covered: unsteered devices using another server by address, secure DNS set up by address alone, VPNs (known issue 93) | `NO_SUCH_NAME_SIGNALS`, `BLOCKED_SIGNALS`, `OTHER_DNS_SERVICES`, `answer_query`, `enforcer.nft_ruleset` |
+| A forged or malformed router announcement | Read only from link-local senders, at most 20 a second and 2,048 bytes each; every length checked and a badly formed announcement dropped whole; at most 16 servers kept, each for an hour at most. It only feeds a warning on the dashboard (escaped); nothing is sent and no rule changes | `router_advert_listener`, `parse_router_advert`, `note_router_dns` |
+| A device taking on another device's rules by getting its address | Each address's rules are tied to the hardware address seen there; when a different one appears they are paused, and the enforcer does not steer it | `refresh_devices`, `scopes_for`, `enforcement_plan` |
 | The Pi's relay token crossing the internet unprotected | A relay address starting `http://` is refused unless the host is this computer; a saved one is never contacted | `cloud_agent.insecure_relay` |
 | A fault in the relay being used with root's powers | The relay hands its data folder to `nobody` (or `QUIETNET_RUN_AS`) and stops being root before it opens the database or answers any request | `drop_privileges` |
 | A forged `Host` header putting shell commands into the install line the relay shows | The relay's address is used only if it is letters, digits, dots, dashes and a port; otherwise a placeholder is shown. The whole line is HTML-escaped | `relay_address`, `usable_relay_url`, `HOST_RE`, `RELAY_URL_RE`, `Relay.home` |
@@ -349,6 +376,8 @@ The dashboard's history questions (today's totals in `/api/status`, the device l
 | Log writer | Saves recorded lookups once a second; prunes old history every 10 minutes |
 | Name refresher | Every two minutes, and soon after a scan, asks the devices on the network for their names (see [Device names](#device-names)) |
 | Name listeners | Hear Bonjour announcements and the DHCP requests devices broadcast when they join or rejoin (each only if it can be opened; on Linux the DHCP one reads packets through a filter and never takes port 67) |
+| IPv6 watcher | Only while the filter listens on IPv6: every minute (`IPV6_RECHECK`), reads this computer's IPv6 addresses and ranges, the address to give devices for DNS, and the IPv6 neighbour table, to match IPv6 devices to their IPv4 address (`refresh_ipv6_view()`) |
+| Router announcement listener | Linux only, when the raw ICMPv6 socket can be opened: reads the router's IPv6 announcements and notes the DNS servers they name (`router_advert_listener()`). Never sends anything |
 | Address watcher | Looks up this computer's network address every 10 seconds until it has one, then every minute; each time, also keeps devices' rules with them when they change address (`refresh_devices()`) |
 | Enforcer | Ticks every two seconds (Linux with the right permissions only) |
 | Cloud agent | Polls the relay when paired |
@@ -414,6 +443,11 @@ Fixed values worth knowing, all near the top of their files:
 | Answers remembered | `MAX_CACHED_ANSWERS` = 5,000, each at most `MAX_CACHED_SIZE` = 4,096 bytes | `server.py` |
 | "Use the network's DNS" signal names | `NO_SUCH_NAME_SIGNALS` = `use-application-dns.net`; `BLOCKED_SIGNALS` = `mask.icloud.com`, `mask-h2.icloud.com` | `server.py` |
 | Other DNS services, blocked for every device with the names beneath them | `OTHER_DNS_SERVICES` (Google, Cloudflare, Quad9, OpenDNS, NextDNS, CleanBrowsing, AdGuard, Mullvad, DNS.SB, Control D) | `server.py` |
+| Lookups that get "no records" for a device with "Cut live connections" on | `NO_IPV6_TYPES` = AAAA (28), SVCB (64), HTTPS (65) | `server.py` |
+| Router announcements | `RA_MAX_PER_SECOND` = 20, `RA_READ_BYTES` = 2,048, `RA_MAX_SERVERS` = 16, `RA_HOLD_MAX` = 3,600 s | `server.py` |
+| When a device with rules counts as gone quiet, and how new a replacement must be | `QUIET_AFTER` = 15 minutes, `NEW_DEVICE_DAYS` = 3 | `server.py` |
+| Notes of what QuietNet did to devices' rules | `MAX_EVENTS` = 200 kept; `MAX_NOTICES` = 10 "may be the same device" notices at once | `server.py` |
+| Private DNS and DNS over QUIC port, dropped for steered devices | `DOT_PORT` = 853 | `enforcer.py` |
 | Home-network endings sent to the router | `HOME_ENDINGS` = `.local`, `.lan`, `.home`, `.internal`, `.home.arpa` | `server.py` |
 | How often the router's address is looked up | `ROUTER_RECHECK` = 300 s | `server.py` |
 | Most addresses one scan covers | `MAX_SCAN` = 1,024 | `server.py` |
