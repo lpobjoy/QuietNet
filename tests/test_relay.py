@@ -538,6 +538,104 @@ class Pairing(RelayCase):
         self.assertEqual(Browser(self.port).get("/agent/poll", headers={"X-QuietNet-Token": token})[0], 401)
 
 
+class Onboarding(RelayCase):
+    """The home page's one-line install command for a new Pi, and its getting-started text."""
+
+    def setUp(self):
+        super().setUp()
+        env = mock.patch.dict(os.environ)
+        env.start()
+        self.addCleanup(env.stop)
+        os.environ.pop("QUIETNET_RELAY_URL", None)
+        os.environ.pop("RAILWAY_PUBLIC_DOMAIN", None)
+
+    def waiting_page(self, headers=None):
+        """Sign in, add a Pi waiting to be paired, and return (its code, the home page's text)."""
+        b = self.signed_in()
+        b.post("/pis/new", form={"name": "Home Pi"})
+        code = relay.sql("SELECT code FROM pis", one=True)[0]
+        return code, b.get("/", headers=headers)[1]
+
+    def test_the_install_command_shows_the_code_and_the_relay_address(self):
+        code, text = self.waiting_page(headers={"Host": "relay.example.com"})
+        self.assertIn("curl -fsSL %s | sh -s -- --relay https://relay.example.com --code %s"
+                      % (relay.INSTALL_URL, code), text)
+
+    def test_the_install_command_is_offered_for_a_new_pi(self):
+        _, text = self.waiting_page()
+        self.assertIn("New Pi?", text)
+
+    def test_the_manual_pairing_instructions_are_still_shown(self):
+        _, text = self.waiting_page()
+        self.assertIn("open <b>Remote access</b>", text)
+
+    def test_a_plain_host_header_with_a_port_is_used(self):
+        _, text = self.waiting_page(headers={"Host": "relay.example.com:8443"})
+        self.assertIn("--relay https://relay.example.com:8443 --code", text)
+
+    def test_a_hostile_host_header_is_not_shown_and_the_placeholder_is_used(self):
+        for host in ('evil.com"><b>x', "evil.com <b>", "evil.com';rm"):
+            _, text = self.waiting_page(headers={"Host": host})
+            self.assertNotIn("evil.com", text, host)
+            self.assertIn("--relay %s --code" % relay.RELAY_PLACEHOLDER, text, host)
+            self.assertIn("Replace %s with this relay" % relay.RELAY_PLACEHOLDER, text, host)
+            relay.sql("DELETE FROM users", commit=True)
+            relay.sql("DELETE FROM pis", commit=True)
+
+    def test_the_placeholder_note_is_not_shown_when_the_address_is_known(self):
+        _, text = self.waiting_page(headers={"Host": "relay.example.com"})
+        self.assertNotIn("Replace ", text)
+
+    def test_the_configured_relay_address_wins(self):
+        os.environ["QUIETNET_RELAY_URL"] = "https://quietnet.example.org/"
+        os.environ["RAILWAY_PUBLIC_DOMAIN"] = "app.up.railway.app"
+        _, text = self.waiting_page(headers={"Host": "relay.example.com"})
+        self.assertIn("--relay https://quietnet.example.org --code", text)
+
+    def test_a_configured_relay_address_with_odd_characters_is_not_used(self):
+        os.environ["QUIETNET_RELAY_URL"] = "https://x.example.org/$(reboot)"
+        _, text = self.waiting_page(headers={"Host": "relay.example.com"})
+        self.assertNotIn("reboot", text)
+        self.assertIn("--relay https://relay.example.com --code", text)
+
+    def test_a_configured_plain_http_address_on_another_computer_is_not_used(self):
+        os.environ["QUIETNET_RELAY_URL"] = "http://relay.lan:8080"
+        _, text = self.waiting_page(headers={"Host": "relay.example.com"})
+        self.assertNotIn("relay.lan", text)
+        self.assertIn("--relay https://relay.example.com --code", text)
+
+    def test_a_configured_plain_http_address_on_this_computer_is_used(self):
+        os.environ["QUIETNET_RELAY_URL"] = "http://127.0.0.1:8080"
+        _, text = self.waiting_page(headers={"Host": "relay.example.com"})
+        self.assertIn("--relay http://127.0.0.1:8080 --code", text)
+
+    def test_a_configured_plain_http_localhost_address_is_used(self):
+        os.environ["QUIETNET_RELAY_URL"] = "http://localhost:8080"
+        _, text = self.waiting_page(headers={"Host": "relay.example.com"})
+        self.assertIn("--relay http://localhost:8080 --code", text)
+
+    def test_a_configured_plain_http_localhost_address_in_capitals_is_not_used(self):
+        os.environ["QUIETNET_RELAY_URL"] = "http://LocalHost:8080"
+        _, text = self.waiting_page(headers={"Host": "relay.example.com"})
+        self.assertIn("--relay https://relay.example.com --code", text)
+
+    def test_the_railway_public_address_is_used(self):
+        os.environ["RAILWAY_PUBLIC_DOMAIN"] = "app.up.railway.app"
+        _, text = self.waiting_page(headers={"Host": "relay.example.com"})
+        self.assertIn("--relay https://app.up.railway.app --code", text)
+
+    def test_the_install_command_is_escaped_on_the_page(self):
+        self.limit("INSTALL_URL", "https://example.com/i.sh?a=1&b=<x>")
+        _, text = self.waiting_page()
+        self.assertNotIn("<x>", text)
+        self.assertIn("https://example.com/i.sh?a=1&amp;b=&lt;x&gt;", text)
+
+    def test_an_account_with_no_quietnets_is_shown_how_to_start(self):
+        text = self.signed_in().get("/")[1]
+        self.assertIn("To get started", text)
+        self.assertIn("Create pairing code", text)
+
+
 # ------------------------------------------------------------------ the Pi's side
 
 class AgentSide(RelayCase):
@@ -1722,6 +1820,25 @@ class NotRoot(unittest.TestCase):
         system.setuid = lambda uid: None            # pretends to work but changes nothing
         with self.assertRaises(SystemExit):
             relay.drop_privileges("/data", "", system)
+
+
+class NoEmoji(unittest.TestCase):
+    """The owner does not want emoji anywhere in the app's pages."""
+
+    EMOJI = re.compile("[\U0001F000-\U0001FAFF☀-➿⬀-⯿️]")
+
+    def test_the_relay_pages_carry_no_emoji(self):
+        """The relay's own page template, and the relay program as a whole, hold no emoji."""
+        with open(relay.__file__, encoding="utf-8") as f:
+            source = f.read()
+        self.assertEqual(self.EMOJI.findall(relay.PAGE), [])
+        self.assertEqual(self.EMOJI.findall(source), [])
+
+    def test_the_dashboard_carries_no_emoji(self):
+        """The dashboard page holds no emoji."""
+        here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(here, "static", "index.html"), encoding="utf-8") as f:
+            self.assertEqual(self.EMOJI.findall(f.read()), [])
 
 
 if __name__ == "__main__":

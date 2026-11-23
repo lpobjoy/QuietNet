@@ -24,19 +24,40 @@ See what every device in your home is talking to, block the adverts and trackers
 
 If the launcher says it can't find a working Python, install it from [python.org](https://www.python.org/downloads/macos/) or run `xcode-select --install`. With Python from python.org, pairing with a relay borrows the Mac's own security certificates; if it still says the relay's certificate couldn't be checked, open that Python's folder in Applications and double-click **Install Certificates.command**, then restart QuietNet.
 
-**On a Raspberry Pi or any Linux box (for leaving it running):** with Docker installed, run:
+**On a Raspberry Pi (for leaving it running): one line.** On Raspberry Pi OS, or another Debian or Ubuntu style Linux, run:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/lpobjoy/QuietNet/main/install.sh | sh
+```
+
+It checks for Docker and, if it is missing, asks before installing it with Docker's own script from get.docker.com. It then downloads QuietNet into `/opt/quietnet`, frees DNS port 53 if the computer's own name service (systemd-resolved, common on Ubuntu) holds it (it asks first), switches on traffic forwarding for **Cut live connections**, and builds and starts the container. At the end it prints the Pi's address on your home network: set that as the DNS server in your router, and have the router always give the Pi that same address. Administrator steps go through `sudo`, which may ask for your password; when running it over SSH, use `ssh -t` so it can. Because the dashboard opens only on the Pi itself, the closing message also gives the SSH tunnel line for opening it from another computer.
+
+- **Pair with your relay in the same step.** On your relay, choose **Add a QuietNet**. The page shows the exact line to run, with the relay's address and a pairing code filled in, for example:
+
+  ```bash
+  curl -fsSL https://raw.githubusercontent.com/lpobjoy/QuietNet/main/install.sh | sh -s -- --relay https://your-relay.up.railway.app --code A1B2-C3D4
+  ```
+
+  The code works once and for 15 minutes. `--relay` and `--code` must be given together. A Pi that is already paired keeps its pairing and ignores a new code.
+- **Update** by running the same line again. The program files are replaced; your history and rules are kept, because they live in Docker's `quietnet_quietnet-data` volume, not in `/opt/quietnet`.
+- **Uninstall** with `curl -fsSL https://raw.githubusercontent.com/lpobjoy/QuietNet/main/install.sh | sh -s -- --uninstall`. It stops QuietNet and removes `/opt/quietnet`, keeps your history and rules, and says how to delete them (`sudo docker volume rm quietnet_quietnet-data`) and how to undo the forwarding and systemd-resolved changes.
+- **Other options:** `--yes` answers yes to every question (for installs with no one at the keyboard; without it and without a terminal, the installer stops rather than install Docker or change systemd-resolved), `--ref NAME` installs a branch or tag other than `main`, and `--help` lists everything. `QUIETNET_DIR` chooses another folder.
+
+The installer always installs from GitHub's `main` branch (or the `--ref` you give), and nothing checks a signature on what it downloads; see known issue 86. You can read [install.sh](install.sh) before running it.
+
+**By hand, on a Raspberry Pi or any Linux box:** with Docker installed, in this folder, run:
 
 ```bash
 docker compose up -d
 ```
 
-QuietNet then runs all the time and restarts with the machine. It installs nothing from the internet — the container is just Python and QuietNet's own code. Host networking is used so QuietNet can see the home network and answer DNS on port 53.
+QuietNet then runs all the time and restarts with the machine. It installs nothing from the internet — the container is just Python and QuietNet's own code. Host networking is used so QuietNet can see the home network and answer DNS on port 53. If you run it this way from a folder called `QuietNet` and later use the installer, the installer takes over the same container and data. Started from a folder with any other name, the installer stops rather than fight over the container, and says how to stop the old one (its history and rules stay in that folder's own volume).
 
 Schedules follow the Pi's own time zone, summer time included: the compose file shares it with the container. To choose a zone by name instead, start with `TZ=Europe/London docker compose up -d` (never set `TZ` to nothing, which means UTC). On Docker Desktop for Mac or Windows the shared zone is usually UTC, so set `TZ` by name there. If you upgraded from a version before this and had shifted your schedule times to make up for UTC, rebuild with `docker compose up -d --build` and put them back to the real times.
 
 The dashboard only opens on the computer QuietNet runs on, at <http://localhost:8377>. On a Pi with no screen, reach it one of two ways:
 
-- **Through your relay** (see [Reach it from anywhere](#reach-it-from-anywhere-optional)). Create a pairing code on the relay, then start the Pi with the relay's address and the code:
+- **Through your relay** (see [Reach it from anywhere](#reach-it-from-anywhere-optional)). The easiest way is the line the relay shows, which installs and pairs in one go (above). If you started QuietNet by hand, create a pairing code on the relay, then start the Pi with the relay's address and the code:
 
   ```bash
   QUIETNET_CLOUD=https://your-relay.up.railway.app QUIETNET_PAIR=A1B2-C3D4 docker compose up -d
@@ -70,7 +91,7 @@ A normal block only stops a device *finding* an address. If a Disney+ stream is 
 When you turn on **Cut live connections** for a device (on that device's page), QuietNet — running on the Raspberry Pi — tells that device "I am the router", so the device's traffic flows through the Pi. The Pi forwards everything as normal **except** packets heading for an address that's blocked for that device, which it drops. So a blocked Disney+ stream dies within seconds, bedtime and the kill switch become instant for that device, and everything else it does is untouched.
 
 - **Raspberry Pi / Linux only.** It uses the Pi's network directly, so it needs the container's `NET_RAW` and `NET_ADMIN` privileges (already set in `docker-compose.yml`) or to run as root. On a Mac it simply reports itself off, and ordinary DNS blocking still applies.
-- **One-time Pi setting.** The Pi must be allowed to pass traffic on, which a container can't switch on by itself. Run this once on the Pi:
+- **One-time Pi setting.** The Pi must be allowed to pass traffic on, which a container can't switch on by itself. The one-line installer does this for you. If you started QuietNet by hand, run this once on the Pi:
 
   ```bash
   echo net.ipv4.ip_forward=1 | sudo tee /etc/sysctl.d/90-quietnet.conf && sudo sysctl --system
@@ -92,7 +113,7 @@ Because the Pi can't usually be reached from the internet directly, it works the
 
 1. Deploy the relay — see [`cloud/README.md`](cloud/README.md). You get a web address like `your-relay.up.railway.app`.
 2. Open it, create your account, then sign in with it, and choose **Add a QuietNet** to get a pairing code. By default only the first account can be created (`QUIETNET_SIGNUP=first`), so create yours straight away; set `QUIETNET_SIGNUP=open` on the relay if other people need accounts of their own.
-3. On the Pi's own dashboard, open **Set up a device → Remote access**, enter the relay address (it must start with `https://`, or have no scheme at all) and the code. (On a Pi with no screen, pass them when starting the container instead — see [Start it](#start-it).)
+3. **New Pi:** run the one line the relay's page shows on the Pi. It installs QuietNet and pairs it (see [Start it](#start-it)). **Pi already running QuietNet:** on the Pi's own dashboard, open **Set up a device → Remote access**, enter the relay address (it must start with `https://`, or have no scheme at all) and the code. (On a Pi with no screen, pass them when starting the container instead — see [Start it](#start-it).)
 
 After that, sign in to the relay from anywhere to control your Pi. Only your account can reach it, and the relay never stores your history or rules — it just passes your requests through to the Pi while you're looking. **Sign out** signs you out on every browser and device at once.
 
@@ -121,8 +142,9 @@ QuietNet uses no third-party packages or libraries. Everything — the DNS filte
 | `services.json` | The apps and services that can be blocked, and the addresses each one uses |
 | `junk_domains.txt` | The built-in advert and tracker list |
 | `Start QuietNet.command` | Double-click launcher for macOS |
+| `install.sh` | The one-line installer for a Raspberry Pi or other Debian or Ubuntu style Linux: installs, updates, pairs and uninstalls |
 | `Dockerfile`, `docker-compose.yml` | Run it in a container on a Pi or any Linux box |
-| `tests/` | Automated checks for every part: rules, DNS, dashboard API, enforcer, relay and remote link (standard library only) |
+| `tests/` | Automated checks for every part: rules, DNS, dashboard API, enforcer, relay, remote link and installer (standard library only) |
 | `docs/` | How it works, the API, how to test it, and known issues |
 | `AGENTS.md` | Rules for anyone, person or AI agent, changing the code |
 | `data/` | Created when it runs: history, your rules, downloaded list (never uploaded) |

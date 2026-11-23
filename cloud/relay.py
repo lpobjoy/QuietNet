@@ -104,6 +104,58 @@ PAIR_LIMIT_PER_ACCOUNT = (20, 24 * 3600)    # successful pairings per account pe
 SIGNUP_LIMIT_OVERALL = (10, 60 * 60)
 EMAIL_RE = re.compile(r"[^@\s]+@[^@\s]+\.[^@\s]+")
 
+# The one-line installer shown on the home page for a new Pi. It is fetched from GitHub by the Pi,
+# never by the relay.
+INSTALL_URL = os.environ.get("QUIETNET_INSTALL_URL") or "https://raw.githubusercontent.com/lpobjoy/QuietNet/main/install.sh"
+RELAY_PLACEHOLDER = "https://your-relay-address"
+GETTING_STARTED = ('<p class="muted">No QuietNets yet. To get started: name your Pi below and press '
+                   '<b>Create pairing code</b>, then run the one line shown here on the Pi. It installs '
+                   'QuietNet and links it to this account.</p>')
+# A plain host name or address, with an optional port: letters, digits, dots and dashes only.
+HOST_RE = re.compile(r"^[A-Za-z0-9.-]{1,253}(:[0-9]{1,5})?$")
+# A web address made only of a scheme and such a host (an optional trailing slash is dropped).
+RELAY_URL_RE = re.compile(r"^https?://[A-Za-z0-9.-]{1,253}(:[0-9]{1,5})?$")
+# The only hosts a plain http:// relay address may name. The installer and the Pi's link refuse
+# http:// anywhere else, because it would send the Pi's key unprotected.
+LOCAL_RELAY_HOSTS = ("localhost", "127.0.0.1")
+
+
+def usable_relay_url(url):
+    """True when `url` is a plain relay address the installer on a Pi will accept.
+
+    It must be https:// (or http:// naming only localhost or 127.0.0.1) followed by a plain host
+    and an optional port, so the install line shown never names an address the installer refuses."""
+    if not RELAY_URL_RE.match(url):
+        return False
+    if url.startswith("https://"):
+        return True
+    # Compared exactly, in lower case, as install.sh does: it would refuse "http://LocalHost".
+    host = url.split("://", 1)[1].split(":", 1)[0]
+    return host in LOCAL_RELAY_HOSTS
+
+
+def relay_address(host_header=None, environ=None):
+    """Work out this relay's public web address, for the install command on the home page.
+
+    In order: QUIETNET_RELAY_URL if set and usable (see usable_relay_url), then https:// plus RAILWAY_PUBLIC_DOMAIN if set, then
+    https:// plus the request's Host header. Each is used only if it is a plain address (letters,
+    digits, dots, dashes and a port), because the result is pasted into a shell on someone's Pi;
+    the Host header in particular comes from whoever sent the request. Returns (address, guessed),
+    where guessed is True when nothing usable was found and RELAY_PLACEHOLDER is returned instead."""
+    env = os.environ if environ is None else environ
+    configured = (env.get("QUIETNET_RELAY_URL") or "").strip().rstrip("/")
+    if configured and usable_relay_url(configured):
+        return configured, False
+    for host in ((env.get("RAILWAY_PUBLIC_DOMAIN") or "").strip(), (host_header or "").strip()):
+        if host and HOST_RE.match(host):
+            return "https://" + host, False
+    return RELAY_PLACEHOLDER, True
+
+
+def install_command(relay_url, code):
+    """The full one-line command that installs QuietNet on a new Pi and pairs it with this relay."""
+    return "curl -fsSL %s | sh -s -- --relay %s --code %s" % (INSTALL_URL, relay_url, code)
+
 
 def find_dashboard():
     """Locate the dashboard page (static/index.html): from QUIETNET_STATIC, beside this
@@ -618,7 +670,8 @@ input{{width:100%;box-sizing:border-box;padding:10px 12px;border:1px solid #dfe5
 .dev:hover{{border-color:#0f766e}}.dot{{width:10px;height:10px;border-radius:50%;background:#9aa9a3;flex:none}}.dot.on{{background:#0f766e}}
 .linkbtn{{background:none;border:0;padding:0;font:inherit;color:#5d6b66;font-size:14px;text-decoration:underline;cursor:pointer}}
 .row{{display:flex;gap:10px;align-items:center;justify-content:space-between;flex-wrap:wrap}}.code{{font:700 26px ui-monospace,Menlo,monospace;letter-spacing:3px;background:#e0f2ef;color:#0f766e;padding:10px 16px;border-radius:10px;display:inline-block}}
-a{{color:#0f766e}}</style></head><body><div class="wrap"><div class="brand">\U0001F6E1 QuietNet</div>{body}</div></body></html>"""
+.cmd{{font:600 13px/1.5 ui-monospace,Menlo,monospace;letter-spacing:0;display:block;word-break:break-all;user-select:all;-webkit-user-select:all}}
+a{{color:#0f766e}}</style></head><body><div class="wrap"><div class="brand">QuietNet</div>{body}</div></body></html>"""
 
 
 def page(body):
@@ -1094,6 +1147,7 @@ class Relay(BaseHTTPRequestHandler):
         pis = sql("SELECT id,name,paired,last_seen FROM pis WHERE user_id=? ORDER BY created", (uid,))
         rows = ""
         now = time.time()
+        address, guessed = relay_address(self.headers.get("Host"))
         for pid, name, paired, seen in pis:
             if not paired:
                 code, code_ts = sql("SELECT code, code_ts FROM pis WHERE id=?", (pid,), one=True)
@@ -1104,10 +1158,17 @@ class Relay(BaseHTTPRequestHandler):
                     sql("UPDATE pis SET code=?, code_ts=? WHERE id=? AND paired=0", (code, now, pid), commit=True)
                 rows += """<div class="card"><div class="row"><div><b>%s</b><div class="muted">Waiting to be paired</div></div>
                     <form method="post" action="/pis/%s/delete"><button class="btn" style="background:#b42318">Remove</button></form></div>
-                    <p class="muted" style="margin-top:12px">On the Pi's own QuietNet page, open <b>Remote access</b>, enter this relay's
-                    web address and this code:</p><div class="code">%s</div>
-                    <p class="muted" style="margin-top:8px">The code works once and for %d minutes. Reload this page for a new one.</p></div>""" % (
-                    html.escape(name), pid, html.escape(code), PAIR_CODE_MINUTES)
+                    <p style="margin:12px 0 6px"><b>New Pi?</b> Run this one line on it:</p>
+                    <div class="code cmd">%s</div>%s
+                    <p class="muted" style="margin-top:8px">It needs Raspberry Pi OS or another Debian-style Linux, and installs
+                    Docker if it is missing (it asks first). The code works once and for %d minutes.</p>
+                    <p class="muted" style="margin-top:12px"><b>Pi already running QuietNet?</b> On the Pi's own QuietNet page,
+                    open <b>Remote access</b>, enter this relay's web address and this code:</p><div class="code">%s</div>
+                    <p class="muted" style="margin-top:8px">Reload this page for a new code.</p></div>""" % (
+                    html.escape(name), pid, html.escape(install_command(address, code)),
+                    ('<p class="muted" style="margin-top:6px">Replace %s with this relay\'s web address.</p>'
+                     % html.escape(address)) if guessed else "",
+                    PAIR_CODE_MINUTES, html.escape(code))
             else:
                 online = seen and (now - seen) < OFFLINE_AFTER
                 rows += """<a class="dev" href="/pi/%s/"><span class="dot %s"></span>
@@ -1118,7 +1179,7 @@ class Relay(BaseHTTPRequestHandler):
             <form method="post" action="/pis/new"><label>Add a QuietNet</label>
             <input name="name" placeholder="e.g. Home Pi" required>
             <button class="btn" type="submit">Create pairing code</button></form>""" % (
-            self.sign_out_form(), rows or '<p class="muted">No QuietNets yet.</p>'))
+            self.sign_out_form(), rows or GETTING_STARTED))
 
     def new_pi(self):
         """Create a QuietNet entry for the signed-in user, with a fresh pairing code. Each account
