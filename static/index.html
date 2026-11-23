@@ -874,12 +874,14 @@ function viewHome(){
       <span class="tile-figs">${d.last
         ? `${num(d.n)} requests today · <b>${num(d.nb)} blocked</b> · active ${esc(ago(d.last))}`
         : '<span class="muted">Not using QuietNet yet</span>'}</span>
-      <span class="tile-badges">${d.off ? '<span class="badge danger">Internet off</span>' : ''}${d.enforced ? '<span class="badge accent">Live-enforced</span>' : ''}${d.other_dns ? '<span class="badge warn">Tried another DNS service</span>' : ''}${d.group ? `<span class="badge">${esc(groupName(d.group))}</span>` : ''}</span>
+      <span class="tile-badges">${d.off ? '<span class="badge danger">Internet off</span>' : ''}${d.enforced ? '<span class="badge accent">Live-enforced</span>' : ''}${d.paused ? '<span class="badge warn">Rules paused</span>' : ''}${d.other_dns ? '<span class="badge warn">Tried another DNS service</span>' : ''}${d.group ? `<span class="badge">${esc(groupName(d.group))}</span>` : ''}</span>
       ${ICON.go}
     </button>`).join('');
   const scanning = st.scan && st.scan.state === 'scanning';
   return `
   ${v6Warning(true)}
+  ${movedNotices(null)}
+  ${deviceEvents()}
   <div class="card">
     <div class="row">
       <div class="grow"><h2>Block known adverts and trackers automatically</h2>
@@ -901,6 +903,25 @@ function viewHome(){
   ${tiles ? `<div class="thead" aria-hidden="true"><span>Device</span><span>Today</span><span></span></div><div class="tiles">${tiles}</div>` : `<div class="card empty">
     <p><b>No devices yet.</b></p><p>QuietNet can only see devices that have been pointed at it.</p>
     <button class="btn primary" data-act="tab" data-tab="setup">Show me how to set up a device</button></div>`}`;
+}
+
+/* ---------- Devices that change address ---------- */
+// A device with rules went quiet just as a new private-address device appeared: it may be the same
+// phone or tablet with a new private Wi-Fi address. st.device_notices comes from refresh_devices on
+// the Pi. On the home page every notice is shown; on a device's page (ip given) only those about it.
+function movedNotices(ip){
+  const list = ((S.status || {}).device_notices || []).filter(n => !ip || n.to === ip);
+  return list.map(n => `<div class="notice warn"><b>A device with rules (${esc(n.name)}) has gone quiet and a new device appeared</b>
+    at ${esc(n.to)}. It may be the same one with a new private Wi-Fi address.
+    <button class="btn primary" data-act="moverules" data-from="${esc(n.from)}" data-to="${esc(n.to)}">Move the rules to this device</button>
+    ${ip ? '' : `<button class="btn link" data-act="open" data-ip="${esc(n.to)}">Open it</button>`}</div>`).join('');
+}
+// What QuietNet did by itself to devices' rules in the last week (moved, paused, new-device group).
+function deviceEvents(){
+  const ev = (S.status || {}).device_events || [];
+  if(!ev.length) return '';
+  return `<div class="card"><h2>Recent changes to devices</h2><ul class="list">${ev.slice(0, 5).map(e =>
+    `<li class="item"><div class="meta">${esc(e.text)} · ${esc(ago(e.ts))}</div></li>`).join('')}</ul></div>`;
 }
 
 /* ---------- One device ---------- */
@@ -998,6 +1019,8 @@ function viewDevice(){
     ${S.groups.length ? '' : '<button class="btn link" data-act="tab" data-tab="groups">Create a group</button>'}</div>
   ${d.last ? '' : `<div class="notice warn"><b>This device isn't using QuietNet yet</b>, so nothing can be seen or blocked for it.
     <button class="btn link" data-act="tab" data-tab="setup">Show me how to set it up</button></div>`}
+  ${d.warning ? `<div class="notice warn">${esc(d.warning)}</div>` : ''}
+  ${movedNotices(d.ip)}
   ${otherDnsNotice(d)}
   ${controls('device:' + S.device, 'this device')}
   ${enforceCard(d)}
@@ -1030,7 +1053,18 @@ function viewGroups(){
     <p class="meta">Put devices together — for example "Kids" or "TVs" — and control them all at once.</p></div>
     <button class="btn primary" data-act="newgroup">New group</button></div>
     ${tiles ? `<div class="thead" aria-hidden="true"><span>Group</span><span>Blocked</span><span></span></div><div class="tiles">${tiles}</div>`
-      : '<div class="card empty">No groups yet.</div>'}`;
+      : '<div class="card empty">No groups yet.</div>'}
+    ${newDeviceCard()}`;
+}
+// The household setting "New devices go into group": st.new_device_group is a group id or null.
+function newDeviceCard(){
+  const chosen = (S.status || {}).new_device_group;
+  return `<div class="card"><div class="row group-pick"><label for="newGroupSel">New devices go into group</label>
+    <select id="newGroupSel"><option value="">None</option>${S.groups.map(g =>
+      `<option value="${esc(g.id)}" ${chosen === g.id ? 'selected' : ''}>${esc(g.name)}</option>`).join('')}</select></div>
+    <p class="meta">Phones, tablets and laptops can make up a new private Wi-Fi address, and then look like a new device
+      with none of their rules. Choose a group here and any device QuietNet has never seen before is put in it
+      straight away, so a child's phone with a new address stays covered. Devices already known are not changed.</p></div>`;
 }
 function viewGroup(){
   const g = S.groups.find(x => x.id === S.group);
@@ -1398,6 +1432,12 @@ const actions = {
     await api('/api/group-delete', {id:S.group}).catch(oops); S.group = null; refresh(true);
   },
   // Put a device into the open group (data-in="1") or take it out (data-in="").
+  async moverules(d){
+    const yes = await ask({title:'Move the rules to this device?', ok:'Move the rules',
+      text:'Its name, group, blocks, schedules and "cut live connections" move from ' + d.from + ' to ' + d.to + '. The history stays where it was.'});
+    if(!yes) return;
+    await api('/api/move-rules', {from:d.from, to:d.to}).catch(oops); refresh(true);
+  },
   async member(d){ await api('/api/device-group', {ip:d.ip, group:d.in ? S.group : null}).catch(oops); refresh(true); },
   open(d){ S.device = d.ip; S.activity = []; S.activityKey = ''; S.open.clear(); S.search = ''; S.filter = 'all'; S.svcOpen = false; refresh(true); },
   back(){ S.device = null; refresh(true); },
@@ -1461,6 +1501,7 @@ document.addEventListener('change', async e => {
   if(e.target.id === 'junkSwitch'){ await api('/api/junk-switch', {on:e.target.checked}).catch(oops); refresh(); }
   if(e.target.id === 'enforceSwitch'){ await api('/api/enforce', {ip:S.device, on:e.target.checked}).catch(oops); refresh(true); }
   if(e.target.id === 'netSwitch'){ await api('/api/internet', {scope:e.target.dataset.scope, off:!e.target.checked}).catch(oops); refresh(true); }
+  if(e.target.id === 'newGroupSel'){ await api('/api/new-device-group', {group:e.target.value ? +e.target.value : null}).catch(oops); e.target.blur(); refresh(true); }
   if(e.target.id === 'groupSel'){ await api('/api/device-group', {ip:S.device, group:e.target.value ? +e.target.value : null}).catch(oops); e.target.blur(); refresh(true); }
   if(e.target.classList.contains('schedOn')){ await api('/api/schedule-enable', {id:+e.target.dataset.id, on:e.target.checked}).catch(oops); refresh(true); }
   if(S.edit){

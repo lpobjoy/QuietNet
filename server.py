@@ -223,6 +223,11 @@ class State:
     ra_heard = None         # when (time.time()) the router last announced IPv6 on the home network
     router_v6_dns = {}      # IPv6 DNS servers the router names -> when to forget each (time.time())
     other_dns = {}          # device address -> when (time.time()) it last looked up another DNS service
+    dev_mac = {}            # device ip with rules or a name -> the hardware address those belong to (see refresh_devices)
+    paused_ips = set()      # device ips whose own rules are paused: a different device has that address now
+    device_warnings = {}    # device ip -> a plain-English warning for its page (rules that could not be moved)
+    device_notices = []     # possible moves for the owner to confirm: see device_notices_now
+    new_device_group = None  # group id that a device seen for the first time is put in (None = no group)
 
 
 S = State()
@@ -331,6 +336,13 @@ def init_db():
         CREATE TABLE IF NOT EXISTS service_blocks(scope TEXT, service TEXT, PRIMARY KEY(scope, service));
         CREATE TABLE IF NOT EXISTS internet_off(scope TEXT PRIMARY KEY);
         CREATE TABLE IF NOT EXISTS enforced(ip TEXT PRIMARY KEY);
+        -- Which device (hardware address) the rules and name kept under an address belong to, and
+        -- whether they are paused because a different device has that address now. See refresh_devices.
+        CREATE TABLE IF NOT EXISTS device_mac(ip TEXT PRIMARY KEY, mac TEXT, paused INTEGER DEFAULT 0);
+        -- Every hardware address ever seen on the network: where and when it was first and last seen.
+        CREATE TABLE IF NOT EXISTS known_macs(mac TEXT PRIMARY KEY, ip TEXT, first REAL, last REAL);
+        -- Plain-English notes of what QuietNet did by itself to a device's rules, newest last.
+        CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY, ts REAL, ip TEXT, text TEXT);
     """)
     db.commit()
     S.blocked = {r[0] for r in sql("SELECT domain FROM blocked")}
@@ -345,6 +357,21 @@ def init_db():
         pass                                                       # already there
     S.enforced_mac = {ip: mac or "" for ip, mac in sql("SELECT ip, mac FROM enforced")}
     S.enforced = set(S.enforced_mac)
+    S.dev_mac, S.paused_ips = {}, set()
+    for ip, mac, paused in sql("SELECT ip, mac, paused FROM device_mac"):
+        S.dev_mac[ip] = mac
+        if paused:
+            S.paused_ips.add(ip)
+    if not sql("SELECT 1 FROM known_macs LIMIT 1"):
+        # First start with this table: every device a scan has already found counts as known, so
+        # none of them is mistaken for a new device and put in the new-device group.
+        for ip, mac, ts in sql("SELECT ip, mac, ts FROM seen"):
+            if clean_mac(mac):
+                db.execute("INSERT OR IGNORE INTO known_macs VALUES(?,?,?,?)", (clean_mac(mac), ip, ts, ts))
+        db.commit()
+    gid = get_setting("new_device_group", "")
+    S.new_device_group = int(gid) if gid.isdigit() and int(gid) in S.group_names else None
+    S.device_warnings, S.device_notices = {}, []
     S.svc_blocks = {}
     for scope, service in sql("SELECT scope, service FROM service_blocks"):
         S.svc_blocks.setdefault(scope, set()).add(service)
@@ -543,9 +570,11 @@ def active_schedules():
 
 
 def scopes_for(client):
-    """Every set of rules that applies to a device: the whole house, itself, and its group."""
+    """Every set of rules that applies to a device: the whole house, itself, and its group.
+    A device whose address now belongs to a different device (S.paused_ips, see refresh_devices)
+    gets the whole house's rules only: its own are kept for the device they belong to."""
     out = ["all"]
-    if client:
+    if client and client not in S.paused_ips:
         out.append("device:" + client)
         if client in S.dev_group:
             out.append("group:%d" % S.dev_group[client])
@@ -888,7 +917,8 @@ def enforcement_plan():
     for names not seen before, or when a rule, the pause, the schedules in force or the set of
     enforced devices has changed - and in any case at least once a minute."""
     with db_lock:                                      # copies: other threads change these while we work
-        victims = {ip: S.enforced_mac.get(ip, "") for ip in S.enforced}
+        # A paused address now belongs to a different device, which must not be steered.
+        victims = {ip: S.enforced_mac.get(ip, "") for ip in S.enforced if ip not in S.paused_ips}
     if not victims:
         S.shared_left = {}
         return {}
@@ -1659,7 +1689,8 @@ def refresh_local_ip():
 
 
 def address_watcher():
-    """Background thread: keep S.local_ip up to date. At start-up the network may not be ready
+    """Background thread: keep S.local_ip up to date, and keep each device's rules with the device
+    when it changes address (refresh_devices). At start-up the network may not be ready
     yet (a Raspberry Pi can start QuietNet before Wi-Fi is connected), and the router may later
     hand this computer a different address. Checks every 10 seconds while there is no address,
     and every minute after that."""
@@ -1669,6 +1700,10 @@ def address_watcher():
             refresh_local_ip()
         except Exception as e:
             print("Could not check this computer's address:", e, flush=True)
+        try:
+            refresh_devices()
+        except Exception as e:
+            print("Could not check which device has which address:", e, flush=True)
 
 
 def neighbours():
@@ -1704,6 +1739,315 @@ def neighbours():
 def tidy_mac(text):
     """A hardware address in the usual form: lower case, two digits per part ('0:1b:...' -> '00:1b:...')."""
     return ":".join(part.zfill(2) for part in text.lower().split(":"))
+
+
+# Keeping rules with the device, not the address. Rules, given and groups are kept under a device's
+# IPv4 address, but a phone can be given a new address (a new private Wi-Fi address, or the router
+# simply handing out a different number), and its old address can then go to another device. So
+# every minute refresh_devices looks at which hardware address is at which IPv4 address and keeps
+# the rules pointed at the right device. See docs/ARCHITECTURE.md, "When a device changes address".
+QUIET_AFTER = 15 * 60          # seconds a device with rules must be unseen before it counts as "gone quiet"
+NEW_DEVICE_DAYS = 3            # how recently a device must have first appeared to be offered as its replacement
+MAX_EVENTS = 200               # notes of what QuietNet did to devices' rules, kept newest first
+MAX_NOTICES = 10               # "may be the same device" notices shown at once
+
+
+def clean_mac(text):
+    """A hardware address in the usual form (six pairs of lower-case hex digits, '0:1b:..' padded
+    to '00:1b:..'), or '' if it isn't one that belongs to a single device: not text, malformed,
+    all zeros (an unfinished entry in the neighbour table), or a group address (broadcast and
+    multicast, whose first byte is odd)."""
+    if not isinstance(text, str):
+        return ""
+    parts = text.strip().lower().split(":")
+    if len(parts) != 6 or not all(re.fullmatch(r"[0-9a-f]{1,2}", p) for p in parts):
+        return ""
+    mac = ":".join(p.zfill(2) for p in parts)
+    if mac == "00:00:00:00:00:00" or int(parts[0], 16) & 1:
+        return ""
+    return mac
+
+
+def named_devices():
+    """{ip: name} for every device someone has given a name. Call holding db_lock."""
+    return {ip: name for ip, name in db.execute("SELECT ip, name FROM devices") if name}
+
+
+def own_rules(ip, given, count_group=True):
+    """Does this address carry anything of its own: a name, a group (unless count_group is False),
+    an internet switch, a blocked service, a schedule, or "cut live connections"? `given` is
+    named_devices(). Reads S only."""
+    scope = "device:" + ip
+    return bool(ip in given or (count_group and ip in S.dev_group) or scope in S.off
+                or S.svc_blocks.get(scope) or ip in S.enforced
+                or any(x["scope"] == scope for x in S.schedules))
+
+
+def device_label(ip, given):
+    """How to name a device in a message: the name it was given, or its address."""
+    return given.get(ip) or ip
+
+
+def add_event(ip, text, now=None):
+    """Note something QuietNet did to a device's rules by itself, for the dashboard, keeping only
+    the newest MAX_EVENTS. Call holding db_lock; the caller commits."""
+    db.execute("INSERT INTO events(ts, ip, text) VALUES(?,?,?)", (time.time() if now is None else now, ip, text))
+    db.execute("DELETE FROM events WHERE id NOT IN (SELECT id FROM events ORDER BY id DESC LIMIT ?)", (MAX_EVENTS,))
+
+
+def set_owner(ip, mac, paused=False):
+    """Record which hardware address the rules under this address belong to, and whether they are
+    paused. Changes S and the database; call holding db_lock (the caller commits)."""
+    S.dev_mac[ip] = mac
+    if paused:
+        S.paused_ips.add(ip)
+    else:
+        S.paused_ips.discard(ip)
+    db.execute("INSERT OR REPLACE INTO device_mac(ip, mac, paused) VALUES(?,?,?)", (ip, mac, int(paused)))
+
+
+def drop_owner(ip):
+    """Forget which device this address's rules belong to (it has none left). Call holding db_lock."""
+    S.dev_mac.pop(ip, None)
+    S.paused_ips.discard(ip)
+    db.execute("DELETE FROM device_mac WHERE ip=?", (ip,))
+
+
+def fixed_addresses():
+    """The addresses that are never treated as a household device here: this computer and the
+    home router. Their rules never move and nothing moves onto them."""
+    return {a for a in (S.local_ip, home_router() or S.router) if a}
+
+
+def move_rules(a, b, mac):
+    """Move everything kept under address `a` to address `b`: its name, its group, its own rules
+    and schedules, "cut live connections" (with the hardware address to steer) and the note of
+    which device it is. `mac` is the device's hardware address at `b` ('' if not known yet).
+    `b` must carry nothing of its own except, perhaps, a group, which `a`'s group replaces.
+    The history stays filed under the address each lookup came from.
+    Changes S and the database together; call holding db_lock (this commits)."""
+    sa, sb = "device:" + a, "device:" + b
+    if db.execute("SELECT name FROM devices WHERE ip=? AND name<>''", (a,)).fetchall():
+        db.execute("DELETE FROM devices WHERE ip=?", (b,))
+        db.execute("UPDATE devices SET ip=? WHERE ip=?", (b, a))
+    if a in S.dev_group:
+        S.dev_group[b] = S.dev_group.pop(a)
+        db.execute("DELETE FROM device_group WHERE ip=?", (b,))
+        db.execute("UPDATE device_group SET ip=? WHERE ip=?", (b, a))
+    if sa in S.svc_blocks:
+        S.svc_blocks[sb] = S.svc_blocks.pop(sa)
+        db.execute("DELETE FROM service_blocks WHERE scope=?", (sb,))
+        db.execute("UPDATE service_blocks SET scope=? WHERE scope=?", (sb, sa))
+    if sa in S.off:
+        S.off.discard(sa)
+        S.off.add(sb)
+        db.execute("DELETE FROM internet_off WHERE scope=?", (sb,))
+        db.execute("UPDATE internet_off SET scope=? WHERE scope=?", (sb, sa))
+    db.execute("UPDATE schedules SET scope=? WHERE scope=?", (sb, sa))
+    if a in S.enforced:
+        steer = mac or S.enforced_mac.get(a, "")
+        S.enforced.discard(a)
+        S.enforced_mac.pop(a, None)
+        S.enforced.add(b)
+        S.enforced_mac[b] = steer
+        db.execute("DELETE FROM enforced WHERE ip=?", (b,))
+        db.execute("UPDATE enforced SET ip=?, mac=? WHERE ip=?", (b, steer, a))
+    drop_owner(a)
+    if mac:
+        set_owner(b, mac)
+    else:
+        drop_owner(b)
+    S.device_warnings.pop(a, None)
+    S.device_warnings.pop(b, None)
+    S.device_notices = [n for n in S.device_notices if n["from"] != a and n["to"] != b]
+    db.commit()
+    load_schedules()                     # also tells the enforcer and the answer cache that rules changed
+
+
+def note_new_devices(present, given, now):
+    """Record every hardware address in `present` ({ip: mac}) as seen, and put each one never seen
+    before into the new-device group, if one is chosen and its address carries nothing of its
+    own. The very first look only records what is there (nothing then is "new").
+    Call holding db_lock; the caller commits."""
+    known = {mac for (mac,) in db.execute("SELECT mac FROM known_macs")}
+    first_look = not known and get_setting("macs_seeded", "") != "1"
+    gid = S.new_device_group if S.new_device_group in S.group_names else None
+    for ip, mac in sorted(present.items()):
+        if mac in known:
+            db.execute("UPDATE known_macs SET ip=?, last=? WHERE mac=?", (ip, now, mac))
+            continue
+        db.execute("INSERT OR REPLACE INTO known_macs VALUES(?,?,?,?)", (mac, ip, now, now))
+        if first_look or gid is None or own_rules(ip, given) or ip in S.dev_mac:
+            continue
+        S.dev_group[ip] = gid
+        db.execute("INSERT OR REPLACE INTO device_group VALUES(?,?)", (ip, gid))
+        set_owner(ip, mac)
+        add_event(ip, "A new device appeared at %s and was put in the %s group, as you asked for new devices."
+                  % (ip, S.group_names[gid]), now)
+        rules_changed()
+    if first_look:
+        db.execute("INSERT OR REPLACE INTO settings(key, value) VALUES('macs_seeded', '1')")
+
+
+def device_notices_now(present, given, now):
+    """Possible moves for the owner to confirm: a device with rules that has gone quiet (unseen for
+    QUIET_AFTER) at about the time a device with a private Wi-Fi address and nothing of its own
+    appeared for the first time. It may be the same phone or tablet with a new private address.
+    Returns a list of {"from", "name", "to", "mac", "first"}. Call holding db_lock."""
+    seen = {mac: (first, last) for mac, first, last in db.execute("SELECT mac, first, last FROM known_macs")}
+    on_now = set(present.values())
+    quiet = []
+    for a, mac in sorted(S.dev_mac.items()):
+        last = seen.get(mac, (0, 0))[1]
+        if mac not in on_now and last and now - last > QUIET_AFTER:
+            quiet.append((a, last))
+    fresh = [(b, mac, seen[mac][0]) for b, mac in sorted(present.items())
+             if mac in seen and free_for_rules(b, given) and names.is_private_mac(mac)
+             and b not in S.paused_ips and now - seen[mac][0] < NEW_DEVICE_DAYS * 86400]
+    out = []
+    for a, last in quiet:
+        for b, mac, first in fresh:
+            if first >= last - QUIET_AFTER:
+                out.append({"from": a, "name": device_label(a, given), "to": b, "mac": mac, "first": first})
+    return out[:MAX_NOTICES]
+
+
+def free_for_rules(ip, given):
+    """Does this address carry nothing of its own apart, perhaps, from a group (which a device can
+    be given automatically as a new device)? Such an address can take another's rules."""
+    return not own_rules(ip, given, count_group=False)
+
+
+def refresh_devices(table=None, now=None):
+    """Keep each device's rules with the device, by hardware address. Run every minute by
+    address_watcher, never on a lookup. `table` is {ip: mac} (the neighbour table when not given).
+
+    For each address whose rules belong to a known hardware address X:
+      - X is still there: nothing to do (rules that were paused start applying again).
+      - X is now at another address B that carries nothing of its own: everything moves to B,
+        and a note is kept. If B has rules of its own, nothing moves and both devices show a warning.
+      - a different device is at the address: the rules are paused (kept for X) until X comes back.
+    Also records every hardware address seen, puts devices seen for the first time into the
+    new-device group if one is chosen, and works out the "may be the same device" notices.
+    Malformed, all-zero, broadcast and multicast hardware addresses are ignored, and this computer
+    and the router never move and are never moved onto."""
+    now = time.time() if now is None else now
+    if table is None:
+        table = neighbours()
+    fixed = fixed_addresses()
+    present = {}
+    for ip, mac in (table or {}).items():
+        try:
+            ip = str(ipaddress.IPv4Address(str(ip)))
+        except ValueError:
+            continue
+        mac = clean_mac(mac)
+        if mac:
+            present[ip] = mac
+    fixed_macs = {present[ip] for ip in fixed if ip in present}
+    present = {ip: mac for ip, mac in present.items() if ip not in fixed and mac not in fixed_macs}
+    where = {}
+    for ip, mac in present.items():
+        where.setdefault(mac, []).append(ip)
+    with db_lock:
+        given = named_devices()
+        note_new_devices(present, given, now)
+        for ip in list(S.dev_mac):                      # rules all removed: nothing left to follow
+            if not own_rules(ip, given):
+                drop_owner(ip)
+        for ip, mac in present.items():                 # rules on an address whose device isn't known yet
+            if ip not in S.dev_mac and own_rules(ip, given):
+                set_owner(ip, clean_mac(S.enforced_mac.get(ip, "")) or mac)
+        warnings = {}
+        for a, mac in sorted(S.dev_mac.items()):
+            if S.dev_mac.get(a) != mac or a in fixed:
+                continue                                 # moved already in this pass, or never moves
+            if present.get(a) == mac:
+                if a in S.paused_ips:
+                    set_owner(a, mac)
+                    add_event(a, "%s is back at %s, so its rules apply again." % (device_label(a, given), a), now)
+                    rules_changed()
+                continue
+            elsewhere = [b for b in where.get(mac, []) if b != a]
+            if len(elsewhere) == 1:
+                b = elsewhere[0]
+                if own_rules(b, given) or b in S.dev_mac:
+                    warnings[a] = ("This device now has the address %s, which has rules of its own, so its rules "
+                                   "were not moved. Check both and remove the rules you no longer want." % b)
+                    warnings[b] = ("This device used to be at %s, which still has rules for it. Check both and "
+                                   "remove the rules you no longer want." % a)
+                    continue
+                label = device_label(a, given)
+                move_rules(a, b, mac)
+                add_event(b, "%s moved from %s to %s; its rules moved with it." % (label, a, b), now)
+                given = named_devices()
+                continue
+            if a in present and a not in S.paused_ips:
+                set_owner(a, mac, paused=True)
+                add_event(a, "A different device now has the address %s, so the rules for %s are paused "
+                             "until it comes back." % (a, device_label(a, given)), now)
+                rules_changed()
+        for a in S.paused_ips:
+            warnings.setdefault(a, "This number now belongs to a different device; the rules for %s are paused "
+                                   "until it comes back." % device_label(a, given))
+        S.device_warnings = warnings
+        S.device_notices = device_notices_now(present, given, now)
+        db.commit()
+
+
+def known_mac_at(ip):
+    """The hardware address last seen at this address: the live neighbour table first, then the
+    record of every device seen, then the last scan. '' if none is known."""
+    mac = clean_mac(neighbours().get(ip, ""))
+    if mac:
+        return mac
+    for statement in ("SELECT mac FROM known_macs WHERE ip=? ORDER BY last DESC LIMIT 1",
+                      "SELECT mac FROM seen WHERE ip=?"):
+        row = sql(statement, (ip,))
+        if row and clean_mac(row[0][0]):
+            return clean_mac(row[0][0])
+    return ""
+
+
+def move_rules_by_hand(a, b):
+    """The owner's "Move the rules to this device": move everything kept under address `a` to
+    address `b`. Returns an error message, or None when moved."""
+    try:
+        a, b = str(ipaddress.IPv4Address(a)), str(ipaddress.IPv4Address(b))
+    except ValueError:
+        return "Those aren't device addresses."
+    if a == b:
+        return "Choose two different devices."
+    if a in fixed_addresses() or b in fixed_addresses():
+        return "Rules can't be moved to or from this computer or the router."
+    mac = known_mac_at(b)
+    with db_lock:
+        given = named_devices()
+        if not own_rules(a, given):
+            return "There are no rules to move."
+        if not free_for_rules(b, given):
+            return ("That device already has rules of its own. Remove them first if you want to move "
+                    "the other device's rules to it.")
+        label = device_label(a, given)
+        move_rules(a, b, mac)
+        add_event(b, "You moved the rules for %s from %s to %s." % (label, a, b))
+        db.commit()
+    return None
+
+
+def set_new_device_group(gid):
+    """Choose the group a device seen for the first time is put in (None, or an unknown group, for none)."""
+    with db_lock:
+        S.new_device_group = gid if (isinstance(gid, int) and not isinstance(gid, bool)
+                                     and gid in S.group_names) else None
+        set_setting("new_device_group", "" if S.new_device_group is None else S.new_device_group)
+
+
+def recent_device_events(limit=10):
+    """The newest notes of what QuietNet did to devices' rules, from the last week, newest first.
+    Asked on the read-only connection, so the status summary never waits for db_lock."""
+    rows = read_sql("SELECT ts, ip, text FROM events WHERE ts>? ORDER BY id DESC LIMIT ?", (time.time() - 7 * 86400, limit))
+    return [{"ts": ts, "ip": ip, "text": text} for ts, ip, text in rows]
 
 
 def own_ipv6():
@@ -2086,6 +2430,9 @@ def api_status():
         "enforcer": dict(ENF.status() if ENF else {"available": False, "reason": "", "active": False},
                          shared=dict(S.shared_left)),
         "ipv6": ipv6_dns_view(now),
+        "new_device_group": S.new_device_group,
+        "device_notices": list(S.device_notices),
+        "device_events": recent_device_events(),
     }
 
 
@@ -2102,7 +2449,8 @@ LAST_SEEN_SQL = """
 
 
 def api_devices():
-    """GET /api/devices: every device that has used QuietNet or been found by a scan,
+    """GET /api/devices: every device that has used QuietNet, been found by a scan or has rules
+    that follow it (S.dev_mac),
     with its name, group, switches and today's counts, and when (if in the last 24 hours) it last
     tried to use another DNS service."""
     since = time.time() - 86400
@@ -2118,7 +2466,8 @@ def api_devices():
             "mac": "",
             "this_computer": ip == S.local_ip, "last": 0, "n": 0, "nb": 0, "on_network": 0,
             "group": S.dev_group.get(ip), "off": internet_off_for(ip),
-            "enforced": ip in S.enforced, "other_dns": other_dns_since(ip, since)})
+            "enforced": ip in S.enforced, "other_dns": other_dns_since(ip, since),
+            "paused": ip in S.paused_ips, "warning": S.device_warnings.get(ip, "")})
 
     # Two small questions, each answered straight from an index, in place of one that read every
     # row of up to 30 days of history on every dashboard refresh.
@@ -2132,6 +2481,11 @@ def api_devices():
         d.update(mac=mac, on_network=ts)
         if host and not d["hint"] and names.tidy_name(host):
             d.update(hint=names.tidy_name(host), hint_source=names.LABELS["dns"])
+    # Every device whose rules follow it by hardware address, and every device a "may be the same
+    # device" notice points at, is listed even before it has used QuietNet or been found by a scan.
+    for ip, mac in list(S.dev_mac.items()) + [(n["to"], n["mac"]) for n in S.device_notices]:
+        d = entry(ip)
+        d["mac"] = d["mac"] or mac
     for d in out.values():
         if not d["hint"] and not d["hint_detail"] and names.is_private_mac(d["mac"]):
             d["hint_detail"] = names.PRIVATE_NOTE
@@ -2341,6 +2695,9 @@ def delete_group(gid):
         db.execute("DELETE FROM service_blocks WHERE scope=?", (scope,))
         db.execute("DELETE FROM internet_off WHERE scope=?", (scope,))
         db.execute("DELETE FROM schedules WHERE scope=?", (scope,))
+        if S.new_device_group == gid:
+            S.new_device_group = None
+            db.execute("DELETE FROM settings WHERE key='new_device_group'")
         db.commit()
         load_schedules()
 
@@ -2614,6 +2971,14 @@ class Web(BaseHTTPRequestHandler):
                 db.commit()
                 rules_changed()
             return self.send_json({"ok": True})
+        if path == "/api/move-rules":       # "Move the rules to this device"
+            if not isinstance(body.get("from"), str) or not isinstance(body.get("to"), str):
+                return self.send_error(400)
+            error = move_rules_by_hand(body["from"], body["to"])
+            return self.send_json({"error": error}, 400) if error else self.send_json({"ok": True})
+        if path == "/api/new-device-group":
+            set_new_device_group(body.get("group"))
+            return self.send_json({"ok": True, "group": S.new_device_group})
         if path == "/api/junk-switch":
             S.junk_on = bool(body.get("on"))
             set_setting("junk_on", "1" if S.junk_on else "0")

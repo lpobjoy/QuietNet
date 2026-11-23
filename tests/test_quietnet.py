@@ -51,7 +51,7 @@ class Base(unittest.TestCase):
             server.init_db()
             server.load_lists()
         for table in ("blocked", "allowed", "groups", "device_group", "service_blocks",
-                      "internet_off", "schedules", "queries", "enforced"):
+                      "internet_off", "schedules", "queries", "enforced", "device_mac", "known_macs", "events"):
             server.sql("DELETE FROM %s" % table, commit=True)
         server.init_db()
         server.S.junk_on, server.S.paused_until = True, 0

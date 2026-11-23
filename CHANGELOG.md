@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+Rules follow the device (23 November):
+- **Fixed: rules belonged to the IP address,** so a phone with a new private Wi-Fi address or a new number lost every rule, and a device later given the old number took them on. Each address's rules are now tied to the hardware address seen there: when the device moves to a free address they move with it (with a note on the home page); when a different device takes the address they are paused until the device comes back; and when the new address has rules of its own, both devices show a warning instead of merging. New `paused` and `warning` in `GET /api/devices`.
+- **New: "New devices go into group"** on the Groups page puts a device never seen before into a chosen group (none by default). New `POST /api/new-device-group` and `new_device_group` in `GET /api/status`.
+- **New: "Move the rules to this device".** When a device with rules goes quiet just as a new private-address device appears, the home page and the new device's page offer to move the rules. New `POST /api/move-rules`, and `device_notices` and `device_events` in `GET /api/status`.
+
 Shared addresses and "Cut live connections" (23 November):
 - **Fixed: blocking YouTube on a device with "Cut live connections" on also cut Google search, Classroom, Docs and Gmail.** They share Google's front-door addresses, and the same could happen with sites on Cloudflare, Fastly or Akamai. An address is no longer dropped for a device if a site that device is allowed was given the same address in the last six hours. The blocked service is still blocked by name, and addresses only it uses (YouTube's video servers) are still dropped; bedtime, the kill switch and the internet switch still cut everything. The device's "Cut live connections" card says when some addresses were left to the name block; new `shared` in `GET /api/enforcer` and in `enforcer` in `GET /api/status`.
 

@@ -47,9 +47,16 @@ A **scope** is `all`, `group:<id>` or `device:<ip>`.
   "scan": {"state": "idle", "ts": 1795000000.0, "network": "192.168.1.0/24", "addresses": 254, "capped": false},
   "enforcer": {"available": false, "reason": "…", "active": false, "shared": {}},
   "ipv6": {"dns_address": "fd12:3456::60", "listening": true, "router_heard": 1795000000.0,
-           "router_dns": ["fe80::1"], "router_dns_not_ours": ["fe80::1"]}
+           "router_dns": ["fe80::1"], "router_dns_not_ours": ["fe80::1"]},
+  "new_device_group": 2,
+  "device_notices": [{"from": "192.168.1.54", "name": "Wilf's iPad", "to": "192.168.1.71",
+                      "mac": "da:11:22:33:44:03", "first": 1795000000.0}],
+  "device_events": [{"ts": 1795000000.0, "ip": "192.168.1.71",
+                     "text": "Wilf's iPad moved from 192.168.1.54 to 192.168.1.71; its rules moved with it."}]
 }
 ```
+
+`new_device_group` is the group a device seen for the first time is put in, or `null` for none (the default). `device_notices` lists devices with rules that have gone quiet just as a new device with a private Wi-Fi address appeared (`from` and `name`: the quiet one; `to`, `mac`, `first`: the new one and when it was first seen); the dashboard offers `POST /api/move-rules` for each. `device_events` is up to ten notes from the last week of what QuietNet did to devices' rules by itself (moved them, paused them, put a new device in the group), newest first. Names, addresses and notes come from the household's network: escape them before display. See ARCHITECTURE.md, "When a device changes address".
 
 `ipv6` is about devices using IPv6 for DNS. `dns_address` is the IPv6 address to give devices as a DNS server, shown on "Set up a device": a unique-local one if this computer has one, else a public one, never a temporary or link-local one; `""` if QuietNet isn't taking lookups over IPv6 or has no lasting address. `listening` says whether QuietNet hears the router's IPv6 announcements (Linux only, and only with the right to read raw network messages; always `false` on a Mac). `router_heard` is when the router last announced IPv6 on the home network (`null` if never heard). `router_dns` lists the IPv6 DNS servers those announcements tell devices to use, each kept until its stated lifetime runs out or for an hour at most; `router_dns_not_ours` is those that are not this computer taking lookups over IPv6. When that is not empty, the dashboard warns that some lookups skip QuietNet. Servers handed out only by DHCPv6 are not seen. The addresses come from the home network: escape them before display.
 
@@ -61,8 +68,10 @@ A **scope** is `all`, `group:<id>` or `device:<ip>`.
 {"ip": "192.168.1.23", "name": "", "hint": "Sams iPad", "hint_source": "Bonjour", "hint_detail": "Model: iPad13,1",
  "mac": "11:22:33:44:55:66",
  "this_computer": false, "last": 1795000000.0, "n": 412, "nb": 37, "on_network": 1795000000.0,
- "group": 1, "off": false, "enforced": false, "other_dns": 0}
+ "group": 1, "off": false, "enforced": false, "other_dns": 0, "paused": false, "warning": ""}
 ```
+
+`paused` is `true` when a different device now has this address, so the rules kept under it (its own and its group's) are paused until the device they belong to comes back; only the whole house's rules apply. `warning` is a plain-English sentence for the device's page when its rules are paused or could not be moved ("" if none); escape it before display. A device whose rules follow it by hardware address, or that a `device_notices` entry points at, is listed even before it has used QuietNet or been found by a scan.
 
 `name` is the name someone gave the device ("" if none). `hint` is the name QuietNet suggests from what the network reported ("" if none); `hint_source` says where it came from: `"DHCP"`, `"Bonjour"`, `"Windows network"`, `"UPnP"` or `"router"` ("" with no hint). `hint_detail` is a model or maker the device reported about itself (for example `"Model: Sonos One (Sonos, Inc.)"` or `"Runs Windows"`), or, for a device with neither a hint nor such a detail whose hardware address is a made-up private one, `"Private Wi-Fi address, so probably a phone, tablet or laptop"`; otherwise "". All three are plain text chosen by devices on the network: escape them before display. The dashboard saves a hint as the name with the ordinary `POST /api/device-name` call. See ARCHITECTURE.md, "Device names".
 
@@ -119,6 +128,8 @@ For QuietNet's own computer, `kill`, `off` and `schedule` never appear: it is ex
 | `POST /api/device-group` | `{"ip", "group"}` | An unknown or missing group removes the device from its group |
 | `POST /api/device-name` | `{"ip", "name"}` | Name cut to 40 characters |
 | `POST /api/enforce` | `{"ip", "on"}` | "Cut live connections" for one device. Must be a real IPv4 address, as text (`400` otherwise). Switching on also refuses, with `400` and `{"error"}`, this computer and addresses that are never devices; when the enforcer is running it also refuses the router and addresses outside the home network. The device's hardware address is recorded so a different device later given the same address is left alone |
+| `POST /api/move-rules` | `{"from", "to"}` | "Move the rules to this device": moves the name, group, own service blocks, internet switch, schedules and "cut live connections" from one address to another. Both must be IPv4 addresses as text (`400` otherwise). Refused with `400` and `{"error"}` when they are the same, either is this computer or the router, `from` has nothing to move, or `to` has rules of its own (a group alone is allowed, and replaced by `from`'s group if it has one). The history stays under the old address |
+| `POST /api/new-device-group` | `{"group"}` | The group a device seen for the first time is put in. `null`, or anything that isn't an existing group's id, means none. Returns `{"ok", "group"}` with the group now set (`null` for none). Deleting the group sets it back to none |
 | `POST /api/cloud` | `{"relay", "code"}` or `{"action": "forget"}` | Pair with a relay, or unpair. A relay address starting `http://` is refused, with nothing sent, unless the host is `localhost`, `127.0.0.1` or `::1`: `400` with `{"error": "That relay address starts with http://, which would send this Pi's key unprotected. Use an address starting with https:// instead."}` |
 | `POST /api/scan` | `{}` | Starts a network scan in the background. Returns what it will cover: `{"ok": true, "network": "192.168.4.0/22", "addresses": 1022, "capped": false}` |
 | `POST /api/update-list` | `{}` | Starts the community list download in the background |

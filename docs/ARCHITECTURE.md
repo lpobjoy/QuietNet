@@ -78,7 +78,7 @@ Over IPv4 the router's address sharing keeps the internet away from the filter, 
 
 Lookups over UDP are handled by a pool of 64 threads. At most 256 are in hand at once (`MAX_DNS_WAITING`), and at most 16 from any one device (`MAX_DNS_PER_DEVICE`), so one busy or broken device can't stop everyone else's; beyond that, new lookups are dropped and devices ask again. Lookups over TCP share 64 connections (`MAX_TCP_CLIENTS`), at most 8 from any one device (`MAX_TCP_PER_DEVICE`); more are closed at once. Both shares count a device by `device_address()`, so an IPv4 device asking over IPv6 shares its count with itself over IPv4.
 
-A device is identified by its IP address. If the router hands a device a different address, its name and rules do not follow it. The README advises reserving addresses in the router.
+A device's name and rules are kept under its IP address, and follow the device by its hardware address when that address changes: see [When a device changes address](#when-a-device-changes-address).
 
 ## The order rules are checked in
 
@@ -115,6 +115,18 @@ A rule applies to one of three scopes, written as text:
 - `device:<ip>`: one device
 
 A device is subject to all three at once: `all`, its own, and its group's (a device is in at most one group). Deleting a group deletes its service blocks, its internet switch and its schedules.
+
+### When a device changes address
+
+Rules, names and groups are kept under a device's IPv4 address, but a phone or tablet can be given a different one: when it makes up a new private Wi-Fi address, or simply when the router hands out a different number. Its old address may then go to another device. So once a minute `refresh_devices()` (run by the address watcher, never on a lookup) reads the neighbour table and keeps each address's rules pointed at the right device:
+
+- **Which device owns the rules.** For every address that carries anything of its own (a name, a group, an internet switch, a blocked service, a schedule, "cut live connections"), the hardware address seen there is recorded in `device_mac` (and `S.dev_mac`). When "cut live connections" is on and its hardware address is already known, that one is used.
+- **The device turns up at a new address.** If the new address carries nothing of its own, everything moves there (`move_rules()`): the name, the group, the device's own service blocks, internet switch and schedules, "cut live connections" with the hardware address to steer, and the note of which device it is. The history stays filed under the address each lookup came from. A note is kept ("Wilf's iPad moved from 192.168.1.54 to 192.168.1.71; its rules moved with it") and shown on the home page. If the new address has rules of its own, nothing is merged: both devices show a warning for the owner to sort out.
+- **A different device takes the address.** The address's own rules, and its group's, are paused (`S.paused_ips`, kept in `device_mac.paused`): they stay stored for the device they belong to, `scopes_for()` gives a paused address the whole house's rules only, and the enforcer does not steer it. The device page says "This number now belongs to a different device; the rules for Wilf's iPad are paused until it comes back". When the device comes back, at the same address or another free one, the rules apply again (or move with it).
+- **New devices.** Every hardware address seen is recorded in `known_macs`. If the owner has chosen a group under "New devices go into group" (Groups page; setting `new_device_group`), a hardware address never seen before, at an address with nothing of its own, is put in that group and a note is kept. That keeps a child's phone covered when it switches to a new private Wi-Fi address. The first look after this was added only records what is there, and the devices already found by scans count as known.
+- **"It may be the same device."** When a device with rules has not been seen for 15 minutes (`QUIET_AFTER`) and a device with a private Wi-Fi address, with nothing of its own but perhaps that group, appeared for the first time since about then (within three days), the home page and the new device's page say so, with a "Move the rules to this device" button (`POST /api/move-rules`).
+
+Hardware addresses are written in lower case; malformed ones, all-zero ones (unfinished entries in the neighbour table) and group (broadcast and multicast) ones are ignored. This computer and the router are never moved, nothing is moved onto them, and a hardware address seen at either is ignored everywhere. `decision()` still reads only memory.
 
 ### Schedules
 
@@ -303,7 +315,10 @@ Tables in `quietnet.db`:
 | `devices` | Names you gave devices |
 | `seen` | Devices found by the network scan: address, hardware address, host name |
 | `enforced` | Devices with "cut live connections" on |
-| `settings` | `junk_on` and `paused_until` |
+| `device_mac` | Which device (hardware address) the rules and name under each address belong to, and whether they are paused because a different device has the address. See [When a device changes address](#when-a-device-changes-address) |
+| `known_macs` | Every hardware address seen on the network, with where, and when first and last |
+| `events` | Notes of what QuietNet did to devices' rules by itself (moved, paused, put in the new-device group), the newest 200 |
+| `settings` | `junk_on`, `paused_until`, `new_device_group` and `macs_seeded` |
 
 Rules are also held in memory (the `State` object) and reloaded from the database at start-up by `init_db()`. Every change writes both, holding `db_lock`, and calls `rules_changed()` so the enforcer's remembered plan is worked out again. A freshly downloaded community list calls it too, since it changes block decisions.
 
@@ -333,7 +348,7 @@ The dashboard's history questions (today's totals in `/api/status`, the device l
 | Log writer | Saves recorded lookups once a second; prunes old history every 10 minutes |
 | Name refresher | Every two minutes, and soon after a scan, asks the devices on the network for their names (see [Device names](#device-names)) |
 | Name listeners | Hear Bonjour announcements and the DHCP requests devices broadcast when they join or rejoin (each only if it can be opened; on Linux the DHCP one reads packets through a filter and never takes port 67) |
-| Address watcher | Looks up this computer's network address every 10 seconds until it has one, then every minute |
+| Address watcher | Looks up this computer's network address every 10 seconds until it has one, then every minute; each time, also keeps devices' rules with them when they change address (`refresh_devices()`) |
 | Enforcer | Ticks every two seconds (Linux with the right permissions only) |
 | Cloud agent | Polls the relay when paired |
 | Scan, list download | Started on demand from the dashboard |
