@@ -879,6 +879,7 @@ function viewHome(){
     </button>`).join('');
   const scanning = st.scan && st.scan.state === 'scanning';
   return `
+  ${v6Warning(true)}
   <div class="card">
     <div class="row">
       <div class="grow"><h2>Block known adverts and trackers automatically</h2>
@@ -1177,20 +1178,51 @@ function appearanceCard(){
       <span class="theme-text"><b>${esc(name)}</b><span class="meta">${esc(text)}</span></span></label>`).join('')}
     </fieldset></section>`;
 }
+// A warning when the router tells devices to use its own IPv6 DNS server, which lets some of their
+// lookups skip QuietNet. Shown on the home page and on "Set up a device".
+function v6Warning(withLink){
+  const others = ((S.status || {}).ipv6 || {}).router_dns_not_ours || [];
+  if(!others.length) return '';
+  return `<div class="notice warn${withLink ? ' flex' : ''}"><span>Your router tells devices to use its own IPv6 DNS server
+    (${others.map(a => '<b>' + esc(a) + '</b>').join(', ')}), so some of their lookups skip QuietNet.
+    Set QuietNet's IPv6 address as well, or switch IPv6 off on your router.</span>
+    ${withLink ? '<button class="btn link" data-act="tab" data-tab="setup">Show me how</button>' : ''}</div>`;
+}
 function viewSetup(){
   const ip = esc((S.status || {}).ip || '…');
+  const v6 = (S.status || {}).ipv6 || {};
+  const ip6 = esc(v6.dns_address || '');
   const step = (title, steps) => `<details><summary>${title}</summary><ol>${steps.map(s => `<li>${s}</li>`).join('')}</ol></details>`;
+  // Steps that only apply when QuietNet has an IPv6 address to give, else an empty list.
+  const if6 = (...steps) => ip6 ? steps : [];
+  const v6Card = ip6 ? `<p>If your router hands out IPv6 (a BT Smart Hub does as it comes), also set this IPv6 address as a DNS server:</p>
+    <div class="bigcode">${ip6}</div>
+    <p class="meta">Or switch IPv6 off on your router instead (on a BT Smart Hub: <b>Advanced settings</b> → <b>IPv6</b>).
+      Otherwise devices also use the router's own IPv6 DNS server, and some of their lookups skip QuietNet.</p>`
+    : `<p class="meta"><b>IPv6:</b> QuietNet has no IPv6 address to give devices. If your router hands out IPv6 (a BT Smart Hub
+      does as it comes), switch IPv6 off on it (on a BT Smart Hub: <b>Advanced settings</b> → <b>IPv6</b>), or accept that
+      some lookups will skip QuietNet.</p>`;
   return `
+  ${v6Warning(false)}
   ${cloudCard()}
   <div class="card"><h2>How to point a device at QuietNet</h2>
     <p>Every device has a setting called <b>DNS</b>. Change it to this number and QuietNet can see and filter that device:</p>
     <div class="bigcode">${ip}</div>
+    ${v6Card}
     <p class="meta">To undo it at any time, set DNS back to <b>Automatic</b> on the device.</p>
-    ${step('iPhone or iPad', ['Open <b>Settings</b> → <b>Wi-Fi</b>.', 'Tap the (i) button next to your home Wi-Fi.', 'Tap <b>Configure DNS</b> → <b>Manual</b>.', 'Delete any numbers already there, tap <b>Add Server</b> and type <b>' + ip + '</b>.', 'Tap <b>Save</b>.'])}
-    ${step('Android phone or tablet', ['Open <b>Settings</b> → <b>Network &amp; internet</b> → <b>Internet</b> (or <b>Wi-Fi</b>).', 'Tap the cog next to your home Wi-Fi, then the pencil / <b>Advanced</b>.', 'Change <b>IP settings</b> to <b>Static</b> and type <b>' + ip + '</b> in <b>DNS 1</b>. Leave the rest as it is.', 'Save. Also check <b>Settings → Network → Private DNS</b> is <b>Off</b>.'])}
-    ${step('Smart TV, streaming stick or games console', ['Open the TV\'s <b>Network</b> settings and choose your connection.', 'Look for <b>Advanced</b>, <b>Manual</b> or <b>DNS settings</b>.', 'Set <b>DNS</b> (or "Primary DNS") to <b>' + ip + '</b>. Leave everything else on automatic.'])}
-    ${step('Windows PC', ['Open <b>Settings</b> → <b>Network &amp; internet</b> → <b>Wi-Fi</b> → <b>Hardware properties</b>.', 'Next to <b>DNS server assignment</b> choose <b>Edit</b> → <b>Manual</b>.', 'Turn on <b>IPv4</b> and type <b>' + ip + '</b> as the <b>Preferred DNS</b>. Save.'])}
-    ${step('Mac', ['Open <b>System Settings</b> → <b>Network</b> → <b>Wi-Fi</b> → <b>Details…</b>', 'Choose <b>DNS</b>, press <b>+</b> and type <b>' + ip + '</b>.', 'Remove any other numbers in the list and press <b>OK</b>.'])}
+    ${step('iPhone or iPad', ['Open <b>Settings</b> → <b>Wi-Fi</b>.', 'Tap the (i) button next to your home Wi-Fi.', 'Tap <b>Configure DNS</b> → <b>Manual</b>.', 'Delete any numbers already there, tap <b>Add Server</b> and type <b>' + ip + '</b>.',
+      ...if6('Tap <b>Add Server</b> again and type <b>' + ip6 + '</b>.'), 'Tap <b>Save</b>.'])}
+    ${step('Android phone or tablet', ['Open <b>Settings</b> → <b>Network &amp; internet</b> → <b>Internet</b> (or <b>Wi-Fi</b>).', 'Tap the cog next to your home Wi-Fi, then the pencil / <b>Advanced</b>.', 'Change <b>IP settings</b> to <b>Static</b> and type <b>' + ip + '</b> in <b>DNS 1</b>. Leave the rest as it is.',
+      ...if6('Type <b>' + ip6 + '</b> in <b>DNS 2</b>.'),
+      'Save. Also check <b>Settings → Network → Private DNS</b> is <b>Off</b>.',
+      'Android may keep using the router\'s own IPv6 DNS server as well, whatever you type here. If your router hands out IPv6, the surest fix is to switch IPv6 off on the router (on a BT Smart Hub: <b>Advanced settings</b> → <b>IPv6</b>).'])}
+    ${step('Smart TV, streaming stick or games console', ['Open the TV\'s <b>Network</b> settings and choose your connection.', 'Look for <b>Advanced</b>, <b>Manual</b> or <b>DNS settings</b>.', 'Set <b>DNS</b> (or "Primary DNS") to <b>' + ip + '</b>. Leave everything else on automatic.',
+      ...if6('If there is a separate IPv6 DNS setting, set it to <b>' + ip6 + '</b>.')])}
+    ${step('Windows PC', ['Open <b>Settings</b> → <b>Network &amp; internet</b> → <b>Wi-Fi</b> → <b>Hardware properties</b>.', 'Next to <b>DNS server assignment</b> choose <b>Edit</b> → <b>Manual</b>.', 'Turn on <b>IPv4</b> and type <b>' + ip + '</b> as the <b>Preferred DNS</b>.',
+      ...(ip6 ? ['Turn on <b>IPv6</b> and type <b>' + ip6 + '</b> as the <b>Preferred DNS</b>. Save.']
+              : ['Save. If your router hands out IPv6, switch IPv6 off on the router (on a BT Smart Hub: <b>Advanced settings</b> → <b>IPv6</b>), or Windows also uses the router\'s own IPv6 DNS server.'])])}
+    ${step('Mac', ['Open <b>System Settings</b> → <b>Network</b> → <b>Wi-Fi</b> → <b>Details…</b>', 'Choose <b>DNS</b>, press <b>+</b> and type <b>' + ip + '</b>.',
+      ...if6('Press <b>+</b> again and type <b>' + ip6 + '</b>.'), 'Remove any other numbers in the list and press <b>OK</b>.'])}
     ${step('The whole house at once (via your router)', ['Log in to your router (the address and password are usually on a sticker on it).', 'Find the <b>DHCP</b> or <b>LAN</b> settings and look for <b>DNS server</b>.', 'Set it to <b>' + ip + '</b> and save. Devices pick it up next time they reconnect to Wi-Fi.', '<b>Careful:</b> the internet will then seem broken for everyone whenever this computer is off or asleep.'])}
   </div>
   <div class="card"><h2>Good to know</h2>

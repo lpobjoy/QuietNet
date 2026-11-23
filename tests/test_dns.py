@@ -713,7 +713,7 @@ class LookupsOverIPv6(Base):
         self.assertTrue(server.TCPServer6.verify_request(None, "conn", ("2001:db8:1:2::5", 5000, 0, 0)))
 
     def test_ipv6_neighbours_are_matched_to_ipv4_devices_by_hardware_address(self):
-        with mock.patch.object(server, "own_ipv6", return_value=(set(), [])), \
+        with mock.patch.object(server, "own_ipv6", return_value=(set(), [], "")), \
                 mock.patch.object(server, "neighbours", return_value={KID: "aa:bb:cc:dd:ee:01"}), \
                 mock.patch.object(server, "ipv6_neighbours",
                                   return_value={self.PHONE_V6: "aa:bb:cc:dd:ee:01", "fd00::2": "aa:bb:cc:dd:ee:99"}):
@@ -724,7 +724,7 @@ class LookupsOverIPv6(Base):
         server.sql("INSERT OR REPLACE INTO seen(ip,mac,host,ts) VALUES(?,?,?,?)",
                    (KID, "aa:bb:cc:dd:ee:01", "", time.time()), commit=True)
         self.addCleanup(server.sql, "DELETE FROM seen WHERE ip=?", (KID,), True)
-        with mock.patch.object(server, "own_ipv6", return_value=(set(), [])), \
+        with mock.patch.object(server, "own_ipv6", return_value=(set(), [], "")), \
                 mock.patch.object(server, "neighbours", return_value={}), \
                 mock.patch.object(server, "ipv6_neighbours", return_value={self.PHONE_V6: "aa:bb:cc:dd:ee:01"}):
             server.refresh_ipv6_view()
@@ -754,9 +754,219 @@ class LookupsOverIPv6(Base):
                 "\tinet6 fd00::60 prefixlen 64 autoconf\n")
         with mock.patch.object(server.os.path, "exists", lambda p: False), \
                 mock.patch.object(server.subprocess, "run", return_value=mock.Mock(stdout=text)):
-            own, ranges = server.own_ipv6()
+            own, ranges, _ = server.own_ipv6()
         self.assertEqual(own, {"fe80::1", "2001:db8:1:2::60", "fd00::60"})
         self.assertEqual(ranges, [server.ipaddress.IPv6Network("2001:db8:1:2::/64")])
+
+    def test_a_lasting_unique_local_address_is_the_one_given_to_devices(self):
+        text = ("\tinet6 fe80::1%en0 prefixlen 64 secured scopeid 0x1\n"
+                "\tinet6 2001:db8:1:2::60 prefixlen 64 autoconf secured\n"
+                "\tinet6 fd00::60 prefixlen 64 autoconf secured\n")
+        with mock.patch.object(server.os.path, "exists", lambda p: False), \
+                mock.patch.object(server.subprocess, "run", return_value=mock.Mock(stdout=text)):
+            self.assertEqual(server.own_ipv6()[2], "fd00::60")
+
+    def test_a_temporary_address_is_never_given_to_devices(self):
+        text = ("\tinet6 2001:db8:1:2::77 prefixlen 64 autoconf temporary\n"
+                "\tinet6 2001:db8:1:2::60 prefixlen 64 autoconf secured\n")
+        with mock.patch.object(server.os.path, "exists", lambda p: False), \
+                mock.patch.object(server.subprocess, "run", return_value=mock.Mock(stdout=text)):
+            self.assertEqual(server.own_ipv6()[2], "2001:db8:1:2::60")
+
+    def test_temporary_and_link_local_addresses_on_linux_are_never_given_to_devices(self):
+        lines = ("20010db8000100020000000000000077 03 40 00 01   wlan0\n"      # temporary
+                 "fe800000000000000000000000000060 03 40 20 80   wlan0\n")     # link-local
+        with mock.patch.object(server.os.path, "exists", lambda p: p == "/proc/net/if_inet6"), \
+                mock.patch("builtins.open", mock.mock_open(read_data=lines)):
+            own, ranges, for_devices = server.own_ipv6()
+        self.assertEqual((len(own), for_devices), (2, ""))
+
+    def test_a_lasting_public_address_on_linux_is_given_to_devices(self):
+        lines = "20010db8000100020000000000000060 03 40 00 00   wlan0\n"
+        with mock.patch.object(server.os.path, "exists", lambda p: p == "/proc/net/if_inet6"), \
+                mock.patch("builtins.open", mock.mock_open(read_data=lines)):
+            self.assertEqual(server.own_ipv6()[2], "2001:db8:1:2::60")
+
+    def test_the_address_for_devices_is_kept_with_the_ipv6_view(self):
+        with mock.patch.object(server, "own_ipv6", return_value=(set(), [], "fd00::60")), \
+                mock.patch.object(server, "neighbours", return_value={}), \
+                mock.patch.object(server, "ipv6_neighbours", return_value={}):
+            server.refresh_ipv6_view()
+        self.assertEqual(server.S.v6_dns, "fd00::60")
+
+
+def router_advert(*options):
+    """A router announcement (ICMPv6 type 134) as it arrives on the socket: the 16-byte start, then
+    the given options, each already in its on-the-wire form."""
+    return bytes([134, 0, 0, 0, 64, 0]) + struct.pack(">HII", 1800, 0, 0) + b"".join(options)
+
+
+def rdnss(lifetime, *addresses):
+    """A DNS server option (type 25) naming the given IPv6 addresses for `lifetime` seconds."""
+    body = b"".join(server.ipaddress.IPv6Address(a).packed for a in addresses)
+    return bytes([25, 1 + 2 * len(addresses), 0, 0]) + struct.pack(">I", lifetime) + body
+
+
+class RouterAnnouncements(Base):
+    """The router's IPv6 announcements, read to spot it telling devices to use its own IPv6 DNS
+    server. Nothing here opens a real socket: the listener is handed stand-ins."""
+
+    HUB = "fe80::1"
+    PI = "2001:db8:1:2::60"
+
+    def listen(self, packets, sock=None):
+        """Run the listener over these (data, source) packets, then stop it."""
+        sock = sock or mock.Mock()
+        sock.recvfrom.side_effect = list(packets) + [KeyboardInterrupt()]
+        with self.assertRaises(KeyboardInterrupt):
+            server.router_advert_listener(sock)
+
+    def test_a_dns_server_named_in_a_router_announcement_is_read(self):
+        self.assertEqual(server.parse_router_advert(router_advert(rdnss(1200, self.HUB))), [(self.HUB, 1200)])
+
+    def test_several_dns_servers_and_other_options_are_read(self):
+        prefix_info = bytes([3, 4]) + bytes(30)                     # a prefix option, which is skipped
+        link_addr = bytes([1, 1, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff])
+        data = router_advert(link_addr, prefix_info, rdnss(600, self.HUB, "fd00::53"), rdnss(300, "2001:db8::53"))
+        self.assertEqual(server.parse_router_advert(data),
+                         [(self.HUB, 600), ("fd00::53", 600), ("2001:db8::53", 300)])
+
+    def test_an_announcement_without_a_dns_server_gives_an_empty_list(self):
+        self.assertEqual(server.parse_router_advert(router_advert()), [])
+
+    def test_a_message_that_is_not_a_router_announcement_is_ignored(self):
+        data = bytearray(router_advert(rdnss(600, self.HUB)))
+        data[0] = 135                                               # a router question, not an announcement
+        self.assertIsNone(server.parse_router_advert(bytes(data)))
+        self.assertIsNone(server.parse_router_advert(b"\x86\x00\x00"))
+
+    def test_a_cut_short_announcement_is_ignored(self):
+        data = router_advert(rdnss(600, self.HUB))
+        for size in (len(data) - 1, len(data) - 16, 17):
+            self.assertIsNone(server.parse_router_advert(data[:size]), size)
+
+    def test_an_option_of_length_zero_is_ignored(self):
+        self.assertIsNone(server.parse_router_advert(router_advert(bytes([25, 0]) + bytes(6))))
+
+    def test_a_dns_server_option_of_the_wrong_length_is_ignored(self):
+        too_short = bytes([25, 1]) + bytes(6)
+        even = bytes([25, 2]) + bytes(14)
+        self.assertIsNone(server.parse_router_advert(router_advert(too_short)))
+        self.assertIsNone(server.parse_router_advert(router_advert(even)))
+
+    def test_an_option_longer_than_the_message_is_ignored(self):
+        data = bytearray(router_advert(rdnss(600, self.HUB)))
+        data[17] = 9                                                # claims 72 bytes; only 24 arrived
+        self.assertIsNone(server.parse_router_advert(bytes(data)))
+
+    def test_many_options_are_read_without_trouble(self):
+        data = router_advert(*[rdnss(600, "2001:db8::%x" % i) for i in range(1, 200)])
+        self.assertEqual(len(server.parse_router_advert(data)), 199)
+
+    def test_addresses_no_device_could_use_for_dns_are_skipped(self):
+        data = router_advert(rdnss(600, "ff02::1", "::", "::1", "::ffff:8.8.8.8", self.HUB))
+        self.assertEqual(server.parse_router_advert(data), [(self.HUB, 600)])
+
+    def test_a_server_named_with_lifetime_zero_is_forgotten(self):
+        server.note_router_dns([(self.HUB, 600)], 1000.0)
+        server.note_router_dns([(self.HUB, 0)], 1001.0)
+        self.assertEqual(server.S.router_v6_dns, {})
+
+    def test_a_named_server_is_kept_for_an_hour_at_most(self):
+        server.note_router_dns([(self.HUB, 0xFFFFFFFF)], 1000.0)
+        self.assertEqual(server.S.router_v6_dns, {self.HUB: 1000.0 + server.RA_HOLD_MAX})
+        self.assertEqual(server.ipv6_dns_view(1000.0 + server.RA_HOLD_MAX + 1)["router_dns"], [])
+
+    def test_only_so_many_named_servers_are_kept(self):
+        server.note_router_dns([("2001:db8::%x" % i, 600 + i) for i in range(1, 50)], 1000.0)
+        self.assertEqual(len(server.S.router_v6_dns), server.RA_MAX_SERVERS)
+        self.assertIn("2001:db8::31", server.S.router_v6_dns)      # the longest-lived are the ones kept
+
+    def test_the_warning_list_names_a_router_server_that_is_not_this_computer(self):
+        server.note_router_dns([(self.HUB, 600)], time.time())
+        view = server.ipv6_dns_view()
+        self.assertEqual((view["router_dns"], view["router_dns_not_ours"]), ([self.HUB], [self.HUB]))
+
+    def test_the_warning_list_is_empty_when_the_router_names_only_this_computer(self):
+        server.S.v6_own = {self.PI}
+        with mock.patch.object(server.S, "dns_ipv6", True):
+            server.note_router_dns([(self.PI, 600)], time.time())
+            self.assertEqual(server.ipv6_dns_view()["router_dns_not_ours"], [])
+
+    def test_this_computer_counts_as_another_server_while_it_is_not_taking_ipv6_lookups(self):
+        server.S.v6_own = {self.PI}
+        with mock.patch.object(server.S, "dns_ipv6", False):
+            server.note_router_dns([(self.PI, 600)], time.time())
+            self.assertEqual(server.ipv6_dns_view()["router_dns_not_ours"], [self.PI])
+
+    def test_the_warning_list_is_empty_when_nothing_was_heard(self):
+        self.assertEqual(server.ipv6_dns_view()["router_dns_not_ours"], [])
+
+    def test_the_status_carries_the_ipv6_address_for_devices_when_known(self):
+        server.S.v6_dns = "fd12:3456::60"
+        with mock.patch.object(server.S, "dns_ipv6", True):
+            self.assertEqual(server.api_status()["ipv6"]["dns_address"], "fd12:3456::60")
+
+    def test_no_ipv6_address_is_offered_while_ipv6_lookups_are_not_taken(self):
+        server.S.v6_dns = "fd12:3456::60"
+        with mock.patch.object(server.S, "dns_ipv6", False):
+            self.assertEqual(server.api_status()["ipv6"]["dns_address"], "")
+
+    def test_the_listener_records_a_router_announcement(self):
+        self.listen([(router_advert(rdnss(600, self.HUB)), ("fe80::1%wlan0", 0, 0, 3))])
+        self.assertIn(self.HUB, server.S.router_v6_dns)
+        self.assertIsNotNone(server.S.ra_heard)
+
+    def test_the_listener_ignores_announcements_not_from_a_link_local_address(self):
+        self.listen([(router_advert(rdnss(600, "2001:db8::53")), ("2001:db8::99", 0, 0, 0))])
+        self.assertEqual(server.S.router_v6_dns, {})
+
+    def test_the_listener_ignores_badly_formed_announcements(self):
+        self.listen([(b"\x86\x00" + bytes(40), ("fe80::1", 0, 0, 3)), (b"junk", ("fe80::1", 0, 0, 3))])
+        self.assertEqual(server.S.router_v6_dns, {})
+
+    def test_the_listener_looks_at_only_so_many_announcements_a_second(self):
+        flood = [(router_advert(rdnss(600, "2001:db8::%x" % i)), ("fe80::1", 0, 0, 3)) for i in range(1, 40)]
+        with mock.patch.object(server, "RA_MAX_SERVERS", 100), \
+                mock.patch.object(server.time, "monotonic", return_value=500.0):
+            self.listen(flood)
+        self.assertEqual(len(server.S.router_v6_dns), server.RA_MAX_PER_SECOND)
+
+    def test_the_listener_never_sends_anything(self):
+        sock = mock.Mock()
+        self.listen([(router_advert(rdnss(600, self.HUB)), ("fe80::1", 0, 0, 3))], sock)
+        sock.sendto.assert_not_called()
+        sock.send.assert_not_called()
+
+    def test_the_listener_stops_quietly_when_the_socket_fails(self):
+        sock = mock.Mock()
+        sock.recvfrom.side_effect = OSError("network gone")
+        with mock.patch("builtins.print"):
+            server.router_advert_listener(sock)                    # returns, does not raise
+        self.assertFalse(server.S.ra_listening)
+
+    def test_the_listener_carries_on_quietly_when_the_socket_cannot_be_opened(self):
+        with mock.patch.object(server.os.path, "exists", return_value=True), \
+                mock.patch.object(server.socket, "socket", side_effect=PermissionError("no NET_RAW")):
+            self.assertIsNone(server.open_ra_socket())
+            server.router_advert_listener()                        # returns, does not raise
+        self.assertFalse(server.S.ra_listening)
+
+    def test_the_listener_is_not_tried_away_from_linux(self):
+        with mock.patch.object(server.os.path, "exists", return_value=False), \
+                mock.patch.object(server.socket, "socket") as opened:
+            self.assertIsNone(server.open_ra_socket())
+        opened.assert_not_called()
+
+    def test_the_socket_is_set_to_pass_on_router_announcements_only(self):
+        sock = mock.Mock()
+        with mock.patch.object(server.os.path, "exists", return_value=True), \
+                mock.patch.object(server.socket, "socket", return_value=sock):
+            self.assertIs(server.open_ra_socket(), sock)
+        level, option, value = sock.setsockopt.call_args[0]
+        words = struct.unpack("=8I", value)
+        self.assertEqual(words[4], 0xFFFFFFFF & ~(1 << 6))         # 134 = 4 * 32 + 6: the one type let through
+        self.assertTrue(all(w == 0xFFFFFFFF for i, w in enumerate(words) if i != 4))
 
 
 class CommunityList(Base):

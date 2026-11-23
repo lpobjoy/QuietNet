@@ -347,6 +347,58 @@ class DashboardContract(unittest.TestCase):
         self.assertIn("It works on IPv4 only", card)
 
 
+class DashboardIPv6Setup(unittest.TestCase):
+    """"Set up a device" and the home page, on routers that hand out their own IPv6 DNS server.
+    These checks read the page's script; nothing is run in a browser."""
+
+    @classmethod
+    def setUpClass(cls):
+        page = read("static", "index.html")
+        cls.setup = page[page.index("function viewSetup(){"):page.index("/* ---------- drawing & refreshing")]
+        cls.warning = page[page.index("function v6Warning("):page.index("function viewSetup(){")]
+        cls.home = page[page.index("function viewHome(){"):page.index("/* ---------- One device")]
+
+    def step(self, title):
+        """The script for one kind of device's steps on "Set up a device"."""
+        start = self.setup.index("step('%s'" % title)
+        return self.setup[start:self.setup.index("${step(", start + 1)]
+
+    def test_the_setup_page_reads_the_ipv6_address_from_the_status(self):
+        self.assertIn("const ip6 = esc(v6.dns_address || '');", self.setup)
+
+    def test_the_windows_steps_give_the_ipv6_address_when_known(self):
+        self.assertIn("Turn on <b>IPv6</b> and type <b>' + ip6 + '</b>", self.step("Windows PC"))
+
+    def test_the_android_steps_give_the_ipv6_address_when_known(self):
+        self.assertIn("' + ip6 + '</b> in <b>DNS 2</b>", self.step("Android phone or tablet"))
+
+    def test_the_iphone_and_mac_steps_give_the_ipv6_address_when_known(self):
+        self.assertIn("ip6", self.step("iPhone or iPad"))
+        self.assertIn("ip6", self.step("Mac"))
+
+    def test_the_setup_page_says_how_to_switch_ipv6_off_on_a_bt_hub(self):
+        self.assertIn("<b>Advanced settings</b> → <b>IPv6</b>", self.setup)
+
+    def test_without_an_ipv6_address_the_setup_page_says_to_switch_ipv6_off_or_accept_the_gap(self):
+        self.assertIn("QuietNet has no IPv6 address to give devices", self.setup)
+        self.assertIn("or accept that\n      some lookups will skip QuietNet", self.setup)
+
+    def test_the_router_dns_warning_is_shown_only_for_servers_that_are_not_ours(self):
+        self.assertIn(".router_dns_not_ours || []", self.warning)
+        self.assertIn("if(!others.length) return '';", self.warning)
+
+    def test_the_router_dns_warning_escapes_the_addresses(self):
+        self.assertIn("esc(a)", self.warning)
+
+    def test_the_router_dns_warning_says_what_to_do(self):
+        self.assertIn("Your router tells devices to use its own IPv6 DNS server", self.warning)
+        self.assertIn("Set QuietNet's IPv6 address as well, or switch IPv6 off on your router.", self.warning)
+
+    def test_the_router_dns_warning_is_on_the_home_page_and_the_setup_page(self):
+        self.assertIn("${v6Warning(true)}", self.home)
+        self.assertIn("${v6Warning(false)}", self.setup)
+
+
 class DashboardThemes(unittest.TestCase):
     """The dashboard has three looks (calm, household, control), picked under Appearance and kept
     in the qn_theme cookie. These checks read the page; nothing is run in a browser."""

@@ -45,9 +45,13 @@ A **scope** is `all`, `group:<id>` or `device:<ip>`.
   "community": {"installed": true, "count": 74100, "updated": 1795000000.0, "state": "idle", "error": ""},
   "today": {"total": 18234, "blocked": 2101},
   "scan": {"state": "idle", "ts": 1795000000.0, "network": "192.168.1.0/24", "addresses": 254, "capped": false},
-  "enforcer": {"available": false, "reason": "…", "active": false}
+  "enforcer": {"available": false, "reason": "…", "active": false},
+  "ipv6": {"dns_address": "fd12:3456::60", "listening": true, "router_heard": 1795000000.0,
+           "router_dns": ["fe80::1"], "router_dns_not_ours": ["fe80::1"]}
 }
 ```
+
+`ipv6` is about devices using IPv6 for DNS. `dns_address` is the IPv6 address to give devices as a DNS server, shown on "Set up a device": a unique-local one if this computer has one, else a public one, never a temporary or link-local one; `""` if QuietNet isn't taking lookups over IPv6 or has no lasting address. `listening` says whether QuietNet hears the router's IPv6 announcements (Linux only, and only with the right to read raw network messages; always `false` on a Mac). `router_heard` is when the router last announced IPv6 on the home network (`null` if never heard). `router_dns` lists the IPv6 DNS servers those announcements tell devices to use, each kept until its stated lifetime runs out or for an hour at most; `router_dns_not_ours` is those that are not this computer taking lookups over IPv6. When that is not empty, the dashboard warns that some lookups skip QuietNet. Servers handed out only by DHCPv6 are not seen. The addresses come from the home network: escape them before display.
 
 `junk_count` is worked out when an advert list is loaded or downloaded, not on each call. In `scan`, `network`, `addresses` and `capped` describe what the last scan covered (or will cover): the home network, how many addresses were knocked on, and whether the network was too big to scan in full (more than 1,024 addresses, in which case the 1,024 around this computer are scanned). They are left out until a scan has been asked for since QuietNet started, and are `""`, `0` and `false` if this computer had no network address at the time.
 

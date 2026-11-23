@@ -22,6 +22,7 @@ import signal
 import socket
 import socketserver
 import sqlite3
+import struct
 import subprocess
 import threading
 import time
@@ -81,6 +82,11 @@ NO_SUCH_NAME_SIGNALS = ("use-application-dns.net",)
 BLOCKED_SIGNALS = ("mask.icloud.com", "mask-h2.icloud.com")
 ROUTER_RECHECK = 300           # seconds between looks at which router this computer uses
 IPV6_RECHECK = 60              # seconds between looks at this computer's IPv6 addresses and its IPv6 neighbours
+# Listening for the router's IPv6 announcements, to spot it naming its own DNS server (see router_advert_listener).
+RA_READ_BYTES = 2048           # the most of one announcement read; real ones are well under 1500
+RA_MAX_PER_SECOND = 20         # announcements looked at each second; any more are read and ignored
+RA_MAX_SERVERS = 16            # IPv6 DNS servers remembered at once; the router normally names one or two
+RA_HOLD_MAX = 3600             # seconds a named server is remembered without being named again
 MAX_CACHED_SIZE = 4096         # bytes; a bigger answer is never remembered (it would tie up memory)
 # Record types a device that checks DNS signatures itself asks about a bare top-level name such as
 # 'com' (NS, SOA, DS, RRSIG, NSEC, DNSKEY, NSEC3). These go to the internet, not the home router.
@@ -188,6 +194,10 @@ class State:
     v6_own = set()          # this computer's own IPv6 addresses (see refresh_ipv6_view)
     v6_prefixes = []        # the home network's public IPv6 ranges, from this computer's own addresses
     v6_devices = {}         # a device's IPv6 address -> its IPv4 address, matched by hardware address
+    v6_dns = ""             # the IPv6 address to give devices as their DNS server ('' = none suitable)
+    ra_listening = False    # is router_advert_listener hearing the router's IPv6 announcements?
+    ra_heard = None         # when (time.time()) the router last announced IPv6 on the home network
+    router_v6_dns = {}      # IPv6 DNS servers the router names -> when to forget each (time.time())
 
 
 S = State()
@@ -215,6 +225,8 @@ answer_cache_lock = threading.Lock()
 # spot a router that sends lookups back here, so the two can't ask each other for ever.
 router_waiting = {}
 router_waiting_lock = threading.Lock()
+# Guards S.router_v6_dns and S.ra_heard, written by router_advert_listener and read by the dashboard.
+router_dns_lock = threading.Lock()
 # The thread clearing one device's history, started by the last POST /api/clear-history that named
 # a device (None before any). Kept so the tests can wait for it to finish.
 last_clear = None
@@ -1534,31 +1546,40 @@ def tidy_mac(text):
 
 
 def own_ipv6():
-    """This computer's own IPv6 addresses, and the public ranges of the home network they belong to.
-    Returns (set of addresses, list of networks). Link-local and unique-local addresses are counted as
-    this computer's but give no range (any such address is from the home network anyway). A range
+    """This computer's own IPv6 addresses, the public ranges of the home network they belong to, and
+    the one address to give devices as their DNS server. Returns (set of addresses, list of
+    networks, address text or ''). Link-local and unique-local addresses are counted as this
+    computer's but give no range (any such address is from the home network anyway). A range
     narrower than /64 is widened to /64, since home networks are /64 and an address handed out on its
-    own often shows as /128. Read from /proc/net/if_inet6 on Linux and from `ifconfig` elsewhere."""
-    found = []                                  # (address text, prefix length)
+    own often shows as /128. Read from /proc/net/if_inet6 on Linux and from `ifconfig` elsewhere.
+
+    The address for devices must last: a "temporary" (privacy) address, or one being given up or
+    still being checked, changes or vanishes within hours, so it is never chosen. A unique-local
+    address (fc00::/7, set by the home router and kept when the internet provider changes the
+    public range) is preferred over a public one. Link-local addresses (fe80::) are never chosen,
+    as most devices cannot be told to use one for DNS."""
+    found = []                                  # (address text, prefix length, lasts?)
     if os.path.exists("/proc/net/if_inet6"):
         try:
             with open("/proc/net/if_inet6") as f:
                 for line in f:
                     cols = line.split()
-                    if len(cols) >= 3 and len(cols[0]) == 32:
+                    if len(cols) >= 5 and len(cols[0]) == 32:
                         text = ":".join(cols[0][i:i + 4] for i in range(0, 32, 4))
-                        found.append((text, int(cols[2], 16)))
+                        # temporary 0x01, failed its check 0x08, being given up 0x20, still being checked 0x40
+                        found.append((text, int(cols[2], 16), not int(cols[4], 16) & 0x69))
         except (OSError, ValueError):
             pass
     else:
         try:
             text = subprocess.run([IFCONFIG, "-a"], capture_output=True, text=True, timeout=10).stdout
-            for m in re.finditer(r"inet6 ([0-9a-fA-F:]+)(?:%\S+)? prefixlen (\d+)", text):
-                found.append((m.group(1), int(m.group(2))))
+            for m in re.finditer(r"inet6 ([0-9a-fA-F:]+)(?:%\S+)? prefixlen (\d+)([^\n]*)", text):
+                passing = re.search(r"\b(temporary|deprecated|tentative|duplicated|detached)\b", m.group(3))
+                found.append((m.group(1), int(m.group(2)), not passing))
         except (OSError, ValueError, subprocess.SubprocessError):
             pass
-    own, ranges = set(), []
-    for text, length in found:
+    own, ranges, local, public = set(), [], [], []
+    for text, length, lasts in found:
         try:
             addr = ipaddress.IPv6Address(text)
         except ValueError:
@@ -1568,7 +1589,11 @@ def own_ipv6():
             net = ipaddress.IPv6Network("%s/%d" % (addr, min(length, 64)), strict=False)
             if net not in ranges:
                 ranges.append(net)
-    return own, ranges
+            if lasts:
+                public.append(str(addr))
+        elif lasts and addr in HOME_ONLY_V6[2]:
+            local.append(str(addr))
+    return own, ranges, (sorted(local) + sorted(public) + [""])[0]
 
 
 def ipv6_neighbours():
@@ -1600,14 +1625,14 @@ def refresh_ipv6_view():
     so a device's IPv6 lookups come under its IPv4 rules (see answer_query). IPv4 devices come from
     the last network scan (the 'seen' table, oldest first) and then the current neighbour table,
     which is fresher and so wins."""
-    own, ranges = own_ipv6()
+    own, ranges, for_devices = own_ipv6()
     by_mac = {}
     if db is not None:
         for ip, mac in sql("SELECT ip, mac FROM seen WHERE mac != '' ORDER BY ts"):
             by_mac[mac] = ip
     by_mac.update({mac: ip for ip, mac in neighbours().items()})
     matched = {addr: by_mac[mac] for addr, mac in ipv6_neighbours().items() if mac in by_mac}
-    S.v6_own, S.v6_prefixes, S.v6_devices = own, ranges, matched
+    S.v6_own, S.v6_prefixes, S.v6_devices, S.v6_dns = own, ranges, matched, for_devices
 
 
 def ipv6_watcher():
@@ -1619,6 +1644,135 @@ def ipv6_watcher():
         except Exception as e:
             print("Could not check this computer's IPv6 addresses:", e, flush=True)
         time.sleep(IPV6_RECHECK)
+
+
+def parse_router_advert(data):
+    """Read one IPv6 router announcement ("router advertisement", ICMPv6 type 134) and return the
+    DNS servers it names (its RDNSS parts, option 25), as a list of (address text, seconds to keep
+    using it). Returns None if the message is not a router announcement or is badly formed.
+
+    The message comes from anyone on the home network, so every length is checked before it is
+    used: the fixed 16-byte start, then each option's length byte (in 8-byte units; 0 is not
+    allowed and would never move forward), which must fit inside what arrived. A DNS server part
+    must be at least 24 bytes, an odd number of units, holding whole 16-byte addresses. A bad
+    option spoils the whole message, as the standard says. Each option takes at least 8 bytes, so
+    the loop ends within len(data) / 8 steps. Multicast, unspecified, loopback and IPv4-style
+    addresses are skipped, as no device would use them for DNS."""
+    if not isinstance(data, (bytes, bytearray)) or len(data) < 16 or data[0] != 134 or data[1] != 0:
+        return None
+    servers, at = [], 16
+    while at < len(data):
+        if len(data) - at < 2:
+            return None
+        kind, units = data[at], data[at + 1]
+        size = units * 8
+        if units == 0 or at + size > len(data):
+            return None
+        if kind == 25:
+            if units < 3 or units % 2 == 0:
+                return None
+            lifetime = int.from_bytes(data[at + 4:at + 8], "big")
+            for start in range(at + 8, at + size, 16):
+                addr = ipaddress.IPv6Address(bytes(data[start:start + 16]))
+                if addr.is_multicast or addr.is_unspecified or addr.is_loopback or addr.ipv4_mapped:
+                    continue
+                servers.append((str(addr), lifetime))
+        at += size
+    return servers
+
+
+def note_router_dns(servers, now):
+    """Remember the IPv6 DNS servers named in one router announcement (from parse_router_advert),
+    each until its stated lifetime runs out, but never more than RA_HOLD_MAX seconds without being
+    named again, so a router that stops naming one (IPv6 switched off, say) is forgotten within the
+    hour. A lifetime of 0 means "stop using this one now". At most RA_MAX_SERVERS are kept; past
+    that the one due to be forgotten soonest makes way. Also notes that the router announced IPv6."""
+    with router_dns_lock:
+        S.ra_heard = now
+        for addr, lifetime in servers:
+            if lifetime == 0:
+                S.router_v6_dns.pop(addr, None)
+                continue
+            S.router_v6_dns[addr] = now + min(lifetime, RA_HOLD_MAX)
+        for addr in [a for a, until in S.router_v6_dns.items() if until <= now]:
+            del S.router_v6_dns[addr]
+        while len(S.router_v6_dns) > RA_MAX_SERVERS:
+            del S.router_v6_dns[min(S.router_v6_dns, key=S.router_v6_dns.get)]
+
+
+def open_ra_socket():
+    """Open a socket that receives the router's IPv6 announcements, or return None if that can't be
+    done here. Linux only, and it needs the right to read raw network messages (NET_RAW), which the
+    QuietNet container has. On a Mac, or without that right, QuietNet carries on without it. The
+    socket is only ever read from; nothing is sent. Where the system allows, it is told to pass on
+    router announcements only, so other IPv6 control messages are not even handed over."""
+    if not os.path.exists("/proc/net/if_inet6") or not hasattr(socket, "IPPROTO_ICMPV6"):
+        return None
+    try:
+        sock = socket.socket(socket.AF_INET6, socket.SOCK_RAW, socket.IPPROTO_ICMPV6)
+    except (OSError, ValueError):
+        return None
+    try:
+        words = [0xFFFFFFFF] * 8                        # a set bit means "don't pass this type on"
+        words[134 >> 5] &= ~(1 << (134 & 31))
+        sock.setsockopt(socket.IPPROTO_ICMPV6, 1, struct.pack("=8I", *words))   # 1 = ICMP6_FILTER
+    except OSError:
+        pass                                            # not needed: parse_router_advert checks the type
+    return sock
+
+
+def router_advert_listener(sock=None):
+    """Background thread: listen for the router's IPv6 announcements and note which DNS servers it
+    tells devices to use (see parse_router_advert and note_router_dns). A router that hands out its
+    own IPv6 DNS server, as a BT Smart Hub does as it ships, lets devices send some lookups past
+    QuietNet, and the dashboard warns about it. Best effort: if the socket can't be opened (see
+    open_ra_socket) this returns quietly. Announcements must come from a link-local address, as real
+    ones always do, and at most RA_MAX_PER_SECOND are looked at each second, so a flood of them
+    costs little. Never sends anything."""
+    sock = sock or open_ra_socket()
+    if sock is None:
+        return
+    S.ra_listening = True
+    window, looked = time.monotonic(), 0
+    try:
+        while True:
+            try:
+                data, addr = sock.recvfrom(RA_READ_BYTES)
+            except OSError as e:
+                print("Stopped listening for the router's IPv6 announcements:", e, flush=True)
+                return
+            now = time.monotonic()
+            if now - window >= 1:
+                window, looked = now, 0
+            if looked >= RA_MAX_PER_SECOND:
+                continue
+            looked += 1
+            try:
+                if not ipaddress.IPv6Address(str(addr[0]).split("%")[0]).is_link_local:
+                    continue
+            except (ValueError, IndexError, TypeError):
+                continue
+            servers = parse_router_advert(data)
+            if servers is not None:
+                note_router_dns(servers, time.time())
+    finally:
+        S.ra_listening = False
+
+
+def ipv6_dns_view(now=None):
+    """What the dashboard shows about IPv6 and DNS (the "ipv6" part of GET /api/status): the
+    address to give devices for IPv6 DNS ('' if QuietNet isn't taking lookups over IPv6 or has no
+    lasting address), whether the router's announcements are being listened for and when it last
+    announced IPv6, the IPv6 DNS servers it names, and which of those are not this computer. A
+    server only counts as this computer if QuietNet is taking lookups over IPv6 on that address."""
+    now = time.time() if now is None else now
+    with router_dns_lock:
+        named = sorted(a for a, until in S.router_v6_dns.items() if until > now)
+        heard = S.ra_heard
+    ours = S.v6_own if S.dns_ipv6 else set()
+    return {"dns_address": S.v6_dns if S.dns_ipv6 else "", "listening": S.ra_listening,
+            "router_heard": heard, "router_dns": named,
+            "router_dns_not_ours": [a for a in named if a not in ours]}
 
 
 def hint_refresher():
@@ -1769,6 +1923,7 @@ def api_status():
         "today": {"total": total, "blocked": blocked},
         "scan": dict(S.scan_info, state=S.scan_state, ts=S.scan_ts),
         "enforcer": ENF.status() if ENF else {"available": False, "reason": "", "active": False},
+        "ipv6": ipv6_dns_view(now),
     }
 
 
@@ -2347,6 +2502,7 @@ def main():
         NAMER.start_listeners()
         threading.Thread(target=hint_refresher, daemon=True).start()
     start_dns(args.dns_port)
+    threading.Thread(target=router_advert_listener, daemon=True).start()
 
     global ENF
     ENF = enforcer.Enforcer(S.local_ip, enforcement_plan, neighbours, data_dir=DATA, learn_mac=learn_enforced_mac)

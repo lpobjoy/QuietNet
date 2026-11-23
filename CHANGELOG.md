@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+The router's own IPv6 DNS server (23 November):
+- **Fixed: "Set up a device" now gives the Pi's IPv6 address too.** A router that hands out IPv6 (a BT Smart Hub does as it ships) also tells devices to use its own IPv6 DNS server, so a Windows laptop or Android phone set up for IPv4 only sent some lookups past QuietNet, and blocks and bedtime applied only some of the time. Each kind of device now gets the IPv6 step as well, with the choice of switching IPv6 off on the router (BT Smart Hub: Advanced settings, IPv6); if the Pi has no IPv6 address, the page says to switch IPv6 off on the router or accept that some lookups skip QuietNet.
+- **New: a warning when the router names its own IPv6 DNS server.** On a Pi, QuietNet listens (never sends) for the router's IPv6 announcements, and the home page and "Set up a device" warn when they name a DNS server that is not the Pi. New `ipv6` part in `GET /api/status`.
+
 Docker's firewall and "Cut live connections" (23 November):
 - **New: the installer can make Docker's firewall let passed-on traffic through for good.** Docker drops traffic the Pi passes on, so "Cut live connections" asked people to run `sudo iptables -I DOCKER-USER -i wlan0 -o wlan0 -j ACCEPT`, and that was lost at every restart. After asking (or with `--yes`), the installer now adds a small systemd service, `quietnet-forward`, that puts this one rule back every time Docker starts, for the network connection the Pi reaches its router on. It lets through only traffic that comes in on that connection and goes straight back out on it. It is skipped, with a note, without systemd or iptables, and a service of the same name made by hand is left alone. `--uninstall` says how to remove it. **To get it on a Pi already installed, run the install line again.**
 - The device page's firewall advice now says a command run by hand lasts until the Pi restarts and, for Docker's firewall, that running the install line again makes it permanent.
