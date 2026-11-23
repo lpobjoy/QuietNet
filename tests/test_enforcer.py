@@ -210,7 +210,7 @@ class Ticking(EnforcerCase):
         self.e._tick()
         for text in self.loaded_rules():
             self.assertTrue(text.startswith("table inet quietnet\ndelete table inet quietnet\ntable inet quietnet {"), text)
-        self.assertNotIn("drop", self.loaded_rules()[-1])
+        self.assertNotIn("ip daddr != %s drop" % US, self.loaded_rules()[-1])
 
     def test_the_firewall_is_only_reloaded_when_the_plan_changes(self):
         self.plan = {KID: {"off": False, "ips": {"203.0.113.5"}}}
@@ -280,7 +280,11 @@ class Ticking(EnforcerCase):
         w = ["iptables", "-w", "5"]
         self.assertEqual(cmds, [w + ["-N", "QUIETNET"], w + ["-C", "FORWARD", "-j", "QUIETNET"],
                                 w + ["-F", "QUIETNET"],
+                                w + ["-A", "QUIETNET", "-s", KID, "-p", "tcp", "--dport", "853", "-j", "DROP"],
+                                w + ["-A", "QUIETNET", "-s", KID, "-p", "udp", "--dport", "853", "-j", "DROP"],
                                 w + ["-A", "QUIETNET", "-s", KID, "-d", "203.0.113.5", "-j", "DROP"],
+                                w + ["-A", "QUIETNET", "-s", TV, "-p", "tcp", "--dport", "853", "-j", "DROP"],
+                                w + ["-A", "QUIETNET", "-s", TV, "-p", "udp", "--dport", "853", "-j", "DROP"],
                                 w + ["-A", "QUIETNET", "-s", TV, "!", "-d", US, "-j", "DROP"],
                                 w + ["-N", "QUIETNET"], w + ["-C", "FORWARD", "-j", "QUIETNET"]])
 
@@ -299,8 +303,8 @@ class Ticking(EnforcerCase):
             self.e._tick()
             failing["on"] = False
             self.e._tick()
-        appends = [args for args, _ in self.commands if "-A" in args]
-        self.assertEqual(len(appends), 2)                        # tried again on the next tick
+        cuts = [args for args, _ in self.commands if "-A" in args and "!" in args]
+        self.assertEqual(len(cuts), 2)                           # tried again on the next tick
         self.assertIn("iptables update failed; will try again.", self.log)
 
     def test_the_iptables_jump_is_put_back_if_something_removed_it(self):
@@ -511,8 +515,123 @@ class FirewallCheckFailures(EnforcerCase):
             return real(args, **kw)
         with mock.patch.object(enforcer.subprocess, "run", flushed):
             self.e._tick()
-        appends = [a for a, _ in self.commands if "-A" in a]
-        self.assertEqual(len(appends), 2)        # loaded once, then again after the flush
+        cuts = [a for a, _ in self.commands if "-A" in a and "!" in a]
+        self.assertEqual(len(cuts), 2)           # loaded once, then again after the flush
+
+
+class DnsRedirect(unittest.TestCase):
+    """A steered device's lookups sent to another DNS server are answered by QuietNet, and private
+    DNS (port 853) is dropped, so it falls back to ordinary DNS (known issue 8)."""
+
+    PLAN = {KID: {"off": False, "ips": set()}, TV: {"off": True, "ips": set()}}
+
+    def text(self, plan=None, port=53):
+        """The firewall text for the plan, with QuietNet answering on `port`."""
+        return enforcer.nft_ruleset(self.PLAN if plan is None else plan, US, port)
+
+    def test_ordinary_dns_from_steered_devices_is_sent_to_quietnet(self):
+        text = self.text()
+        for proto in ("udp", "tcp"):
+            self.assertIn("ip saddr { %s, %s } ip daddr != %s %s dport 53 dnat ip to %s:53" % (KID, TV, US, proto, US),
+                          text)
+
+    def test_the_redirect_goes_to_the_port_quietnet_answers_on(self):
+        self.assertIn("dnat ip to %s:5353" % US, self.text(port=5353))
+
+    def test_the_redirect_is_made_before_routing_in_a_nat_chain(self):
+        self.assertIn("type nat hook prerouting priority -100; policy accept;", self.text())
+
+    def test_private_dns_from_steered_devices_is_dropped(self):
+        text = self.text()
+        self.assertIn("ip saddr { %s, %s } tcp dport 853 drop" % (KID, TV), text)
+        self.assertIn("ip saddr { %s, %s } udp dport 853 drop" % (KID, TV), text)
+
+    def test_the_redirect_and_drops_name_only_steered_devices(self):
+        text = self.text({KID: {"off": False, "ips": set()}})
+        for line in text.splitlines():
+            if "dport 53 " in line or "dport 853 " in line:
+                self.assertIn("ip saddr { %s }" % KID, line)
+                self.assertNotIn("ip saddr { %s" % US, line)
+                self.assertNotIn(GATEWAY, line)
+
+    def test_nothing_is_redirected_or_dropped_when_nobody_is_steered(self):
+        text = self.text({})
+        self.assertNotIn("dnat", text)
+        self.assertNotIn("853", text)
+        self.assertNotIn("prerouting", text)
+
+    def test_the_whole_table_including_the_redirect_is_replaced_in_one_step(self):
+        self.assertTrue(self.text().startswith("table inet quietnet\ndelete table inet quietnet\ntable inet quietnet {"))
+
+    def test_without_a_dns_port_there_is_no_redirect_but_private_dns_is_still_dropped(self):
+        text = self.text(port=None)
+        self.assertNotIn("dnat", text)
+        self.assertIn("tcp dport 853 drop", text)
+
+    def test_no_redirect_while_this_machine_only_knows_itself_as_127_0_0_1(self):
+        self.assertNotIn("dnat", enforcer.nft_ruleset(self.PLAN, "127.0.0.1", 53))
+
+    def test_a_bad_device_address_is_refused(self):
+        for bad in ("192.168.1.23; flush ruleset", "192.168.1.256", "2001:db8::1", "kid"):
+            with self.assertRaises(ValueError, msg=bad):
+                enforcer.nft_ruleset({bad: {"off": True, "ips": set()}}, US, 53)
+
+    def test_a_bad_address_for_this_machine_is_refused(self):
+        with self.assertRaises(ValueError):
+            enforcer.nft_ruleset(self.PLAN, "192.168.1.60 } flush ruleset {", 53)
+
+    def test_a_bad_port_is_refused(self):
+        for bad in (0, 65536, -1, "53", True, 53.0):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                enforcer.nft_ruleset(self.PLAN, US, bad)
+
+    def test_the_older_iptables_tool_drops_private_dns_but_does_not_redirect(self):
+        cmds = enforcer.iptables_rules({KID: {"off": False, "ips": set()}}, US)
+        self.assertIn(["-A", "QUIETNET", "-s", KID, "-p", "tcp", "--dport", "853", "-j", "DROP"], cmds)
+        self.assertIn(["-A", "QUIETNET", "-s", KID, "-p", "udp", "--dport", "853", "-j", "DROP"], cmds)
+        self.assertFalse(any("DNAT" in c or "53" in c for c in cmds))
+
+    def test_the_older_iptables_tool_refuses_a_bad_device_address(self):
+        with self.assertRaises(ValueError):
+            enforcer.iptables_rules({"-j ACCEPT": {"off": True, "ips": set()}}, US)
+
+
+class DnsRedirectLoaded(EnforcerCase):
+    """The enforcer loads the DNS redirect with its other rules, and takes it away with them."""
+
+    def setUp(self):
+        super().setUp()
+        self.e.dns_port = 53
+
+    def test_the_loaded_rules_send_a_steered_devices_lookups_to_quietnet(self):
+        self.plan = {KID: {"off": False, "ips": set()}}
+        self.e._tick()
+        self.assertIn("udp dport 53 dnat ip to %s:53" % US, self.loaded_rules()[-1])
+
+    def test_the_redirect_goes_when_the_last_device_is_released(self):
+        self.plan = {KID: {"off": False, "ips": set()}}
+        self.e._tick()
+        self.plan = {}
+        self.e._tick()
+        self.assertNotIn("dnat", self.loaded_rules()[-1])
+
+    def test_stopping_deletes_the_whole_table_with_the_redirect_in_it(self):
+        self.plan = {KID: {"off": False, "ips": set()}}
+        self.e._tick()
+        self.commands.clear()
+        self.e._teardown()
+        self.assertIn((["nft", "delete", "table", "inet", "quietnet"], None), self.commands)
+
+    def test_a_start_after_a_crash_deletes_the_whole_table_with_the_redirect_in_it(self):
+        self.e._recover()
+        self.assertIn((["nft", "delete", "table", "inet", "quietnet"], None), self.commands)
+
+    def test_the_status_says_the_redirect_is_on_with_nft(self):
+        self.assertTrue(self.e.status()["dns_redirect"])
+
+    def test_the_status_says_the_redirect_is_off_with_the_older_iptables_tool(self):
+        self.e.backend = "iptables"
+        self.assertFalse(self.e.status()["dns_redirect"])
 
 
 class FirewallAdvice(EnforcerCase):
@@ -925,7 +1044,7 @@ class Availability(unittest.TestCase):
         e = self.make()
         self.assertTrue(e.available())
         self.assertEqual(e.status(), {"available": True, "reason": "", "problem": "", "problems": {},
-                                      "active": False, "backend": "nft", "gateway": GATEWAY})
+                                      "active": False, "backend": "nft", "gateway": GATEWAY, "dns_redirect": False})
 
     def test_off_on_a_mac_with_a_plain_explanation(self):
         e = self.make(linux=False)

@@ -24,6 +24,7 @@ import socketserver
 import sqlite3
 import struct
 import subprocess
+import sys
 import threading
 import time
 import urllib.request
@@ -80,6 +81,28 @@ HOME_ENDINGS = (".local", ".lan", ".home", ".internal", ".home.arpa")
 #  - Apple devices switch off iCloud Private Relay for the network if these names are blocked.
 NO_SUCH_NAME_SIGNALS = ("use-application-dns.net",)
 BLOCKED_SIGNALS = ("mask.icloud.com", "mask-h2.icloud.com")
+# Other DNS services that a phone, a computer or a browser can be set to use instead of QuietNet,
+# over an encrypted connection ("secure DNS" in a browser, "Private DNS" on Android). Each name, and
+# every name beneath it (NextDNS and others give each customer a name of their own), gets the
+# blocked answer for every device, whatever the rules say, so the device can't reach the service
+# and falls back to ordinary DNS, which comes to QuietNet. The lookup is kept in the history and
+# shown on the device's page as "tried to use another DNS service" (known issue 8).
+# To add a service, add its name here.
+OTHER_DNS_SERVICES = frozenset((
+    "dns.google", "dns.google.com", "8888.google",                                  # Google
+    "cloudflare-dns.com", "mozilla.cloudflare-dns.com", "chrome.cloudflare-dns.com",
+    "security.cloudflare-dns.com", "family.cloudflare-dns.com",
+    "1dot1dot1dot1.cloudflare-dns.com", "one.one.one.one",                           # Cloudflare
+    "dns.quad9.net", "dns9.quad9.net", "dns10.quad9.net", "dns11.quad9.net",        # Quad9
+    "doh.opendns.com",                                                              # OpenDNS
+    "dns.nextdns.io",                                                               # NextDNS
+    "doh.cleanbrowsing.org",                                                        # CleanBrowsing
+    "dns.adguard.com", "dns.adguard-dns.com",                                       # AdGuard
+    "doh.mullvad.net", "dns.mullvad.net",                                           # Mullvad
+    "doh.dns.sb",                                                                   # DNS.SB
+    "dns.controld.com", "freedns.controld.com",                                     # Control D
+))
+MAX_OTHER_DNS_DEVICES = 1024   # devices remembered as having tried another DNS service (see S.other_dns)
 ROUTER_RECHECK = 300           # seconds between looks at which router this computer uses
 IPV6_RECHECK = 60              # seconds between looks at this computer's IPv6 addresses and its IPv6 neighbours
 # Listening for the router's IPv6 announcements, to spot it naming its own DNS server (see router_advert_listener).
@@ -198,6 +221,7 @@ class State:
     ra_listening = False    # is router_advert_listener hearing the router's IPv6 announcements?
     ra_heard = None         # when (time.time()) the router last announced IPv6 on the home network
     router_v6_dns = {}      # IPv6 DNS servers the router names -> when to forget each (time.time())
+    other_dns = {}          # device address -> when (time.time()) it last looked up another DNS service
 
 
 S = State()
@@ -462,6 +486,14 @@ def suffixes(domain):
     A rule on any of these applies to the name, which is how one entry covers everything beneath it."""
     parts = domain.split(".")
     return [".".join(parts[i:]) for i in range(len(parts) - 1)]
+
+
+def is_other_dns_service(name):
+    """Is this name, or a name it sits beneath, one of the other DNS services in OTHER_DNS_SERVICES?
+    Capitals and a final dot are ignored ('DNS.Google.' counts). Only a few set lookups, so it is
+    cheap enough to ask for every lookup."""
+    name = (name or "").strip().rstrip(".").lower()
+    return bool(name) and any(s in OTHER_DNS_SERVICES for s in suffixes(name))
 
 
 def is_junk(domain):
@@ -1226,6 +1258,13 @@ def answer_query(data, client, forwarder, over_tcp=False):
         if name in NO_SUCH_NAME_SIGNALS:
             return reply(data, qend, 3)
         return blocked_reply(data, qtype, qend)
+    if is_other_dns_service(name):
+        # Another DNS service (see OTHER_DNS_SERVICES): blocked for every device, paused or not,
+        # whatever the rules say, and noted so the device's page can say it tried.
+        log_q.put((time.time(), client, name, 1))
+        if client in S.other_dns or len(S.other_dns) < MAX_OTHER_DNS_DEVICES:
+            S.other_dns[client] = time.time()
+        return blocked_reply(data, qtype, qend)
     if not loggable:
         # Names that skip the checks: odd characters, home-network endings, reverse lookups.
         # If this device's internet is off they get the blocked answer, so they can't be used
@@ -1256,6 +1295,66 @@ def answer_query(data, client, forwarder, over_tcp=False):
     return resp
 
 
+# Linux's "tell me which of my addresses this packet was sent to" option (IP_PKTINFO). Python only
+# names it from 3.13 on Linux; its number there has always been 8. Other systems go without it.
+IP_PKTINFO = getattr(socket, "IP_PKTINFO", 8) if sys.platform.startswith("linux") else None
+
+
+def ask_for_reply_address(sock):
+    """On Linux, ask an IPv4 UDP socket to report, with each lookup, which of this computer's
+    addresses it was sent to. True if that worked.
+
+    Why: the socket listens on every address at once, so without this the system picks the
+    address an answer is sent from. When the enforcer redirects a steered device's lookup meant for
+    8.8.8.8 to this computer (see enforcer.nft_ruleset), the answer must leave from exactly the
+    address the lookup was redirected to; only then can the firewall put 8.8.8.8 back as the
+    sender. An answer from any other address of this computer would be thrown away by the device."""
+    if IP_PKTINFO is None or sock.family != socket.AF_INET or not hasattr(sock, "recvmsg"):
+        return False
+    try:
+        sock.setsockopt(socket.IPPROTO_IP, IP_PKTINFO, 1)
+        return True
+    except OSError:
+        return False
+
+
+def receive_lookup(sock, with_address):
+    """Wait for one lookup. Returns (packet, sender, the address it was sent to or None). The last
+    is only known when ask_for_reply_address worked (with_address)."""
+    if not with_address:
+        data, addr = sock.recvfrom(4096)
+        return data, addr, None
+    data, ancillary, _flags, addr = sock.recvmsg(4096, socket.CMSG_SPACE(12))
+    return data, addr, reply_address(ancillary)
+
+
+def reply_address(ancillary):
+    """The address a lookup was sent to, from the extra details Linux gives with it (a 12-byte
+    record: the network card's number, then two addresses, the second being the one the packet
+    was addressed to). None if it isn't there or isn't a plain address of one device."""
+    for level, kind, value in ancillary:
+        if level == socket.IPPROTO_IP and kind == IP_PKTINFO and len(value) >= 12:
+            addr = ipaddress.IPv4Address(value[8:12])
+            if addr.is_multicast or addr.is_unspecified or addr == ipaddress.IPv4Address("255.255.255.255"):
+                return None
+            return str(addr)
+    return None
+
+
+def send_answer(sock, resp, addr, source):
+    """Send an answer back to the device that asked, from `source` (the address the lookup was sent
+    to) when that is known, so the answer leaves from the address the device or the firewall
+    expects. If the system won't send from it, fall back to letting the system choose."""
+    if source:
+        try:
+            info = struct.pack("=i4s4s", 0, socket.inet_aton(source), bytes(4))
+            sock.sendmsg([resp], [(socket.IPPROTO_IP, IP_PKTINFO, info)], 0, addr)
+            return
+        except OSError:
+            pass
+    sock.sendto(resp, addr)
+
+
 def udp_server(sock):
     """Receive lookups on the UDP socket for ever, handing each to a pool of 64 worker
     threads so that one slow upstream answer does not hold up the rest. At most
@@ -1263,20 +1362,22 @@ def udp_server(sock):
     beyond that, new lookups are dropped rather than queued without limit (a flood from one
     device, or the internet being down). The per-device share means one busy or broken device
     can't use up every slot and stop everyone else's lookups. Devices simply ask again.
-    On the IPv6 socket, lookups from outside the home network are dropped unanswered."""
+    On the IPv6 socket, lookups from outside the home network are dropped unanswered.
+    On Linux, each answer leaves from the address its lookup was sent to (see ask_for_reply_address)."""
     pool = ThreadPoolExecutor(max_workers=64)
+    with_address = ask_for_reply_address(sock)
     slots = threading.BoundedSemaphore(MAX_DNS_WAITING)
     on_ipv6 = sock.family == socket.AF_INET6
     in_hand = {}                    # device address -> lookups of its being answered now
     in_hand_lock = threading.Lock()
 
-    def work(data, addr):
-        """Answer one lookup and send the reply back to the device that asked."""
+    def work(data, addr, source):
+        """Answer one lookup and send the reply back to the device that asked, from `source`."""
         who = device_address(addr[0])
         try:
             resp = answer_query(data, addr[0], forward_udp)
             if resp:
-                sock.sendto(resp, addr)
+                send_answer(sock, resp, addr, source)
         except Exception as e:
             print("Lookup problem:", e)
         finally:
@@ -1290,8 +1391,8 @@ def udp_server(sock):
 
     while True:
         try:
-            data, addr = sock.recvfrom(4096)
-        except OSError:
+            data, addr, source = receive_lookup(sock, with_address)
+        except (OSError, ValueError):
             continue
         if on_ipv6 and not v6_source_allowed(addr[0]):
             continue                        # from outside the home: no answer at all (see v6_source_allowed)
@@ -1301,7 +1402,7 @@ def udp_server(sock):
             if mine >= MAX_DNS_PER_DEVICE or not slots.acquire(blocking=False):
                 continue
             in_hand[who] = mine + 1
-        pool.submit(work, data, addr)
+        pool.submit(work, data, addr, source)
 
 
 class TCPHandler(socketserver.BaseRequestHandler):
@@ -1941,7 +2042,8 @@ LAST_SEEN_SQL = """
 
 def api_devices():
     """GET /api/devices: every device that has used QuietNet or been found by a scan,
-    with its name, group, switches and today's counts."""
+    with its name, group, switches and today's counts, and when (if in the last 24 hours) it last
+    tried to use another DNS service."""
     since = time.time() - 86400
     given = dict(sql("SELECT ip, name FROM devices"))
     hints = S.hints
@@ -1955,7 +2057,7 @@ def api_devices():
             "mac": "",
             "this_computer": ip == S.local_ip, "last": 0, "n": 0, "nb": 0, "on_network": 0,
             "group": S.dev_group.get(ip), "off": internet_off_for(ip),
-            "enforced": ip in S.enforced})
+            "enforced": ip in S.enforced, "other_dns": other_dns_since(ip, since)})
 
     # Two small questions, each answered straight from an index, in place of one that read every
     # row of up to 30 days of history on every dashboard refresh.
@@ -2013,15 +2115,25 @@ def api_activity(ip, hours, seen=None):
     return activity_groups(ip, since)
 
 
+def other_dns_since(ip, since):
+    """When this device last tried to use another DNS service (see OTHER_DNS_SERVICES), if that
+    was after `since` and since QuietNet started; otherwise 0. Kept in memory, so it costs the
+    device list no trip to the history."""
+    last = S.other_dns.get(ip, 0)
+    return last if last > since else 0
+
+
 def activity_groups(ip, since):
-    """The activity list for one device since a time: see api_activity."""
+    """The activity list for one device since a time: see api_activity. A name of another DNS
+    service (see OTHER_DNS_SERVICES) is shown as blocked with why 'other_dns', since every lookup
+    of it is, and its group is marked "other_dns" too."""
     rows = read_sql("""SELECT domain, COUNT(*), MAX(ts), SUM(blocked) FROM queries
                   WHERE client=? AND ts>? GROUP BY domain""", (ip, since))
     groups = {}
     for domain, n, last, nb in rows:
         base = base_of(domain)
         g = groups.setdefault(base, {"base": base, "owner": OWNERS.get(base, ""), "n": 0, "nb": 0, "last": 0, "hosts": []})
-        b, why, svc = decision(domain, ip)
+        b, why, svc = (True, "other_dns", "") if is_other_dns_service(domain) else decision(domain, ip)
         g["hosts"].append({"d": domain, "n": n, "nb": nb, "last": last, "v": verdict(domain),
                            "b": b, "why": why, "svc": svc})
         g["n"] += n
@@ -2031,8 +2143,12 @@ def activity_groups(ip, since):
         g["hosts"].sort(key=lambda h: -h["n"])
         vs = {h["v"] for h in g["hosts"]}
         g["v"] = "junk" if vs == {"junk"} else ("suspect" if vs & {"junk", "suspect"} else "ok")
-        g["b"], g["why"], g["svc"] = decision(g["base"], ip)
+        if is_other_dns_service(g["base"]):
+            g["b"], g["why"], g["svc"] = True, "other_dns", ""
+        else:
+            g["b"], g["why"], g["svc"] = decision(g["base"], ip)
         g["some_blocked"] = any(h["b"] for h in g["hosts"])
+        g["other_dns"] = any(h["why"] == "other_dns" for h in g["hosts"])
     return sorted(groups.values(), key=lambda g: -g["n"])
 
 
@@ -2505,7 +2621,8 @@ def main():
     threading.Thread(target=router_advert_listener, daemon=True).start()
 
     global ENF
-    ENF = enforcer.Enforcer(S.local_ip, enforcement_plan, neighbours, data_dir=DATA, learn_mac=learn_enforced_mac)
+    ENF = enforcer.Enforcer(S.local_ip, enforcement_plan, neighbours, data_dir=DATA, learn_mac=learn_enforced_mac,
+                            dns_port=None if S.dns_error else S.dns_port)
     ENF.start()
     threading.Thread(target=address_watcher, daemon=True).start()
     global CA

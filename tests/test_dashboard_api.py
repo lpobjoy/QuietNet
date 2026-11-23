@@ -16,7 +16,7 @@ from http.server import ThreadingHTTPServer
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from test_quietnet import ADULT, KID, Base, is_blocked, server
+from test_quietnet import ADULT, KID, Base, is_blocked, query, server
 
 
 class Api(Base):
@@ -457,6 +457,27 @@ class Devices(Api):
         self.assertEqual(len(devices), 1)
         d = devices[0]
         self.assertEqual((d["ip"], d["n"], d["nb"], d["name"], d["off"], d["enforced"]), (KID, 2, 1, "", False, False))
+
+    def test_a_device_that_tried_another_dns_service_is_flagged_in_the_device_list(self):
+        self.log(KID, "www.bbc.co.uk")
+        server.answer_query(query("dns.google"), KID, lambda d: None)
+        d = self.get("/api/devices")[1][0]
+        self.assertGreater(d["other_dns"], time.time() - 60)
+
+    def test_a_device_that_never_tried_another_dns_service_is_not_flagged(self):
+        self.log(KID, "www.bbc.co.uk")
+        self.assertEqual(self.get("/api/devices")[1][0]["other_dns"], 0)
+
+    def test_a_dns_service_lookup_is_flagged_in_the_devices_activity(self):
+        self.log(KID, "abc.dns.nextdns.io", blocked=1)
+        g = self.get("/api/activity?ip=%s&hours=24" % KID)[1][0]
+        self.assertTrue(g["other_dns"])
+        self.assertEqual((g["hosts"][0]["b"], g["hosts"][0]["why"]), (True, "other_dns"))
+
+    def test_ordinary_activity_is_not_flagged_as_another_dns_service(self):
+        self.log(KID, "www.bbc.co.uk")
+        g = self.get("/api/activity?ip=%s&hours=24" % KID)[1][0]
+        self.assertFalse(g["other_dns"])
 
     def test_naming_a_device(self):
         self.log(KID, "www.bbc.co.uk")

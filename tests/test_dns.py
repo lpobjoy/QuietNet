@@ -439,6 +439,157 @@ class NetworkDnsSignals(Base):
         self.assertEqual(self.ask("www.icloud.com")[-4:], bytes([93, 184, 216, 34]))
 
 
+class OtherDnsServices(Base):
+    """Names of other DNS services (secure DNS in a browser, Private DNS on a phone) are blocked for
+    every device, so it falls back to ordinary DNS and comes to QuietNet (known issue 8)."""
+
+    def setUp(self):
+        super().setUp()
+        drain_log()
+        self.asked = []
+
+    def ask(self, name, client=KID, qtype=1):
+        """Answer a lookup, noting anything that reached the pretend internet."""
+        return server.answer_query(query(name, qtype), client,
+                                   lambda d: self.asked.append(d) or fake_answer(d))
+
+    def test_every_listed_dns_service_is_blocked(self):
+        for name in sorted(server.OTHER_DNS_SERVICES):
+            self.assertEqual(self.ask(name)[-4:], bytes(4), name)
+        self.assertEqual(self.asked, [])
+
+    def test_the_list_holds_the_well_known_services(self):
+        for name in ("dns.google", "dns.google.com", "8888.google", "cloudflare-dns.com", "mozilla.cloudflare-dns.com",
+                     "one.one.one.one", "1dot1dot1dot1.cloudflare-dns.com", "security.cloudflare-dns.com",
+                     "family.cloudflare-dns.com", "dns.quad9.net", "dns9.quad9.net", "dns10.quad9.net",
+                     "dns11.quad9.net", "doh.opendns.com", "dns.nextdns.io", "doh.cleanbrowsing.org",
+                     "dns.adguard.com", "dns.adguard-dns.com", "doh.mullvad.net", "dns.mullvad.net",
+                     "chrome.cloudflare-dns.com", "doh.dns.sb", "dns.controld.com", "freedns.controld.com"):
+            self.assertIn(name, server.OTHER_DNS_SERVICES)
+
+    def test_a_dns_service_is_blocked_for_a_device_with_no_rules(self):
+        self.assertEqual(self.ask("dns.google", client=ADULT)[-4:], bytes(4))
+
+    def test_a_name_beneath_a_dns_service_is_blocked(self):
+        self.assertEqual(self.ask("abc123.dns.nextdns.io")[-4:], bytes(4))
+
+    def test_a_dns_service_asked_for_in_capitals_is_blocked(self):
+        self.assertEqual(self.ask("DNS.Google")[-4:], bytes(4))
+
+    def test_a_dns_service_name_with_a_final_dot_still_counts(self):
+        self.assertTrue(server.is_other_dns_service("Cloudflare-DNS.com."))
+
+    def test_a_name_that_only_ends_the_same_way_does_not_count(self):
+        self.assertFalse(server.is_other_dns_service("notdns.google"))
+        self.assertFalse(server.is_other_dns_service("www.google.com"))
+
+    def test_a_dns_service_ipv6_question_gets_the_blocked_answer(self):
+        self.assertEqual(self.ask("dns.quad9.net", qtype=28)[-16:], bytes(16))
+
+    def test_a_dns_service_stays_blocked_while_blocking_is_paused(self):
+        server.S.paused_until = time.time() + 600
+        self.assertEqual(self.ask("dns.google")[-4:], bytes(4))
+
+    def test_a_dns_service_stays_blocked_even_if_always_allowed(self):
+        server.unblock("cloudflare-dns.com")
+        self.assertEqual(self.ask("cloudflare-dns.com")[-4:], bytes(4))
+
+    def test_a_dns_service_lookup_is_written_down_as_blocked(self):
+        self.ask("dns.google")
+        log = [(client, name, blocked) for ts, client, name, blocked in drain_log()]
+        self.assertEqual(log, [(KID, "dns.google", 1)])
+
+    def test_a_dns_service_lookup_is_remembered_against_the_device(self):
+        self.ask("doh.opendns.com")
+        self.assertGreater(server.S.other_dns.get(KID, 0), time.time() - 60)
+
+    def test_ordinary_google_names_are_not_affected(self):
+        self.assertEqual(self.ask("www.google.com")[-4:], bytes([93, 184, 216, 34]))
+
+
+class ReplyAddress(unittest.TestCase):
+    """On Linux each answer leaves from the address its lookup was sent to, so a lookup the enforcer
+    redirected from 8.8.8.8 is answered from the address it was redirected to. Stand-in sockets only."""
+
+    PI = "192.168.1.60"
+
+    def pktinfo(self, addressed_to):
+        """The extra details Linux gives with a lookup: card number, local address, address it was sent to."""
+        info = struct.pack("=i4s4s", 3, socket.inet_aton(self.PI), socket.inet_aton(addressed_to))
+        return [(socket.IPPROTO_IP, server.IP_PKTINFO or 8, info)]
+
+    def test_the_address_a_lookup_was_sent_to_is_read(self):
+        with mock.patch.object(server, "IP_PKTINFO", 8):
+            self.assertEqual(server.reply_address(self.pktinfo(self.PI)), self.PI)
+
+    def test_a_lookup_sent_to_everyone_gives_no_reply_address(self):
+        with mock.patch.object(server, "IP_PKTINFO", 8):
+            self.assertIsNone(server.reply_address(self.pktinfo("255.255.255.255")))
+            self.assertIsNone(server.reply_address(self.pktinfo("224.0.0.251")))
+
+    def test_no_details_gives_no_reply_address(self):
+        self.assertIsNone(server.reply_address([]))
+
+    def test_the_answer_is_sent_from_the_address_the_lookup_was_sent_to(self):
+        sock = mock.Mock()
+        with mock.patch.object(server, "IP_PKTINFO", 8):
+            server.send_answer(sock, b"answer", ("192.168.1.23", 5000), self.PI)
+        sock.sendmsg.assert_called_once()
+        (parts, ancillary, flags, addr), _ = sock.sendmsg.call_args
+        self.assertEqual((parts, flags, addr), ([b"answer"], 0, ("192.168.1.23", 5000)))
+        level, kind, info = ancillary[0]
+        self.assertEqual((level, kind), (socket.IPPROTO_IP, 8))
+        self.assertEqual(info, struct.pack("=i4s4s", 0, socket.inet_aton(self.PI), bytes(4)))
+        sock.sendto.assert_not_called()
+
+    def test_without_a_known_address_the_system_chooses(self):
+        sock = mock.Mock()
+        server.send_answer(sock, b"answer", ("192.168.1.23", 5000), None)
+        sock.sendto.assert_called_once_with(b"answer", ("192.168.1.23", 5000))
+
+    def test_if_the_address_cannot_be_sent_from_the_system_chooses(self):
+        sock = mock.Mock()
+        sock.sendmsg.side_effect = OSError("cannot assign requested address")
+        with mock.patch.object(server, "IP_PKTINFO", 8):
+            server.send_answer(sock, b"answer", ("192.168.1.23", 5000), self.PI)
+        sock.sendto.assert_called_once_with(b"answer", ("192.168.1.23", 5000))
+
+    def test_the_option_is_asked_for_on_linux_ipv4_sockets(self):
+        sock = mock.Mock(family=socket.AF_INET)
+        with mock.patch.object(server, "IP_PKTINFO", 8):
+            self.assertTrue(server.ask_for_reply_address(sock))
+        sock.setsockopt.assert_called_once_with(socket.IPPROTO_IP, 8, 1)
+
+    def test_the_option_is_not_asked_for_away_from_linux(self):
+        sock = mock.Mock(family=socket.AF_INET)
+        with mock.patch.object(server, "IP_PKTINFO", None):
+            self.assertFalse(server.ask_for_reply_address(sock))
+        sock.setsockopt.assert_not_called()
+
+    def test_the_option_is_not_asked_for_on_the_ipv6_listener(self):
+        sock = mock.Mock(family=socket.AF_INET6)
+        with mock.patch.object(server, "IP_PKTINFO", 8):
+            self.assertFalse(server.ask_for_reply_address(sock))
+
+    def test_the_listener_answers_from_the_address_each_lookup_was_sent_to(self):
+        sock = mock.Mock(family=socket.AF_INET)
+        sock.recvmsg.side_effect = [(query("www.bbc.co.uk"), self.pktinfo(self.PI), 0, ("192.168.1.23", 5000)),
+                                    KeyboardInterrupt()]
+        sent = []
+
+        def run_now(fn, data, addr, source):
+            """Answer the lookup straight away."""
+            fn(data, addr, source)
+        pool = mock.Mock(submit=run_now)
+        with mock.patch.object(server, "IP_PKTINFO", 8), \
+                mock.patch.object(server, "answer_query", return_value=b"answer"), \
+                mock.patch.object(server, "send_answer", lambda s, resp, addr, source: sent.append((addr, source))), \
+                mock.patch.object(server, "ThreadPoolExecutor", lambda max_workers: pool):
+            with self.assertRaises(KeyboardInterrupt):
+                server.udp_server(sock)
+        self.assertEqual(sent, [(("192.168.1.23", 5000), self.PI)])
+
+
 class RememberedAnswers(Base):
     """Answers kept in memory for their shortened lifetime (known issue 22)."""
 
@@ -690,7 +841,7 @@ class LookupsOverIPv6(Base):
         sock = mock.Mock(family=socket.AF_INET6)
         sock.recvfrom.side_effect = [(query("www.bbc.co.uk"), ("2001:db8:9:9::1", 5000, 0, 0)), KeyboardInterrupt()]
         submitted = []
-        pool = mock.Mock(submit=lambda fn, data, addr: submitted.append(addr))
+        pool = mock.Mock(submit=lambda fn, data, addr, source: submitted.append(addr))
         with mock.patch.object(server, "ThreadPoolExecutor", lambda max_workers: pool):
             with self.assertRaises(KeyboardInterrupt):
                 server.udp_server(sock)
@@ -701,7 +852,7 @@ class LookupsOverIPv6(Base):
         sock = mock.Mock(family=socket.AF_INET6)
         sock.recvfrom.side_effect = [(query("www.bbc.co.uk"), ("fe80::1", 5000, 0, 2)), KeyboardInterrupt()]
         submitted = []
-        pool = mock.Mock(submit=lambda fn, data, addr: submitted.append(addr))
+        pool = mock.Mock(submit=lambda fn, data, addr, source: submitted.append(addr))
         with mock.patch.object(server, "ThreadPoolExecutor", lambda max_workers: pool):
             with self.assertRaises(KeyboardInterrupt):
                 server.udp_server(sock)
@@ -1292,7 +1443,7 @@ class Limits(unittest.TestCase):
         incoming = [(query("n%d.example.com" % i), ("192.168.1.23", 5000 + i)) for i in range(5)]
         sock.recvfrom.side_effect = incoming + [KeyboardInterrupt()]
         submitted = []
-        pool = mock.Mock(submit=lambda fn, data, addr: submitted.append(addr))
+        pool = mock.Mock(submit=lambda fn, data, addr, source: submitted.append(addr))
         with mock.patch.object(server, "MAX_DNS_WAITING", 2), \
                 mock.patch.object(server, "ThreadPoolExecutor", lambda max_workers: pool):
             with self.assertRaises(KeyboardInterrupt):
@@ -1305,7 +1456,7 @@ class Limits(unittest.TestCase):
         other = [(query("www.bbc.co.uk"), ("192.168.1.40", 6000))]
         sock.recvfrom.side_effect = greedy + other + [KeyboardInterrupt()]
         submitted = []
-        pool = mock.Mock(submit=lambda fn, data, addr: submitted.append(addr[0]))
+        pool = mock.Mock(submit=lambda fn, data, addr, source: submitted.append(addr[0]))
         with mock.patch.object(server, "MAX_DNS_PER_DEVICE", 2), \
                 mock.patch.object(server, "ThreadPoolExecutor", lambda max_workers: pool):
             with self.assertRaises(KeyboardInterrupt):
@@ -1318,10 +1469,10 @@ class Limits(unittest.TestCase):
         sock.recvfrom.side_effect = incoming + [KeyboardInterrupt()]
         submitted = []
 
-        def run_now(fn, data, addr):
+        def run_now(fn, data, addr, source):
             """Answer each lookup straight away, as if the pool had a free worker."""
             submitted.append(addr)
-            fn(data, addr)
+            fn(data, addr, source)
         pool = mock.Mock(submit=run_now)
         with mock.patch.object(server, "MAX_DNS_PER_DEVICE", 1), \
                 mock.patch.object(server, "answer_query", return_value=None), \

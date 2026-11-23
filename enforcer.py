@@ -80,12 +80,52 @@ def parse_arp_request(frame):
     return socket.inet_ntoa(frame[28:32]), frame[22:28].hex(":"), socket.inet_ntoa(frame[38:42])
 
 
-def nft_ruleset(plan, our_ip):
+def _checked_ipv4(text):
+    """The address as checked text, or ValueError if it isn't a plain IPv4 address. Every address
+    that goes into a firewall rule passes through here first, so nothing a person or a device typed
+    can ever be read by the firewall as part of a rule."""
+    return str(ipaddress.IPv4Address(text))
+
+
+def _redirect_target(our_ip, dns_port):
+    """(this machine's address, the DNS port) for the DNS redirect, or None when there should be
+    no redirect: no port given, or this machine only knows itself as 127.0.0.1 (its network is
+    down), which a device's lookup can't be sent to. A port outside 1-65535 is a ValueError."""
+    if dns_port is None:
+        return None
+    if isinstance(dns_port, bool) or not isinstance(dns_port, int) or not 0 < dns_port < 65536:
+        raise ValueError("not a port number: %r" % (dns_port,))
+    addr = ipaddress.IPv4Address(our_ip)
+    if addr.is_loopback or addr.is_unspecified:
+        return None
+    return str(addr), dns_port
+
+
+DOT_PORT = 853      # private DNS (DNS over TLS) and DNS over QUIC both use this port
+
+
+def nft_ruleset(plan, our_ip, dns_port=None):
     """The complete nftables program for the current plan.
 
     plan: {victim_ip: {"off": bool, "ips": [blocked ip, ...]}}
     'off' means cut everything for that device (except reaching QuietNet itself);
-    otherwise only the listed addresses are dropped."""
+    otherwise only the listed addresses are dropped.
+
+    For every steered device, two more things are done whatever its plan says (known issue 8):
+      - Ordinary DNS lookups (port 53) sent to any other server (8.8.8.8, the router) are sent to
+        QuietNet instead, at our_ip and dns_port, so this household's rules still apply. Only
+        traffic arriving from a steered device is touched: this machine's own lookups never pass
+        the "prerouting" step, and the router and this machine are never steered.
+      - Private DNS (DNS over TLS, port 853 over TCP) and DNS over QUIC (port 853 over UDP) are
+        dropped, so the device falls back to ordinary DNS, which then comes to QuietNet.
+    With dns_port None the redirect is left out (the port 853 drops stay).
+
+    Every address is checked first; a bad one raises ValueError rather than reach the firewall."""
+    our_ip = _checked_ipv4(our_ip)
+    victims = sorted(plan, key=lambda ip: ipaddress.IPv4Address(ip))
+    for victim in victims:
+        _checked_ipv4(victim)
+    target = _redirect_target(our_ip, dns_port)
     # Loading a table that already exists ADDS to it; it does not replace it. Without the first
     # two lines, a rule dropped from the plan would stay in the kernel - a device whose internet
     # was switched back on would stay cut off until QuietNet restarted. "Declare, delete, define"
@@ -94,20 +134,41 @@ def nft_ruleset(plan, our_ip):
     # no moment with half the rules loaded.
     lines = ["table inet %s" % TABLE, "delete table inet %s" % TABLE,
              "table inet %s {" % TABLE, "  chain forward {", "    type filter hook forward priority -150; policy accept;"]
-    for victim, rule in sorted(plan.items()):
+    who = "{ %s }" % ", ".join(victims)
+    if victims:
+        lines.append("    ip saddr %s tcp dport %d drop" % (who, DOT_PORT))
+        lines.append("    ip saddr %s udp dport %d drop" % (who, DOT_PORT))
+    for victim in victims:
+        rule = plan[victim]
         if rule.get("off"):
             lines.append("    ip saddr %s ip daddr != %s drop" % (victim, our_ip))
         elif rule.get("ips"):
             addrs = ", ".join(sorted(rule["ips"]))
             lines.append("    ip saddr %s ip daddr { %s } drop" % (victim, addrs))
-    lines += ["  }", "}"]
+    lines.append("  }")
+    if victims and target:
+        # Priority -100 is the usual place for this step ("dstnat"), written as a number so that
+        # older versions of nft read it too. conntrack puts the original server's address back on
+        # the answers, so the device sees a reply from the server it asked.
+        lines += ["  chain dns_redirect {", "    type nat hook prerouting priority -100; policy accept;"]
+        for proto in ("udp", "tcp"):
+            lines.append("    ip saddr %s ip daddr != %s %s dport 53 dnat ip to %s:%d"
+                         % (who, target[0], proto, target[0], target[1]))
+        lines.append("  }")
+    lines.append("}")
     return "\n".join(lines) + "\n"
 
 
 def iptables_rules(plan, our_ip):
-    """The same plan expressed as iptables commands, for systems without nft."""
+    """The same plan expressed as iptables commands, for systems without nft. Port 853 (private
+    DNS) is dropped here too, but ordinary DNS sent to another server is NOT redirected to
+    QuietNet: that would need rules in a second iptables table, kept and cleared alongside this one,
+    and the Pi's own image always has nft. Status() says so when this tool is in use."""
     cmds = [["-F", "QUIETNET"]]
     for victim, rule in sorted(plan.items()):
+        _checked_ipv4(victim)
+        for proto in ("tcp", "udp"):
+            cmds.append(["-A", "QUIETNET", "-s", victim, "-p", proto, "--dport", str(DOT_PORT), "-j", "DROP"])
         if rule.get("off"):
             cmds.append(["-A", "QUIETNET", "-s", victim, "!", "-d", our_ip, "-j", "DROP"])
         else:
@@ -362,14 +423,17 @@ class Enforcer:
     {victim_ip: {"off": bool, "ips": set(), "mac": optional hardware address}} and a neighbours()
     callback that returns {ip: mac}. Call start() once; it does nothing until plan() is non-empty."""
 
-    def __init__(self, local_ip, plan, neighbours, log=print, data_dir=None, learn_mac=None):
+    def __init__(self, local_ip, plan, neighbours, log=print, data_dir=None, learn_mac=None, dns_port=None):
         """Work out this machine's network (interface, router, own hardware address) and which
         firewall tool is installed. Touches nothing on the network; start() does that.
 
         data_dir: where to keep notes of what was changed, so a crash can be undone at the next
         start (None keeps no notes). learn_mac(ip, mac): told the hardware address of a chosen
-        device the first time it is seen, if the plan didn't already say."""
+        device the first time it is seen, if the plan didn't already say. dns_port: the port QuietNet
+        answers lookups on; a steered device's lookups sent to another server are redirected there
+        (None: no redirect)."""
         self.local_ip = local_ip
+        self.dns_port = dns_port
         self.plan = plan
         self.neighbours = neighbours
         self.log = log
@@ -422,10 +486,13 @@ class Enforcer:
 
     def status(self):
         """What the dashboard needs to know: available, why not, any problem stopping all steering,
-        problems with particular devices, active, tool and router."""
+        problems with particular devices, active, tool and router, and whether a steered device's
+        lookups sent to another DNS server are redirected to QuietNet ("dns_redirect"; only the
+        nft tool does this, see iptables_rules)."""
         return {"available": self.available(), "reason": self.reason, "problem": self.problem,
                 "problems": dict(self.device_problems), "active": self._active,
-                "backend": self.backend, "gateway": self.gateway_ip}
+                "backend": self.backend, "gateway": self.gateway_ip,
+                "dns_redirect": self.backend == "nft" and self.dns_port is not None}
 
     # -- lifecycle ----------------------------------------------------------
 
@@ -794,7 +861,7 @@ class Enforcer:
         rules are left to clear, iptables isn't run at all: each call takes the firewall lock that
         Docker and ufw also need, and the empty plan is asked for every two seconds."""
         if self.backend == "nft":
-            text = nft_ruleset(plan, self.local_ip)
+            text = nft_ruleset(plan, self.local_ip, self.dns_port)
             if text != self._applied:
                 p = subprocess.run(["nft", "-f", "-"], input=text, text=True, capture_output=True)
                 if p.returncode:
@@ -834,7 +901,8 @@ class Enforcer:
         return sum(1 for line in p.stdout.splitlines() if line.startswith("-A QUIETNET"))
 
     def _remove_firewall(self):
-        """Remove our firewall table (nft) or chain (iptables). Harmless if it isn't there."""
+        """Remove our firewall table (nft) or chain (iptables). Harmless if it isn't there. With nft
+        this one command removes every chain in the table: the drops and the DNS redirect alike."""
         if self.backend == "nft":
             subprocess.run(["nft", "delete", "table", "inet", TABLE], capture_output=True)
         elif self.backend == "iptables":

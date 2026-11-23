@@ -33,7 +33,7 @@ A **scope** is `all`, `group:<id>` or `device:<ip>`.
 | `GET /api/schedules` | All schedules, each with `"active"` (in force right now) |
 | `GET /api/controls?scope=<scope>` | Switches for one scope, and what it inherits. `400` if the scope is badly formed |
 | `GET /api/cloud` | Remote access state: `{"configured", "paired", "relay", "name", "state", "detail"}` |
-| `GET /api/enforcer` | `{"available", "reason", "problem", "problems", "active", "backend", "gateway"}`. `problem` says why all steering is paused right now (forwarding off, or another firewall in the way or impossible to check), or `""`. `problems` is `{device address: text}` for devices left alone, e.g. because a different device now has the address |
+| `GET /api/enforcer` | `{"available", "reason", "problem", "problems", "active", "backend", "gateway", "dns_redirect"}`. `dns_redirect` is `true` when a steered device's ordinary DNS sent to another server is redirected to QuietNet (the `nft` tool only; with `iptables` it is `false`). `problem` says why all steering is paused right now (forwarding off, or another firewall in the way or impossible to check), or `""`. `problems` is `{device address: text}` for devices left alone, e.g. because a different device now has the address |
 
 `/api/status`:
 
@@ -61,10 +61,12 @@ A **scope** is `all`, `group:<id>` or `device:<ip>`.
 {"ip": "192.168.1.23", "name": "", "hint": "Sams iPad", "hint_source": "Bonjour", "hint_detail": "Model: iPad13,1",
  "mac": "11:22:33:44:55:66",
  "this_computer": false, "last": 1795000000.0, "n": 412, "nb": 37, "on_network": 1795000000.0,
- "group": 1, "off": false, "enforced": false}
+ "group": 1, "off": false, "enforced": false, "other_dns": 0}
 ```
 
 `name` is the name someone gave the device ("" if none). `hint` is the name QuietNet suggests from what the network reported ("" if none); `hint_source` says where it came from: `"DHCP"`, `"Bonjour"`, `"Windows network"`, `"UPnP"` or `"router"` ("" with no hint). `hint_detail` is a model or maker the device reported about itself (for example `"Model: Sonos One (Sonos, Inc.)"` or `"Runs Windows"`), or, for a device with neither a hint nor such a detail whose hardware address is a made-up private one, `"Private Wi-Fi address, so probably a phone, tablet or laptop"`; otherwise "". All three are plain text chosen by devices on the network: escape them before display. The dashboard saves a hint as the name with the ordinary `POST /api/device-name` call. See ARCHITECTURE.md, "Device names".
+
+`other_dns` is when (seconds since 1970) the device last looked up another DNS service such as `dns.google` in the last 24 hours, or 0. It is kept in memory, so it starts at 0 again when QuietNet restarts; the device's activity list still shows older tries.
 
 `n` and `nb` are lookups and blocked lookups in the last 24 hours. `last` is 0 for a device that has been seen on the network but has never used QuietNet.
 
@@ -72,7 +74,7 @@ A **scope** is `all`, `group:<id>` or `device:<ip>`.
 
 ```json
 {"base": "bbc.co.uk", "owner": "BBC", "n": 3, "nb": 0, "last": 1795000000.0,
- "v": "ok", "b": false, "why": null, "svc": "", "some_blocked": false,
+ "v": "ok", "b": false, "why": null, "svc": "", "some_blocked": false, "other_dns": false,
  "hosts": [{"d": "www.bbc.co.uk", "n": 2, "nb": 0, "last": 1795000000.0, "v": "ok", "b": false, "why": null, "svc": ""}]}
 ```
 
@@ -86,7 +88,7 @@ Sending that `marker` back as `since` with the same `ip` and `hours` gets `{"unc
 
 For QuietNet's own computer, `kill`, `off` and `schedule` never appear: it is exempt from them (see [How QuietNet works](ARCHITECTURE.md#the-order-rules-are-checked-in)).
 
-`v` is the label: `ok`, `suspect` (possibly junk, shown for a person to judge, never blocked on its own) or `junk` (on the advert list). `b` is whether it is blocked for this device now, `why` is the reason code (`kill`, `off`, `schedule`, `you`, `allowed`, `service`, `list`), and `svc` names the service or schedule responsible.
+`v` is the label: `ok`, `suspect` (possibly junk, shown for a person to judge, never blocked on its own) or `junk` (on the advert list). `b` is whether it is blocked for this device now, `why` is the reason code (`kill`, `off`, `schedule`, `you`, `allowed`, `service`, `list`, or `other_dns` for another DNS service, which is blocked for every device whatever the rules say), and `svc` names the service or schedule responsible. A group's `other_dns` is `true` when any of its names is another DNS service.
 
 `/api/controls`:
 

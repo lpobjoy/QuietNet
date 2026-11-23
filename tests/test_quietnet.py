@@ -62,6 +62,7 @@ class Base(unittest.TestCase):
         server.S.v6_own, server.S.v6_prefixes, server.S.v6_devices = set(), [], {}
         # Nothing heard from the router about IPv6, and no IPv6 address to give devices.
         server.S.v6_dns, server.S.router_v6_dns, server.S.ra_heard = "", {}, None
+        server.S.other_dns = {}
 
     def schedule(self, **kw):
         body = {"name": "Bedtime", "scope": "device:" + KID, "days": [0, 1, 2, 3, 4, 5, 6],
@@ -316,9 +317,9 @@ class EnforcerLogic(unittest.TestCase):
         self.assertIn("ip saddr 192.168.1.24 ip daddr != 192.168.1.60 drop", text)
         self.assertIn("hook forward", text)
 
-    def test_nothing_blocked_means_no_drop_lines(self):
+    def test_nothing_blocked_means_no_address_drop_lines(self):
         text = enforcer.nft_ruleset({"192.168.1.23": {"off": False, "ips": set()}}, "192.168.1.60")
-        self.assertNotIn("drop", text)
+        self.assertNotIn("ip daddr", text)
 
     def test_iptables_rules(self):
         cmds = enforcer.iptables_rules({"192.168.1.23": {"off": False, "ips": {"1.2.3.4"}}}, "192.168.1.60")

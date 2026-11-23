@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+Other DNS services (23 November):
+- **Fixed: a device could get round every name block by using another DNS server.** The well-known encrypted DNS services (Google's `dns.google`, Cloudflare's `cloudflare-dns.com`, Quad9, OpenDNS, NextDNS, CleanBrowsing, AdGuard, Mullvad, DNS.SB and Control D, with every name beneath them) now get the blocked answer for every device, paused or not, so Android's Private DNS or a browser's secure DNS set to one of them falls back to ordinary DNS. The list is `OTHER_DNS_SERVICES` in `server.py`. The device page and the device list say "tried to use another DNS service"; new `other_dns` in `GET /api/devices` and `/api/activity`.
+- **New: for devices with "Cut live connections" on, ordinary DNS sent to any other server (8.8.8.8, the router) is answered by QuietNet,** and Private DNS and DNS over QUIC (port 853) are dropped. Only the `nft` tool does the redirect; `GET /api/enforcer` has a new `dns_redirect` to say whether it is on. On Linux, answers now leave from the address each lookup was sent to, which the redirect needs.
+
 The router's own IPv6 DNS server (23 November):
 - **Fixed: "Set up a device" now gives the Pi's IPv6 address too.** A router that hands out IPv6 (a BT Smart Hub does as it ships) also tells devices to use its own IPv6 DNS server, so a Windows laptop or Android phone set up for IPv4 only sent some lookups past QuietNet, and blocks and bedtime applied only some of the time. Each kind of device now gets the IPv6 step as well, with the choice of switching IPv6 off on the router (BT Smart Hub: Advanced settings, IPv6); if the Pi has no IPv6 address, the page says to switch IPv6 off on the router or accept that some lookups skip QuietNet.
 - **New: a warning when the router names its own IPv6 DNS server.** On a Pi, QuietNet listens (never sends) for the router's IPv6 announcements, and the home page and "Set up a device" warn when they name a DNS server that is not the Pi. New `ipv6` part in `GET /api/status`.

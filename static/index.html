@@ -874,7 +874,7 @@ function viewHome(){
       <span class="tile-figs">${d.last
         ? `${num(d.n)} requests today · <b>${num(d.nb)} blocked</b> · active ${esc(ago(d.last))}`
         : '<span class="muted">Not using QuietNet yet</span>'}</span>
-      <span class="tile-badges">${d.off ? '<span class="badge danger">Internet off</span>' : ''}${d.enforced ? '<span class="badge accent">Live-enforced</span>' : ''}${d.group ? `<span class="badge">${esc(groupName(d.group))}</span>` : ''}</span>
+      <span class="tile-badges">${d.off ? '<span class="badge danger">Internet off</span>' : ''}${d.enforced ? '<span class="badge accent">Live-enforced</span>' : ''}${d.other_dns ? '<span class="badge warn">Tried another DNS service</span>' : ''}${d.group ? `<span class="badge">${esc(groupName(d.group))}</span>` : ''}</span>
       ${ICON.go}
     </button>`).join('');
   const scanning = st.scan && st.scan.state === 'scanning';
@@ -904,6 +904,14 @@ function viewHome(){
 }
 
 /* ---------- One device ---------- */
+// Shown when the device looked up another DNS service (secure DNS in a browser, Private DNS on a
+// phone): d.other_dns is when it last did, from the device list; the activity list shows older tries.
+function otherDnsNotice(d){
+  if(!d.other_dns && !S.activity.some(g => g.other_dns)) return '';
+  return `<div class="notice warn"><b>This device tried to use another DNS service</b>${d.other_dns ? ' ' + esc(ago(d.other_dns)) : ''},
+    which would let it get round QuietNet. QuietNet stopped it. Check its settings: on Android, Private DNS should be Off
+    or Automatic; in Chrome, Edge or Firefox, secure DNS (DNS over HTTPS) should be off.</div>`;
+}
 function enforceCard(d){
   const e = (S.status || {}).enforcer || {};
   if(!d.last) return '';                       // device isn't using QuietNet yet, nothing to enforce
@@ -923,7 +931,8 @@ function statusBadges(x){
   let out = '';
   if(x.v === 'junk') out += '<span class="badge danger">Advert / tracker</span>';
   else if(x.v === 'suspect') out += '<span class="badge warn">Possibly junk</span>';
-  if(x.b) out += `<span class="badge accent">${x.why === 'you' ? 'Blocked by you' : x.why === 'service' || x.why === 'schedule' ? 'Blocked · ' + esc(x.svc)
+  if(x.b && x.why === 'other_dns') out += '<span class="badge warn">Tried to use another DNS service</span>';
+  else if(x.b) out += `<span class="badge accent">${x.why === 'you' ? 'Blocked by you' : x.why === 'service' || x.why === 'schedule' ? 'Blocked · ' + esc(x.svc)
     : x.why === 'off' ? 'Internet off' : x.why === 'kill' ? 'Kill switch' : 'Blocked automatically'}</span>`;
   else if(x.some_blocked) out += '<span class="badge accent">Partly blocked</span>';
   else if(x.why === 'allowed') out += '<span class="badge">Allowed by you</span>';
@@ -931,6 +940,7 @@ function statusBadges(x){
 }
 function blockBtn(x, domain){
   if(['service', 'off', 'schedule', 'kill'].includes(x.why)) return '';   // managed with the switches at the top of the page
+  if(x.why === 'other_dns') return '';                                   // always blocked: see otherDnsNotice
   return x.b
     ? `<button class="btn" data-act="unblock" data-d="${esc(domain)}">Unblock</button>`
     : `<button class="btn ${x.v === 'ok' ? '' : 'primary'}" data-act="block" data-d="${esc(domain)}" data-v="${esc(x.v)}">Block</button>`;
@@ -976,6 +986,7 @@ function viewDevice(){
     ${S.groups.length ? '' : '<button class="btn link" data-act="tab" data-tab="groups">Create a group</button>'}</div>
   ${d.last ? '' : `<div class="notice warn"><b>This device isn't using QuietNet yet</b>, so nothing can be seen or blocked for it.
     <button class="btn link" data-act="tab" data-tab="setup">Show me how to set it up</button></div>`}
+  ${otherDnsNotice(d)}
   ${controls('device:' + S.device, 'this device')}
   ${enforceCard(d)}
   <h2 class="list-head">What it has been talking to</h2>
