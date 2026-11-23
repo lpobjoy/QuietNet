@@ -33,21 +33,34 @@ A **scope** is `all`, `group:<id>` or `device:<ip>`.
 | `GET /api/schedules` | All schedules, each with `"active"` (in force right now) |
 | `GET /api/controls?scope=<scope>` | Switches for one scope, and what it inherits. `400` if the scope is badly formed |
 | `GET /api/cloud` | Remote access state: `{"configured", "paired", "relay", "name", "state", "detail"}` |
-| `GET /api/enforcer` | `{"available", "reason", "problem", "problems", "active", "backend", "gateway"}`. `problem` says why all steering is paused right now (forwarding off, or another firewall in the way or impossible to check), or `""`. `problems` is `{device address: text}` for devices left alone, e.g. because a different device now has the address |
+| `GET /api/enforcer` | `{"available", "reason", "problem", "problems", "active", "backend", "gateway", "dns_redirect", "firewall", "shared"}`. `firewall` is `null`, or, when another firewall on the Pi is what stops all steering, `{"blocked_by": [text, ...], "commands": [command, ...], "installer": true/false}`: the firewall rules in the way, the commands that let passed-on traffic through (each lasts until the Pi restarts), and whether running the install command again makes the fix permanent (only for Docker's firewall). The home page shows it; escape every part. `dns_redirect` is `true` when a steered device's ordinary DNS sent to another server is redirected to QuietNet (the `nft` tool only; with `iptables` it is `false`). `problem` says why all steering is paused right now (forwarding off, or another firewall in the way or impossible to check), or `""`. `problems` is `{device address: text}` for devices left alone, e.g. because a different device now has the address. `shared` is `{device address: {"count", "names"}}` for enforced devices with addresses left to the DNS block because a site the device is allowed shares them: `count` addresses, and up to five blocked services or names (`names`). Escape both before display |
 
 `/api/status`:
 
 ```json
 {
   "ip": "192.168.1.60", "dns_ok": true, "dns_error": null, "dns_port": 53,
-  "paused_for": 0, "junk_on": true, "kill": false, "clock": "08:49",
+  "paused_for": 0, "junk_on": true, "other_dns_all": false, "kill": false, "clock": "08:49",
   "junk_count": 74210,
   "community": {"installed": true, "count": 74100, "updated": 1795000000.0, "state": "idle", "error": ""},
   "today": {"total": 18234, "blocked": 2101},
   "scan": {"state": "idle", "ts": 1795000000.0, "network": "192.168.1.0/24", "addresses": 254, "capped": false},
-  "enforcer": {"available": false, "reason": "…", "active": false}
+  "enforcer": {"available": false, "reason": "…", "active": false, "shared": {}},
+  "ipv6": {"dns_address": "fd12:3456::60", "listening": true, "router_heard": 1795000000.0,
+           "router_dns": ["fe80::1"], "router_dns_not_ours": ["fe80::1"], "in_use": true},
+  "new_device_group": 2,
+  "device_notices": [{"from": "192.168.1.54", "name": "Wilf's iPad", "to": "192.168.1.71",
+                      "mac": "da:11:22:33:44:03", "first": 1795000000.0, "same": false}],
+  "device_events": [{"ts": 1795000000.0, "ip": "192.168.1.71",
+                     "text": "Wilf's iPad moved from 192.168.1.54 to 192.168.1.71; its rules moved with it."}]
 }
 ```
+
+`new_device_group` is the group a device seen for the first time is put in, or `null` for none (the default). `device_notices` lists devices with rules that have gone quiet just as a new device with a private Wi-Fi address appeared (`from` and `name`: the quiet one; `to`, `mac`, `first`: the new one and when it was first seen); the dashboard offers `POST /api/move-rules` for each. An entry with `same` true is a device with a private Wi-Fi address that appeared, since the rules' device was last seen, at the very address the rules are kept under (`from` and `to` are then that address): the rules still apply to it, and the dashboard asks whether it is the same device, offering `POST /api/move-rules` with that address twice ("yes") and `POST /api/different-device` ("no"). `other_dns_all` is whether every device is kept away from other DNS services, not just those the owner controls (see `POST /api/other-dns-switch`). `device_events` is up to ten notes from the last week of what QuietNet did to devices' rules by itself (moved them, paused them, put a new device in the group), newest first. Names, addresses and notes come from the household's network: escape them before display. See ARCHITECTURE.md, "When a device changes address".
+
+`ipv6` is about devices using IPv6 for DNS. `dns_address` is the IPv6 address to give devices as a DNS server, shown on "Set up a device": a unique-local one if this computer has one, else a public one, never a temporary or link-local one; `""` if QuietNet isn't taking lookups over IPv6 or has no lasting address. `listening` says whether QuietNet hears the router's IPv6 announcements (Linux only, and only with the right to read raw network messages; always `false` on a Mac). `router_heard` is when the router last announced IPv6 on the home network (`null` if never heard). `router_dns` lists the IPv6 DNS servers those announcements tell devices to use, each kept until its stated lifetime runs out or for an hour at most; `router_dns_not_ours` is those that are not this computer taking lookups over IPv6. When that is not empty, the dashboard warns that some lookups skip QuietNet. Servers handed out only by DHCPv6 are not seen. `in_use` is `true` when the home network has IPv6: this computer has a public IPv6 range, or the router announced IPv6 in the last hour. The "Cut live connections" card then says that IPv6 connections can't be cut directly. The addresses come from the home network: escape them before display.
+
+`enforcer` is `{"available", "reason", "active", "shared"}` when the enforcer never started (as on a Mac, shown above); otherwise it carries every field of `GET /api/enforcer`, `firewall` and `shared` included.
 
 `junk_count` is worked out when an advert list is loaded or downloaded, not on each call. In `scan`, `network`, `addresses` and `capped` describe what the last scan covered (or will cover): the home network, how many addresses were knocked on, and whether the network was too big to scan in full (more than 1,024 addresses, in which case the 1,024 around this computer are scanned). They are left out until a scan has been asked for since QuietNet started, and are `""`, `0` and `false` if this computer had no network address at the time.
 
@@ -57,10 +70,14 @@ A **scope** is `all`, `group:<id>` or `device:<ip>`.
 {"ip": "192.168.1.23", "name": "", "hint": "Sams iPad", "hint_source": "Bonjour", "hint_detail": "Model: iPad13,1",
  "mac": "11:22:33:44:55:66",
  "this_computer": false, "last": 1795000000.0, "n": 412, "nb": 37, "on_network": 1795000000.0,
- "group": 1, "off": false, "enforced": false}
+ "group": 1, "off": false, "enforced": false, "other_dns": 0, "paused": false, "warning": ""}
 ```
 
+`paused` is `true` when a different device now has this address, so the rules kept under it (its own and its group's) are paused until the device they belong to comes back; only the whole house's rules apply, plus the new-device group if the device there now was never seen before. `warning` is a plain-English sentence for the device's page when its rules are paused or could not be moved, or the device is behind a Wi-Fi range extender ("" if none); escape it before display. A device whose rules follow it by hardware address, or that a `device_notices` entry points at, is listed even before it has used QuietNet or been found by a scan.
+
 `name` is the name someone gave the device ("" if none). `hint` is the name QuietNet suggests from what the network reported ("" if none); `hint_source` says where it came from: `"DHCP"`, `"Bonjour"`, `"Windows network"`, `"UPnP"` or `"router"` ("" with no hint). `hint_detail` is a model or maker the device reported about itself (for example `"Model: Sonos One (Sonos, Inc.)"` or `"Runs Windows"`), or, for a device with neither a hint nor such a detail whose hardware address is a made-up private one, `"Private Wi-Fi address, so probably a phone, tablet or laptop"`; otherwise "". All three are plain text chosen by devices on the network: escape them before display. The dashboard saves a hint as the name with the ordinary `POST /api/device-name` call. See ARCHITECTURE.md, "Device names".
+
+`other_dns` is when (seconds since 1970) the device last looked up another DNS service such as `dns.google` in the last 24 hours, or 0. It is kept in memory, so it starts at 0 again when QuietNet restarts; the device's activity list still shows older tries.
 
 `n` and `nb` are lookups and blocked lookups in the last 24 hours. `last` is 0 for a device that has been seen on the network but has never used QuietNet.
 
@@ -68,7 +85,7 @@ A **scope** is `all`, `group:<id>` or `device:<ip>`.
 
 ```json
 {"base": "bbc.co.uk", "owner": "BBC", "n": 3, "nb": 0, "last": 1795000000.0,
- "v": "ok", "b": false, "why": null, "svc": "", "some_blocked": false,
+ "v": "ok", "b": false, "why": null, "svc": "", "some_blocked": false, "other_dns": false,
  "hosts": [{"d": "www.bbc.co.uk", "n": 2, "nb": 0, "last": 1795000000.0, "v": "ok", "b": false, "why": null, "svc": ""}]}
 ```
 
@@ -82,7 +99,7 @@ Sending that `marker` back as `since` with the same `ip` and `hours` gets `{"unc
 
 For QuietNet's own computer, `kill`, `off` and `schedule` never appear: it is exempt from them (see [How QuietNet works](ARCHITECTURE.md#the-order-rules-are-checked-in)).
 
-`v` is the label: `ok`, `suspect` (possibly junk, shown for a person to judge, never blocked on its own) or `junk` (on the advert list). `b` is whether it is blocked for this device now, `why` is the reason code (`kill`, `off`, `schedule`, `you`, `allowed`, `service`, `list`), and `svc` names the service or schedule responsible.
+`v` is the label: `ok`, `suspect` (possibly junk, shown for a person to judge, never blocked on its own) or `junk` (on the advert list). `b` is whether it is blocked for this device now, `why` is the reason code (`kill`, `off`, `schedule`, `you`, `allowed`, `service`, `list`, or `other_dns` for another DNS service, which is blocked whatever the rules say for a device the owner controls: one with "cut live connections", a group, or rules of its own, or every device when `other_dns_all` is on), and `svc` names the service or schedule responsible. A group's `other_dns` is `true` when any of its names is another DNS service.
 
 `/api/controls`:
 
@@ -105,6 +122,7 @@ For QuietNet's own computer, `kill`, `off` and `schedule` never appear: it is ex
 | `POST /api/kill` | `{"on"}` | The kill switch |
 | `POST /api/pause` | `{"minutes"}` | Pauses advert blocking and your own blocks. 0 resumes. Limited to 24 hours |
 | `POST /api/junk-switch` | `{"on"}` | Advert blocking on or off |
+| `POST /api/other-dns-switch` | `{"on"}` | "Stop every device using another DNS service". Off (the default), other DNS services such as `dns.google` are blocked only for devices the owner controls; on, for every device. Saved, and shown as `other_dns_all` in `/api/status` |
 | `POST /api/schedule` | see below | Creates, or changes when `id` matches an existing schedule |
 | `POST /api/schedule-enable` | `{"id", "on"}` | |
 | `POST /api/schedule-delete` | `{"id"}` | |
@@ -113,6 +131,9 @@ For QuietNet's own computer, `kill`, `off` and `schedule` never appear: it is ex
 | `POST /api/device-group` | `{"ip", "group"}` | An unknown or missing group removes the device from its group |
 | `POST /api/device-name` | `{"ip", "name"}` | Name cut to 40 characters |
 | `POST /api/enforce` | `{"ip", "on"}` | "Cut live connections" for one device. Must be a real IPv4 address, as text (`400` otherwise). Switching on also refuses, with `400` and `{"error"}`, this computer and addresses that are never devices; when the enforcer is running it also refuses the router and addresses outside the home network. The device's hardware address is recorded so a different device later given the same address is left alone |
+| `POST /api/move-rules` | `{"from", "to"}` | "Move the rules to this device": moves the name, group, own service blocks, internet switch, schedules and "cut live connections" from one address to another. Both must be IPv4 addresses as text (`400` otherwise). Refused with `400` and `{"error"}` when either is this computer or the router, `from` has nothing to move, or `to` has rules of its own (a group alone is allowed, and replaced by `from`'s group, or removed if `from` has none). The history stays under the old address. With `from` and `to` the same address it means "the device at this address now is the one these rules are for": the rules belong to its hardware address from then on, and a pause ends. Refused with `400` and `{"error"}` if the address has no rules or the device there can't be seen |
+| `POST /api/different-device` | `{"ip"}` | "No, it's a different device": the rules kept under this IPv4 address are paused, kept for the device they belong to, until it comes back, and the device there now gets the new-device group if one is chosen. Refused with `400` and `{"error"}` when the address has no rules, or the device there is the one they belong to |
+| `POST /api/new-device-group` | `{"group"}` | The group a device seen for the first time is put in. `null`, or anything that isn't an existing group's id, means none. Returns `{"ok", "group"}` with the group now set (`null` for none). Deleting the group sets it back to none |
 | `POST /api/cloud` | `{"relay", "code"}` or `{"action": "forget"}` | Pair with a relay, or unpair. A relay address starting `http://` is refused, with nothing sent, unless the host is `localhost`, `127.0.0.1` or `::1`: `400` with `{"error": "That relay address starts with http://, which would send this Pi's key unprotected. Use an address starting with https:// instead."}` |
 | `POST /api/scan` | `{}` | Starts a network scan in the background. Returns what it will cover: `{"ok": true, "network": "192.168.4.0/22", "addresses": 1022, "capped": false}` |
 | `POST /api/update-list` | `{}` | Starts the community list download in the background |

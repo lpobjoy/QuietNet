@@ -51,8 +51,10 @@ class Base(unittest.TestCase):
             server.init_db()
             server.load_lists()
         for table in ("blocked", "allowed", "groups", "device_group", "service_blocks",
-                      "internet_off", "schedules", "queries", "enforced"):
+                      "internet_off", "schedules", "queries", "enforced", "device_mac", "known_macs", "events",
+                      "shared_macs"):
             server.sql("DELETE FROM %s" % table, commit=True)
+        server.sql("DELETE FROM settings WHERE key='other_dns_all'", commit=True)
         server.init_db()
         server.S.junk_on, server.S.paused_until = True, 0
         server.S.enforced, server.S.resolved = set(), {}
@@ -60,6 +62,11 @@ class Base(unittest.TestCase):
         server.S.router, server.S.router_checked = "", float("inf")
         # No IPv6 view of the real machine: nothing matched, no home range, no own addresses.
         server.S.v6_own, server.S.v6_prefixes, server.S.v6_devices = set(), [], {}
+        # Nothing heard from the router about IPv6, and no IPv6 address to give devices.
+        server.S.v6_dns, server.S.router_v6_dns, server.S.ra_heard = "", {}, None
+        server.S.router_prefixes = {}
+        server.S.other_dns = {}
+        server.S.shared_left, server.S.plan_cache = {}, {}
 
     def schedule(self, **kw):
         body = {"name": "Bedtime", "scope": "device:" + KID, "days": [0, 1, 2, 3, 4, 5, 6],
@@ -314,9 +321,9 @@ class EnforcerLogic(unittest.TestCase):
         self.assertIn("ip saddr 192.168.1.24 ip daddr != 192.168.1.60 drop", text)
         self.assertIn("hook forward", text)
 
-    def test_nothing_blocked_means_no_drop_lines(self):
+    def test_nothing_blocked_means_no_address_drop_lines(self):
         text = enforcer.nft_ruleset({"192.168.1.23": {"off": False, "ips": set()}}, "192.168.1.60")
-        self.assertNotIn("drop", text)
+        self.assertNotIn("ip daddr", text)
 
     def test_iptables_rules(self):
         cmds = enforcer.iptables_rules({"192.168.1.23": {"off": False, "ips": {"1.2.3.4"}}}, "192.168.1.60")
@@ -410,6 +417,66 @@ class EnforcementPlan(Base):
         server.enforcement_plan()
         server.record_resolved("example.org", self._answer("example.org", "198.51.100.7"))
         self.assertIn("198.51.100.7", server.enforcement_plan()[KID]["ips"])
+
+    def _youtube_blocked_for_the_kid(self):
+        """YouTube blocked for the enforced device, with Google search sharing one of its addresses."""
+        server.record_resolved("www.youtube.com", self._answer("www.youtube.com", "142.250.1.10"))
+        server.record_resolved("www.google.com", self._answer("www.google.com", "142.250.1.10"))
+        server.record_resolved("rr1.googlevideo.com", self._answer("rr1.googlevideo.com", "173.194.0.5"))
+        server.set_service_block("device:" + KID, "youtube", True)
+        server.S.enforced = {KID}
+
+    def test_an_address_shared_with_an_allowed_name_is_not_dropped(self):
+        self._youtube_blocked_for_the_kid()
+        self.assertNotIn("142.250.1.10", server.enforcement_plan()[KID]["ips"])
+
+    def test_an_address_only_blocked_names_use_is_dropped(self):
+        self._youtube_blocked_for_the_kid()
+        self.assertIn("173.194.0.5", server.enforcement_plan()[KID]["ips"])
+
+    def test_a_video_server_address_shared_with_an_allowed_download_name_is_still_dropped(self):
+        # Google's caches serve YouTube video and Chrome or Play downloads (gvt1.com) from one address.
+        self._youtube_blocked_for_the_kid()
+        server.record_resolved("r3---sn-aiglln7e.gvt1.com", self._answer("r3---sn-aiglln7e.gvt1.com", "173.194.0.5"))
+        self.assertIn("173.194.0.5", server.enforcement_plan()[KID]["ips"])
+
+    def test_a_shared_address_is_still_dropped_when_the_allowed_name_is_blocked_elsewhere(self):
+        # The guard is per device: a name allowed for another device does not spare the address.
+        self._youtube_blocked_for_the_kid()
+        server.block("www.google.com")
+        self.assertIn("142.250.1.10", server.enforcement_plan()[KID]["ips"])
+
+    def test_a_whole_device_cut_still_drops_everything(self):
+        self._youtube_blocked_for_the_kid()
+        server.set_internet_off("device:" + KID, True)
+        plan = server.enforcement_plan()
+        self.assertTrue(plan[KID]["off"])
+        self.assertNotIn(KID, server.S.shared_left)
+
+    def test_the_shared_count_appears_in_the_status_api(self):
+        self._youtube_blocked_for_the_kid()
+        server.enforcement_plan()
+        shared = server.api_status()["enforcer"]["shared"]
+        self.assertEqual(shared[KID], {"count": 1, "names": ["YouTube"]})
+
+    def test_an_allowed_names_old_addresses_age_out_of_the_guard(self):
+        self._youtube_blocked_for_the_kid()
+        old = time.time() - server.RESOLVED_HOURS * 3600 - 60
+        server.S.resolved["www.google.com"]["142.250.1.10"] = old
+        self.assertIn("142.250.1.10", server.enforcement_plan()[KID]["ips"])
+        self.assertNotIn(KID, server.S.shared_left)
+
+    def test_the_guard_stays_bounded_under_many_names(self):
+        for i in range(5000):                          # many allowed names, some sharing a blocked address
+            name = "site%d.example.net" % i
+            server.record_resolved(name, self._answer(name, "10.%d.%d.1" % (i // 250, i % 250)))
+        self._youtube_blocked_for_the_kid()
+        plan = server.enforcement_plan()
+        self.assertLessEqual(len(server.S.resolved), 4000)
+        self.assertLessEqual(len(server.S.plan_cache["cut"]), 4000)
+        self.assertEqual(set(server.S.shared_left), {KID})
+        self.assertLessEqual(len(server.S.shared_left[KID]["names"]), 5)
+        self.assertIn("173.194.0.5", plan[KID]["ips"])
 
     def test_recording_a_lookups_addresses_does_not_wait_for_the_database_lock(self):
         # Every allowed answer records its addresses before it is sent; a slow database query

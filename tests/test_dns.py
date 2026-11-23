@@ -439,6 +439,177 @@ class NetworkDnsSignals(Base):
         self.assertEqual(self.ask("www.icloud.com")[-4:], bytes([93, 184, 216, 34]))
 
 
+class OtherDnsServices(Base):
+    """Names of other DNS services (secure DNS in a browser, Private DNS on a phone) are blocked for
+    devices the owner controls, or every device if the owner chooses, so they fall back to
+    ordinary DNS and come to QuietNet (known issue 8). KID has a rule of its own; ADULT has none."""
+
+    def setUp(self):
+        super().setUp()
+        server.set_service_block("device:" + KID, "tiktok", True)
+        drain_log()
+        self.asked = []
+
+    def ask(self, name, client=KID, qtype=1):
+        """Answer a lookup, noting anything that reached the pretend internet."""
+        return server.answer_query(query(name, qtype), client,
+                                   lambda d: self.asked.append(d) or fake_answer(d))
+
+    def test_every_listed_dns_service_is_blocked(self):
+        for name in sorted(server.OTHER_DNS_SERVICES):
+            self.assertEqual(self.ask(name)[-4:], bytes(4), name)
+        self.assertEqual(self.asked, [])
+
+    def test_the_list_holds_the_well_known_services(self):
+        for name in ("dns.google", "dns.google.com", "8888.google", "cloudflare-dns.com", "mozilla.cloudflare-dns.com",
+                     "one.one.one.one", "1dot1dot1dot1.cloudflare-dns.com", "security.cloudflare-dns.com",
+                     "family.cloudflare-dns.com", "dns.quad9.net", "dns9.quad9.net", "dns10.quad9.net",
+                     "dns11.quad9.net", "doh.opendns.com", "dns.nextdns.io", "doh.cleanbrowsing.org",
+                     "dns.adguard.com", "dns.adguard-dns.com", "doh.mullvad.net", "dns.mullvad.net",
+                     "chrome.cloudflare-dns.com", "doh.dns.sb", "dns.controld.com", "freedns.controld.com"):
+            self.assertIn(name, server.OTHER_DNS_SERVICES)
+
+    def test_a_dns_service_gets_a_real_answer_for_a_device_with_no_rules_of_its_own(self):
+        self.assertEqual(self.ask("dns.google", client=ADULT)[-4:], bytes([93, 184, 216, 34]))
+        self.assertNotIn(ADULT, server.S.other_dns)
+
+    def test_a_dns_service_is_blocked_for_every_device_when_the_owner_chooses(self):
+        server.S.other_dns_all = True
+        self.assertEqual(self.ask("dns.google", client=ADULT)[-4:], bytes(4))
+
+    def test_a_dns_service_is_blocked_for_a_device_in_a_group(self):
+        server.S.group_names[7] = "Kids"
+        server.S.dev_group[ADULT] = 7
+        self.assertEqual(self.ask("dns.google", client=ADULT)[-4:], bytes(4))
+
+    def test_a_dns_service_is_blocked_for_a_device_with_live_cut_on(self):
+        server.S.enforced.add(ADULT)
+        self.assertEqual(self.ask("dns.google", client=ADULT)[-4:], bytes(4))
+
+    def test_a_dns_service_is_blocked_for_a_device_with_its_own_schedule(self):
+        self.schedule(scope="device:" + ADULT)
+        self.assertEqual(self.ask("dns.google", client=ADULT)[-4:], bytes(4))
+
+    def test_a_name_beneath_a_dns_service_is_blocked(self):
+        self.assertEqual(self.ask("abc123.dns.nextdns.io")[-4:], bytes(4))
+
+    def test_a_dns_service_asked_for_in_capitals_is_blocked(self):
+        self.assertEqual(self.ask("DNS.Google")[-4:], bytes(4))
+
+    def test_a_dns_service_name_with_a_final_dot_still_counts(self):
+        self.assertTrue(server.is_other_dns_service("Cloudflare-DNS.com."))
+
+    def test_a_name_that_only_ends_the_same_way_does_not_count(self):
+        self.assertFalse(server.is_other_dns_service("notdns.google"))
+        self.assertFalse(server.is_other_dns_service("www.google.com"))
+
+    def test_a_dns_service_ipv6_question_gets_the_blocked_answer(self):
+        self.assertEqual(self.ask("dns.quad9.net", qtype=28)[-16:], bytes(16))
+
+    def test_a_dns_service_stays_blocked_while_blocking_is_paused(self):
+        server.S.paused_until = time.time() + 600
+        self.assertEqual(self.ask("dns.google")[-4:], bytes(4))
+
+    def test_a_dns_service_stays_blocked_even_if_always_allowed(self):
+        server.unblock("cloudflare-dns.com")
+        self.assertEqual(self.ask("cloudflare-dns.com")[-4:], bytes(4))
+
+    def test_a_dns_service_lookup_is_written_down_as_blocked(self):
+        self.ask("dns.google")
+        log = [(client, name, blocked) for ts, client, name, blocked in drain_log()]
+        self.assertEqual(log, [(KID, "dns.google", 1)])
+
+    def test_a_dns_service_lookup_is_remembered_against_the_device(self):
+        self.ask("doh.opendns.com")
+        self.assertGreater(server.S.other_dns.get(KID, 0), time.time() - 60)
+
+    def test_ordinary_google_names_are_not_affected(self):
+        self.assertEqual(self.ask("www.google.com")[-4:], bytes([93, 184, 216, 34]))
+
+
+class ReplyAddress(unittest.TestCase):
+    """On Linux each answer leaves from the address its lookup was sent to, so a lookup the enforcer
+    redirected from 8.8.8.8 is answered from the address it was redirected to. Stand-in sockets only."""
+
+    PI = "192.168.1.60"
+
+    def pktinfo(self, addressed_to):
+        """The extra details Linux gives with a lookup: card number, local address, address it was sent to."""
+        info = struct.pack("=i4s4s", 3, socket.inet_aton(self.PI), socket.inet_aton(addressed_to))
+        return [(socket.IPPROTO_IP, server.IP_PKTINFO or 8, info)]
+
+    def test_the_address_a_lookup_was_sent_to_is_read(self):
+        with mock.patch.object(server, "IP_PKTINFO", 8):
+            self.assertEqual(server.reply_address(self.pktinfo(self.PI)), self.PI)
+
+    def test_a_lookup_sent_to_everyone_gives_no_reply_address(self):
+        with mock.patch.object(server, "IP_PKTINFO", 8):
+            self.assertIsNone(server.reply_address(self.pktinfo("255.255.255.255")))
+            self.assertIsNone(server.reply_address(self.pktinfo("224.0.0.251")))
+
+    def test_no_details_gives_no_reply_address(self):
+        self.assertIsNone(server.reply_address([]))
+
+    def test_the_answer_is_sent_from_the_address_the_lookup_was_sent_to(self):
+        sock = mock.Mock()
+        with mock.patch.object(server, "IP_PKTINFO", 8):
+            server.send_answer(sock, b"answer", ("192.168.1.23", 5000), self.PI)
+        sock.sendmsg.assert_called_once()
+        (parts, ancillary, flags, addr), _ = sock.sendmsg.call_args
+        self.assertEqual((parts, flags, addr), ([b"answer"], 0, ("192.168.1.23", 5000)))
+        level, kind, info = ancillary[0]
+        self.assertEqual((level, kind), (socket.IPPROTO_IP, 8))
+        self.assertEqual(info, struct.pack("=i4s4s", 0, socket.inet_aton(self.PI), bytes(4)))
+        sock.sendto.assert_not_called()
+
+    def test_without_a_known_address_the_system_chooses(self):
+        sock = mock.Mock()
+        server.send_answer(sock, b"answer", ("192.168.1.23", 5000), None)
+        sock.sendto.assert_called_once_with(b"answer", ("192.168.1.23", 5000))
+
+    def test_if_the_address_cannot_be_sent_from_the_system_chooses(self):
+        sock = mock.Mock()
+        sock.sendmsg.side_effect = OSError("cannot assign requested address")
+        with mock.patch.object(server, "IP_PKTINFO", 8):
+            server.send_answer(sock, b"answer", ("192.168.1.23", 5000), self.PI)
+        sock.sendto.assert_called_once_with(b"answer", ("192.168.1.23", 5000))
+
+    def test_the_option_is_asked_for_on_linux_ipv4_sockets(self):
+        sock = mock.Mock(family=socket.AF_INET)
+        with mock.patch.object(server, "IP_PKTINFO", 8):
+            self.assertTrue(server.ask_for_reply_address(sock))
+        sock.setsockopt.assert_called_once_with(socket.IPPROTO_IP, 8, 1)
+
+    def test_the_option_is_not_asked_for_away_from_linux(self):
+        sock = mock.Mock(family=socket.AF_INET)
+        with mock.patch.object(server, "IP_PKTINFO", None):
+            self.assertFalse(server.ask_for_reply_address(sock))
+        sock.setsockopt.assert_not_called()
+
+    def test_the_option_is_not_asked_for_on_the_ipv6_listener(self):
+        sock = mock.Mock(family=socket.AF_INET6)
+        with mock.patch.object(server, "IP_PKTINFO", 8):
+            self.assertFalse(server.ask_for_reply_address(sock))
+
+    def test_the_listener_answers_from_the_address_each_lookup_was_sent_to(self):
+        sock = mock.Mock(family=socket.AF_INET)
+        sock.recvmsg.side_effect = [(query("www.bbc.co.uk"), self.pktinfo(self.PI), 0, ("192.168.1.23", 5000)),
+                                    KeyboardInterrupt()]
+        sent = []
+
+        def run_now(fn, data, addr, source):
+            """Answer the lookup straight away."""
+            fn(data, addr, source)
+        pool = mock.Mock(submit=run_now)
+        with mock.patch.object(server, "IP_PKTINFO", 8), \
+                mock.patch.object(server, "answer_query", return_value=b"answer"), \
+                mock.patch.object(server, "send_answer", lambda s, resp, addr, source: sent.append((addr, source))), \
+                mock.patch.object(server, "ThreadPoolExecutor", lambda max_workers: pool):
+            with self.assertRaises(KeyboardInterrupt):
+                server.udp_server(sock)
+        self.assertEqual(sent, [(("192.168.1.23", 5000), self.PI)])
+
+
 class RememberedAnswers(Base):
     """Answers kept in memory for their shortened lifetime (known issue 22)."""
 
@@ -690,7 +861,7 @@ class LookupsOverIPv6(Base):
         sock = mock.Mock(family=socket.AF_INET6)
         sock.recvfrom.side_effect = [(query("www.bbc.co.uk"), ("2001:db8:9:9::1", 5000, 0, 0)), KeyboardInterrupt()]
         submitted = []
-        pool = mock.Mock(submit=lambda fn, data, addr: submitted.append(addr))
+        pool = mock.Mock(submit=lambda fn, data, addr, source: submitted.append(addr))
         with mock.patch.object(server, "ThreadPoolExecutor", lambda max_workers: pool):
             with self.assertRaises(KeyboardInterrupt):
                 server.udp_server(sock)
@@ -701,7 +872,7 @@ class LookupsOverIPv6(Base):
         sock = mock.Mock(family=socket.AF_INET6)
         sock.recvfrom.side_effect = [(query("www.bbc.co.uk"), ("fe80::1", 5000, 0, 2)), KeyboardInterrupt()]
         submitted = []
-        pool = mock.Mock(submit=lambda fn, data, addr: submitted.append(addr))
+        pool = mock.Mock(submit=lambda fn, data, addr, source: submitted.append(addr))
         with mock.patch.object(server, "ThreadPoolExecutor", lambda max_workers: pool):
             with self.assertRaises(KeyboardInterrupt):
                 server.udp_server(sock)
@@ -713,7 +884,7 @@ class LookupsOverIPv6(Base):
         self.assertTrue(server.TCPServer6.verify_request(None, "conn", ("2001:db8:1:2::5", 5000, 0, 0)))
 
     def test_ipv6_neighbours_are_matched_to_ipv4_devices_by_hardware_address(self):
-        with mock.patch.object(server, "own_ipv6", return_value=(set(), [])), \
+        with mock.patch.object(server, "own_ipv6", return_value=(set(), [], "")), \
                 mock.patch.object(server, "neighbours", return_value={KID: "aa:bb:cc:dd:ee:01"}), \
                 mock.patch.object(server, "ipv6_neighbours",
                                   return_value={self.PHONE_V6: "aa:bb:cc:dd:ee:01", "fd00::2": "aa:bb:cc:dd:ee:99"}):
@@ -724,7 +895,7 @@ class LookupsOverIPv6(Base):
         server.sql("INSERT OR REPLACE INTO seen(ip,mac,host,ts) VALUES(?,?,?,?)",
                    (KID, "aa:bb:cc:dd:ee:01", "", time.time()), commit=True)
         self.addCleanup(server.sql, "DELETE FROM seen WHERE ip=?", (KID,), True)
-        with mock.patch.object(server, "own_ipv6", return_value=(set(), [])), \
+        with mock.patch.object(server, "own_ipv6", return_value=(set(), [], "")), \
                 mock.patch.object(server, "neighbours", return_value={}), \
                 mock.patch.object(server, "ipv6_neighbours", return_value={self.PHONE_V6: "aa:bb:cc:dd:ee:01"}):
             server.refresh_ipv6_view()
@@ -754,9 +925,349 @@ class LookupsOverIPv6(Base):
                 "\tinet6 fd00::60 prefixlen 64 autoconf\n")
         with mock.patch.object(server.os.path, "exists", lambda p: False), \
                 mock.patch.object(server.subprocess, "run", return_value=mock.Mock(stdout=text)):
-            own, ranges = server.own_ipv6()
+            own, ranges, _ = server.own_ipv6()
         self.assertEqual(own, {"fe80::1", "2001:db8:1:2::60", "fd00::60"})
         self.assertEqual(ranges, [server.ipaddress.IPv6Network("2001:db8:1:2::/64")])
+
+    def test_a_lasting_unique_local_address_is_the_one_given_to_devices(self):
+        text = ("\tinet6 fe80::1%en0 prefixlen 64 secured scopeid 0x1\n"
+                "\tinet6 2001:db8:1:2::60 prefixlen 64 autoconf secured\n"
+                "\tinet6 fd00::60 prefixlen 64 autoconf secured\n")
+        with mock.patch.object(server.os.path, "exists", lambda p: False), \
+                mock.patch.object(server.subprocess, "run", return_value=mock.Mock(stdout=text)):
+            self.assertEqual(server.own_ipv6()[2], "fd00::60")
+
+    def test_a_temporary_address_is_never_given_to_devices(self):
+        text = ("\tinet6 2001:db8:1:2::77 prefixlen 64 autoconf temporary\n"
+                "\tinet6 2001:db8:1:2::60 prefixlen 64 autoconf secured\n")
+        with mock.patch.object(server.os.path, "exists", lambda p: False), \
+                mock.patch.object(server.subprocess, "run", return_value=mock.Mock(stdout=text)):
+            self.assertEqual(server.own_ipv6()[2], "2001:db8:1:2::60")
+
+    def test_temporary_and_link_local_addresses_on_linux_are_never_given_to_devices(self):
+        lines = ("20010db8000100020000000000000077 03 40 00 01   wlan0\n"      # temporary
+                 "fe800000000000000000000000000060 03 40 20 80   wlan0\n")     # link-local
+        with mock.patch.object(server.os.path, "exists", lambda p: p == "/proc/net/if_inet6"), \
+                mock.patch("builtins.open", mock.mock_open(read_data=lines)):
+            own, ranges, for_devices = server.own_ipv6()
+        self.assertEqual((len(own), for_devices), (2, ""))
+
+    def test_a_lasting_public_address_on_linux_is_given_to_devices(self):
+        lines = "20010db8000100020000000000000060 03 40 00 00   wlan0\n"
+        with mock.patch.object(server.os.path, "exists", lambda p: p == "/proc/net/if_inet6"), \
+                mock.patch("builtins.open", mock.mock_open(read_data=lines)):
+            self.assertEqual(server.own_ipv6()[2], "2001:db8:1:2::60")
+
+    def test_the_address_for_devices_is_kept_with_the_ipv6_view(self):
+        with mock.patch.object(server, "own_ipv6", return_value=(set(), [], "fd00::60")), \
+                mock.patch.object(server, "neighbours", return_value={}), \
+                mock.patch.object(server, "ipv6_neighbours", return_value={}):
+            server.refresh_ipv6_view()
+        self.assertEqual(server.S.v6_dns, "fd00::60")
+
+
+def router_advert(*options):
+    """A router announcement (ICMPv6 type 134) as it arrives on the socket: the 16-byte start, then
+    the given options, each already in its on-the-wire form."""
+    return bytes([134, 0, 0, 0, 64, 0]) + struct.pack(">HII", 1800, 0, 0) + b"".join(options)
+
+
+def rdnss(lifetime, *addresses):
+    """A DNS server option (type 25) naming the given IPv6 addresses for `lifetime` seconds."""
+    body = b"".join(server.ipaddress.IPv6Address(a).packed for a in addresses)
+    return bytes([25, 1 + 2 * len(addresses), 0, 0]) + struct.pack(">I", lifetime) + body
+
+
+def prefix(valid, network):
+    """An address range option (type 3) handing out `network` for `valid` seconds."""
+    net = server.ipaddress.IPv6Network(network)
+    return (bytes([3, 4, net.prefixlen, 0xC0]) + struct.pack(">III", valid, valid, 0)
+            + net.network_address.packed)
+
+
+class RouterAnnouncements(Base):
+    """The router's IPv6 announcements, read to spot it telling devices to use its own IPv6 DNS
+    server. Nothing here opens a real socket: the listener is handed stand-ins."""
+
+    HUB = "fe80::1"
+    PI = "2001:db8:1:2::60"
+
+    def listen(self, packets, sock=None, hops=255):
+        """Run the listener over these (data, source) packets, each arriving with this hop limit
+        (None: the system noted none), then stop it."""
+        sock = sock or mock.Mock()
+        extra = [] if hops is None else [(server.socket.IPPROTO_IPV6, server.IPV6_HOPLIMIT, struct.pack("=i", hops))]
+        sock.recvmsg.side_effect = [(data, extra, 0, source) for data, source in packets] + [KeyboardInterrupt()]
+        with self.assertRaises(KeyboardInterrupt):
+            server.router_advert_listener(sock)
+
+    def test_a_dns_server_named_in_a_router_announcement_is_read(self):
+        self.assertEqual(server.parse_router_advert(router_advert(rdnss(1200, self.HUB))), [(self.HUB, 1200)])
+
+    def test_several_dns_servers_and_other_options_are_read(self):
+        prefix_info = bytes([3, 4]) + bytes(30)                     # a prefix option, which is skipped
+        link_addr = bytes([1, 1, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff])
+        data = router_advert(link_addr, prefix_info, rdnss(600, self.HUB, "fd00::53"), rdnss(300, "2001:db8::53"))
+        self.assertEqual(server.parse_router_advert(data),
+                         [(self.HUB, 600), ("fd00::53", 600), ("2001:db8::53", 300)])
+
+    def test_an_announcement_without_a_dns_server_gives_an_empty_list(self):
+        self.assertEqual(server.parse_router_advert(router_advert()), [])
+
+    def test_a_message_that_is_not_a_router_announcement_is_ignored(self):
+        data = bytearray(router_advert(rdnss(600, self.HUB)))
+        data[0] = 135                                               # a router question, not an announcement
+        self.assertIsNone(server.parse_router_advert(bytes(data)))
+        self.assertIsNone(server.parse_router_advert(b"\x86\x00\x00"))
+
+    def test_a_cut_short_announcement_is_ignored(self):
+        data = router_advert(rdnss(600, self.HUB))
+        for size in (len(data) - 1, len(data) - 16, 17):
+            self.assertIsNone(server.parse_router_advert(data[:size]), size)
+
+    def test_an_option_of_length_zero_is_ignored(self):
+        self.assertIsNone(server.parse_router_advert(router_advert(bytes([25, 0]) + bytes(6))))
+
+    def test_a_dns_server_option_of_the_wrong_length_is_ignored(self):
+        too_short = bytes([25, 1]) + bytes(6)
+        even = bytes([25, 2]) + bytes(14)
+        self.assertIsNone(server.parse_router_advert(router_advert(too_short)))
+        self.assertIsNone(server.parse_router_advert(router_advert(even)))
+
+    def test_an_option_longer_than_the_message_is_ignored(self):
+        data = bytearray(router_advert(rdnss(600, self.HUB)))
+        data[17] = 9                                                # claims 72 bytes; only 24 arrived
+        self.assertIsNone(server.parse_router_advert(bytes(data)))
+
+    def test_many_options_are_read_without_trouble(self):
+        data = router_advert(*[rdnss(600, "2001:db8::%x" % i) for i in range(1, 200)])
+        self.assertEqual(len(server.parse_router_advert(data)), 199)
+
+    def test_addresses_no_device_could_use_for_dns_are_skipped(self):
+        data = router_advert(rdnss(600, "ff02::1", "::", "::1", "::ffff:8.8.8.8", self.HUB))
+        self.assertEqual(server.parse_router_advert(data), [(self.HUB, 600)])
+
+    def test_a_server_named_with_lifetime_zero_is_forgotten(self):
+        server.note_router_dns([(self.HUB, 600)], 1000.0)
+        server.note_router_dns([(self.HUB, 0)], 1001.0)
+        self.assertEqual(server.S.router_v6_dns, {})
+
+    def test_a_named_server_is_kept_for_an_hour_at_most(self):
+        server.note_router_dns([(self.HUB, 0xFFFFFFFF)], 1000.0)
+        self.assertEqual(server.S.router_v6_dns, {self.HUB: 1000.0 + server.RA_HOLD_MAX})
+        self.assertEqual(server.ipv6_dns_view(1000.0 + server.RA_HOLD_MAX + 1)["router_dns"], [])
+
+    def test_only_so_many_named_servers_are_kept(self):
+        server.note_router_dns([("2001:db8::%x" % i, 600 + i) for i in range(1, 50)], 1000.0)
+        self.assertEqual(len(server.S.router_v6_dns), server.RA_MAX_SERVERS)
+        self.assertIn("2001:db8::31", server.S.router_v6_dns)      # the longest-lived are the ones kept
+
+    def test_the_warning_list_names_a_router_server_that_is_not_this_computer(self):
+        server.note_router_dns([(self.HUB, 600)], time.time())
+        view = server.ipv6_dns_view()
+        self.assertEqual((view["router_dns"], view["router_dns_not_ours"]), ([self.HUB], [self.HUB]))
+
+    def test_the_warning_list_is_empty_when_the_router_names_only_this_computer(self):
+        server.S.v6_own = {self.PI}
+        with mock.patch.object(server.S, "dns_ipv6", True):
+            server.note_router_dns([(self.PI, 600)], time.time())
+            self.assertEqual(server.ipv6_dns_view()["router_dns_not_ours"], [])
+
+    def test_this_computer_counts_as_another_server_while_it_is_not_taking_ipv6_lookups(self):
+        server.S.v6_own = {self.PI}
+        with mock.patch.object(server.S, "dns_ipv6", False):
+            server.note_router_dns([(self.PI, 600)], time.time())
+            self.assertEqual(server.ipv6_dns_view()["router_dns_not_ours"], [self.PI])
+
+    def test_the_warning_list_is_empty_when_nothing_was_heard(self):
+        self.assertEqual(server.ipv6_dns_view()["router_dns_not_ours"], [])
+
+    def test_the_status_carries_the_ipv6_address_for_devices_when_known(self):
+        server.S.v6_dns = "fd12:3456::60"
+        with mock.patch.object(server.S, "dns_ipv6", True):
+            self.assertEqual(server.api_status()["ipv6"]["dns_address"], "fd12:3456::60")
+
+    def test_no_ipv6_address_is_offered_while_ipv6_lookups_are_not_taken(self):
+        server.S.v6_dns = "fd12:3456::60"
+        with mock.patch.object(server.S, "dns_ipv6", False):
+            self.assertEqual(server.api_status()["ipv6"]["dns_address"], "")
+
+    def test_the_listener_records_a_router_announcement(self):
+        self.listen([(router_advert(rdnss(600, self.HUB)), ("fe80::1%wlan0", 0, 0, 3))])
+        self.assertIn(self.HUB, server.S.router_v6_dns)
+        self.assertIsNotNone(server.S.ra_heard)
+
+    def test_the_listener_ignores_announcements_whose_hop_limit_is_not_255(self):
+        self.listen([(router_advert(rdnss(600, self.HUB)), ("fe80::1%wlan0", 0, 0, 3))], hops=64)
+        self.assertEqual((server.S.router_v6_dns, server.S.ra_heard), ({}, None))
+
+    def test_the_listener_accepts_announcements_when_the_system_gives_no_hop_limit(self):
+        self.listen([(router_advert(rdnss(600, self.HUB)), ("fe80::1%wlan0", 0, 0, 3))], hops=None)
+        self.assertIn(self.HUB, server.S.router_v6_dns)
+
+    def test_the_socket_asks_for_each_announcements_hop_limit(self):
+        sock = mock.Mock()
+        with mock.patch.object(server.os.path, "exists", return_value=True), \
+                mock.patch.object(server.socket, "socket", return_value=sock):
+            self.assertIs(server.open_ra_socket(), sock)
+        sock.setsockopt.assert_any_call(server.socket.IPPROTO_IPV6, server.IPV6_RECVHOPLIMIT, 1)
+
+    def test_an_announcement_with_router_lifetime_zero_does_not_mean_the_network_has_ipv6(self):
+        thread_router = bytearray(router_advert(prefix(0xFFFFFFFF, "fd11:22:33:44::/64")))
+        thread_router[6:8] = bytes(2)                               # "not a router for you"
+        self.listen([(bytes(thread_router), ("fe80::9%wlan0", 0, 0, 3))])
+        self.assertIsNone(server.S.ra_heard)
+        self.assertEqual(server.S.router_prefixes, {})
+        self.assertFalse(server.ipv6_dns_view()["in_use"])
+
+    def test_a_real_routers_address_range_is_remembered(self):
+        self.listen([(router_advert(prefix(7200, "fd00:1::/64")), ("fe80::1%wlan0", 0, 0, 3))])
+        self.assertIn(server.ipaddress.IPv6Network("fd00:1::/64"), server.S.router_prefixes)
+
+    def test_a_range_announced_with_router_lifetime_zero_is_read(self):
+        found = server.read_router_advert(router_advert(prefix(600, "fd11::/64")))
+        self.assertEqual(found["prefixes"], [(server.ipaddress.IPv6Network("fd11::/64"), 600)])
+        self.assertEqual(found["lifetime"], 1800)
+
+    def test_a_unique_local_address_outside_every_announced_range_is_not_given_to_devices(self):
+        text = "\tinet6 fd11:22:33:44::60 prefixlen 64 autoconf secured\n"
+        with mock.patch.object(server.os.path, "exists", lambda p: False), \
+                mock.patch.object(server.subprocess, "run", return_value=mock.Mock(stdout=text)):
+            self.assertEqual(server.own_ipv6([server.ipaddress.IPv6Network("fd00:1::/64")])[2], "")
+            self.assertEqual(server.own_ipv6([server.ipaddress.IPv6Network("fd11:22:33:44::/64")])[2],
+                             "fd11:22:33:44::60")
+
+    def test_the_listener_ignores_announcements_not_from_a_link_local_address(self):
+        self.listen([(router_advert(rdnss(600, "2001:db8::53")), ("2001:db8::99", 0, 0, 0))])
+        self.assertEqual(server.S.router_v6_dns, {})
+
+    def test_the_listener_ignores_badly_formed_announcements(self):
+        self.listen([(b"\x86\x00" + bytes(40), ("fe80::1", 0, 0, 3)), (b"junk", ("fe80::1", 0, 0, 3))])
+        self.assertEqual(server.S.router_v6_dns, {})
+
+    def test_the_listener_looks_at_only_so_many_announcements_a_second(self):
+        flood = [(router_advert(rdnss(600, "2001:db8::%x" % i)), ("fe80::1", 0, 0, 3)) for i in range(1, 40)]
+        with mock.patch.object(server, "RA_MAX_SERVERS", 100), \
+                mock.patch.object(server.time, "monotonic", return_value=500.0):
+            self.listen(flood)
+        self.assertEqual(len(server.S.router_v6_dns), server.RA_MAX_PER_SECOND)
+
+    def test_the_listener_never_sends_anything(self):
+        sock = mock.Mock()
+        self.listen([(router_advert(rdnss(600, self.HUB)), ("fe80::1", 0, 0, 3))], sock)
+        sock.sendto.assert_not_called()
+        sock.send.assert_not_called()
+
+    def test_the_listener_stops_quietly_when_the_socket_fails(self):
+        sock = mock.Mock()
+        sock.recvmsg.side_effect = OSError("network gone")
+        with mock.patch("builtins.print"):
+            server.router_advert_listener(sock)                    # returns, does not raise
+        self.assertFalse(server.S.ra_listening)
+
+    def test_the_listener_carries_on_quietly_when_the_socket_cannot_be_opened(self):
+        with mock.patch.object(server.os.path, "exists", return_value=True), \
+                mock.patch.object(server.socket, "socket", side_effect=PermissionError("no NET_RAW")):
+            self.assertIsNone(server.open_ra_socket())
+            server.router_advert_listener()                        # returns, does not raise
+        self.assertFalse(server.S.ra_listening)
+
+    def test_the_listener_is_not_tried_away_from_linux(self):
+        with mock.patch.object(server.os.path, "exists", return_value=False), \
+                mock.patch.object(server.socket, "socket") as opened:
+            self.assertIsNone(server.open_ra_socket())
+        opened.assert_not_called()
+
+    def test_the_socket_is_set_to_pass_on_router_announcements_only(self):
+        sock = mock.Mock()
+        with mock.patch.object(server.os.path, "exists", return_value=True), \
+                mock.patch.object(server.socket, "socket", return_value=sock):
+            self.assertIs(server.open_ra_socket(), sock)
+        level, option, value = sock.setsockopt.call_args_list[0][0]
+        words = struct.unpack("=8I", value)
+        self.assertEqual(words[4], 0xFFFFFFFF & ~(1 << 6))         # 134 = 4 * 32 + 6: the one type let through
+        self.assertTrue(all(w == 0xFFFFFFFF for i, w in enumerate(words) if i != 4))
+
+
+class NoIPv6ForLiveCutDevices(Base):
+    """A device with "Cut live connections" on gets no IPv6 addresses, so its apps connect over
+    IPv4, through the Pi, where they can be cut. Other devices are answered as normal."""
+
+    V6 = bytes.fromhex("2a001450400908000000000000000200")
+
+    def setUp(self):
+        super().setUp()
+        server.S.paused_ips = set()
+        with server.answer_cache_lock:
+            server.answer_cache.clear()
+        self.asked = []
+
+    def internet(self, d):
+        """A pretend internet: one address for an A or AAAA question, one HTTPS record otherwise."""
+        self.asked.append(d)
+        qtype = server.parse_question(d)[1]
+        if qtype == 1:
+            return fake_answer(d)
+        if qtype == 28:
+            return answer_with(d, [(28, self.V6)])
+        return answer_with(d, [(qtype, b"\x00\x01\x00\x00\x06\x00\x10" + self.V6)])   # ipv6hint
+
+    def ask(self, client, qtype=28, name="www.youtube.com"):
+        """Ask for `name` with the given kind of question, as `client`."""
+        return server.answer_query(query(name, qtype), client, self.internet)
+
+    def is_empty(self, resp):
+        """True if `resp` is 'no error, no records'."""
+        return resp[3] & 0x0F == 0 and resp[6:8] == b"\x00\x00"
+
+    def test_an_ipv6_address_lookup_from_a_live_cut_device_gets_no_records(self):
+        server.S.enforced = {KID}
+        resp = self.ask(KID)
+        self.assertTrue(self.is_empty(resp))
+        self.assertEqual(self.asked, [])
+
+    def test_an_https_lookup_from_a_live_cut_device_gets_no_records(self):
+        server.S.enforced = {KID}
+        self.assertTrue(self.is_empty(self.ask(KID, qtype=65)))
+        self.assertTrue(self.is_empty(self.ask(KID, qtype=64)))
+
+    def test_an_ipv4_address_lookup_from_a_live_cut_device_is_answered_as_normal(self):
+        server.S.enforced = {KID}
+        resp = self.ask(KID, qtype=1)
+        self.assertEqual(resp[-4:], bytes([93, 184, 216, 34]))
+        self.assertEqual(len(self.asked), 1)
+
+    def test_a_device_without_live_cut_still_gets_its_ipv6_address(self):
+        server.S.enforced = {KID}
+        resp = self.ask(ADULT)
+        self.assertIn(self.V6, resp)
+
+    def test_a_device_whose_rules_are_paused_still_gets_its_ipv6_address(self):
+        server.S.enforced, server.S.paused_ips = {KID}, {KID}
+        self.assertIn(self.V6, self.ask(KID))
+
+    def test_a_live_cut_devices_empty_answer_is_not_remembered_for_other_devices(self):
+        server.S.enforced = {KID}
+        self.ask(KID)
+        self.assertIn(self.V6, self.ask(ADULT))
+        self.assertEqual(len(self.asked), 1)
+
+    def test_a_remembered_ipv6_answer_is_not_given_to_a_live_cut_device(self):
+        server.S.enforced = {KID}
+        self.assertIn(self.V6, self.ask(ADULT))
+        self.assertTrue(self.is_empty(self.ask(KID)))
+
+    def test_the_status_says_ipv6_is_in_use_when_this_computer_has_a_public_range(self):
+        server.S.v6_prefixes = [server.ipaddress.IPv6Network("2001:db8:1:2::/64")]
+        self.assertTrue(server.ipv6_dns_view(1000.0)["in_use"])
+
+    def test_the_status_says_ipv6_is_in_use_when_the_router_announced_it_lately(self):
+        server.S.ra_heard = 1000.0
+        self.assertTrue(server.ipv6_dns_view(1000.0 + 60)["in_use"])
+        self.assertFalse(server.ipv6_dns_view(1000.0 + server.RA_HOLD_MAX + 1)["in_use"])
+
+    def test_the_status_says_ipv6_is_not_in_use_on_an_ipv4_only_network(self):
+        self.assertFalse(server.ipv6_dns_view(1000.0)["in_use"])
 
 
 class CommunityList(Base):
@@ -1082,7 +1593,7 @@ class Limits(unittest.TestCase):
         incoming = [(query("n%d.example.com" % i), ("192.168.1.23", 5000 + i)) for i in range(5)]
         sock.recvfrom.side_effect = incoming + [KeyboardInterrupt()]
         submitted = []
-        pool = mock.Mock(submit=lambda fn, data, addr: submitted.append(addr))
+        pool = mock.Mock(submit=lambda fn, data, addr, source: submitted.append(addr))
         with mock.patch.object(server, "MAX_DNS_WAITING", 2), \
                 mock.patch.object(server, "ThreadPoolExecutor", lambda max_workers: pool):
             with self.assertRaises(KeyboardInterrupt):
@@ -1095,7 +1606,7 @@ class Limits(unittest.TestCase):
         other = [(query("www.bbc.co.uk"), ("192.168.1.40", 6000))]
         sock.recvfrom.side_effect = greedy + other + [KeyboardInterrupt()]
         submitted = []
-        pool = mock.Mock(submit=lambda fn, data, addr: submitted.append(addr[0]))
+        pool = mock.Mock(submit=lambda fn, data, addr, source: submitted.append(addr[0]))
         with mock.patch.object(server, "MAX_DNS_PER_DEVICE", 2), \
                 mock.patch.object(server, "ThreadPoolExecutor", lambda max_workers: pool):
             with self.assertRaises(KeyboardInterrupt):
@@ -1108,10 +1619,10 @@ class Limits(unittest.TestCase):
         sock.recvfrom.side_effect = incoming + [KeyboardInterrupt()]
         submitted = []
 
-        def run_now(fn, data, addr):
+        def run_now(fn, data, addr, source):
             """Answer each lookup straight away, as if the pool had a free worker."""
             submitted.append(addr)
-            fn(data, addr)
+            fn(data, addr, source)
         pool = mock.Mock(submit=run_now)
         with mock.patch.object(server, "MAX_DNS_PER_DEVICE", 1), \
                 mock.patch.object(server, "answer_query", return_value=None), \

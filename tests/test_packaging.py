@@ -341,10 +341,205 @@ class DashboardContract(unittest.TestCase):
         self.assertIn("document.documentElement.className += ' nogap'", self.page)
         self.assertIn(".nogap .row>*", self.page)
 
-    def test_the_enforcer_card_says_it_works_on_ipv4_only(self):
+    def test_the_enforcer_card_explains_ipv6_only_when_the_network_has_it(self):
         card = self.page[self.page.index("function enforceCard"):]
         card = card[:card.index("\nfunction ")]
-        self.assertIn("It works on IPv4 only", card)
+        self.assertIn("((S.status || {}).ipv6 || {}).in_use ? `<p class=\"small muted\">This device's IPv6 connections "
+                      "can't be cut directly; QuietNet stops giving it", card)
+        self.assertIn("IPv6 addresses so it uses IPv4 instead. Connections it already had over IPv6 may carry on "
+                      "for a short while.</p>` : ''", card)
+
+    def test_the_enforcer_card_no_longer_says_it_works_on_ipv4_only(self):
+        card = self.page[self.page.index("function enforceCard"):]
+        card = card[:card.index("\nfunction ")]
+        self.assertNotIn("It works on IPv4 only", card)
+
+
+class DashboardFirewallNotice(unittest.TestCase):
+    """The home page's notice when another firewall on the Pi stops "Cut live connections" for
+    every device. These checks read the page's script; nothing is run in a browser."""
+
+    @classmethod
+    def setUpClass(cls):
+        page = read("static", "index.html")
+        cls.notice = page[page.index("function firewallNotice("):page.index("/* ---------- Devices that change address")]
+        cls.home = page[page.index("function viewHome(){"):page.index("/* ---------- Another firewall in the way")]
+
+    def test_the_firewall_notice_is_on_the_home_page(self):
+        self.assertIn("${firewallNotice()}", self.home)
+
+    def test_the_firewall_notice_is_shown_only_when_the_enforcer_reports_a_blocker(self):
+        self.assertIn("((S.status || {}).enforcer || {}).firewall;", self.notice)
+        self.assertIn("if(!fw || !(fw.commands || []).length) return '';", self.notice)
+
+    def test_the_firewall_notice_escapes_the_names_and_the_command(self):
+        self.assertIn("(fw.blocked_by || []).map(esc)", self.notice)
+        self.assertIn("${esc(fw.commands.join(' && '))}", self.notice)
+
+    def test_the_firewall_notice_says_the_command_lasts_until_the_next_restart(self):
+        self.assertIn("A command run like this lasts until the next restart.", self.notice)
+
+    def test_the_firewall_notice_says_the_install_command_makes_dockers_fix_permanent(self):
+        self.assertIn("fw.installer ? 'Re-running the install command sets this up permanently.'", self.notice)
+
+
+class DashboardIPv6Setup(unittest.TestCase):
+    """"Set up a device" and the home page, on routers that hand out their own IPv6 DNS server.
+    These checks read the page's script; nothing is run in a browser."""
+
+    @classmethod
+    def setUpClass(cls):
+        page = read("static", "index.html")
+        cls.setup = page[page.index("function viewSetup(){"):page.index("/* ---------- drawing & refreshing")]
+        cls.warning = page[page.index("function v6Warning("):page.index("function viewSetup(){")]
+        cls.home = page[page.index("function viewHome(){"):page.index("/* ---------- One device")]
+
+    def step(self, title):
+        """The script for one kind of device's steps on "Set up a device"."""
+        start = self.setup.index("step('%s'" % title)
+        return self.setup[start:self.setup.index("${step(", start + 1)]
+
+    def test_the_setup_page_reads_the_ipv6_address_from_the_status(self):
+        self.assertIn("const ip6 = esc(v6.dns_address || '');", self.setup)
+
+    def test_the_windows_steps_give_the_ipv6_address_when_known(self):
+        self.assertIn("Turn on <b>IPv6</b> and type <b>' + ip6 + '</b>", self.step("Windows PC"))
+
+    def test_the_android_steps_give_the_ipv6_address_when_known(self):
+        self.assertIn("' + ip6 + '</b> in <b>DNS 2</b>", self.step("Android phone or tablet"))
+
+    def test_the_iphone_and_mac_steps_give_the_ipv6_address_when_known(self):
+        self.assertIn("ip6", self.step("iPhone or iPad"))
+        self.assertIn("ip6", self.step("Mac"))
+
+    def test_the_setup_page_says_how_to_switch_ipv6_off_on_a_bt_hub(self):
+        self.assertIn("<b>Advanced settings</b> → <b>IPv6</b>", self.setup)
+
+    def test_without_an_ipv6_address_the_setup_page_says_to_switch_ipv6_off_or_accept_the_gap(self):
+        self.assertIn("QuietNet has no IPv6 address to give devices", self.setup)
+        self.assertIn("or accept that\n      some lookups will skip QuietNet", self.setup)
+
+    def test_the_router_dns_warning_is_shown_only_for_servers_that_are_not_ours(self):
+        self.assertIn(".router_dns_not_ours || []", self.warning)
+        self.assertIn("if(!others.length) return '';", self.warning)
+
+    def test_the_router_dns_warning_escapes_the_addresses(self):
+        self.assertIn("esc(a)", self.warning)
+
+    def test_the_router_dns_warning_says_what_to_do(self):
+        self.assertIn("Your router tells devices to use its own IPv6 DNS server", self.warning)
+        self.assertIn("Set QuietNet's IPv6 address as well, or switch IPv6 off on your router.", self.warning)
+
+    def test_the_router_dns_warning_is_on_the_home_page_and_the_setup_page(self):
+        self.assertIn("${v6Warning(true)}", self.home)
+        self.assertIn("${v6Warning(false)}", self.setup)
+
+
+class DashboardSharedAddresses(unittest.TestCase):
+    """The device page's note that some of a blocked service's addresses are left to the name
+    block because sites the device is allowed share them. Reads the page's script only."""
+
+    @classmethod
+    def setUpClass(cls):
+        page = read("static", "index.html")
+        cls.note = page[page.index("function sharedNote("):page.index("function enforceCard(")]
+        cls.card = page[page.index("function enforceCard("):page.index("function statusBadges(")]
+
+    def test_the_live_cut_card_shows_the_shared_address_note(self):
+        self.assertIn("${sharedNote(d, e)}", self.card)
+
+    def test_the_shared_address_note_escapes_the_names_and_the_count(self):
+        self.assertIn(".map(esc)", self.note)
+        self.assertIn("${num(sh.count)}", self.note)
+
+    def test_the_shared_address_note_says_what_happened_in_plain_words(self):
+        self.assertIn("addresses are shared with sites this device is allowed, so those connections are left to the name block", self.note)
+
+
+class DashboardDeviceMoves(unittest.TestCase):
+    """The dashboard's parts for devices that change address and for other DNS services: the
+    "may be the same device" notices, recent changes to devices, the new-device group picker, the
+    device badges and warning, and the other-DNS notice and switch. Device names, addresses and
+    event notes come from the household network, so each must be escaped. Reads the page's
+    script only; nothing is run in a browser."""
+
+    @classmethod
+    def setUpClass(cls):
+        page = read("static", "index.html")
+        cls.notices = page[page.index("function movedNotices("):page.index("function deviceWarning(")]
+        cls.warning = page[page.index("function deviceWarning("):page.index("// What QuietNet did by itself")]
+        cls.events = page[page.index("function deviceEvents("):page.index("/* ---------- One device")]
+        cls.picker = page[page.index("function newDeviceCard("):page.index("function viewGroup(")]
+        cls.other = page[page.index("function otherDnsNotice("):page.index("// Blocked things whose addresses")]
+        cls.switch = page[page.index("function otherDnsSwitch("):page.index("/* ---------- Another firewall in the way")]
+        cls.home = page[page.index("function viewHome(){"):page.index("// The household setting \"Stop every device")]
+        cls.device = page[page.index("function viewDevice("):page.index("/* ---------- Groups")]
+        cls.page = page
+
+    def test_the_notices_are_on_the_home_page_and_the_device_page(self):
+        self.assertIn("${movedNotices(null)}", self.home)
+        self.assertIn("${movedNotices(d.ip)}", self.device)
+
+    def test_the_notices_come_from_the_status_and_a_device_page_shows_only_its_own(self):
+        self.assertIn("((S.status || {}).device_notices || []).filter(n => !ip || n.to === ip)", self.notices)
+
+    def test_the_notices_escape_the_name_and_both_addresses(self):
+        self.assertIn("${esc(n.name)}", self.notices)
+        self.assertIn('data-from="${esc(n.from)}" data-to="${esc(n.to)}"', self.notices)
+        self.assertIn('data-ip="${esc(n.to)}"', self.notices)
+        self.assertNotIn("${n.", self.notices)
+
+    def test_the_move_notice_offers_to_move_the_rules(self):
+        self.assertIn('data-act="moverules"', self.notices)
+        self.assertIn("Move the rules to this device", self.notices)
+
+    def test_the_same_number_notice_asks_whether_it_is_the_same_device(self):
+        self.assertIn("n.same", self.notices)
+        self.assertIn("Yes, it's the same device", self.notices)
+        self.assertIn('data-act="notsame"', self.notices)
+
+    def test_the_different_device_answer_is_sent_to_the_pi(self):
+        self.assertIn("api('/api/different-device', {ip:d.ip})", self.page)
+
+    def test_the_device_warning_is_shown_only_when_there_is_one_and_is_escaped(self):
+        self.assertIn("if(!d.warning) return '';", self.warning)
+        self.assertIn("${esc(d.warning)}", self.warning)
+        self.assertIn("${deviceWarning(d)}", self.device)
+
+    def test_a_paused_device_can_be_confirmed_as_the_same_device_from_its_warning(self):
+        self.assertIn("d.paused", self.warning)
+        self.assertIn('data-from="${esc(d.ip)}" data-to="${esc(d.ip)}"', self.warning)
+
+    def test_recent_changes_are_on_the_home_page_only_when_there_are_some(self):
+        self.assertIn("${deviceEvents()}", self.home)
+        self.assertIn("if(!ev.length) return '';", self.events)
+
+    def test_recent_changes_escape_the_note_and_the_time(self):
+        self.assertIn("${esc(e.text)} · ${esc(ago(e.ts))}", self.events)
+
+    def test_the_new_device_group_picker_escapes_group_ids_and_names(self):
+        self.assertIn('<option value="${esc(g.id)}"', self.picker)
+        self.assertIn("${esc(g.name)}</option>", self.picker)
+        self.assertIn("(S.status || {}).new_device_group", self.picker)
+
+    def test_the_rules_paused_badge_shows_only_for_a_paused_device(self):
+        self.assertIn("${d.paused ? '<span class=\"badge warn\">Rules paused</span>' : ''}", self.home)
+
+    def test_the_other_dns_badge_shows_only_for_a_device_that_tried(self):
+        self.assertIn("${d.other_dns ? '<span class=\"badge warn\">Tried another DNS service</span>' : ''}", self.home)
+
+    def test_the_other_dns_notice_shows_only_when_the_device_tried_and_escapes_the_time(self):
+        self.assertIn("if(!d.other_dns && !S.activity.some(g => g.other_dns)) return '';", self.other)
+        self.assertIn("esc(ago(d.other_dns))", self.other)
+        self.assertIn("${otherDnsNotice(d)}", self.device)
+
+    def test_the_other_dns_switch_is_on_the_home_page_and_follows_the_status(self):
+        self.assertIn("${otherDnsSwitch(st)}", self.home)
+        self.assertIn("st.other_dns_all ? 'checked' : ''", self.switch)
+        self.assertIn("api('/api/other-dns-switch', {on:e.target.checked})", self.page)
+
+    def test_the_other_dns_switch_says_what_it_can_cut_off(self):
+        self.assertIn("will then have no internet at home until its setting is changed", self.switch)
 
 
 class DashboardThemes(unittest.TestCase):
