@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+Docker's firewall and "Cut live connections" (23 November):
+- **New: the installer can make Docker's firewall let passed-on traffic through for good.** Docker drops traffic the Pi passes on, so "Cut live connections" asked people to run `sudo iptables -I DOCKER-USER -i wlan0 -o wlan0 -j ACCEPT`, and that was lost at every restart. After asking (or with `--yes`), the installer now adds a small systemd service, `quietnet-forward`, that puts this one rule back every time Docker starts, for the network connection the Pi reaches its router on. It lets through only traffic that comes in on that connection and goes straight back out on it. It is skipped, with a note, without systemd or iptables, and a service of the same name made by hand is left alone. `--uninstall` says how to remove it. **To get it on a Pi already installed, run the install line again.**
+- The device page's firewall advice now says a command run by hand lasts until the Pi restarts and, for Docker's firewall, that running the install line again makes it permanent.
+
 Device names (23 November):
 - **New: QuietNet suggests a name for most devices** instead of "Unnamed device". It asks the devices themselves, in the ways they already answer: Bonjour (Apple devices, printers, TVs, speakers, Linux), the Windows network (Windows PCs, network drives), UPnP (TVs, Sonos, consoles, routers), the names devices give when they join the network (DHCP, on a Pi only) and, as before, the router. The new `names.py` does this; **rebuild the Pi container** to include it.
 - The Devices page shows a suggestion marked as one, with where it came from and a **Use this name** button. A model or maker the device reported, or "Private Wi-Fi address, so probably a phone, tablet or laptop", shows under an unnamed device.

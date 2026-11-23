@@ -239,6 +239,16 @@ def iptables_advice(tool, listing, iface):
     return "sudo %s -I %s -i %s -o %s -j ACCEPT" % (tool, chain, iface, iface)
 
 
+def lasting_note(fixes):
+    """A sentence to put before the commands that let passed-on traffic through: a rule added by
+    hand lasts only until the Pi restarts. For Docker's chain, QuietNet's installer can add a small
+    service that puts the rule back after every restart, so say that running it again does so."""
+    if any(" DOCKER-USER " in fix for fix in fixes):
+        return ("A command run by hand lasts until the Pi restarts; running QuietNet's install command "
+                "again (with --yes) makes the Docker part permanent. ")
+    return "A command run by hand lasts until the Pi restarts. "
+
+
 def target_problem(ip, subnet, gateway_ip, local_ip):
     """Why this address can't be steered, in plain English, or '' if it can.
     subnet may be None when this machine's network isn't known (then only the basics are checked)."""
@@ -601,7 +611,8 @@ class Enforcer:
                 if fix not in unique:
                     unique.append(fix)
             message = ("Another firewall on this machine (%s) blocks passed-on traffic, so steering a device "
-                       "would cut it off. To allow it, run on the Pi: %s" % (", ".join(names), " && ".join(unique)))
+                       "would cut it off. %sTo allow it, run on the Pi: %s"
+                       % (", ".join(names), lasting_note(unique), " && ".join(unique)))
         self._fw_checked, self._fw_blocker = now, message
         return message
 

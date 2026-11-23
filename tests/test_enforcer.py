@@ -533,6 +533,16 @@ class FirewallAdvice(EnforcerCase):
         self.assertIn("Docker's table 'filter'", message)
         self.assertTrue(message.endswith("run on the Pi: sudo iptables -I DOCKER-USER -i eth0 -o eth0 -j ACCEPT"))
 
+    def test_the_docker_advice_says_the_installer_makes_it_last_after_a_restart(self):
+        message = self.blocker({"nft": DOCKER_RULESET})
+        self.assertIn("lasts until the Pi restarts", message)
+        self.assertIn("running QuietNet's install command again", message)
+
+    def test_advice_for_other_firewalls_says_it_lasts_until_a_restart_without_mentioning_the_installer(self):
+        message = self.blocker({"nft": FIREWALLD_RULESET})
+        self.assertIn("lasts until the Pi restarts", message)
+        self.assertNotIn("install command", message)
+
     def test_firewallds_reject_gets_an_nft_command_for_its_own_chain(self):
         message = self.blocker({"nft": FIREWALLD_RULESET})
         self.assertNotIn("DOCKER-USER", message)

@@ -8,9 +8,10 @@
 #
 # What it does: checks for Docker (and offers to install it), downloads QuietNet into
 # /opt/quietnet, frees DNS port 53 if this computer's own name service holds it, switches on
-# packet forwarding (needed only for "Cut live connections"), then builds and starts QuietNet's
-# container. Running it again updates QuietNet in place. Your history and rules live in a
-# Docker volume, not in /opt/quietnet, so an update or an uninstall keeps them.
+# packet forwarding and lets that traffic through Docker's firewall (both needed only for "Cut live
+# connections"), then builds and starts QuietNet's container. Running it again updates QuietNet in
+# place. Your history and rules live in a Docker volume, not in /opt/quietnet, so an update or an
+# uninstall keeps them.
 #
 # Run "sh install.sh --help" to see every option.
 #
@@ -572,6 +573,118 @@ enable_forwarding() {
     say "Done."
 }
 
+# Print the name of the network connection this computer reaches its router on (like eth0 or
+# wlan0), from its default route, or nothing if it has none. It is checked by check_iface before use.
+default_iface() {
+    if have ip; then
+        ip -4 route show default 2>/dev/null </dev/null | sed -n 's/.* dev \([^ ]*\).*/\1/p' | head -n 1
+    fi
+}
+
+# True when a network connection's name is safe to put in a firewall rule: 1 to 15 letters,
+# digits, dots, dashes or underscores (Linux's own limit), not starting with a dash or a dot.
+check_iface() {
+    case "$1" in
+        ""|-*|.*|*[!"$LOWER$UPPER$DIGITS"._-]*) return 1 ;;
+    esac
+    [ "${#1}" -le 15 ]
+}
+
+# True when iptables can be run as the administrator. It usually lives in /usr/sbin, which an
+# ordinary user's search path may leave out but root's (and sudo's) includes.
+have_iptables() {
+    have iptables || as_root sh -c 'command -v iptables' >/dev/null 2>&1 </dev/null
+}
+
+# The text of the systemd unit that lets traffic in and out on one network connection pass
+# through Docker's firewall. It adds its rule only when the rule is not there already, so starting
+# it again (or after a rule added by hand) never adds a second copy.
+forward_unit_text() {
+    rule="DOCKER-USER -i $1 -o $1 -j ACCEPT"
+    printf '%s\n' "# Written by the QuietNet installer. It lets devices that QuietNet steers through this computer
+# (for \"Cut live connections\") pass on through Docker's firewall, and only traffic that comes in
+# on $1 and goes straight back out on $1. To remove it:
+#   sudo systemctl disable --now quietnet-forward && sudo rm /etc/systemd/system/quietnet-forward.service
+[Unit]
+Description=Let QuietNet pass on traffic on $1 through Docker's firewall
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c 'iptables -C $rule 2>/dev/null || iptables -I $rule'
+
+[Install]
+WantedBy=docker.service"
+}
+
+# Docker's firewall drops traffic this computer passes on for other devices, which "Cut live
+# connections" relies on. Offer to add a small systemd service that lets through only traffic that
+# comes in and goes back out on the connection to the router, and adds that rule again after every
+# restart (a rule added by hand is lost when the computer restarts). It never stops the install:
+# anything missing or refused is skipped with a note.
+allow_forwarding_through_docker() {
+    step "Letting passed-on traffic through Docker's firewall (needed only for \"Cut live connections\")"
+    unit="$SYSROOT/etc/systemd/system/quietnet-forward.service"
+    if ! have systemctl; then
+        warn "skipped: this computer does not use systemd, so the setting could not be made to last.
+If \"Cut live connections\" says another firewall blocks passed-on traffic, run the command it shows."
+        return 0
+    fi
+    if ! have_iptables; then
+        warn "skipped: the iptables command is not installed, so Docker's firewall cannot be changed.
+If \"Cut live connections\" says another firewall blocks passed-on traffic, install iptables and run this again."
+        return 0
+    fi
+    iface="$(default_iface)"
+    if [ -z "$iface" ]; then
+        warn "skipped: could not tell which network connection this computer reaches its router on."
+        return 0
+    fi
+    if ! check_iface "$iface"; then
+        warn "skipped: the network connection's name ($iface) is not one that is safe to put in a firewall rule."
+        return 0
+    fi
+    text="$(forward_unit_text "$iface")"
+    if as_root test -e "$unit" </dev/null; then
+        old="$(as_root cat "$unit" 2>/dev/null </dev/null || true)"
+        if [ "$old" = "$text" ]; then
+            as_root systemctl enable --now quietnet-forward.service </dev/null >/dev/null 2>&1 \
+                || warn "the setting is in place but could not be switched on. See why with: sudo systemctl status quietnet-forward"
+            say "Already set up."
+            return 0
+        fi
+        case "$old" in
+            "# Written by the QuietNet installer."*) ;;
+            *) say "A quietnet-forward service that this installer did not write is already here, so it was left alone.
+(To let the installer manage it instead, delete /etc/systemd/system/quietnet-forward.service and run this again.)"
+               return 0 ;;
+        esac
+    fi
+    say "Docker's firewall stops this computer passing traffic on for other devices, which"
+    say "\"Cut live connections\" needs. A small service can let through only traffic that comes in"
+    say "on this computer's network connection ($iface) and goes straight back out on it, and set"
+    say "that up again after every restart. It does not open anything to the internet or to"
+    say "QuietNet's container."
+    rc=0
+    ask "Add that service?" || rc=$?
+    case "$rc" in
+        0) ;;
+        2) say "Skipped, as there is no terminal here to ask on. Run the install command again with --yes to add it."
+           return 0 ;;
+        *) say "Skipped. \"Cut live connections\" will say what to run if it needs it."
+           return 0 ;;
+    esac
+    write_root_file "$unit" "$text"
+    as_root systemctl daemon-reload </dev/null >/dev/null 2>&1 || true
+    if as_root systemctl enable --now quietnet-forward.service </dev/null >/dev/null 2>&1; then
+        say "Done. (To undo: sudo systemctl disable --now quietnet-forward && sudo rm /etc/systemd/system/quietnet-forward.service)"
+    else
+        warn "the service was added but could not be started. See why with: sudo systemctl status quietnet-forward"
+    fi
+}
+
 # Build and start QuietNet's container. The relay address and pairing code, when given, are
 # passed only in the environment of this one command and are never written to a file.
 start_quietnet() {
@@ -691,6 +804,9 @@ Stop it where it was started (for a Compose project: sudo docker compose down in
     if [ -f "$SYSROOT/etc/sysctl.d/90-quietnet.conf" ]; then
         say "Traffic forwarding was left on. To undo it: sudo rm /etc/sysctl.d/90-quietnet.conf (it goes off at the next restart)."
     fi
+    if [ -f "$SYSROOT/etc/systemd/system/quietnet-forward.service" ]; then
+        say "Docker's firewall still lets passed-on traffic through. To undo it: sudo systemctl disable --now quietnet-forward && sudo rm /etc/systemd/system/quietnet-forward.service (the rule it added goes at the next restart)."
+    fi
     if [ -f "$SYSROOT/etc/systemd/resolved.conf.d/quietnet.conf" ]; then
         say "To give port 53 back to systemd-resolved: sudo rm /etc/systemd/resolved.conf.d/quietnet.conf && sudo systemctl restart systemd-resolved"
     fi
@@ -732,6 +848,7 @@ main() {
     install_files
     check_port_53
     enable_forwarding
+    allow_forwarding_through_docker
     start_quietnet
     wait_until_running
     finish_message
