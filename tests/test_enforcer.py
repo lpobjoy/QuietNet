@@ -692,6 +692,27 @@ class FirewallAdvice(EnforcerCase):
         self.assertIn("sudo nft insert rule inet firewalld filter_FORWARD iifname eth0 oifname eth0 accept && "
                       "sudo iptables -I DOCKER-USER -i eth0 -o eth0 -j ACCEPT", message)
 
+    def test_the_status_gives_dockers_blocker_and_its_command_for_the_home_page(self):
+        self.e.problem = self.blocker({"nft": DOCKER_RULESET})
+        self.assertEqual(self.e.status()["firewall"],
+                         {"blocked_by": ["Docker's table 'filter'"], "installer": True,
+                          "commands": ["sudo iptables -I DOCKER-USER -i eth0 -o eth0 -j ACCEPT"]})
+
+    def test_the_status_says_the_installer_cannot_fix_other_firewalls(self):
+        self.e.problem = self.blocker({"nft": FIREWALLD_RULESET})
+        self.assertFalse(self.e.status()["firewall"]["installer"])
+
+    def test_the_status_gives_no_firewall_blocker_once_it_is_fixed(self):
+        self.e.problem = self.blocker({"nft": DOCKER_RULESET})
+        self.e._fw_checked = 0.0
+        self.e.problem = self.blocker({"nft": FIREWALLD_FIXED})
+        self.assertIsNone(self.e.status()["firewall"])
+
+    def test_the_status_gives_no_firewall_blocker_when_another_problem_stops_steering(self):
+        self.blocker({"nft": DOCKER_RULESET})
+        self.e.problem = "This machine won't pass traffic on, so steering a device would cut it off."
+        self.assertIsNone(self.e.status()["firewall"])
+
 
 class QuietIptables(EnforcerCase):
     """With only iptables, nothing is run every tick while no device is enforced."""
@@ -1044,7 +1065,8 @@ class Availability(unittest.TestCase):
         e = self.make()
         self.assertTrue(e.available())
         self.assertEqual(e.status(), {"available": True, "reason": "", "problem": "", "problems": {},
-                                      "active": False, "backend": "nft", "gateway": GATEWAY, "dns_redirect": False})
+                                      "active": False, "backend": "nft", "gateway": GATEWAY, "dns_redirect": False,
+                                      "firewall": None})
 
     def test_off_on_a_mac_with_a_plain_explanation(self):
         e = self.make(linux=False)

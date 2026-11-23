@@ -880,6 +880,7 @@ function viewHome(){
   const scanning = st.scan && st.scan.state === 'scanning';
   return `
   ${v6Warning(true)}
+  ${firewallNotice()}
   ${movedNotices(null)}
   ${deviceEvents()}
   <div class="card">
@@ -903,6 +904,22 @@ function viewHome(){
   ${tiles ? `<div class="thead" aria-hidden="true"><span>Device</span><span>Today</span><span></span></div><div class="tiles">${tiles}</div>` : `<div class="card empty">
     <p><b>No devices yet.</b></p><p>QuietNet can only see devices that have been pointed at it.</p>
     <button class="btn primary" data-act="tab" data-tab="setup">Show me how to set up a device</button></div>`}`;
+}
+
+/* ---------- Another firewall in the way ---------- */
+// Shown on the home page when another firewall on the Pi (usually Docker's) stops "Cut live
+// connections" for every device. e.firewall comes from Enforcer.firewall_fix: blocked_by, commands,
+// and installer (true when running the install command again makes the fix last). Every part is escaped.
+function firewallNotice(){
+  const fw = ((S.status || {}).enforcer || {}).firewall;
+  if(!fw || !(fw.commands || []).length) return '';
+  return `<div class="notice danger"><b>"Cut live connections" is not working for any device.</b>
+    Another firewall on the Pi (${(fw.blocked_by || []).map(esc).join(', ')}) blocks the traffic QuietNet passes on,
+    so QuietNet is leaving every device alone rather than cut it off. To fix it now, run this on the Pi:
+    <code>${esc(fw.commands.join(' && '))}</code>
+    A command run like this lasts until the next restart.
+    ${fw.installer ? 'Re-running the install command sets this up permanently.'
+      : 'To make it permanent, add the same rule to that firewall\'s own saved settings.'}</div>`;
 }
 
 /* ---------- Devices that change address ---------- */
@@ -953,8 +970,9 @@ function enforceCard(d){
     <div class="grow"><h2>Cut live connections${d.enforced ? '<span class="badge danger">On</span>' : ''}</h2>
     <p class="meta">Normally a block only stops new connections. Turn this on and blocks, bedtimes and the kill switch
       also stop things that are <b>already running</b> on this device (like a Disney+ video mid-stream). QuietNet steers this
-      device through itself and drops only what's blocked for it. Takes a few seconds to bite.
-      It works on IPv4 only, so a connection this device already has over IPv6 is not cut.</p>
+      device through itself and drops only what's blocked for it. Takes a few seconds to bite.</p>
+    ${((S.status || {}).ipv6 || {}).in_use ? `<p class="small muted">This device's IPv6 connections can't be cut directly; QuietNet stops giving it
+      IPv6 addresses so it uses IPv4 instead. Connections it already had over IPv6 may carry on for a short while.</p>` : ''}
     ${d.enforced && (e.problem || (e.problems || {})[d.ip]) ? `<p class="small err-text"><b>Not working yet:</b> ${esc(e.problem || e.problems[d.ip])}</p>` : ''}
     ${sharedNote(d, e)}</div>
     <label class="switch"><input type="checkbox" id="enforceSwitch" ${d.enforced ? 'checked' : ''} aria-label="Cut live connections for this device"><span></span></label></div></div>`;

@@ -451,6 +451,7 @@ class Enforcer:
         self._applied = ""            # last firewall text we pushed, to avoid needless reloads
         self._ipt_loaded = False      # iptables only: our chain may hold drop rules that must be cleared
         self._fw_checked, self._fw_blocker = 0.0, ""
+        self._fw_fix = None     # what another firewall blocks and the commands that fix it (see firewall_fix)
         self.device_problems = {}     # device address -> a problem with that device alone
         self._pending = {}            # device address -> (hardware address, times answers are due)
         self._pending_lock = threading.Lock()
@@ -492,7 +493,21 @@ class Enforcer:
         return {"available": self.available(), "reason": self.reason, "problem": self.problem,
                 "problems": dict(self.device_problems), "active": self._active,
                 "backend": self.backend, "gateway": self.gateway_ip,
-                "dns_redirect": self.backend == "nft" and self.dns_port is not None}
+                "dns_redirect": self.backend == "nft" and self.dns_port is not None,
+                "firewall": self.firewall_fix()}
+
+    def firewall_fix(self):
+        """When another firewall on this machine is what stops all steering right now: which firewall
+        rules are in the way ("blocked_by"), the commands that let passed-on traffic through
+        ("commands"), and whether the installer can make the fix last after a restart ("installer":
+        true when one of the commands is for Docker's DOCKER-USER chain, which the installer's
+        quietnet-forward service keeps). None when no firewall is in the way, so the dashboard can
+        show this on its home page as well as on a device's page."""
+        fix = self._fw_fix
+        if not fix or not self.problem or self.problem != self._fw_blocker:
+            return None
+        return {"blocked_by": list(fix["blocked_by"]), "commands": list(fix["commands"]),
+                "installer": fix["installer"]}
 
     # -- lifecycle ----------------------------------------------------------
 
@@ -661,6 +676,7 @@ class Enforcer:
                     re.search(r"does not exist|insmod", p.stderr or ""):
                 continue                     # the old firewall isn't loaded at all, so it holds no rules
             if p is None or p.returncode != 0:
+                self._fw_fix = None
                 return ("QuietNet couldn't read this machine's firewall rules with %s, so it won't steer a device "
                         "in case they would cut it off. Check that 'sudo %s' works on the Pi."
                         % (tool, " ".join(a for a in args if a not in ("-w", "5"))))
@@ -671,7 +687,7 @@ class Enforcer:
             elif iptables_forward_drop(p.stdout or "", self.iface):
                 names.append("%s's forwarding rules" % tool)
                 fixes.append(iptables_advice(tool, p.stdout or "", self.iface))
-        message = ""
+        message, self._fw_fix = "", None
         if names:
             unique = []
             for fix in fixes:                # nft and iptables can both see the same rules
@@ -680,6 +696,8 @@ class Enforcer:
             message = ("Another firewall on this machine (%s) blocks passed-on traffic, so steering a device "
                        "would cut it off. %sTo allow it, run on the Pi: %s"
                        % (", ".join(names), lasting_note(unique), " && ".join(unique)))
+            self._fw_fix = {"blocked_by": names, "commands": unique,
+                            "installer": any(" DOCKER-USER " in fix for fix in unique)}
         self._fw_checked, self._fw_blocker = now, message
         return message
 

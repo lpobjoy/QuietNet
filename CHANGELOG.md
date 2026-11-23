@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+IPv6 and "Cut live connections" (23 November):
+- **Fixed: on BT's default IPv6, "Cut live connections" missed most streams and app connections,** because it only steers IPv4. A device with it on now gets "no records" when it looks up IPv6 addresses (and for HTTPS and SVCB lookups, which can carry IPv6 hints), so its apps connect over IPv4 through the Pi. Other devices are unaffected. The device's card says, when the network has IPv6, that IPv6 connections can't be cut directly and that ones it already had may carry on for a short while. New `in_use` in the `ipv6` part of `GET /api/status`. The README no longer calls the cut instant.
+- **New: the home page says when another firewall on the Pi stops "Cut live connections" for every device,** with the command to run, that it lasts until the next restart and, for Docker's firewall, that re-running the install command sets it up permanently. New `firewall` in `GET /api/enforcer` and in `enforcer` in `GET /api/status`.
+
 Rules follow the device (23 November):
 - **Fixed: rules belonged to the IP address,** so a phone with a new private Wi-Fi address or a new number lost every rule, and a device later given the old number took them on. Each address's rules are now tied to the hardware address seen there: when the device moves to a free address they move with it (with a note on the home page); when a different device takes the address they are paused until the device comes back; and when the new address has rules of its own, both devices show a warning instead of merging. New `paused` and `warning` in `GET /api/devices`.
 - **New: "New devices go into group"** on the Groups page puts a device never seen before into a chosen group (none by default). New `POST /api/new-device-group` and `new_device_group` in `GET /api/status`.

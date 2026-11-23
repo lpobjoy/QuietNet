@@ -1120,6 +1120,87 @@ class RouterAnnouncements(Base):
         self.assertTrue(all(w == 0xFFFFFFFF for i, w in enumerate(words) if i != 4))
 
 
+class NoIPv6ForLiveCutDevices(Base):
+    """A device with "Cut live connections" on gets no IPv6 addresses, so its apps connect over
+    IPv4, through the Pi, where they can be cut. Other devices are answered as normal."""
+
+    V6 = bytes.fromhex("2a001450400908000000000000000200")
+
+    def setUp(self):
+        super().setUp()
+        server.S.paused_ips = set()
+        with server.answer_cache_lock:
+            server.answer_cache.clear()
+        self.asked = []
+
+    def internet(self, d):
+        """A pretend internet: one address for an A or AAAA question, one HTTPS record otherwise."""
+        self.asked.append(d)
+        qtype = server.parse_question(d)[1]
+        if qtype == 1:
+            return fake_answer(d)
+        if qtype == 28:
+            return answer_with(d, [(28, self.V6)])
+        return answer_with(d, [(qtype, b"\x00\x01\x00\x00\x06\x00\x10" + self.V6)])   # ipv6hint
+
+    def ask(self, client, qtype=28, name="www.youtube.com"):
+        """Ask for `name` with the given kind of question, as `client`."""
+        return server.answer_query(query(name, qtype), client, self.internet)
+
+    def is_empty(self, resp):
+        """True if `resp` is 'no error, no records'."""
+        return resp[3] & 0x0F == 0 and resp[6:8] == b"\x00\x00"
+
+    def test_an_ipv6_address_lookup_from_a_live_cut_device_gets_no_records(self):
+        server.S.enforced = {KID}
+        resp = self.ask(KID)
+        self.assertTrue(self.is_empty(resp))
+        self.assertEqual(self.asked, [])
+
+    def test_an_https_lookup_from_a_live_cut_device_gets_no_records(self):
+        server.S.enforced = {KID}
+        self.assertTrue(self.is_empty(self.ask(KID, qtype=65)))
+        self.assertTrue(self.is_empty(self.ask(KID, qtype=64)))
+
+    def test_an_ipv4_address_lookup_from_a_live_cut_device_is_answered_as_normal(self):
+        server.S.enforced = {KID}
+        resp = self.ask(KID, qtype=1)
+        self.assertEqual(resp[-4:], bytes([93, 184, 216, 34]))
+        self.assertEqual(len(self.asked), 1)
+
+    def test_a_device_without_live_cut_still_gets_its_ipv6_address(self):
+        server.S.enforced = {KID}
+        resp = self.ask(ADULT)
+        self.assertIn(self.V6, resp)
+
+    def test_a_device_whose_rules_are_paused_still_gets_its_ipv6_address(self):
+        server.S.enforced, server.S.paused_ips = {KID}, {KID}
+        self.assertIn(self.V6, self.ask(KID))
+
+    def test_a_live_cut_devices_empty_answer_is_not_remembered_for_other_devices(self):
+        server.S.enforced = {KID}
+        self.ask(KID)
+        self.assertIn(self.V6, self.ask(ADULT))
+        self.assertEqual(len(self.asked), 1)
+
+    def test_a_remembered_ipv6_answer_is_not_given_to_a_live_cut_device(self):
+        server.S.enforced = {KID}
+        self.assertIn(self.V6, self.ask(ADULT))
+        self.assertTrue(self.is_empty(self.ask(KID)))
+
+    def test_the_status_says_ipv6_is_in_use_when_this_computer_has_a_public_range(self):
+        server.S.v6_prefixes = [server.ipaddress.IPv6Network("2001:db8:1:2::/64")]
+        self.assertTrue(server.ipv6_dns_view(1000.0)["in_use"])
+
+    def test_the_status_says_ipv6_is_in_use_when_the_router_announced_it_lately(self):
+        server.S.ra_heard = 1000.0
+        self.assertTrue(server.ipv6_dns_view(1000.0 + 60)["in_use"])
+        self.assertFalse(server.ipv6_dns_view(1000.0 + server.RA_HOLD_MAX + 1)["in_use"])
+
+    def test_the_status_says_ipv6_is_not_in_use_on_an_ipv4_only_network(self):
+        self.assertFalse(server.ipv6_dns_view(1000.0)["in_use"])
+
+
 class CommunityList(Base):
     def setUp(self):
         super().setUp()

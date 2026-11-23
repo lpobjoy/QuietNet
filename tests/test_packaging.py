@@ -341,10 +341,46 @@ class DashboardContract(unittest.TestCase):
         self.assertIn("document.documentElement.className += ' nogap'", self.page)
         self.assertIn(".nogap .row>*", self.page)
 
-    def test_the_enforcer_card_says_it_works_on_ipv4_only(self):
+    def test_the_enforcer_card_explains_ipv6_only_when_the_network_has_it(self):
         card = self.page[self.page.index("function enforceCard"):]
         card = card[:card.index("\nfunction ")]
-        self.assertIn("It works on IPv4 only", card)
+        self.assertIn("((S.status || {}).ipv6 || {}).in_use ? `<p class=\"small muted\">This device's IPv6 connections "
+                      "can't be cut directly; QuietNet stops giving it", card)
+        self.assertIn("IPv6 addresses so it uses IPv4 instead. Connections it already had over IPv6 may carry on "
+                      "for a short while.</p>` : ''", card)
+
+    def test_the_enforcer_card_no_longer_says_it_works_on_ipv4_only(self):
+        card = self.page[self.page.index("function enforceCard"):]
+        card = card[:card.index("\nfunction ")]
+        self.assertNotIn("It works on IPv4 only", card)
+
+
+class DashboardFirewallNotice(unittest.TestCase):
+    """The home page's notice when another firewall on the Pi stops "Cut live connections" for
+    every device. These checks read the page's script; nothing is run in a browser."""
+
+    @classmethod
+    def setUpClass(cls):
+        page = read("static", "index.html")
+        cls.notice = page[page.index("function firewallNotice("):page.index("/* ---------- Devices that change address")]
+        cls.home = page[page.index("function viewHome(){"):page.index("/* ---------- Another firewall in the way")]
+
+    def test_the_firewall_notice_is_on_the_home_page(self):
+        self.assertIn("${firewallNotice()}", self.home)
+
+    def test_the_firewall_notice_is_shown_only_when_the_enforcer_reports_a_blocker(self):
+        self.assertIn("((S.status || {}).enforcer || {}).firewall;", self.notice)
+        self.assertIn("if(!fw || !(fw.commands || []).length) return '';", self.notice)
+
+    def test_the_firewall_notice_escapes_the_names_and_the_command(self):
+        self.assertIn("(fw.blocked_by || []).map(esc)", self.notice)
+        self.assertIn("${esc(fw.commands.join(' && '))}", self.notice)
+
+    def test_the_firewall_notice_says_the_command_lasts_until_the_next_restart(self):
+        self.assertIn("A command run like this lasts until the next restart.", self.notice)
+
+    def test_the_firewall_notice_says_the_install_command_makes_dockers_fix_permanent(self):
+        self.assertIn("fw.installer ? 'Re-running the install command sets this up permanently.'", self.notice)
 
 
 class DashboardIPv6Setup(unittest.TestCase):

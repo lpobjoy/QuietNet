@@ -109,6 +109,9 @@ IPV6_RECHECK = 60              # seconds between looks at this computer's IPv6 a
 RA_READ_BYTES = 2048           # the most of one announcement read; real ones are well under 1500
 RA_MAX_PER_SECOND = 20         # announcements looked at each second; any more are read and ignored
 RA_MAX_SERVERS = 16            # IPv6 DNS servers remembered at once; the router normally names one or two
+# Kinds of DNS question that can hand a device IPv6 addresses: AAAA (28), and HTTPS (65) and SVCB (64),
+# which may carry IPv6 hints. Devices with "Cut live connections" on get no records for these (answer_query).
+NO_IPV6_TYPES = (28, 64, 65)
 RA_HOLD_MAX = 3600             # seconds a named server is remembered without being named again
 MAX_CACHED_SIZE = 4096         # bytes; a bigger answer is never remembered (it would tie up memory)
 # Record types a device that checks DNS signatures itself asks about a bare top-level name such as
@@ -1369,6 +1372,13 @@ def answer_query(data, client, forwarder, over_tcp=False):
     log_q.put((time.time(), client, name, 1 if blocked else 0))
     if blocked:
         return blocked_reply(data, qtype, qend)
+    if qtype in NO_IPV6_TYPES and client in S.enforced and client not in S.paused_ips:
+        # "Cut live connections" steers and cuts IPv4 only. So a device it is on gets no IPv6
+        # addresses ('no error, no records', like blocked_reply for other questions), and its apps
+        # connect over IPv4, through the Pi, where they can be cut. Made fresh each time and never
+        # remembered, so the answer cache can't hand this empty answer to other devices, or their
+        # real IPv6 answers to this one.
+        return reply(data, qend, 0)
     # Only now, with the device's own rules already checked, may a remembered answer stand in for
     # the trip to the internet.
     key = cache_key(data, q)
@@ -2268,15 +2278,18 @@ def ipv6_dns_view(now=None):
     """What the dashboard shows about IPv6 and DNS (the "ipv6" part of GET /api/status): the
     address to give devices for IPv6 DNS ('' if QuietNet isn't taking lookups over IPv6 or has no
     lasting address), whether the router's announcements are being listened for and when it last
-    announced IPv6, the IPv6 DNS servers it names, and which of those are not this computer. A
+    announced IPv6, the IPv6 DNS servers it names, and which of those are not this computer.
+    "in_use" says the home network has IPv6: this computer has a public IPv6 range, or the router
+    announced IPv6 within the last hour (the live-cut card then says IPv6 can't be cut). A
     server only counts as this computer if QuietNet is taking lookups over IPv6 on that address."""
     now = time.time() if now is None else now
     with router_dns_lock:
         named = sorted(a for a, until in S.router_v6_dns.items() if until > now)
         heard = S.ra_heard
     ours = S.v6_own if S.dns_ipv6 else set()
+    in_use = bool(S.v6_prefixes) or bool(heard and now - heard < RA_HOLD_MAX)
     return {"dns_address": S.v6_dns if S.dns_ipv6 else "", "listening": S.ra_listening,
-            "router_heard": heard, "router_dns": named,
+            "router_heard": heard, "router_dns": named, "in_use": in_use,
             "router_dns_not_ours": [a for a in named if a not in ours]}
 
 
