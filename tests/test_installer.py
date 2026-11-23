@@ -4,7 +4,7 @@ Run with:  python3 -m unittest tests.test_installer
 
 The installer is run for real, with /bin/sh (and with dash or busybox too where this computer
 has them), but its PATH holds only stand-in commands: docker, curl, wget, sudo, id, uname, ss,
-sysctl, systemctl, hostname, ip and sleep are small scripts that write down how they were called
+sysctl, systemctl, iptables, hostname, ip and sleep are small scripts that write down how they were called
 and answer as each test asks. Ordinary tools (tar, cp, mv and so on) are the real ones, reached
 through links. Nothing is downloaded, no real Docker or firewall command is run, and nothing
 outside a throwaway folder is changed: QUIETNET_SYSROOT moves /etc into that folder.
@@ -113,8 +113,17 @@ echo "systemctl $*" >> "$STUB_LOG"
     "hostname": """
 echo "192.168.1.50 172.17.0.1 fd00::5"
 """,
+    # Answers "ip -4 route show default" with STUB_ROUTE (wlan0 unless a test says otherwise), and
+    # any other question with the route to the internet.
     "ip": """
-echo "1.1.1.1 via 192.168.1.1 dev eth0 src 192.168.1.50 uid 1000"
+case "$*" in
+  *"route show default"*) printf '%s\\n' "${STUB_ROUTE-default via 192.168.1.1 dev wlan0 proto dhcp src 192.168.1.50 metric 600}" ;;
+  *) echo "1.1.1.1 via 192.168.1.1 dev eth0 src 192.168.1.50 uid 1000" ;;
+esac
+""",
+    # Only writes down that it was called: the installer must never run the firewall itself.
+    "iptables": """
+echo "iptables $*" >> "$STUB_LOG"
 """,
     "sleep": """
 exit 0
@@ -627,6 +636,146 @@ class Uninstalling(Installer):
             f.write("keep me")
         self.run_installer("--uninstall")
         self.assertTrue(os.path.exists(os.path.join(self.dir, "precious.txt")))
+
+
+class ForwardThroughDocker(Installer):
+    """The optional service that lets passed-on traffic through Docker's firewall after every restart."""
+
+    def unit_path(self):
+        """Where the service file goes, inside the test's stand-in /etc."""
+        return os.path.join(self.sysroot, "etc", "systemd", "system", "quietnet-forward.service")
+
+    def unit(self):
+        """The text of the service file the installer wrote."""
+        with open(self.unit_path()) as f:
+            return f.read()
+
+    def write_unit(self, text):
+        """Put a service file of the same name in place before the installer runs."""
+        os.makedirs(os.path.dirname(self.unit_path()))
+        with open(self.unit_path(), "w") as f:
+            f.write(text)
+
+    def test_with_yes_the_service_is_written_for_the_connection_to_the_router(self):
+        self.assertInstalled(self.run_installer("--yes"))
+        unit = self.unit()
+        self.assertIn("ExecStart=/bin/sh -c 'iptables -C DOCKER-USER -i wlan0 -o wlan0 -j ACCEPT 2>/dev/null"
+                      " || iptables -I DOCKER-USER -i wlan0 -o wlan0 -j ACCEPT'", unit)
+        for line in ("After=docker.service", "Requires=docker.service", "WantedBy=docker.service",
+                     "Type=oneshot", "RemainAfterExit=yes"):
+            self.assertIn("\n" + line + "\n", unit + "\n")
+
+    def test_with_yes_the_service_is_switched_on(self):
+        self.assertInstalled(self.run_installer("--yes"))
+        self.assertIn("systemctl enable --now quietnet-forward.service", self.calls())
+
+    def test_the_installer_never_runs_the_firewall_itself(self):
+        self.assertInstalled(self.run_installer("--yes"))
+        self.assertEqual([c for c in self.calls() if c.startswith("iptables")], [])
+
+    def test_it_uses_the_connection_named_in_the_default_route(self):
+        self.assertInstalled(self.run_installer("--yes", STUB_ROUTE="default via 10.0.0.1 dev end0 proto static"))
+        self.assertIn("-i end0 -o end0", self.unit())
+
+    def test_the_question_says_what_the_service_lets_through(self):
+        answer = os.path.join(self.tmp, "answer")
+        with open(answer, "w") as f:
+            f.write("n\n")
+        r = self.run_installer(QUIETNET_TTY=answer)
+        self.assertInstalled(r)
+        self.assertIn("comes in\non this computer's network connection (wlan0) and goes straight back out", r.stdout)
+        self.assertFalse(os.path.exists(self.unit_path()))
+
+    def test_without_a_terminal_or_yes_it_is_skipped_and_the_install_goes_on(self):
+        r = self.run_installer()
+        self.assertInstalled(r)
+        self.assertIn("--yes", r.stdout)
+        self.assertFalse(os.path.exists(self.unit_path()))
+        self.assertEqual(len(self.compose_up()), 1)
+
+    def test_a_connection_name_with_unsafe_characters_is_refused(self):
+        for bad in ["wl;an0", "wlan0$(id)", "-wlan0", "wl*an0", "eth/0", "eth0'", "abcdefghijklmnop"]:
+            r = self.run_installer("--yes", STUB_ROUTE="default via 192.168.1.1 dev %s proto dhcp" % bad)
+            self.assertInstalled(r)
+            self.assertIn("not one that is safe", r.stdout, bad)
+            self.assertFalse(os.path.exists(self.unit_path()), bad)
+
+    def test_a_connection_name_of_fifteen_characters_is_accepted(self):
+        self.assertInstalled(self.run_installer("--yes", STUB_ROUTE="default via 192.168.1.1 dev abc.def_ghi-jkl"))
+        self.assertIn("-i abc.def_ghi-jkl -o abc.def_ghi-jkl", self.unit())
+
+    def test_without_a_default_route_it_is_skipped(self):
+        r = self.run_installer("--yes", STUB_ROUTE="")
+        self.assertInstalled(r)
+        self.assertIn("could not tell which network connection", r.stdout)
+        self.assertFalse(os.path.exists(self.unit_path()))
+
+    def test_without_systemd_it_is_skipped_with_a_note(self):
+        os.remove(os.path.join(self.bin, "systemctl"))
+        r = self.run_installer("--yes")
+        self.assertInstalled(r)
+        self.assertIn("does not use systemd", r.stdout)
+        self.assertFalse(os.path.exists(self.unit_path()))
+
+    def test_without_iptables_it_is_skipped_with_a_note(self):
+        os.remove(os.path.join(self.bin, "iptables"))
+        r = self.run_installer("--yes")
+        self.assertInstalled(r)
+        self.assertIn("iptables command is not installed", r.stdout)
+        self.assertFalse(os.path.exists(self.unit_path()))
+
+    def test_running_it_again_leaves_the_same_service_in_place_without_asking(self):
+        self.assertInstalled(self.run_installer("--yes"))
+        first = self.unit()
+        open(self.log, "w").close()
+        r = self.run_installer()
+        self.assertInstalled(r)
+        self.assertIn("Already set up.", r.stdout)
+        self.assertEqual(self.unit(), first)
+        self.assertNotIn("systemctl daemon-reload", self.calls())
+
+    def test_a_service_it_wrote_for_another_connection_is_replaced(self):
+        self.assertInstalled(self.run_installer("--yes", STUB_ROUTE="default via 192.168.1.1 dev eth0"))
+        self.assertInstalled(self.run_installer("--yes"))
+        self.assertIn("-i wlan0 -o wlan0", self.unit())
+        self.assertNotIn("eth0", self.unit())
+
+    def test_a_service_of_the_same_name_made_by_hand_is_left_alone(self):
+        mine = "[Service]\nExecStart=/usr/sbin/iptables -I DOCKER-USER -i wlan0 -o wlan0 -j ACCEPT\n"
+        self.write_unit(mine)
+        r = self.run_installer("--yes")
+        self.assertInstalled(r)
+        self.assertIn("left alone", r.stdout)
+        self.assertEqual(self.unit(), mine)
+
+    def test_it_works_under_the_other_shells_found_here(self):
+        if not other_shells():
+            self.skipTest("neither dash nor busybox is installed here")
+        for shell in other_shells():
+            if os.path.exists(self.unit_path()):
+                os.remove(self.unit_path())
+            self.assertInstalled(self.run_installer("--yes", shell=shell))
+            if os.path.basename(shell[0]) == "busybox":
+                # Busybox's shell may run its own built-in ip rather than the stand-in, and so read
+                # this computer's real route; check only that the rule names one connection twice.
+                self.assertRegex(self.unit(), r"-i ([A-Za-z0-9._-]+) -o \1 -j ACCEPT")
+                continue
+            self.assertIn("-i wlan0 -o wlan0", self.unit())
+            r = self.run_installer("--yes", shell=shell, STUB_ROUTE="default dev wl;an0")
+            self.assertIn("not one that is safe", r.stdout)
+
+    def test_uninstall_says_how_to_remove_the_service(self):
+        self.assertInstalled(self.run_installer("--yes"))
+        r = self.run_installer("--uninstall")
+        self.assertEqual(r.returncode, 0, r.stdout)
+        self.assertIn("sudo systemctl disable --now quietnet-forward && "
+                      "sudo rm /etc/systemd/system/quietnet-forward.service", r.stdout)
+        self.assertTrue(os.path.exists(self.unit_path()))
+
+    def test_uninstall_says_nothing_about_the_service_when_there_is_none(self):
+        self.assertInstalled(self.run_installer())
+        r = self.run_installer("--uninstall")
+        self.assertNotIn("quietnet-forward", r.stdout)
 
 
 class CutOff(Installer):

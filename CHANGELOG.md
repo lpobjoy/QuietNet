@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+Docker's firewall and "Cut live connections" (23 November):
+- **New: the installer can make Docker's firewall let passed-on traffic through for good.** Docker drops traffic the Pi passes on, so "Cut live connections" asked people to run `sudo iptables -I DOCKER-USER -i wlan0 -o wlan0 -j ACCEPT`, and that was lost at every restart. After asking (or with `--yes`), the installer now adds a small systemd service, `quietnet-forward`, that puts this one rule back every time Docker starts, for the network connection the Pi reaches its router on. It lets through only traffic that comes in on that connection and goes straight back out on it. It is skipped, with a note, without systemd or iptables, and a service of the same name made by hand is left alone. `--uninstall` says how to remove it. **To get it on a Pi already installed, run the install line again.**
+- The device page's firewall advice now says a command run by hand lasts until the Pi restarts and, for Docker's firewall, that running the install line again makes it permanent.
+
 Looks (dashboard):
 - **New: three looks to choose from (Calm, Household, Control room)** under Appearance on the dashboard, at the end of "Set up a device" and from the Appearance button in the header. Calm (the default) puts the sections down the side; Household shows devices and groups as large cards with initials; Control room is always dark, with dense rows and the day's figures across the top. Calm and Household follow the device's light or dark setting. The choice switches at once, is kept in the `qn_theme` cookie for a year, and is shared with the relay's pages when the dashboard is opened through the relay. No fonts or anything else are loaded from other websites.
 - The kill switch and the advert pause sit together in a "whole house" area in every look; the kill switch still asks before it stops anything. Back buttons and icons are line drawings hidden from screen readers; switches, chips and small buttons are at least 44 pixels tall.
