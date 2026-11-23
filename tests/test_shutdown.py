@@ -37,7 +37,8 @@ class Shutdown(unittest.TestCase):
         env.pop("QUIETNET_PAIR", None)
         self.web_port = spare_port()
         proc = subprocess.Popen(
-            [sys.executable, os.path.join(ROOT, "server.py"), "--no-browser",
+            # --no-device-names: the program must not send name questions onto the real network.
+            [sys.executable, os.path.join(ROOT, "server.py"), "--no-browser", "--no-device-names",
              "--dns-port", str(spare_port(socket.SOCK_DGRAM)), "--web-port", str(self.web_port)],
             env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         self.addCleanup(lambda: proc.poll() is None and proc.kill())
@@ -68,6 +69,11 @@ class Shutdown(unittest.TestCase):
         self.assertIn("QuietNet is running.", out)
         self.assertIn("QuietNet stopped.", out)
         self.assertNotIn("Traceback", out)
+
+    def test_the_program_can_be_started_without_asking_the_network_for_device_names(self):
+        code, out = self.stopped_with(signal.SIGTERM)
+        self.assertEqual(code, 0, out)
+        self.assertNotIn("Device names:", out)
 
     def test_ctrl_c_ends_the_program_cleanly(self):
         code, out = self.stopped_with(signal.SIGINT)

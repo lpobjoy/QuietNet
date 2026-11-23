@@ -33,7 +33,7 @@ Since the fourth review, names such as `printer.lan` or `nas.home`, and reverse 
 - Single-word names (a plain `nas`, with no ending) now go to the home router too, or get "no such name" if the router isn't known. They never go to the public servers. The exception is a question about a single word with one of the record types used to check DNS signatures (NS, SOA, DS, RRSIG, NSEC, DNSKEY, NSEC3): that is a device checking signatures asking about a top-level name such as `com`, and it goes to the internet as before. Answering it "no such name" would make that device reject every `.com` name.
 - If the same question (name and type) arrives while QuietNet is still waiting on the router for it, the answer is "server failure" rather than a second ask, so a router set up to send its lookups back to QuietNet can't make the two ask each other for ever. Two devices asking for the very same home name at the very same moment also get "server failure"; they simply ask again.
 
-**Still to check on a real Pi:** that home names, single-word names included, resolve through a real router, and that the device name hints work when the Pi uses itself for DNS.
+**Still to check on a real Pi:** that home names, single-word names included, resolve through a real router, and that the router's device names (one of the sources in issue 89) work when the Pi uses itself for DNS.
 
 ### 79. Other changes that need a real Pi or host
 
@@ -46,6 +46,24 @@ These could only be checked with stand-ins here:
 - **DNS over IPv6 (added 23 November).** On a home network with IPv6, check that the log does not say IPv6 listening failed, that the router actually gives devices the Pi's IPv6 address for DNS, and that such devices' lookups appear on the dashboard under their IPv4 address (matched through `ip -6 neigh`, which the rebuilt image now includes). Check that a lookup from a public IPv6 address outside the home range gets no answer, and that with a device switched off, its IPv6 lookups are blocked or refused.
 - **The relay giving up root on Railway (added 23 November).** After a redeploy the log should say "Running as user 65534, group 65534, not root." Sign-up and sign-in should still save to `/data`, and an existing root-owned `relay.db` (with its `-wal` and `-shm` files) should be handed over and keep working. If Railway refuses the change of owner, the log shows the "still running as root" warning instead.
 - **Row spacing on old Safari (added 23 November).** The dashboard spaces rows with margins where flex `gap` is ignored. This has not been seen on a real Safari before 14.1.
+
+### 89. Device names: what still can't be named, and what the Pi now sends
+
+Since 23 November QuietNet asks devices for their own names over DHCP, Bonjour, the Windows network, UPnP and the router (ARCHITECTURE.md, "Device names"). Written and tested with stand-ins only; not yet run on a real Pi or home network.
+
+**What this means for the network.** The Pi now listens on UDP 5353 (the Bonjour group address only) and reads a copy of the DHCP requests arriving for UDP 67 (through a packet filter, without taking the port and never answering), and every two minutes sends a Bonjour question to the group and to each device, a NetBIOS question to each device, one UPnP call to the UPnP group, and short HTTP requests to devices' own UPnP description addresses. These are small and ordinary, but they are new: a household with network monitoring will see them.
+
+**What still can't be named, and why:**
+- Phones and tablets with a private Wi-Fi address that send no name when joining, don't answer Bonjour while asleep, and aren't known to the router. Many Android phones fall here. They get the "private Wi-Fi address" note instead.
+- DHCP names are heard only when a device joins or rejoins the network while QuietNet is running: switching on, a computer restarting, a phone reconnecting to Wi-Fi. A device that stays connected only renews its lease, and renewals go straight to the router, so they are not heard. A Windows PC or smart TV on a cable that is never restarted may never give a DHCP name. Heard only on the Pi (Linux), through a packet filter that needs the container's NET_RAW permission; on a Mac only if run with admin rights and port 67 is free.
+- On a Mac, the DHCP listener binds the broadcast address on port 67. A DHCP server started on the same Mac afterwards may find the port taken. On the Pi this does not happen: there the listener never takes the port, so dnsmasq or a hotspot can start before or after QuietNet.
+- Bonjour answers are believed only from the device they are about. A Mac that is asleep, whose Bonjour Sleep Proxy (often an Apple TV or AirPort) answers for it, is named only once it wakes. This is deliberate: any device could otherwise answer for another and give it a misleading name.
+- A Bonjour announcement heard from an address before QuietNet has seen which device holds it is tied to the device holding it at the next round, up to two minutes later. If the address passes to another device inside those two minutes, the announcement could be shown for the wrong device until it ages out (6 hours) or that device is named.
+- Smart plugs, cameras and other small devices that speak none of these. No hardware-maker table is used, by choice.
+- Devices on another network segment or behind a mesh node that doesn't pass multicast on.
+- On a Mac, the Bonjour listener may share port 5353 with the system or be refused; asking devices directly still works.
+
+**Still to check on a real Pi:** that the log shows no "Device names: not listening" line on a plain Raspberry Pi OS with avahi running (or, if it does, that avahi keeps working: `avahi-browse -a` still lists devices); that iPhones, Macs, a Windows PC, a smart TV and the router each get a suggestion; that the round never takes much more than 5 seconds (`docker logs` stays quiet; the dashboard stays quick); that nothing is ever sent from port 67 (`sudo tcpdump -ni eth0 udp port 67 or udp port 68` shows only the router and devices); that a DHCP server started on the Pi after QuietNet still starts.
 
 ### 85. The one-line installer has not been run on a real Pi
 

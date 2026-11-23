@@ -15,7 +15,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends nftables iptabl
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-COPY server.py enforcer.py cloud_agent.py services.json junk_domains.txt ./
+COPY server.py names.py enforcer.py cloud_agent.py services.json junk_domains.txt ./
 COPY static ./static
 
 # History and your rules live here. Mount a volume so they survive restarts.

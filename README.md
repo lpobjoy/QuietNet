@@ -15,7 +15,7 @@ See what every device in your home is talking to, block the adverts and trackers
 - **Schedules** — block apps, services or all internet automatically at set times (bedtime, homework, school nights), per device, group or whole house.
 - **Kill switch** — one button stops all internet everywhere until you turn it back on.
 - **Cut live connections** (Raspberry Pi) — optionally stop a device even mid-stream, not just new connections. See below.
-- **Finds the devices on your network**, with their names and hardware addresses, so you can name and group them.
+- **Finds the devices on your network**, with their hardware addresses and a suggested name for each, found by asking the devices themselves (Bonjour, the Windows network, UPnP, DHCP and the router). One click uses the suggestion.
 - **Pause advert blocking for 10 minutes** when a website or app misbehaves.
 
 ## Start it
@@ -135,6 +135,7 @@ QuietNet uses no third-party packages or libraries. Everything — the DNS filte
 | File | What it is |
 | --- | --- |
 | `server.py` | The main program: DNS filter, rules, network scan and dashboard server |
+| `names.py` | Finds names for the devices on your network by asking them (Bonjour, Windows network, UPnP, DHCP and the router) |
 | `enforcer.py` | The live-connection enforcer (ARP + kernel firewall, Linux/Pi) |
 | `cloud_agent.py` | The Pi's outbound link to the relay (for remote access) |
 | `cloud/` | The relay you host (e.g. on Railway) to reach your Pi from anywhere |

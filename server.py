@@ -33,14 +33,16 @@ from urllib.parse import parse_qs, urlparse
 
 import enforcer
 import cloud_agent
+import names
 
 # MAP OF THIS FILE (each part starts with a "# ----- name" banner):
 #   settings and State   the values you might tune, and S, everything held in memory
 #   database             the SQLite connection, the tables, saved settings, the history writer
 #   rules                the lists, schedules and decision(): is this name blocked for this device, and why
 #   DNS                  reading questions, building answers, asking the real servers, the UDP/TCP listeners
-#   helpers              this computer's address, the neighbour table, the network scan, and the
-#                        api_...() functions that build each dashboard answer
+#   helpers              this computer's address, the neighbour table, device names (the work is in
+#                        names.py), the network scan, and the api_...() functions that build each
+#                        dashboard answer
 #   dashboard web server the Web class (every HTTP call) and main()
 #
 # HOW A CHANGE TO A RULE WORKS: the rule sets live in S for speed and in the database so they
@@ -163,7 +165,7 @@ class State:
     local_ip = "127.0.0.1"
     list_state = "idle"     # idle | downloading | error
     list_error = ""
-    hints = {}              # ip -> name the network reports
+    hints = {}              # ip -> {"name", "source", "detail"}: the name suggested for it (see names.py)
     services = []           # the catalogue from services.json
     svc_names = {}          # service id -> friendly name
     dom2svc = {}            # address -> service id
@@ -1620,19 +1622,18 @@ def ipv6_watcher():
 
 
 def hint_refresher():
-    """Background thread: every two minutes, look up the host name of each device this
-    computer knows about, so the dashboard can suggest names for them."""
+    """Background thread: every two minutes (or soon after a network scan), look for a name for
+    each device this computer knows about, so the dashboard can suggest one. The asking is done by
+    NAMER (names.py), which never takes much more than names.ROUND_SECONDS however devices behave.
+    Never run on a lookup or a dashboard request."""
     while True:
         try:
-            hints = {}
-            for ip, mac in neighbours().items():
-                name = reverse_name(ip)
-                if name:
-                    hints[ip] = name
-            S.hints = hints
-        except Exception:
-            pass
-        time.sleep(120)
+            devices = {ip: mac for ip, mac in neighbours().items() if ip != S.local_ip}
+            S.hints = NAMER.round(devices)
+        except Exception as e:
+            print("Could not look for device names:", e, flush=True)
+        NAMES_WANTED.wait(120)
+        NAMES_WANTED.clear()
 
 
 def reverse_name(ip):
@@ -1642,6 +1643,12 @@ def reverse_name(ip):
         return "" if name == ip else name.split(".")[0]
     except OSError:
         return ""
+
+
+# Finds device names (names.py). Reverse lookups go through reverse_name, looked up afresh on each
+# call so a stand-in put in its place is used. NAMES_WANTED asks hint_refresher to look again now.
+NAMER = names.Namer(reverse=lambda ip: reverse_name(ip))
+NAMES_WANTED = threading.Event()
 
 
 MAX_SCAN = 1024        # the most addresses one network scan knocks on
@@ -1739,6 +1746,7 @@ def scan_network():
                            (ip, found[ip], host, now))
             db.commit()
         pool.shutdown(wait=False)
+        NAMES_WANTED.set()          # ask the devices just found for their names now, not in two minutes
     except Exception as e:
         print("Scan problem:", e, flush=True)
     finally:
@@ -1780,13 +1788,16 @@ def api_devices():
     """GET /api/devices: every device that has used QuietNet or been found by a scan,
     with its name, group, switches and today's counts."""
     since = time.time() - 86400
-    names = dict(sql("SELECT ip, name FROM devices"))
+    given = dict(sql("SELECT ip, name FROM devices"))
+    hints = S.hints
     out = {}
 
     def entry(ip):
         """The dict for one device, created with empty defaults the first time it is asked for."""
         return out.setdefault(ip, {
-            "ip": ip, "name": names.get(ip) or "", "hint": S.hints.get(ip, ""), "mac": "",
+            "ip": ip, "name": given.get(ip) or "", "hint": hints.get(ip, {}).get("name", ""),
+            "hint_source": hints.get(ip, {}).get("source", ""), "hint_detail": hints.get(ip, {}).get("detail", ""),
+            "mac": "",
             "this_computer": ip == S.local_ip, "last": 0, "n": 0, "nb": 0, "on_network": 0,
             "group": S.dev_group.get(ip), "off": internet_off_for(ip),
             "enforced": ip in S.enforced})
@@ -1801,8 +1812,11 @@ def api_devices():
     for ip, mac, host, ts in sql("SELECT ip, mac, host, ts FROM seen"):
         d = entry(ip)
         d.update(mac=mac, on_network=ts)
-        if host:
-            d["hint"] = host
+        if host and not d["hint"] and names.tidy_name(host):
+            d.update(hint=names.tidy_name(host), hint_source=names.LABELS["dns"])
+    for d in out.values():
+        if not d["hint"] and not d["hint_detail"] and names.is_private_mac(d["mac"]):
+            d["hint_detail"] = names.PRIVATE_NOTE
     # Devices using QuietNet first (most recent at the top), then the rest in address order.
     return sorted(out.values(), key=lambda d: (-d["last"], [int(x) if x.isdigit() else 0 for x in d["ip"].split(".")]))
 
@@ -2321,13 +2335,17 @@ def main():
     ap.add_argument("--dns-port", type=int, default=53)
     ap.add_argument("--web-port", type=int, default=8377)
     ap.add_argument("--no-browser", action="store_true")
+    ap.add_argument("--no-device-names", action="store_true",
+                    help="don't ask the home network for device names (the tests use this)")
     args = ap.parse_args()
 
     init_db()
     load_lists()
     S.local_ip = find_local_ip()
     threading.Thread(target=log_writer, daemon=True).start()
-    threading.Thread(target=hint_refresher, daemon=True).start()
+    if not args.no_device_names:
+        NAMER.start_listeners()
+        threading.Thread(target=hint_refresher, daemon=True).start()
     start_dns(args.dns_port)
 
     global ENF
