@@ -11,16 +11,92 @@ QUIETNET_PAIR environment variables. After that the Pi reconnects on its own.
 
 Standard library only.
 """
+import http.client
 import json
 import os
 import socket
+import ssl
 import threading
 import time
 import urllib.error
 import urllib.request
+from urllib.parse import urlsplit
 
 MAX_AT_ONCE = 8                     # relayed requests handled at the same time
 MAX_ANSWER = 12 * 1024 * 1024       # largest answer sent up; the relay takes 16 MB, and JSON escaping adds some
+PAIR_RETRY_MAX = 60                 # longest wait, in seconds, between tries of a QUIETNET_PAIR code
+
+# Lists of trusted certificate authorities that operating systems keep, tried in this order when
+# Python has none of its own (python.org's Mac builds start with none). Adding trusted authorities
+# never weakens the check: certificates are always verified.
+SYSTEM_CA_FILES = (
+    "/etc/ssl/cert.pem",                                 # macOS, Alpine, the BSDs
+    "/etc/ssl/certs/ca-certificates.crt",                # Debian, Ubuntu, Raspberry Pi OS
+    "/etc/pki/tls/certs/ca-bundle.crt",                  # Fedora, Red Hat
+    "/etc/ssl/ca-bundle.pem",                            # openSUSE
+)
+
+# Hosts a relay may be reached on over plain http://, for running a relay on the same computer
+# while developing. Anywhere else the token would cross the network unprotected.
+LOCAL_HOSTS = ("localhost", "127.0.0.1", "::1")
+
+INSECURE_HELP = ("That relay address starts with http://, which would send this Pi's key unprotected. "
+                 "Use an address starting with https:// instead.")
+
+CERT_HELP = ("The relay's security certificate couldn't be checked. If you installed Python from "
+             "python.org on a Mac, open its folder in Applications, double-click "
+             "'Install Certificates.command', then restart QuietNet. Otherwise check the relay address.")
+
+_tls = None
+_tls_lock = threading.Lock()
+
+
+def tls_context():
+    """The settings used for secure (https) calls, made once and shared by every thread.
+
+    Used for calls to the relay, and safe for any other https download (server.py uses it for the
+    community advert list): it holds no relay-specific settings, and the host name being called
+    is always checked against its certificate.
+
+    Starts from Python's defaults, which always check the certificate and the host name. If Python
+    has no trusted certificate authorities loaded (the case for python.org's Mac builds until
+    'Install Certificates.command' is run), the operating system's own list is added from the
+    first of SYSTEM_CA_FILES that exists. If there is none, calls fail with a certificate error,
+    which is reported with CERT_HELP. Verification is never turned off."""
+    global _tls
+    with _tls_lock:
+        if _tls is None:
+            ctx = ssl.create_default_context()
+            if not ctx.cert_store_stats().get("x509_ca"):
+                for path in SYSTEM_CA_FILES:
+                    if os.path.isfile(path):
+                        try:
+                            ctx.load_verify_locations(cafile=path)
+                            break
+                        except (OSError, ssl.SSLError):
+                            continue
+            _tls = ctx
+        return _tls
+
+
+def insecure_relay(relay):
+    """True when `relay` is a plain http:// address on another computer, which QuietNet refuses.
+
+    http:// is allowed only for localhost, 127.0.0.1 and ::1 (a relay on this same computer, for
+    development). Any other scheme or host is judged by the caller; https:// is always allowed."""
+    if not relay.lower().startswith("http://"):
+        return False
+    try:
+        host = urlsplit(relay).hostname or ""
+    except ValueError:
+        return True
+    return host.lower() not in LOCAL_HOSTS
+
+
+def is_cert_error(e):
+    """True when `e` is a failed certificate check, whether raised directly or wrapped by urllib."""
+    reason = getattr(e, "reason", None) if isinstance(e, urllib.error.URLError) else e
+    return isinstance(reason, ssl.SSLCertVerificationError)
 
 
 class CloudAgent:
@@ -39,6 +115,9 @@ class CloudAgent:
         self.detail = ""
         self._stop = threading.Event()
         self._slots = threading.BoundedSemaphore(MAX_AT_ONCE)
+        self._pending_code = ""     # a QUIETNET_PAIR code still being retried; see start()
+        self._next_pair_try = 0.0
+        self._pair_wait = 5
         # Headless setup: environment variables win if the Pi isn't paired yet.
         env_relay = os.environ.get("QUIETNET_CLOUD", "").strip()
         if env_relay and not self.cfg.get("token"):
@@ -75,6 +154,7 @@ class CloudAgent:
     def forget(self):
         """Unpair: wipe the saved relay address and token. The loop notices and goes idle."""
         self.cfg = {}
+        self._pending_code = ""
         self._save()
         self.state, self.detail = "off", ""
 
@@ -83,36 +163,79 @@ class CloudAgent:
     def pair(self, relay, code):
         """Exchange a pairing code for a token and save it. Returns None on success, or a
         sentence explaining what went wrong (shown to the person as is)."""
+        return self._pair(relay, code)[0]
+
+    def _pair(self, relay, code):
+        """Do the work of pair(). Returns (message, final): message is None on success; final is
+        True when trying the same code again cannot help, because the relay refused the code
+        itself (wrong, used or expired). A busy relay (429), a relay fault, an unreachable relay
+        or an unreadable answer are not final. A plain http:// address on another computer is
+        refused before anything is sent, and is final."""
         relay = (relay or self.cfg.get("relay", "")).strip().rstrip("/")
-        if not relay.startswith(("http://", "https://")):
+        if not relay.lower().startswith(("http://", "https://")):
             relay = "https://" + relay
+        if insecure_relay(relay):
+            return INSECURE_HELP, True
         try:
             resp = self._http("POST", relay + "/agent/pair", {"code": str(code).strip().upper()}, timeout=20)
         except urllib.error.HTTPError as e:
+            final = 400 <= e.code < 500 and e.code not in (408, 429)
             try:
-                return (json.loads(e.read()).get("error") or "Pairing failed.")
+                return (json.loads(e.read()).get("error") or "Pairing failed."), final
             except Exception:
-                return "Pairing failed (the relay rejected the code)."
-        except (urllib.error.URLError, socket.timeout, OSError):
-            return "Couldn't reach the relay at that address."
-        if not resp.get("token"):
-            return "Pairing failed."
+                return "Pairing failed (the relay rejected the code).", final
+        except (urllib.error.URLError, socket.timeout, OSError) as e:
+            if is_cert_error(e):
+                return CERT_HELP, False
+            return "Couldn't reach the relay at that address.", False
+        except (http.client.HTTPException, ValueError):
+            return "The relay sent an answer QuietNet couldn't read.", False
+        if not isinstance(resp, dict) or not resp.get("token"):
+            return "Pairing failed.", False
         self.cfg = {"relay": relay, "token": resp["token"], "id": resp.get("id", "")}
         self._save()
         self.state = "connecting"
-        return None
+        return None, False
 
     # -- run loop -------------------------------------------------------
 
     def start(self):
-        # Allow one-shot pairing from an environment variable on first boot.
         """Pair from the QUIETNET_PAIR environment variable if set and not yet paired, then
-        start the background loop."""
+        start the background loop.
+
+        If that first try fails for a reason that may pass (the relay is busy, faulty or can't be
+        reached), the loop keeps trying the code with growing waits; see _retry_pairing. It gives
+        up only when the relay says the code is wrong, used or expired."""
         code = os.environ.get("QUIETNET_PAIR", "").strip()
         if code and self.cfg.get("relay") and not self.cfg.get("token"):
-            err = self.pair(self.cfg["relay"], code)
-            self.log("Cloud pairing: " + (err or "success"))
+            self._pending_code = code
+            self._pair_wait = 5
+            self._next_pair_try = 0.0
+            self._retry_pairing()
         threading.Thread(target=self._run, daemon=True).start()
+
+    def _retry_pairing(self):
+        """Try the QUIETNET_PAIR code once, if one is waiting and its next try is due.
+
+        On success, or when the relay refuses the code itself, the code is dropped. Otherwise the
+        next try is put off: 5 seconds, then 10, 20, 40, and at most PAIR_RETRY_MAX seconds."""
+        if not self._pending_code or time.time() < self._next_pair_try:
+            return
+        err, final = self._pair(self.cfg.get("relay", ""), self._pending_code)
+        if err is None:
+            self._pending_code = ""
+            self.log("Cloud pairing: success")
+        elif final:
+            self._pending_code = ""
+            self.state, self.detail = "error", err
+            self.log("Cloud pairing: " + err)
+        else:
+            wait = self._pair_wait
+            self._next_pair_try = time.time() + wait
+            self._pair_wait = min(wait * 2, PAIR_RETRY_MAX)
+            self.state = "error"
+            self.detail = "Pairing didn't work yet: %s Trying again in %d seconds." % (err, wait)
+            self.log("Cloud pairing: %s Trying again in %d seconds." % (err, wait))
 
     def stop(self):
         """Ask the background loop to end."""
@@ -122,25 +245,47 @@ class CloudAgent:
         """The background loop. While paired: wait on the relay for a request (the relay holds
         the call open for up to 25 seconds), run it, send the answer, repeat.
 
+        While not paired, it retries a QUIETNET_PAIR code that failed for a reason that may pass.
+
         On 401 the relay no longer knows this Pi, so the token is discarded. On other failures the
         pairing is kept and the loop waits before retrying: 5 seconds after a relay error, and 1, 2,
-        4 ... up to 30 seconds while the relay cannot be reached."""
+        4 ... up to 30 seconds while the relay cannot be reached or something unexpected goes wrong.
+        Nothing is allowed to end the loop except stop(), because on a Pi with no screen the relay
+        is the only way in.
+
+        A saved plain http:// relay address on another computer (possible from an older version)
+        is never contacted, so the token is not sent unprotected; the dashboard says to pair again
+        with https://."""
         backoff = 1
         while not self._stop.is_set():
-            if not (self.cfg.get("relay") and self.cfg.get("token")):
-                self.state = "off"
-                self._stop.wait(2)
-                continue
             try:
+                if not (self.cfg.get("relay") and self.cfg.get("token")):
+                    if self._pending_code and self.cfg.get("relay"):
+                        self._retry_pairing()
+                    else:
+                        self._pending_code = ""
+                        self.state = "off"
+                    if not self.cfg.get("token"):
+                        self._stop.wait(2)
+                    continue
+                self._pending_code = ""          # paired, by the code or by hand
+                if insecure_relay(self.cfg["relay"]):
+                    self.state, self.detail = "error", INSECURE_HELP
+                    self._stop.wait(2)
+                    continue
                 self.state = "connecting" if self.state != "online" else self.state
                 call = self._http("GET", self.cfg["relay"] + "/agent/poll", None, timeout=35, token=True)
                 self.state, self.detail, backoff = "online", "", 1
-                if call and call.get("id"):
+                if isinstance(call, dict) and call.get("id"):
                     # Answer in the background and go straight back to listening, so the several
                     # requests a dashboard page makes at once don't queue behind each other.
                     # At most MAX_AT_ONCE are in hand; beyond that, wait for one to finish.
                     self._slots.acquire()
-                    threading.Thread(target=self._handle_and_release, args=(call,), daemon=True).start()
+                    try:
+                        threading.Thread(target=self._handle_and_release, args=(call,), daemon=True).start()
+                    except Exception:
+                        self._slots.release()
+                        raise
             except urllib.error.HTTPError as e:
                 if e.code == 401:
                     self.state, self.detail = "error", "This Pi was unpaired on the relay. Pair it again."
@@ -150,7 +295,20 @@ class CloudAgent:
                     self.state, self.detail = "error", "Relay error %d" % e.code
                 self._stop.wait(5)
             except (urllib.error.URLError, socket.timeout, OSError) as e:
-                self.state, self.detail = "error", "Can't reach the relay (%s)" % e
+                if is_cert_error(e):
+                    self.state, self.detail = "error", CERT_HELP
+                else:
+                    self.state, self.detail = "error", "Can't reach the relay (%s)" % e
+                self._stop.wait(min(backoff, 30))
+                backoff = min(backoff * 2, 30)
+            except (http.client.HTTPException, ValueError):
+                # A cut-off or garbled answer: the relay restarting, or a proxy page instead of JSON.
+                self.state, self.detail = "error", "The relay sent an answer QuietNet couldn't read. Trying again."
+                self._stop.wait(min(backoff, 30))
+                backoff = min(backoff * 2, 30)
+            except Exception as e:
+                self.state, self.detail = "error", "Something unexpected went wrong with the relay link. Trying again."
+                self.log("Cloud link: unexpected problem: %r" % (e,))
                 self._stop.wait(min(backoff, 30))
                 backoff = min(backoff * 2, 30)
 
@@ -172,7 +330,8 @@ class CloudAgent:
             self._http("POST", self.cfg["relay"] + "/agent/respond",
                        {"id": call["id"], "status": status, "body": body}, timeout=60, token=True,
                        headers={"X-QuietNet-Call": str(call["id"])})
-        except (urllib.error.URLError, urllib.error.HTTPError, socket.timeout, OSError):
+        except (urllib.error.URLError, urllib.error.HTTPError, socket.timeout, OSError,
+                http.client.HTTPException, ValueError):
             pass        # the browser's request will simply time out; no harm done
 
     def _local(self, method, path, body):
@@ -195,13 +354,15 @@ class CloudAgent:
 
     def _http(self, method, url, obj, timeout, token=False, headers=None):
         """One JSON request to the relay; returns the decoded answer ({} if empty). Raises
-        urllib's errors for the caller to handle. token=True adds this Pi's token header;
+        urllib's errors for the caller to handle, and http.client.HTTPException or ValueError for
+        a cut-off or garbled answer. https calls use tls_context(). token=True adds this Pi's token header;
         `headers` adds any others."""
         data = json.dumps(obj).encode() if obj is not None else None
         headers = dict(headers or {}, **{"Content-Type": "application/json"})
         if token and self.cfg.get("token"):
             headers["X-QuietNet-Token"] = self.cfg["token"]
         req = urllib.request.Request(url, data=data, method=method, headers=headers)
-        with urllib.request.urlopen(req, timeout=timeout) as r:
+        context = tls_context() if url.lower().startswith("https://") else None
+        with urllib.request.urlopen(req, timeout=timeout, context=context) as r:
             raw = r.read()
             return json.loads(raw) if raw else {}

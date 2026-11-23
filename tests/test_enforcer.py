@@ -25,6 +25,72 @@ KID, KID_MAC = "192.168.1.23", "11:22:33:44:55:66"
 TV, TV_MAC = "192.168.1.30", "77:77:77:77:77:77"
 
 
+# `nft list ruleset` as printed on a host running Docker (its iptables rules, seen through nft).
+DOCKER_RULESET = """table ip nat {
+	chain DOCKER {
+		iifname "docker0" counter packets 0 bytes 0 return
+	}
+}
+table ip filter {
+	chain DOCKER {
+	}
+	chain DOCKER-ISOLATION-STAGE-1 {
+		iifname "docker0" oifname != "docker0" counter packets 0 bytes 0 jump DOCKER-ISOLATION-STAGE-2
+		counter packets 0 bytes 0 return
+	}
+	chain DOCKER-ISOLATION-STAGE-2 {
+		oifname "docker0" counter packets 0 bytes 0 drop
+		counter packets 0 bytes 0 return
+	}
+	chain FORWARD {
+		type filter hook forward priority filter; policy drop;
+		counter packets 0 bytes 0 jump DOCKER-USER
+		counter packets 0 bytes 0 jump DOCKER-ISOLATION-STAGE-1
+		oifname "docker0" ct state related,established counter packets 0 bytes 0 accept
+		oifname "docker0" counter packets 0 bytes 0 jump DOCKER
+		iifname "docker0" oifname != "docker0" counter packets 0 bytes 0 accept
+		iifname "docker0" oifname "docker0" counter packets 0 bytes 0 accept
+	}
+	chain DOCKER-USER {
+		counter packets 0 bytes 0 return
+	}
+}
+"""
+# The same host after running our Docker advice.
+DOCKER_FIXED = DOCKER_RULESET.replace(
+    "\tchain DOCKER-USER {\n", '\tchain DOCKER-USER {\n\t\tiifname "eth0" oifname "eth0" counter packets 0 bytes 0 accept\n')
+
+# `nft list ruleset` for firewalld's own table, which ends its forward chain with a reject.
+FIREWALLD_RULESET = """table inet firewalld {
+	set allowed_nets {
+		type ipv4_addr
+		flags interval
+		elements = { 10.0.0.0/8,
+			     192.168.0.0/16 }
+	}
+	chain filter_FORWARD {
+		type filter hook forward priority filter + 10; policy accept;
+		ct state { established, related } accept
+		ct status dnat accept
+		iifname "lo" accept
+		ct state invalid drop
+		jump filter_FORWARD_POLICIES
+		reject with icmpx admin-prohibited
+	}
+	chain filter_FORWARD_POLICIES {
+		iifname "wlan0" oifname "wlan0" goto filter_FWD_trusted
+		return
+	}
+	chain filter_FWD_trusted {
+		accept
+	}
+}
+"""
+# firewalld's table after running our nft advice for it.
+FIREWALLD_FIXED = FIREWALLD_RULESET.replace(
+    "policy accept;\n", 'policy accept;\n\t\tiifname "eth0" oifname "eth0" accept\n')
+
+
 class FakeSocket:
     def __init__(self):
         self.frames, self.closed = [], False
@@ -283,11 +349,11 @@ class Safety(EnforcerCase):
         self.assertIn("won't pass traffic on", self.e.status()["problem"])
 
     def test_nothing_is_steered_when_another_firewall_drops_passed_on_traffic(self):
-        self.e._forward_blocker = lambda: "table 'filter'"
+        self.e._forward_blocker = lambda: "Another firewall on this machine (table 'filter') blocks passed-on traffic."
         self.plan = {KID: {"off": False, "ips": set()}}
         self.e._tick()
         self.assertEqual(self.sock.frames, [])
-        self.assertIn("DOCKER-USER -i eth0 -o eth0 -j ACCEPT", self.e.status()["problem"])
+        self.assertIn("blocks passed-on traffic", self.e.status()["problem"])
 
     def test_steered_devices_are_handed_back_if_it_becomes_unsafe(self):
         self.steer_kid()
@@ -419,7 +485,7 @@ class FirewallCheckFailures(EnforcerCase):
             self.plan = {KID: {"off": False, "ips": set()}}
             self.e._tick()
         self.assertEqual(self.sock.frames, [])
-        self.assertIn("couldn't list", self.e.status()["problem"])
+        self.assertIn("couldn't read this machine's firewall rules", self.e.status()["problem"])
 
     def test_an_old_firewall_that_is_not_loaded_at_all_is_not_a_blocker(self):
         real = enforcer.subprocess.run
@@ -447,6 +513,126 @@ class FirewallCheckFailures(EnforcerCase):
             self.e._tick()
         appends = [a for a, _ in self.commands if "-A" in a]
         self.assertEqual(len(appends), 2)        # loaded once, then again after the flush
+
+
+class FirewallAdvice(EnforcerCase):
+    """The command shown on the device page matches the firewall that is actually in the way."""
+
+    def blocker(self, listings):
+        """Ask the enforcer about other firewalls, with each tool listing the given text."""
+        def run(args, **kw):
+            r = Result()
+            r.stdout = listings.get(args[0], "")
+            return r
+        self.tools = set(listings)
+        with mock.patch.object(enforcer.subprocess, "run", run):
+            return self.e._forward_blocker()
+
+    def test_dockers_drop_policy_gets_the_docker_user_command(self):
+        message = self.blocker({"nft": DOCKER_RULESET})
+        self.assertIn("Docker's table 'filter'", message)
+        self.assertTrue(message.endswith("run on the Pi: sudo iptables -I DOCKER-USER -i eth0 -o eth0 -j ACCEPT"))
+
+    def test_firewallds_reject_gets_an_nft_command_for_its_own_chain(self):
+        message = self.blocker({"nft": FIREWALLD_RULESET})
+        self.assertNotIn("DOCKER-USER", message)
+        self.assertTrue(message.endswith(
+            "run on the Pi: sudo nft insert rule inet firewalld filter_FORWARD iifname eth0 oifname eth0 accept"))
+
+    def test_following_the_nft_command_clears_the_blocker(self):
+        self.assertEqual(self.blocker({"nft": FIREWALLD_FIXED}), "")
+
+    def test_a_forward_drop_made_with_iptables_without_docker_gets_a_forward_chain_command(self):
+        ufw = "table ip filter {\n\tchain FORWARD {\n\t\ttype filter hook forward priority filter; policy drop;\n\t}\n}\n"
+        message = self.blocker({"nft": ufw})
+        self.assertTrue(message.endswith("run on the Pi: sudo iptables -I FORWARD -i eth0 -o eth0 -j ACCEPT"))
+
+    def test_the_older_tool_without_docker_gets_a_forward_chain_command(self):
+        self.e.backend = "iptables"
+        message = self.blocker({"iptables": "-P INPUT ACCEPT\n-P FORWARD DROP\n-P OUTPUT ACCEPT\n"})
+        self.assertTrue(message.endswith("run on the Pi: sudo iptables -I FORWARD -i eth0 -o eth0 -j ACCEPT"))
+
+    def test_the_older_tool_with_docker_gets_the_docker_user_command(self):
+        self.e.backend = "iptables"
+        message = self.blocker({"iptables": "-P FORWARD DROP\n-N DOCKER-USER\n-A FORWARD -j DOCKER-USER\n"})
+        self.assertTrue(message.endswith("run on the Pi: sudo iptables -I DOCKER-USER -i eth0 -o eth0 -j ACCEPT"))
+
+    def test_every_blocking_firewall_is_named_with_its_own_command(self):
+        message = self.blocker({"nft": DOCKER_RULESET + FIREWALLD_RULESET})
+        self.assertIn("(table 'firewalld', Docker's table 'filter')", message)
+        self.assertIn("sudo nft insert rule inet firewalld filter_FORWARD iifname eth0 oifname eth0 accept && "
+                      "sudo iptables -I DOCKER-USER -i eth0 -o eth0 -j ACCEPT", message)
+
+
+class QuietIptables(EnforcerCase):
+    """With only iptables, nothing is run every tick while no device is enforced."""
+
+    def setUp(self):
+        super().setUp()
+        self.e.backend = "iptables"
+
+    def iptables_calls(self):
+        """The firewall-changing iptables commands sent so far (not the read-only checks)."""
+        return [a for a, _ in self.commands if a[0] == "iptables" and "-S" not in a]
+
+    def test_with_nobody_chosen_iptables_is_not_run_at_all(self):
+        for _ in range(3):
+            self.e._tick()
+        self.assertEqual(self.iptables_calls(), [])
+
+    def test_when_the_last_device_is_released_its_rules_are_emptied_once(self):
+        self.plan = {KID: {"off": True, "ips": set()}}
+        self.e._tick()
+        self.plan = {}
+        self.e._tick()
+        after_release = len(self.iptables_calls())
+        self.assertIn(["iptables", "-w", "5", "-F", "QUIETNET"], self.iptables_calls()[-3:])
+        self.e._tick()
+        self.e._tick()
+        self.assertEqual(len(self.iptables_calls()), after_release)
+
+    def test_rules_left_by_a_failed_release_are_emptied_on_a_later_tick(self):
+        self.plan = {KID: {"off": True, "ips": set()}}
+        self.e._tick()
+        self.plan = {}
+        real = enforcer.subprocess.run
+
+        def locked(args, **kw):
+            if "-F" in args:
+                self.commands.append((args, None))
+                return Result(4, "Another app is currently holding the xtables lock")
+            return real(args, **kw)
+        with mock.patch.object(enforcer.subprocess, "run", locked):
+            self.e._tick()
+        self.e._tick()
+        flushes = [a for a in self.iptables_calls() if "-F" in a]
+        self.assertEqual(len(flushes), 3)        # loaded, failed to empty, emptied next tick
+
+    def test_a_chain_whose_removal_could_not_be_checked_is_still_emptied(self):
+        def locked(args, **kw):
+            self.commands.append((args, None))
+            return Result(4, "Another app is currently holding the xtables lock")
+        with mock.patch.object(enforcer.subprocess, "run", locked):
+            self.e._remove_firewall()
+        del self.commands[:]
+        self.e._tick()
+        self.assertIn(["iptables", "-w", "5", "-F", "QUIETNET"], self.iptables_calls())
+
+    def test_a_chain_that_is_definitely_gone_is_not_emptied_again(self):
+        def gone(args, **kw):
+            self.commands.append((args, None))
+            return Result(1, "No chain/target/match by that name.")
+        with mock.patch.object(enforcer.subprocess, "run", gone):
+            self.e._remove_firewall()
+        del self.commands[:]
+        self.e._tick()
+        self.assertEqual(self.iptables_calls(), [])
+
+    def test_a_chain_that_could_not_be_removed_at_start_up_is_still_emptied(self):
+        self.e._remove_firewall()                # the stand-in says the chain is still there afterwards
+        del self.commands[:]
+        self.e._tick()
+        self.assertIn(["iptables", "-w", "5", "-F", "QUIETNET"], self.iptables_calls())
 
 
 class StartingUnavailable(EnforcerCase):
@@ -562,6 +748,55 @@ class FirewallChecks(unittest.TestCase):
         ours = enforcer.nft_ruleset({KID: {"off": True, "ips": set()}}, US).replace("policy accept", "policy drop")
         self.assertEqual(enforcer.foreign_forward_drop(ours, "eth0"), "")
 
+    def test_an_accept_in_dockers_table_does_not_clear_a_reject_in_firewallds_table(self):
+        found = enforcer.forward_blockers(DOCKER_FIXED + FIREWALLD_RULESET, "eth0")
+        self.assertEqual(found, [("inet", "firewalld", "filter_FORWARD", False)])
+
+    def test_an_accept_in_firewallds_table_does_not_clear_dockers_drop_policy(self):
+        found = enforcer.forward_blockers(DOCKER_RULESET + FIREWALLD_FIXED, "eth0")
+        self.assertEqual(found, [("ip", "filter", "FORWARD", True)])
+
+    def test_an_accept_in_every_blocking_table_clears_them_all(self):
+        self.assertEqual(enforcer.forward_blockers(DOCKER_FIXED + FIREWALLD_FIXED, "eth0"), [])
+
+    def test_an_accept_after_the_reject_does_not_clear_the_chain(self):
+        late = FIREWALLD_RULESET.replace("admin-prohibited\n", 'admin-prohibited\n\t\tiifname "eth0" oifname "eth0" accept\n')
+        self.assertEqual(enforcer.foreign_forward_drop(late, "eth0"), "firewalld")
+
+    def test_an_accept_in_a_chain_only_some_traffic_jumps_to_does_not_clear_it(self):
+        sometimes = ("table inet filter {\n\tchain forward {\n\t\ttype filter hook forward priority 0; policy drop;\n"
+                     '\t\tiifname "wlan0" jump mine\n\t}\n\tchain mine {\n'
+                     '\t\tiifname "eth0" oifname "eth0" accept\n\t}\n}\n')
+        self.assertEqual(enforcer.foreign_forward_drop(sometimes, "eth0"), "filter")
+
+    def test_a_catch_all_goto_inside_a_jumped_chain_does_not_hide_the_final_reject(self):
+        zones = ("table inet firewalld {\n\tchain filter_FORWARD {\n"
+                 "\t\ttype filter hook forward priority filter + 10; policy accept;\n"
+                 "\t\tjump filter_FORWARD_ZONES\n\t\treject with icmpx admin-prohibited\n\t}\n"
+                 '\tchain filter_FORWARD_ZONES {\n\t\tiifname "wlan1" goto filter_FWD_home\n'
+                 "\t\tgoto filter_FWD_public\n\t}\n\tchain filter_FWD_home {\n\t}\n"
+                 "\tchain filter_FWD_public {\n\t}\n}\n")
+        self.assertEqual(enforcer.forward_blockers(zones, "eth0"), [("inet", "firewalld", "filter_FORWARD", False)])
+
+    def test_a_goto_from_the_forward_chain_to_an_empty_chain_leaves_it_to_the_policy(self):
+        gone = ("table inet filter {\n\tchain forward {\n\t\ttype filter hook forward priority 0; policy accept;\n"
+                "\t\tgoto empty\n\t\treject\n\t}\n\tchain empty {\n\t}\n}\n")
+        self.assertEqual(enforcer.forward_blockers(gone, "eth0"), [])
+
+    def test_an_ipv6_only_table_does_not_block_steering(self):
+        v6 = ("table ip6 filter {\n\tchain FORWARD {\n\t\ttype filter hook forward priority filter; policy drop;\n"
+              "\t\tjump DOCKER-USER\n\t}\n\tchain DOCKER-USER {\n\t}\n}\n")
+        self.assertEqual(enforcer.forward_blockers(v6, "eth0"), [])
+
+    def test_a_bridge_table_does_not_block_steering(self):
+        bridge = ("table bridge filter {\n\tchain forward {\n"
+                  "\t\ttype filter hook forward priority 0; policy drop;\n\t}\n}\n")
+        self.assertEqual(enforcer.forward_blockers(bridge, "eth0"), [])
+
+    def test_a_set_listed_over_several_lines_does_not_confuse_the_check(self):
+        self.assertEqual(enforcer.forward_blockers(FIREWALLD_FIXED, "eth0"), [])
+        self.assertEqual(enforcer.foreign_forward_drop(FIREWALLD_RULESET, "eth0"), "firewalld")
+
     def test_the_older_tools_drop_policy_is_spotted(self):
         self.assertTrue(enforcer.iptables_forward_drop("-P INPUT ACCEPT\n-P FORWARD DROP\n", "eth0"))
         self.assertFalse(enforcer.iptables_forward_drop("-P FORWARD DROP\n-A DOCKER-USER -i eth0 -o eth0 -j ACCEPT\n", "eth0"))
@@ -655,8 +890,8 @@ class Teardown(EnforcerCase):
         self.e._teardown()
         cmds = [args for args, _ in self.commands]
         w = ["iptables", "-w", "5"]
-        self.assertEqual(cmds, [w + ["-D", "FORWARD", "-j", "QUIETNET"], w + ["-F", "QUIETNET"],
-                                w + ["-X", "QUIETNET"]])
+        self.assertEqual(cmds[:3], [w + ["-D", "FORWARD", "-j", "QUIETNET"], w + ["-F", "QUIETNET"],
+                                    w + ["-X", "QUIETNET"]])
 
     def test_if_the_routers_hardware_address_is_unknown_it_still_cleans_up(self):
         del self.hosts[GATEWAY]

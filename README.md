@@ -22,6 +22,8 @@ See what every device in your home is talking to, block the adverts and trackers
 
 **On a Mac (for trying it out):** double-click **Start QuietNet.command**. A window opens (leave it open) and the dashboard appears at <http://localhost:8377>. The first time, macOS may ask whether Python can accept incoming connections, or find devices on your local network — choose **Allow** for both.
 
+If the launcher says it can't find a working Python, install it from [python.org](https://www.python.org/downloads/macos/) or run `xcode-select --install`. With Python from python.org, pairing with a relay borrows the Mac's own security certificates; if it still says the relay's certificate couldn't be checked, open that Python's folder in Applications and double-click **Install Certificates.command**, then restart QuietNet.
+
 **On a Raspberry Pi or any Linux box (for leaving it running):** with Docker installed, run:
 
 ```bash
@@ -29,6 +31,8 @@ docker compose up -d
 ```
 
 QuietNet then runs all the time and restarts with the machine. It installs nothing from the internet — the container is just Python and QuietNet's own code. Host networking is used so QuietNet can see the home network and answer DNS on port 53.
+
+Schedules follow the Pi's own time zone, summer time included: the compose file shares it with the container. To choose a zone by name instead, start with `TZ=Europe/London docker compose up -d` (never set `TZ` to nothing, which means UTC). On Docker Desktop for Mac or Windows the shared zone is usually UTC, so set `TZ` by name there. If you upgraded from a version before this and had shifted your schedule times to make up for UTC, rebuild with `docker compose up -d --build` and put them back to the real times.
 
 The dashboard only opens on the computer QuietNet runs on, at <http://localhost:8377>. On a Pi with no screen, reach it one of two ways:
 
@@ -55,9 +59,9 @@ The dashboard only opens on the computer QuietNet runs on, at <http://localhost:
 
 ## How it works
 
-Every device has a setting called DNS — the "phone book" it uses to find addresses on the internet. When a device is pointed at QuietNet, it asks QuietNet first. QuietNet writes the request down, then either passes it on (to 1.1.1.1, with 8.8.8.8 as a spare) or, if it's blocked, answers "that doesn't exist".
+Every device has a setting called DNS — the "phone book" it uses to find addresses on the internet. When a device is pointed at QuietNet, it asks QuietNet first. QuietNet writes the request down, then either passes it on (to 1.1.1.1, with 8.8.8.8 as a spare) or, if it's blocked, answers with the address `0.0.0.0` (`::` for IPv6), which devices treat as "can't be reached". Names that only exist on your home network, such as `printer.lan` or a plain `nas`, are asked of your router instead and never leave the house. Repeat lookups within a couple of minutes are answered from memory, but your rules are always checked first, so a block bites on the very next lookup. QuietNet answers on both IPv4 and IPv6, where the computer has it.
 
-Rules are checked in this order: internet switched off → addresses you blocked or allowed yourself → blocked services → the advert list.
+Rules are checked in this order: internet switched off → addresses you blocked or allowed yourself → blocked services → the advert list. The kill switch, internet switches and bedtimes never cut off the QuietNet computer itself, so it keeps its link to your relay and can always be switched back on from outside.
 
 ## Cutting live connections (the enforcer)
 
@@ -72,12 +76,12 @@ When you turn on **Cut live connections** for a device (on that device's page), 
   echo net.ipv4.ip_forward=1 | sudo tee /etc/sysctl.d/90-quietnet.conf && sudo sysctl --system
   ```
 
-  If it's missing — or another firewall on the Pi (often Docker's own) would drop the traffic — QuietNet **won't steer** the device rather than cut it off, and the device's page says exactly what to run.
+  If it's missing — or another firewall on the Pi (often Docker's own, or firewalld) would drop the traffic — QuietNet **won't steer** the device rather than cut it off, and the device's page says exactly what to run for each firewall in the way. With firewalld or ufw, that command lasts until the firewall reloads, so also add the rule to that firewall's own settings.
 - **Opt-in per device.** It only ever touches devices you switch it on for — never the router, the Pi itself, or anything outside your home network — and hands each device straight back to the router when you switch it off. If a different device later gets the same network number, it's left alone.
 - **Safe if stopped suddenly.** `docker stop`, a restart or a crash all end with devices handed back to the router: QuietNet notes what it changed, and puts it back first thing at its next start if it didn't get the chance.
 - **Works best when the device uses QuietNet for DNS** (the normal setup), because that's how QuietNet learns which addresses belong to Disney+, Fortnite and so on.
 - **It cuts by address, for things you chose:** blocked services, schedules, the internet switch, the kill switch and addresses you blocked yourself. The advert list isn't enforced this way, because advert addresses are often shared with ordinary sites. If a blocked service shares an address with something else (big content networks sometimes do), that other thing can be affected too. Switching the enforcer off for the device removes all of this instantly.
-- **IPv4 only.** A device that also uses IPv6 can keep connections made that way; DNS blocking still applies to it.
+- **IPv4 only.** A device that also uses IPv6 can keep connections made that way; DNS blocking still applies to it. The device's page says so.
 - Everyone on the network should know it's in use — it steers a device's traffic through the Pi.
 
 ## Reach it from anywhere (optional)
@@ -87,10 +91,10 @@ By default the dashboard only opens on your home network. If you want to check o
 Because the Pi can't usually be reached from the internet directly, it works the other way around: the Pi makes an outgoing connection to your relay and holds it open, and your browser's requests travel down that line. **No router changes are needed.**
 
 1. Deploy the relay — see [`cloud/README.md`](cloud/README.md). You get a web address like `your-relay.up.railway.app`.
-2. Open it, create an account, and choose **Add a QuietNet** to get a pairing code.
-3. On the Pi's own dashboard, open **Set up a device → Remote access**, enter the relay address and the code. (On a Pi with no screen, pass them when starting the container instead — see [Start it](#start-it).)
+2. Open it, create your account, then sign in with it, and choose **Add a QuietNet** to get a pairing code. By default only the first account can be created (`QUIETNET_SIGNUP=first`), so create yours straight away; set `QUIETNET_SIGNUP=open` on the relay if other people need accounts of their own.
+3. On the Pi's own dashboard, open **Set up a device → Remote access**, enter the relay address (it must start with `https://`, or have no scheme at all) and the code. (On a Pi with no screen, pass them when starting the container instead — see [Start it](#start-it).)
 
-After that, sign in to the relay from anywhere to control your Pi. Only your account can reach it, and the relay never stores your history or rules — it just passes your requests through to the Pi while you're looking.
+After that, sign in to the relay from anywhere to control your Pi. Only your account can reach it, and the relay never stores your history or rules — it just passes your requests through to the Pi while you're looking. **Sign out** signs you out on every browser and device at once.
 
 ## Good to know
 
@@ -98,7 +102,7 @@ After that, sign in to the relay from anywhere to control your Pi. Only your acc
 - A device only shows activity, and can only be blocked, once it has been pointed at QuietNet.
 - QuietNet sees which addresses are contacted (e.g. `ads.example.com`), never the content of pages or messages.
 - It can't remove adverts that come from the same address as the real content (e.g. YouTube adverts).
-- Blocking isn't instant: a device may carry on for a few minutes until it next looks an address up. A few apps use their own built-in phone book and can get around it.
+- Blocking isn't instant: a device may carry on for a few minutes until it next looks an address up. A few apps use their own built-in phone book and can get around it. QuietNet tells Firefox to switch off its own secure DNS and Apple devices to switch off iCloud Private Relay on your network; Android's "Private DNS" setting should be left off on devices you want covered.
 - Devices are recognised by their network number (IP address). Reserve each device's number in your router so its name and rules stay with it.
 - History is stored only on this computer, in the `data` folder, for 30 days. Tell the people in your home that it's running.
 - The dashboard can only be opened on the computer QuietNet runs on.

@@ -115,6 +115,11 @@ class Containers(unittest.TestCase):
         lines = [l for l in read("cloud", "Dockerfile").splitlines() if l.strip().upper().startswith("VOLUME")]
         self.assertEqual(lines, [])
 
+    def test_the_relay_container_starts_as_root_so_it_can_take_over_the_volume(self):
+        # Railway's volume belongs to root; relay.py hands it to an ordinary user and drops root itself.
+        lines = [l for l in read("cloud", "Dockerfile").splitlines() if l.strip().upper().startswith("USER")]
+        self.assertEqual(lines, [])
+
     def test_railway_is_pointed_at_the_relay_container(self):
         cfg = json.loads(read("railway.json"))
         self.assertEqual(cfg["build"]["dockerfilePath"], "cloud/Dockerfile")
@@ -135,10 +140,54 @@ class Containers(unittest.TestCase):
         grace = int(re.search(r"stop_grace_period: (\d+)s", read("docker-compose.yml")).group(1))
         self.assertGreater(grace, 15)          # longer than Enforcer.stop() is prepared to wait
 
+    def test_the_pi_container_installs_the_time_zone_tables(self):
+        # Without them the container can only run on UTC, and schedules fire at the wrong hour.
+        install = [l for l in read("Dockerfile").splitlines() if "apt-get install" in l]
+        self.assertTrue(any("tzdata" in l for l in install))
+
+    def test_the_pi_container_installs_the_tool_that_reads_ipv6_neighbours(self):
+        # Without `ip`, devices asking over IPv6 can't be matched to their rules and are refused.
+        install = [l for l in read("Dockerfile").splitlines() if "apt-get install" in l]
+        self.assertTrue(any("iproute2" in l for l in install))
+
+    def test_compose_shares_the_pis_time_zone_with_the_container(self):
+        self.assertIn("- /etc/localtime:/etc/localtime:ro", read("docker-compose.yml"))
+
+    def test_compose_never_leaves_the_time_zone_setting_empty(self):
+        # An empty TZ means UTC to the system, which would undo the shared time zone file.
+        compose = read("docker-compose.yml")
+        self.assertIn("TZ=${TZ:-:/etc/localtime}", compose)
+        self.assertNotIn("TZ=${TZ:-}", compose)
+
     def test_every_copied_path_exists(self):
         for dockerfile in ("Dockerfile", os.path.join("cloud", "Dockerfile")):
             for path in copied_into(dockerfile):
                 self.assertTrue(os.path.exists(os.path.join(ROOT, path)), "%s copies missing %s" % (dockerfile, path))
+
+
+class MacLauncher(unittest.TestCase):
+    """The double-click launcher for the Mac, checked as text (it is not run)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.script = read("Start QuietNet.command")
+
+    def test_the_launcher_recognises_apples_python_stand_in(self):
+        # Without Apple's Command Line Tools, /usr/bin/python3 only offers to install them.
+        self.assertIn("/usr/bin/xcode-select -p", self.script)
+        self.assertIn("! apple_python_is_stub", self.script)
+
+    def test_the_launcher_never_falls_back_to_apples_python_a_second_time(self):
+        self.assertIn('[ "$OTHER" != /usr/bin/python3 ]', self.script)
+        self.assertNotIn("PY=python3\n", self.script)
+
+    def test_the_launcher_says_how_to_get_python_when_none_works(self):
+        self.assertIn("https://www.python.org/downloads/", self.script)
+        self.assertIn("xcode-select --install", self.script)
+
+    def test_the_launcher_quotes_paths_that_may_contain_spaces(self):
+        self.assertIn('cd "$(dirname "$0")"', self.script)
+        self.assertIn('"$PY" server.py', self.script)
 
 
 class ServiceCatalogue(unittest.TestCase):
@@ -240,6 +289,57 @@ class DashboardContract(unittest.TestCase):
 
     def test_the_page_loads_nothing_from_other_websites(self):
         self.assertEqual(re.findall(r"""(?:src|href)=["']https?://""", self.page), [])
+
+    def test_the_script_avoids_operators_that_older_safari_cannot_read(self):
+        # '??' and '?.' are syntax errors before Safari 13.1, and one of them stops the whole script.
+        script = self.page[self.page.index("<script>"):self.page.rindex("</script>")]
+        for newer in ("??", "?."):
+            self.assertNotIn(newer, script, newer)
+
+    def test_the_page_spells_out_offsets_instead_of_using_inset(self):
+        # Safari before 14.1 ignores 'inset', which left dialogs off-screen.
+        self.assertNotIn("inset:", self.page)
+
+    def test_the_timed_refresh_waits_for_the_last_one_and_for_a_visible_tab(self):
+        timer = self.page[self.page.index("setInterval("):]
+        timer = timer[:timer.index("\n")]
+        self.assertIn("refreshFree()", timer)
+        self.assertIn("!inFlight", self.page[self.page.index("const refreshFree"):][:120])
+        self.assertIn("!document.hidden", timer)
+
+    def test_a_stuck_refresh_does_not_stop_the_timer_for_good(self):
+        free = self.page[self.page.index("const refreshFree"):]
+        free = free[:free.index("\n")]
+        self.assertIn("Date.now() - inFlightSince > STUCK_AFTER", free)
+        self.assertIn("inFlightSince = Date.now()", self.page)
+        self.assertIn("refreshFree()", self.page[self.page.index("'visibilitychange'"):][:100])
+
+    def test_the_timed_refresh_fetches_the_activity_list_less_often(self):
+        self.assertIn("tick && Date.now() - activityAt < ACTIVITY_EVERY", self.page)
+
+    def test_the_activity_refresh_sends_back_the_last_marker(self):
+        self.assertIn("&since=${encodeURIComponent(since)}", self.page)
+        self.assertIn("S.activityKey === key ? S.activityMark : ''", self.page)
+
+    def test_an_unchanged_activity_answer_keeps_the_list_shown(self):
+        self.assertIn("if(!(x.unchanged && since)) S.activity = x.groups || [];", self.page)
+
+    def test_opening_a_device_forgets_the_last_activity_marker(self):
+        opener = self.page[self.page.index("open(d){"):]
+        self.assertIn("S.activityKey = ''", opener[:opener.index("\n")])
+
+    def test_the_page_says_when_a_scan_covered_only_part_of_the_network(self):
+        self.assertIn("st.scan.capped", self.page)
+        self.assertIn("Your network is large, so only the ${num(st.scan.addresses)} addresses", self.page)
+
+    def test_the_page_spaces_flex_rows_with_margins_where_gap_is_ignored(self):
+        self.assertIn("document.documentElement.className += ' nogap'", self.page)
+        self.assertIn(".nogap .row>*", self.page)
+
+    def test_the_enforcer_card_says_it_works_on_ipv4_only(self):
+        card = self.page[self.page.index("function enforceCard"):]
+        card = card[:card.index("\nfunction ")]
+        self.assertIn("It works on IPv4 only", card)
 
 
 class Readme(unittest.TestCase):

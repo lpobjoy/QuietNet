@@ -274,6 +274,14 @@ class Switches(Api):
         self.ok("/api/internet", {"scope": "device:" + KID, "off": False})
         self.assertFalse(is_blocked("www.bbc.co.uk", KID))
 
+    def test_the_internet_switch_is_refused_for_this_computer(self):
+        self.addCleanup(setattr, server.S, "local_ip", server.S.local_ip)
+        server.S.local_ip = "192.168.1.60"
+        status, out = self.post("/api/internet", {"scope": "device:192.168.1.60", "off": True})
+        self.assertEqual(status, 400)
+        self.assertIn("computer it runs on", out["error"])
+        self.assertNotIn("device:192.168.1.60", server.S.off)
+
     def test_badly_formed_scopes_are_refused(self):
         for scope in ("", "everyone", "group:x", "device:", "device:1.2.3.4; drop table"):
             self.assertEqual(self.post("/api/internet", {"scope": scope, "off": True})[0], 400, scope)
@@ -507,6 +515,7 @@ class Devices(Api):
         self.log(KID, "www.bbc.co.uk")
         self.log(ADULT, "www.bbc.co.uk")
         self.ok("/api/clear-history", {"ip": KID})
+        server.last_clear.join(5)
         self.assertEqual([d["ip"] for d in self.get("/api/devices")[1]], [ADULT])
         self.ok("/api/clear-history", {})
         self.assertEqual(self.get("/api/devices")[1], [])
@@ -521,11 +530,210 @@ class Devices(Api):
         counts = plan("""SELECT client, COUNT(*), COALESCE(SUM(blocked), 0) FROM queries INDEXED BY q_ts
                          WHERE ts>? GROUP BY client""", (0,))
         self.assertIn("COVERING INDEX q_ts", counts)
-        last = plan("SELECT client, MAX(ts) FROM queries GROUP BY client", ())
+        last = plan(server.LAST_SEEN_SQL, ())
         self.assertIn("COVERING INDEX q_client_ts", last)
         activity = plan("SELECT domain, COUNT(*), MAX(ts), SUM(blocked) FROM queries WHERE client=? AND ts>? GROUP BY domain",
                         (KID, 0))
         self.assertIn("INDEX q_client_ts (client=? AND ts>?)", activity)
+
+    def test_each_devices_last_lookup_is_found_without_walking_the_whole_history(self):
+        # The device list refreshes every 4 seconds; walking a month of history each time is too slow.
+        plan = " | ".join(row[-1] for row in server.sql("EXPLAIN QUERY PLAN " + server.LAST_SEEN_SQL))
+        self.assertNotIn("SCAN queries", plan)
+        self.assertIn("q_client_ts (client=?)", plan)
+
+    def test_a_devices_last_lookup_is_its_newest(self):
+        self.log(KID, "a.example.com", ago=500)
+        self.log(KID, "b.example.com", ago=5)
+        self.log(KID, "c.example.com", ago=50)
+        last = self.get("/api/devices")[1][0]["last"]
+        self.assertAlmostEqual(last, time.time() - 5, delta=3)
+
+    # ----- the read-only connection for history questions (known issue 82)
+
+    def answered_while_db_lock_is_held(self, ask):
+        """Run `ask` in another thread while this thread holds db_lock; True if it finished."""
+        done = threading.Event()
+        server.db_lock.acquire()
+        try:
+            t = threading.Thread(target=lambda: (ask(), done.set()), daemon=True)
+            t.start()
+            finished = done.wait(2)
+        finally:
+            server.db_lock.release()
+        t.join(2)
+        return finished
+
+    def test_the_activity_list_does_not_wait_for_the_database_lock(self):
+        self.log(KID, "www.bbc.co.uk")
+        self.assertTrue(self.answered_while_db_lock_is_held(lambda: server.api_activity(KID, 24)))
+
+    def test_the_status_summary_does_not_wait_for_the_database_lock(self):
+        self.log(KID, "www.bbc.co.uk")
+        self.assertTrue(self.answered_while_db_lock_is_held(server.api_status))
+
+    def test_the_device_list_history_questions_do_not_wait_for_the_database_lock(self):
+        self.log(KID, "www.bbc.co.uk")
+        names = server.sql("SELECT ip, name FROM devices")     # the one small question still on the main connection
+        with mock.patch.object(server, "sql", lambda *a, **k: names):
+            self.assertTrue(self.answered_while_db_lock_is_held(server.api_devices))
+
+    def test_the_read_only_connection_refuses_changes(self):
+        with self.assertRaises(server.sqlite3.Error):
+            server.read_sql("DELETE FROM queries")
+
+    def test_history_saved_on_the_main_connection_is_seen_by_the_dashboard_at_once(self):
+        self.log(KID, "www.bbc.co.uk")
+        self.assertEqual(self.get("/api/activity?ip=%s" % KID)[1][0]["base"], "bbc.co.uk")
+
+    def test_clearing_a_busy_devices_history_lets_go_of_the_lock_between_steps(self):
+        for i in range(25):
+            self.log(KID, "n%d.example.com" % i)
+        free = []
+
+        def lock_free_for_another_thread(seconds):
+            got = []
+
+            def other():                                # db_lock is re-entrant, so ask from another thread
+                ok = server.db_lock.acquire(blocking=False)
+                got.append(ok)
+                if ok:
+                    server.db_lock.release()
+            t = threading.Thread(target=other)
+            t.start()
+            t.join()
+            free.append(got[0])
+        with mock.patch.object(server, "PRUNE_BATCH", 10), \
+                mock.patch.object(server.time, "sleep", lock_free_for_another_thread):
+            server.clear_history(KID)
+        self.assertEqual(server.sql("SELECT COUNT(*) FROM queries")[0][0], 0)
+        self.assertEqual(free, [True, True])
+
+    def test_clearing_a_devices_history_in_steps_leaves_other_devices_alone(self):
+        for i in range(25):
+            self.log(KID, "n%d.example.com" % i)
+        self.log(ADULT, "www.bbc.co.uk")
+        with mock.patch.object(server, "PRUNE_BATCH", 10), mock.patch.object(server.time, "sleep", lambda s: None):
+            server.clear_history(KID)
+        self.assertEqual(server.sql("SELECT client FROM queries"), [(ADULT,)])
+
+    def test_the_clear_history_request_answers_without_waiting_for_the_steps_to_finish(self):
+        self.log(KID, "www.bbc.co.uk")
+        may_finish = threading.Event()
+
+        def slow_clear(ip=None):
+            """Stands in for a long clear: holds on until the test lets it go."""
+            may_finish.wait(5)
+
+        with mock.patch.object(server, "clear_history", slow_clear):
+            started = time.monotonic()
+            self.ok("/api/clear-history", {"ip": KID})
+            self.assertLess(time.monotonic() - started, 2)
+            self.assertTrue(server.last_clear.is_alive())
+            may_finish.set()
+            server.last_clear.join(5)
+
+    def test_clearing_everyones_history_is_done_before_the_answer(self):
+        self.log(KID, "www.bbc.co.uk")
+        self.ok("/api/clear-history", {})
+        self.assertEqual(server.sql("SELECT COUNT(*) FROM queries")[0][0], 0)
+
+    def test_clearing_a_devices_history_is_answered_from_an_index(self):
+        plan = " | ".join(row[-1] for row in server.sql("EXPLAIN QUERY PLAN " + server.CLEAR_DEVICE_SQL, (KID, 0, 1)))
+        self.assertIn("q_client_ts (client=?", plan)
+
+    # ----- "unchanged" answers for the activity list (known issue 83)
+
+    def activity(self, since, hours=24):
+        """Ask for KID's activity with a marker ('' for the first ask)."""
+        status, out = self.get("/api/activity?ip=%s&hours=%s&since=%s" % (KID, hours, since))
+        self.assertEqual(status, 200)
+        return out
+
+    def test_activity_without_a_marker_is_the_plain_list_as_before(self):
+        self.log(KID, "www.bbc.co.uk")
+        _, out = self.get("/api/activity?ip=%s" % KID)
+        self.assertIsInstance(out, list)
+
+    def test_activity_asked_for_with_an_empty_marker_carries_the_list_and_a_marker(self):
+        self.log(KID, "www.bbc.co.uk")
+        out = self.activity("")
+        self.assertEqual((out["unchanged"], [g["base"] for g in out["groups"]]), (False, ["bbc.co.uk"]))
+        self.assertTrue(out["marker"])
+
+    def test_activity_with_the_same_marker_is_answered_unchanged_without_the_list(self):
+        self.log(KID, "www.bbc.co.uk")
+        marker = self.activity("")["marker"]
+        self.assertEqual(self.activity(marker), {"unchanged": True, "marker": marker})
+
+    def test_an_unchanged_activity_answer_does_not_build_the_list(self):
+        self.log(KID, "www.bbc.co.uk")
+        marker = self.activity("")["marker"]
+        with mock.patch.object(server, "activity_groups", side_effect=AssertionError("built the list")):
+            self.assertTrue(server.api_activity(KID, 24, marker)["unchanged"])
+
+    def test_a_new_lookup_changes_the_activity_marker(self):
+        self.log(KID, "www.bbc.co.uk")
+        marker = self.activity("")["marker"]
+        self.log(KID, "news.bbc.co.uk", ago=1)
+        out = self.activity(marker)
+        self.assertEqual((out["unchanged"], out["groups"][0]["n"]), (False, 2))
+
+    def test_another_devices_lookup_does_not_change_the_activity_marker(self):
+        self.log(KID, "www.bbc.co.uk")
+        marker = self.activity("")["marker"]
+        self.log(ADULT, "www.netflix.com", ago=1)
+        self.assertTrue(self.activity(marker)["unchanged"])
+
+    def test_a_rule_change_changes_the_activity_marker(self):
+        self.log(KID, "www.bbc.co.uk")
+        marker = self.activity("")["marker"]
+        self.ok("/api/block", {"domain": "bbc.co.uk"})
+        out = self.activity(marker)
+        self.assertEqual((out["unchanged"], out["groups"][0]["b"]), (False, True))
+
+    def test_pausing_changes_the_activity_marker(self):
+        self.log(KID, "stats.g.doubleclick.net", blocked=1)
+        marker = self.activity("")["marker"]
+        server.S.paused_until = time.time() + 600
+        self.assertFalse(self.activity(marker)["unchanged"])
+
+    def test_switching_advert_blocking_changes_the_activity_marker(self):
+        self.log(KID, "stats.g.doubleclick.net", blocked=1)
+        marker = self.activity("")["marker"]
+        self.ok("/api/junk-switch", {"on": False})
+        self.assertFalse(self.activity(marker)["unchanged"])
+
+    def test_clearing_a_devices_history_changes_its_activity_marker(self):
+        self.log(KID, "www.bbc.co.uk")
+        marker = self.activity("")["marker"]
+        self.ok("/api/clear-history", {"ip": KID})
+        server.last_clear.join(5)
+        out = self.activity(marker)
+        self.assertEqual((out["unchanged"], out["groups"]), (False, []))
+
+    def test_a_lookup_leaving_the_time_window_changes_the_activity_marker(self):
+        self.log(KID, "old.example.com", ago=3000)
+        self.log(KID, "new.example.com", ago=60)
+        marker = self.activity("", hours=1)["marker"]
+        server.sql("UPDATE queries SET ts=ts-1000 WHERE domain='old.example.com'", commit=True)  # as if time passed
+        out = self.activity(marker, hours=1)
+        self.assertEqual([h["d"] for g in out["groups"] for h in g["hosts"]], ["new.example.com"])
+
+    def test_a_different_time_window_has_a_different_activity_marker(self):
+        self.log(KID, "www.bbc.co.uk")
+        self.assertNotEqual(self.activity("", hours=24)["marker"], self.activity("", hours=48)["marker"])
+
+    def test_an_out_of_date_marker_gets_the_full_list(self):
+        self.log(KID, "www.bbc.co.uk")
+        out = self.activity("not-a-real-marker")
+        self.assertEqual((out["unchanged"], len(out["groups"])), (False, 1))
+
+    def test_the_activity_markers_questions_are_answered_from_an_index(self):
+        def plan(statement, args):
+            return " | ".join(row[-1] for row in server.sql("EXPLAIN QUERY PLAN " + statement, args))
+        self.assertIn("q_client_ts (client=?)", plan(server.NEWEST_FOR_DEVICE_SQL, (KID,)))
+        self.assertIn("q_client_ts (client=? AND ts>?)", plan(server.OLDEST_IN_WINDOW_SQL, (KID, 0)))
 
     def test_the_status_summary_counts_today(self):
         self.log(KID, "www.bbc.co.uk")
@@ -536,6 +744,69 @@ class Devices(Api):
         self.assertGreater(st["junk_count"], 100)
         self.assertRegex(st["clock"], r"^\d\d:\d\d$")
         self.assertEqual(st["enforcer"]["active"], False)
+
+
+class Scanning(Api):
+    def setUp(self):
+        super().setUp()
+        self.addCleanup(setattr, server.S, "local_ip", server.S.local_ip)
+        self.addCleanup(setattr, server.S, "scan_info", server.S.scan_info)
+        server.S.local_ip = "192.168.4.20"
+        # A stand-in for the home network's size, and for the names devices report.
+        self.subnet = server.ipaddress.IPv4Network("192.168.4.0/22")
+        for name, stand_in in (("home_subnet", lambda ip: self.subnet), ("reverse_name", lambda ip: "")):
+            p = mock.patch.object(server, name, stand_in)
+            p.start()
+            self.addCleanup(p.stop)
+
+    def scan(self):
+        """Run a scan with a socket that sends nothing and no pauses. The socket is replaced only
+        for the scan itself: the tests' own web requests need the real one."""
+        with mock.patch.object(server.socket, "socket", mock.MagicMock()), \
+                mock.patch.object(server.time, "sleep", lambda s: None):
+            server.scan_network()
+
+    def test_a_scan_lists_devices_anywhere_on_the_home_network(self):
+        self.neighbours_now = {"192.168.5.37": "aa:aa:aa:aa:aa:01", "192.168.5.255": "aa:aa:aa:aa:aa:02",
+                               "10.0.0.5": "aa:aa:aa:aa:aa:03", "192.168.7.255": "ff:ff:ff:ff:ff:fe"}
+        self.scan()
+        seen = {r[0] for r in server.sql("SELECT ip FROM seen")}
+        self.assertEqual(seen, {"192.168.4.20", "192.168.5.37", "192.168.5.255"})
+
+    def test_a_scan_waits_for_device_names_without_holding_the_database_lock(self):
+        # Name lookups can take seconds; the dashboard and history writer must not wait behind them.
+        self.neighbours_now = {"192.168.5.37": "aa:aa:aa:aa:aa:01"}
+        free = []
+
+        def lock_is_free():
+            ok = server.db_lock.acquire(blocking=False)     # released by the thread that took it
+            if ok:
+                server.db_lock.release()
+            free.append(ok)
+
+        def name_of(ip):
+            t = threading.Thread(target=lock_is_free)
+            t.start()
+            t.join()
+            return "tv"
+        server.reverse_name = name_of
+        self.scan()
+        self.assertTrue(free and all(free))
+
+    def test_the_scan_answer_says_when_the_network_was_too_big_to_scan_in_full(self):
+        self.subnet = server.ipaddress.IPv4Network("192.168.0.0/16")
+        with mock.patch.object(server, "scan_network", lambda: None):
+            out = self.ok("/api/scan")
+        server.S.scan_state = "idle"
+        self.assertEqual((out["capped"], out["network"]), (True, "192.168.0.0/16"))
+        self.assertLessEqual(out["addresses"], server.MAX_SCAN)
+
+    def test_the_status_summary_says_what_the_last_scan_covered(self):
+        with mock.patch.object(server, "scan_network", lambda: None):
+            self.ok("/api/scan")
+        server.S.scan_state = "idle"
+        scan = self.get("/api/status")[1]["scan"]
+        self.assertEqual((scan["network"], scan["addresses"], scan["capped"]), ("192.168.4.0/22", 1022, False))
 
 
 class EnforceAndCloud(Api):

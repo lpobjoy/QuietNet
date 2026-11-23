@@ -56,6 +56,10 @@ class Base(unittest.TestCase):
         server.init_db()
         server.S.junk_on, server.S.paused_until = True, 0
         server.S.enforced, server.S.resolved = set(), {}
+        # No home router, and never look one up: the routing table is the real machine's.
+        server.S.router, server.S.router_checked = "", float("inf")
+        # No IPv6 view of the real machine: nothing matched, no home range, no own addresses.
+        server.S.v6_own, server.S.v6_prefixes, server.S.v6_devices = set(), [], {}
 
     def schedule(self, **kw):
         body = {"name": "Bedtime", "scope": "device:" + KID, "days": [0, 1, 2, 3, 4, 5, 6],
@@ -115,10 +119,35 @@ class KillSwitch(Base):
     def test_kill_switch_stops_everyone_and_survives_pause(self):
         server.set_internet_off("all", True)
         server.S.paused_until = time.time() + 600
-        for client in (KID, ADULT, "127.0.0.1"):
+        for client in (KID, ADULT):
             self.assertTrue(is_blocked("www.bbc.co.uk", client))
         self.assertEqual(server.decision("www.bbc.co.uk", KID)[1], "kill")
         self.assertTrue(server.api_status()["kill"])
+
+    def test_the_kill_switch_does_not_stop_this_computers_own_lookups(self):
+        # Otherwise the Pi loses the relay and the owner can't switch it back on from outside.
+        self.addCleanup(setattr, server.S, "local_ip", server.S.local_ip)
+        server.S.local_ip = "192.168.1.60"
+        server.set_internet_off("all", True)
+        for client in ("127.0.0.1", "192.168.1.60"):
+            self.assertFalse(is_blocked("relay.example.com", client), client)
+
+    def test_a_whole_house_bedtime_does_not_stop_this_computers_own_lookups(self):
+        self.addCleanup(setattr, server.S, "local_ip", server.S.local_ip)
+        server.S.local_ip = "192.168.1.60"
+        self.schedule(scope="all", start="00:00", end="23:59")
+        self.assertTrue(is_blocked("www.bbc.co.uk", KID))
+        self.assertFalse(is_blocked("www.bbc.co.uk", "127.0.0.1"))
+
+    def test_the_device_list_does_not_show_this_computer_as_switched_off(self):
+        self.addCleanup(setattr, server.S, "local_ip", server.S.local_ip)
+        server.S.local_ip = "192.168.1.60"
+        server.set_internet_off("device:192.168.1.60", True)
+        self.assertFalse(server.internet_off_for("192.168.1.60"))
+        self.assertFalse(is_blocked("www.bbc.co.uk", "192.168.1.60"))
+
+    def test_this_computers_own_lookups_still_follow_the_advert_list(self):
+        self.assertTrue(is_blocked("ads.doubleclick.net", "127.0.0.1"))
 
     def test_kill_switch_overrides_always_allowed(self):
         server.unblock("doubleclick.net")
@@ -351,6 +380,52 @@ class EnforcementPlan(Base):
         server.S.enforced, server.S.enforced_mac = {KID}, {KID: "aa:bb:cc:dd:ee:ff"}
         self.assertEqual(server.enforcement_plan()[KID]["mac"], "aa:bb:cc:dd:ee:ff")
 
+    def test_the_plan_does_not_ask_again_about_names_it_has_already_worked_out(self):
+        # It runs every two seconds; re-checking thousands of unchanged names each time wastes the Pi.
+        server.record_resolved("www.bbc.co.uk", self._answer("www.bbc.co.uk", "151.101.0.81"))
+        server.S.enforced = {KID}
+        server.enforcement_plan()
+        with mock.patch.object(server, "decision", wraps=server.decision) as asked:
+            server.enforcement_plan()
+        self.assertEqual(asked.call_count, 0)
+
+    def test_a_rule_change_is_seen_by_the_next_plan(self):
+        server.record_resolved("example.org", self._answer("example.org", "198.51.100.7"))
+        server.S.enforced = {KID}
+        self.assertNotIn("198.51.100.7", server.enforcement_plan()[KID]["ips"])
+        server.block("example.org")
+        self.assertIn("198.51.100.7", server.enforcement_plan()[KID]["ips"])
+
+    def test_a_new_address_for_a_blocked_name_is_added_to_the_next_plan(self):
+        server.block("example.org")
+        server.record_resolved("example.org", self._answer("example.org", "198.51.100.7"))
+        server.S.enforced = {KID}
+        server.enforcement_plan()
+        server.record_resolved("example.org", self._answer("example.org", "198.51.100.8"))
+        self.assertIn("198.51.100.8", server.enforcement_plan()[KID]["ips"])
+
+    def test_a_name_seen_after_the_last_plan_is_added_to_the_next_one(self):
+        server.block("example.org")
+        server.S.enforced = {KID}
+        server.enforcement_plan()
+        server.record_resolved("example.org", self._answer("example.org", "198.51.100.7"))
+        self.assertIn("198.51.100.7", server.enforcement_plan()[KID]["ips"])
+
+    def test_recording_a_lookups_addresses_does_not_wait_for_the_database_lock(self):
+        # Every allowed answer records its addresses before it is sent; a slow database query
+        # elsewhere must not hold it up.
+        done = threading.Event()
+        server.db_lock.acquire()
+        try:
+            t = threading.Thread(target=lambda: (server.record_resolved(
+                "www.bbc.co.uk", self._answer("www.bbc.co.uk", "151.101.0.81")), done.set()))
+            t.start()
+            finished = done.wait(5)
+        finally:
+            server.db_lock.release()
+        t.join()
+        self.assertTrue(finished)
+
     def test_addresses_a_name_no_longer_uses_are_forgotten(self):
         server.record_resolved("x.example.com", self._answer("x.example.com", "198.51.100.1"))
         server.S.resolved["x.example.com"]["198.51.100.1"] = time.time() - 7 * 3600
@@ -404,6 +479,33 @@ class HistoryLimits(Base):
         self.assertTrue(all(steps))                                 # the lock was free at every pause
         self.assertEqual(server.sql("SELECT COUNT(*) FROM queries")[0][0], 5)
 
+    def explain(self, statement, args):
+        return " | ".join(row[-1] for row in server.sql("EXPLAIN QUERY PLAN " + statement, args))
+
+    def test_trimming_old_history_finds_the_rows_through_the_time_index(self):
+        # It runs every ten minutes; reading the whole table each time would hold the lock for long.
+        plan = self.explain(server.PRUNE_OLD_SQL, (0, 10))
+        self.assertIn("INDEX q_ts (ts<?)", plan)
+        self.assertNotIn("SCAN queries", plan)
+
+    def test_trimming_surplus_history_finds_the_rows_by_row_number(self):
+        plan = self.explain(server.PRUNE_SURPLUS_SQL, (0, 10))
+        self.assertIn("INTEGER PRIMARY KEY (rowid<?)", plan)
+        self.assertNotIn("SCAN queries", plan)
+
+    def test_history_is_trimmed_by_age_and_size_in_the_same_pass(self):
+        now = time.time()
+        old = now - (server.KEEP_DAYS + 1) * 86400
+        server.sql("DELETE FROM queries", commit=True)
+        with server.db_lock:
+            server.db.executemany("INSERT INTO queries(ts,client,domain,blocked) VALUES(?,?,?,0)",
+                                  [(old if i < 5 else now, KID, "n%d.example.com" % i) for i in range(30)])
+            server.db.commit()
+        with mock.patch.object(server, "MAX_HISTORY_ROWS", 20):
+            server.prune_history()
+        names = [r[0] for r in server.sql("SELECT domain FROM queries ORDER BY id")]
+        self.assertEqual(names, ["n%d.example.com" % i for i in range(10, 30)])
+
     def test_an_older_database_gains_the_hardware_address_column(self):
         server.db.execute("DROP TABLE enforced")
         server.db.execute("CREATE TABLE enforced(ip TEXT PRIMARY KEY)")      # as 0.5 made it
@@ -421,6 +523,92 @@ class HistoryLimits(Base):
         self.assertEqual(len(kept), 64)
         self.assertIn("198.51.100.79", kept)                         # the newest are the ones kept
         self.assertNotIn("198.51.100.0", kept)
+
+
+class ThisComputersAddress(Base):
+    def setUp(self):
+        super().setUp()
+        self.addCleanup(setattr, server.S, "local_ip", server.S.local_ip)
+        self.addCleanup(setattr, server, "ENF", server.ENF)
+        server.ENF = None
+        p = mock.patch("builtins.print")                    # the 'address is now' notice
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_a_new_address_for_this_computer_is_picked_up(self):
+        server.S.local_ip = "127.0.0.1"                     # started before the network was ready
+        with mock.patch.object(server, "find_local_ip", return_value="192.168.1.60"):
+            self.assertTrue(server.refresh_local_ip())
+        self.assertEqual(server.S.local_ip, "192.168.1.60")
+
+    def test_losing_the_network_keeps_the_last_known_address(self):
+        server.S.local_ip = "192.168.1.60"
+        with mock.patch.object(server, "find_local_ip", return_value="127.0.0.1"):
+            self.assertFalse(server.refresh_local_ip())
+        self.assertEqual(server.S.local_ip, "192.168.1.60")
+
+    def test_the_enforcer_is_told_this_computers_new_address(self):
+        server.S.local_ip = "192.168.1.60"
+        server.ENF = mock.Mock(local_ip="192.168.1.60")
+        with mock.patch.object(server, "find_local_ip", return_value="192.168.1.61"):
+            server.refresh_local_ip()
+        self.assertEqual(server.ENF.local_ip, "192.168.1.61")
+
+    def test_this_computers_new_address_is_exempt_from_the_kill_switch(self):
+        server.S.local_ip = "127.0.0.1"
+        server.set_internet_off("all", True)
+        with mock.patch.object(server, "find_local_ip", return_value="192.168.1.60"):
+            server.refresh_local_ip()
+        self.assertFalse(is_blocked("relay.example.com", "192.168.1.60"))
+
+
+class AdvertCount(Base):
+    def test_the_advert_count_includes_a_newly_downloaded_list(self):
+        self.addCleanup(server.count_junk)                  # runs last: cleanups run in reverse order
+        self.addCleanup(setattr, server.S, "junk_community", server.S.junk_community)
+        before = server.api_status()["junk_count"]
+        lines = "\n".join("0.0.0.0 new%d.example.net" % i for i in range(1500)).encode()
+        reply = mock.MagicMock()
+        reply.__enter__.return_value.read.return_value = lines
+        path = os.path.join(server.DATA, "test-community.txt")
+        self.addCleanup(lambda: os.path.exists(path) and os.remove(path))
+        with mock.patch.object(server.urllib.request, "urlopen", return_value=reply), \
+                mock.patch.object(server, "COMMUNITY_FILE", path):
+            server.update_community_list()
+        self.assertEqual(server.api_status()["junk_count"], len(server.S.junk_builtin | server.S.junk_community))
+        self.assertGreater(server.api_status()["junk_count"], before)
+
+    def test_the_status_summary_does_not_rebuild_the_advert_lists_to_count_them(self):
+        server.S.junk_count = 12345                         # whatever was worked out when the lists last changed
+        self.addCleanup(server.count_junk)
+        self.assertEqual(server.api_status()["junk_count"], 12345)
+
+
+class ScanTargets(unittest.TestCase):
+    def test_a_scan_covers_the_whole_of_a_bigger_home_network(self):
+        # eero's usual network is a /22: four times the 254 addresses a /24 has.
+        targets, capped = server.scan_targets("192.168.4.20", server.ipaddress.IPv4Network("192.168.4.0/22"))
+        self.assertEqual(len(targets), 1022)
+        self.assertIn("192.168.5.37", targets)
+        self.assertIn("192.168.5.255", targets)             # an ordinary address on a /22
+        self.assertNotIn("192.168.7.255", targets)          # the network's own broadcast address
+        self.assertFalse(capped)
+
+    def test_a_scan_of_a_very_big_network_is_capped_around_this_computer(self):
+        targets, capped = server.scan_targets("10.0.37.5", server.ipaddress.IPv4Network("10.0.0.0/16"))
+        self.assertTrue(capped)
+        self.assertLessEqual(len(targets), server.MAX_SCAN)
+        self.assertIn("10.0.37.5", targets)
+
+    def test_without_a_known_network_size_the_usual_home_size_is_assumed(self):
+        with mock.patch.object(server.enforcer, "interface_and_gateway", return_value=(None, None)):
+            self.assertEqual(str(server.home_subnet("192.168.1.60")), "192.168.1.0/24")
+
+    def test_the_network_size_is_read_from_the_routing_table_when_known(self):
+        with mock.patch.object(server.enforcer, "interface_and_gateway", return_value=("wlan0", "192.168.4.1")), \
+                mock.patch.object(server.enforcer, "local_subnet",
+                                  return_value=server.ipaddress.IPv4Network("192.168.4.0/22")):
+            self.assertEqual(str(server.home_subnet("192.168.4.20")), "192.168.4.0/22")
 
 
 if __name__ == "__main__":
