@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+Looks (dashboard):
+- **New: three looks to choose from (Calm, Household, Control room)** under Appearance on the dashboard, at the end of "Set up a device" and from the Appearance button in the header. Calm (the default) puts the sections down the side; Household shows devices and groups as large cards with initials; Control room is always dark, with dense rows and the day's figures across the top. Calm and Household follow the device's light or dark setting. The choice switches at once, is kept in the `qn_theme` cookie for a year, and is shared with the relay's pages when the dashboard is opened through the relay. No fonts or anything else are loaded from other websites.
+- The kill switch and the advert pause sit together in a "whole house" area in every look; the kill switch still asks before it stops anything. Back buttons and icons are line drawings hidden from screen readers; switches, chips and small buttons are at least 44 pixels tall.
+- A device's, group's and the whole house's rules are one card: the internet switch, blocked services as tags (each with its own "Allow" button), the schedules that apply, with a "Change" button each, and the note that changes take a couple of minutes to bite.
+- A group's page lists its devices with "Remove from group", and the other devices with "Add", "Use this name" (for a suggested name) or "Name it", in place of a list of tick boxes.
+- **Fixed before release (review):** the keyboard focus ring on a device or group row is no longer cut off in Calm and Control room; Control room puts its figures above the whole-house controls below 1180 pixels wide, so they no longer wrap; Household no longer keeps an empty column when the whole-house controls are hidden; Control room sets only the address line in monospace, not the suggested name; Household's header leaves room for the Appearance button's focus ring.
+
+Looks (relay):
+- **New: three looks to choose from (Calm, Household, Control room)** under Appearance on the relay's home page. The relay's sign-in, create-account, home, sign-out, refused and error pages are redrawn in the chosen look, with no scripts and nothing loaded from other websites. The choice is kept in a `qn_theme` cookie for a year and also sets the look of the dashboard opened through the relay. New call: `POST /theme`.
+- The relay's home page has the sign-out button in the header, each waiting QuietNet's pairing code and install line in one card, and the bar on a relayed dashboard says whether the Pi is online. Pi ids in the page's links are now escaped too.
+- **Fixed before release (review):** the Control room's focus ring on the "Your QuietNets" rows is no longer cut off; Household and Control room now set every colour and size Calm sets (no visible change), and a test keeps it that way; the relay's theme names are checked against the dashboard's.
+
+Looks (docs):
+- The README has a short Appearance note; known issue 90 lists how the looks differ from the mockups (system fonts in place of Inter, Space Grotesk and JetBrains Mono, since nothing is downloaded; the choice is per browser, not per account) and what is untried; `docs/TESTING.md` has manual checks for each look in light and dark and at phone width; `AGENTS.md` says each look must stay complete.
+
 Device names (23 November):
 - **New: QuietNet suggests a name for most devices** instead of "Unnamed device". It asks the devices themselves, in the ways they already answer: Bonjour (Apple devices, printers, TVs, speakers, Linux), the Windows network (Windows PCs, network drives), UPnP (TVs, Sonos, consoles, routers), the names devices give when they join the network (DHCP, on a Pi only) and, as before, the router. The new `names.py` does this; **rebuild the Pi container** to include it.
 - The Devices page shows a suggestion marked as one, with where it came from and a **Use this name** button. A model or maker the device reported, or "Private Wi-Fi address, so probably a phone, tablet or laptop", shows under an unnamed device.

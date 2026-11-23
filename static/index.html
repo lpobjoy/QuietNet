@@ -1,132 +1,646 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" data-theme="calm">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>QuietNet</title>
+<script>
+/* Theme: set before the page is drawn, so it never flashes the wrong colours. Only the three known
+   names are accepted; anything else in the cookie means the calm theme. */
+(function(){
+  var m = /(?:^|;\s*)qn_theme=(calm|household|control)(?:;|$)/.exec(document.cookie || '');
+  document.documentElement.setAttribute('data-theme', m ? m[1] : 'calm');
+})();
+</script>
 <style>
-:root{
-  --bg:#f4f6f5; --card:#fff; --ink:#17231f; --muted:#5d6b66; --line:#dfe5e2;
-  --brand:#0f766e; --brand-ink:#fff; --brand-soft:#e0f2ef;
-  --red:#b42318; --red-soft:#fde8e6; --amber:#93540a; --amber-soft:#fdf0d5; --grey-soft:#edf0ef;
+/* ===== Looks (themes) =====
+   Three looks share one set of class names. Each look sets the colour, size and spacing values
+   below (custom properties) on the page's root element through its data-theme attribute, and lays
+   the same markup out its own way further down. Calm is the default and is also used when the
+   attribute is missing. Fonts come from the device only: nothing is downloaded. */
+:root, [data-theme="calm"]{
+  color-scheme:light dark;
+  --font-body:system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  --font-head:var(--font-body);
+  --font-mono:ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
+  --bg:#f4f3ef; --surface:#ffffff; --surface-2:#f4f3ef; --surface-3:#f4f3ef; --chip-bg:#efede7; --field-bg:#ffffff;
+  --ink:#1d1c1a; --ink-2:#3d3a35; --body-2:#3d3a35; --muted:#5e5a53;
+  --line:#e0ddd5; --line-2:#e0ddd5; --line-strong:#e0ddd5; --field-line:#8a857b; --dashed:#a29d93;
+  --accent:#0e6b62; --accent-hover:#0a4f48; --on-accent:#ffffff;
+  --accent-soft:#e1eeeb; --accent-soft-ink:#0a524b; --accent-line:#b9d6d1;
+  --ok:#0e6b62; --ok-ink:#0a524b; --ok-soft:#e1eeeb; --ok-line:#b9d6d1;
+  --warn:#7a4a07; --warn-dot:#b7791f; --warn-soft:#fbf1dc;
+  --danger:#a33222; --danger-hover:#862819; --on-danger:#ffffff;
+  --danger-soft:#fbf3f1; --danger-soft-ink:#a33222; --danger-line:#e9cfc8;
+  --knob:#ffffff; --knob-on:#ffffff; --focus:#0e6b62; --focus-halo:#cfe5e1; --focus-w:2px;
+  --code-bg:#f4f3ef; --code-ink:#1d1c1a; --code-line:#e0ddd5; --code-hi:#1d1c1a;
+  --bar-bg:#23221f; --bar-ink:#f4f3ef; --bar-muted:#c9c5bc; --bar-line:#4a4842; --bar-dot:#5fc4b6;
+  --overlay:rgba(29,28,26,.45); --shadow-card:none; --shadow-raise:0 8px 24px rgba(29,28,26,.12);
+  --row-hover:#f4f3ef; --tile-hover-line:#e0ddd5;
+  --r-sm:4px; --r-md:8px; --r-lg:12px; --r-btn:8px; --r-pill:999px;
+  --fs-body:15px; --fs-small:13px; --fs-xs:12.5px; --fs-h1:24px; --fs-h2:15px; --fs-h3:13px;
+  --head-weight:600; --head-track:-0.02em;
+  --gap:12px; --pad-card:20px; --pad-row:8px 8px 8px 12px;
 }
-@media (prefers-color-scheme: dark){:root{
-  --bg:#111715; --card:#1b2421; --ink:#e8efec; --muted:#9aa9a3; --line:#2e3a36;
-  --brand:#2bb3a6; --brand-ink:#06211e; --brand-soft:#173530;
-  --red:#ff8a7d; --red-soft:#40201c; --amber:#f2c063; --amber-soft:#3a2d12; --grey-soft:#26302d;
-}}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="household"]):not([data-theme="control"]){
+    --bg:#161513; --surface:#1f1e1b; --surface-2:#2a2925; --surface-3:#2a2925; --chip-bg:#2a2925; --field-bg:#161513;
+    --ink:#ecebe6; --ink-2:#d2cfc7; --body-2:#d2cfc7; --muted:#a9a49a;
+    --line:#3a3832; --line-2:#3a3832; --line-strong:#48453e; --field-line:#7a756b; --dashed:#7a756b;
+    --accent:#5fc4b6; --accent-hover:#7dd3c7; --on-accent:#0b2522;
+    --accent-soft:#1d3633; --accent-soft-ink:#9fded4; --accent-line:#2f5a54;
+    --ok:#5fc4b6; --ok-ink:#9fded4; --ok-soft:#1d3633; --ok-line:#2f5a54;
+    --warn:#e6b25a; --warn-dot:#e6b25a; --warn-soft:#3a2d12;
+    --danger:#f0907f; --danger-hover:#f5a698; --on-danger:#1a0d0a;
+    --danger-soft:#3a1f1b; --danger-soft-ink:#f0907f; --danger-line:#5c2e27;
+    --knob:#ecebe6; --knob-on:#0b2522; --focus:#5fc4b6; --focus-halo:#234541;
+    --code-bg:#161513; --code-ink:#ecebe6; --code-line:#3a3832; --code-hi:#ecebe6;
+    --bar-bg:#0f0e0d; --bar-ink:#f4f3ef; --bar-muted:#c9c5bc; --bar-line:#3a3832; --bar-dot:#5fc4b6;
+    --overlay:rgba(0,0,0,.6); --shadow-card:none; --shadow-raise:0 8px 24px rgba(0,0,0,.5);
+    --row-hover:#2a2925; --tile-hover-line:#48453e;
+  }
+}
+[data-theme="household"]{
+  color-scheme:light dark;
+  --font-head:ui-rounded, "SF Pro Rounded", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --bg:#FAF7F2; --surface:#FFFFFF; --surface-2:#FBF8F4; --surface-3:#FBF8F4; --chip-bg:#F3EDE7; --field-bg:#FFFFFF;
+  --ink:#2A2125; --ink-2:#2A2125; --body-2:#2A2125; --muted:#5E5156;
+  --line:#E8E0D8; --line-2:#EFE8E1; --line-strong:#E0D6CD; --field-line:#94878D; --dashed:#CFC4BB;
+  --accent:#6B2E5F; --accent-hover:#4A1F42; --on-accent:#FFFFFF;
+  --accent-soft:#F3E8F0; --accent-soft-ink:#4A1F42; --accent-line:#D9B8D1;
+  --ok:#0F766E; --ok-ink:#0F766E; --ok-soft:#E1F2EF; --ok-line:#BFE6DF;
+  --warn:#7A4B2A; --warn-dot:#B7791F; --warn-soft:#F4ECE4;
+  --danger:#A3302A; --danger-hover:#FBEDEC; --on-danger:#FFFFFF;
+  --danger-soft:#FBEDEC; --danger-soft-ink:#A3302A; --danger-line:#E6C9C6;
+  --knob:#FFFFFF; --knob-on:#FFFFFF; --focus:#6B2E5F; --focus-halo:#D9B8D1; --focus-w:3px;
+  --code-bg:#2A2125; --code-ink:#F6EFE9; --code-line:#2A2125; --code-hi:#F6EFE9;
+  --bar-bg:#2A2125; --bar-ink:#F6EFE9; --bar-muted:#BFE6DF; --bar-line:#4A3D43; --bar-dot:#5EC4B6;
+  --overlay:rgba(42,33,37,.45); --shadow-card:0 1px 2px rgba(42,33,37,.04);
+  --shadow-raise:0 1px 2px rgba(42,33,37,.04), 0 8px 24px rgba(42,33,37,.06);
+  --row-hover:#FBF8F4; --tile-hover-line:#C9B3C2;
+  --r-sm:6px; --r-md:12px; --r-lg:20px; --r-btn:999px; --r-pill:999px;
+  --fs-body:16px; --fs-small:14px; --fs-xs:13px; --fs-h1:30px; --fs-h2:17px; --fs-h3:15px;
+  --head-weight:600; --head-track:-0.02em;
+  --gap:16px; --pad-card:20px 24px; --pad-row:14px 16px;
+}
+@media (prefers-color-scheme: dark){
+  [data-theme="household"]{
+    --bg:#1C1619; --surface:#261E22; --surface-2:#2F262A; --surface-3:#2F262A; --chip-bg:#33282E; --field-bg:#1C1619;
+    --ink:#F6EFE9; --ink-2:#F6EFE9; --body-2:#F6EFE9; --muted:#C2B4BA;
+    --line:#3D3237; --line-2:#362C31; --line-strong:#4A3D43; --field-line:#857479; --dashed:#5E5156;
+    --accent:#E3B5D8; --accent-hover:#EDC8E3; --on-accent:#2A1025;
+    --accent-soft:#3E2639; --accent-soft-ink:#F0D3E8; --accent-line:#5A3A52;
+    --ok:#5EC4B6; --ok-ink:#8FD9CE; --ok-soft:#1E3532; --ok-line:#2F5A54;
+    --warn:#E8B48C; --warn-dot:#E8B48C; --warn-soft:#3A2A1E;
+    --danger:#F2948C; --danger-hover:#3A1F1E; --on-danger:#2A0F0D;
+    --danger-soft:#3A1F1E; --danger-soft-ink:#F2948C; --danger-line:#5C3431;
+    --knob:#F6EFE9; --knob-on:#1C1619; --focus:#E3B5D8; --focus-halo:#5A3A52;
+    --code-bg:#120E10; --code-ink:#F6EFE9; --code-line:#3D3237; --code-hi:#F6EFE9;
+    --bar-bg:#120E10; --bar-ink:#F6EFE9; --bar-muted:#BFE6DF; --bar-line:#3D3237; --bar-dot:#5EC4B6;
+    --overlay:rgba(0,0,0,.6); --shadow-card:none; --shadow-raise:0 8px 24px rgba(0,0,0,.5);
+    --row-hover:#2F262A; --tile-hover-line:#4A3D43;
+  }
+}
+[data-theme="control"]{
+  color-scheme:dark;
+  --font-head:var(--font-body);
+  --bg:#0E1116; --surface:#151A21; --surface-2:#11151B; --surface-3:#0F1318; --chip-bg:#1B222B; --field-bg:#0B0E12;
+  --ink:#E6EAF0; --ink-2:#C9D2DC; --body-2:#B4BFCC; --muted:#9AA6B5;
+  --line:#2A333F; --line-2:#222A35; --line-strong:#2F3946; --field-line:#5C6878; --dashed:#3A4553;
+  --accent:#F5B83D; --accent-hover:#FFC95C; --on-accent:#14110A;
+  --accent-soft:#2A2210; --accent-soft-ink:#F5B83D; --accent-line:#5C4A1E;
+  --ok:#4ADE80; --ok-ink:#7EE2A8; --ok-soft:#10241A; --ok-line:#24503A;
+  --warn:#F5B83D; --warn-dot:#F5B83D; --warn-soft:#2A2210;
+  --danger:#FF8A80; --danger-hover:#FF6B5E; --on-danger:#14110A;
+  --danger-soft:#1E1415; --danger-soft-ink:#FFB4AC; --danger-line:#5A2E2A;
+  --knob:#6B7685; --knob-on:#14110A; --focus:#F5B83D; --focus-halo:transparent; --focus-w:2px;
+  --code-bg:#0B0E12; --code-ink:#E6EAF0; --code-line:#2A333F; --code-hi:#F5B83D;
+  --bar-bg:#0A0C10; --bar-ink:#C9D2DC; --bar-muted:#9AA6B5; --bar-line:#1C232D; --bar-dot:#4ADE80;
+  --overlay:rgba(0,0,0,.65); --shadow-card:none; --shadow-raise:0 12px 32px rgba(0,0,0,.6);
+  --row-hover:#1B222B; --tile-hover-line:#3A4553;
+  --r-sm:4px; --r-md:6px; --r-lg:10px; --r-btn:6px; --r-pill:999px;
+  --fs-body:15px; --fs-small:13px; --fs-xs:11px; --fs-h1:24px; --fs-h2:15px; --fs-h3:14px;
+  --head-weight:600; --head-track:-0.01em;
+  --gap:16px; --pad-card:16px; --pad-row:10px 16px;
+  --band-pad:max(16px, calc((100vw - 76rem) / 2));
+}
+
+/* ===== Shared parts (every look) ===== */
 *{box-sizing:border-box}
-body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
+html{background:var(--bg)}
+body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--font-body);font-size:var(--fs-body);line-height:1.5;-webkit-font-smoothing:antialiased}
 button,input,select{font:inherit;color:inherit}
-.wrap{max-width:920px;margin:0 auto;padding:0 16px 64px}
-header{display:flex;align-items:center;gap:12px;flex-wrap:wrap;padding:20px 0 12px}
-.logo{font-size:22px;font-weight:700;letter-spacing:-.01em;display:flex;align-items:center;gap:8px}
-.logo svg{width:28px;height:28px}
-.pill{padding:4px 12px;border-radius:999px;font-size:14px;font-weight:600;background:var(--brand-soft);color:var(--brand)}
-.pill.warn{background:var(--amber-soft);color:var(--amber)} .pill.bad{background:var(--red-soft);color:var(--red)}
+h1{font-family:var(--font-head);font-size:var(--fs-h1);font-weight:var(--head-weight);letter-spacing:var(--head-track);line-height:1.2;margin:0 0 4px;overflow-wrap:anywhere}
+h2{font-size:var(--fs-h2);font-weight:var(--head-weight);letter-spacing:-.01em;line-height:1.35;margin:0 0 4px}
+h3{font-size:var(--fs-h3);font-weight:600;color:var(--ink-2);margin:20px 0 8px}
+p{margin:0 0 10px}
+a{color:var(--accent)}
+.muted{color:var(--muted)} .small{font-size:var(--fs-small)}
+.meta{font-size:var(--fs-small);color:var(--muted);margin:0}
+.mono{font-variant-numeric:tabular-nums}
+.ico{width:18px;height:18px;flex:none}
+.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
+[hidden]{display:none!important}
+:focus-visible{outline:var(--focus-w) solid var(--focus);outline-offset:2px}
+/* Rows inside a clipped list (Calm, Control room) draw the ring inside themselves, or the list would cut it off. */
+[data-theme="calm"] .tiles .tile:focus-visible,[data-theme="control"] .tiles .tile:focus-visible{outline-offset:calc(-1 * var(--focus-w) - 2px)}
 .spacer{flex:1}
-nav{display:flex;gap:4px;border-bottom:1px solid var(--line);margin-bottom:20px;overflow-x:auto}
-nav button{background:none;border:0;padding:10px 14px;font-weight:600;color:var(--muted);border-bottom:3px solid transparent;cursor:pointer;white-space:nowrap}
-nav button.on{color:var(--brand);border-color:var(--brand)}
-.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:18px;margin-bottom:16px}
-h1{font-size:24px;margin:0 0 4px;letter-spacing:-.01em} h2{font-size:18px;margin:0 0 6px} p{margin:0 0 10px}
-.muted{color:var(--muted)} .small{font-size:14px}
-.btn{border:1px solid var(--line);background:var(--card);border-radius:10px;padding:8px 14px;font-weight:600;cursor:pointer;white-space:nowrap}
-.btn:hover{border-color:var(--brand)}
-.btn.primary{background:var(--brand);border-color:var(--brand);color:var(--brand-ink)}
-.btn.danger{background:var(--red);border-color:var(--red);color:var(--card)}
-.btn.link{border:0;background:none;color:var(--brand);padding:4px 6px}
-:focus-visible{outline:3px solid var(--brand);outline-offset:2px}
-.banner{border-radius:12px;padding:14px 16px;margin-bottom:16px;background:var(--red-soft);color:var(--red)}
-.banner.warn{background:var(--amber-soft);color:var(--amber);display:flex;gap:12px;align-items:center;flex-wrap:wrap}
-.row{display:flex;gap:14px;align-items:center;flex-wrap:wrap}
-.stats{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-top:14px}
-.stat{background:var(--grey-soft);border-radius:10px;padding:12px}
-.stat b{display:block;font-size:24px;font-variant-numeric:tabular-nums}
-.switch{position:relative;width:52px;height:30px;flex:none}
+.grow{flex:1 1 220px;min-width:0}
+.row{display:flex;flex-wrap:wrap;align-items:center;gap:12px}
+.err-text{color:var(--danger)}
+
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:8px;min-height:44px;padding:0 14px;border:1px solid var(--line-strong);
+  background:var(--surface);color:var(--ink-2);border-radius:var(--r-btn);font-size:14px;font-weight:500;line-height:1.25;cursor:pointer;
+  white-space:nowrap;text-decoration:none;vertical-align:middle}
+.btn:hover{border-color:var(--field-line)}
+.btn:disabled{opacity:.65;cursor:default}
+.btn.primary{background:var(--accent);border-color:var(--accent);color:var(--on-accent);font-weight:600}
+.btn.primary:hover{background:var(--accent-hover);border-color:var(--accent-hover)}
+.btn.danger{background:var(--danger);border-color:var(--danger);color:var(--on-danger);font-weight:600}
+.btn.danger:hover{filter:brightness(.93)}
+.btn.danger-outline{background:var(--surface);border-color:var(--danger);color:var(--danger)}
+.btn.danger-outline:hover{background:var(--danger-soft)}
+.btn.soft{background:var(--accent-soft);border-color:var(--accent-line);color:var(--accent-soft-ink);font-weight:600}
+.btn.ghost{background:none;border-color:transparent;color:var(--ink-2)}
+.btn.ghost:hover{background:var(--chip-bg)}
+.btn.link{border:0;background:none;color:var(--accent);padding:0 4px;text-decoration:underline;text-underline-offset:2px;font-weight:500;font-size:inherit}
+.btn.link:hover{color:var(--accent-hover)}
+.btn.link.danger-text{color:var(--danger)}
+.btn.back{text-decoration:none;color:var(--muted);padding:0;gap:4px;font-size:var(--fs-small);margin:0 0 4px}
+.btn.back:hover{color:var(--ink)}
+.btn .ico{width:18px;height:18px}
+
+.card{background:var(--surface);border:1px solid var(--line);border-radius:var(--r-lg);padding:var(--pad-card);box-shadow:var(--shadow-card);margin:0 0 var(--gap)}
+.card.flush{padding:0;overflow:hidden}
+.part{padding:16px 0;border-top:1px solid var(--line-2)}
+.part:first-child{border-top:0;padding-top:0}
+.part:last-child{padding-bottom:0}
+.part.net{display:flex;align-items:center;gap:12px}
+.section-head{margin:8px 0 12px}
+.list-head{margin:24px 0 0}
+
+.pill{display:inline-flex;align-items:center;gap:6px;padding:3px 10px;border-radius:var(--r-pill);font-size:12px;font-weight:500;
+  background:var(--accent-soft);color:var(--accent-soft-ink);white-space:nowrap}
+.pill.warn{background:var(--warn-soft);color:var(--warn)}
+.pill.bad{background:var(--danger-soft);color:var(--danger-soft-ink)}
+.badge{display:inline-block;font-size:var(--fs-xs);font-weight:600;line-height:1.5;padding:1px 8px;border-radius:var(--r-pill);background:var(--chip-bg);
+  color:var(--muted);margin-left:6px;vertical-align:1px;white-space:nowrap}
+.badge.accent{background:var(--accent-soft);color:var(--accent-soft-ink)}
+.badge.warn{background:var(--warn-soft);color:var(--warn)}
+.badge.danger{background:var(--danger-soft);color:var(--danger-soft-ink)}
+.dot{display:inline-block;width:8px;height:8px;border-radius:50%;flex:none;background:var(--muted)}
+.dot.on{background:var(--ok)} .dot.wait{background:none;border:2px solid var(--warn-dot)}
+
+.notice{border-radius:var(--r-md);padding:12px 16px;margin:0 0 var(--gap)}
+.notice.flex{display:flex;flex-wrap:wrap;gap:8px 12px;align-items:center}
+.notice.danger{background:var(--danger-soft);color:var(--danger-soft-ink);border:1px solid var(--danger-line)}
+.notice.warn{background:var(--warn-soft);color:var(--warn)}
+.notice.info{background:var(--accent-soft);color:var(--accent-soft-ink)}
+.notice .btn.link{color:inherit}
+
+/* The on/off switch: a real checkbox drawn as a track and a knob. The box is 44px tall so it is easy
+   to hit; the track drawn inside it is 32px. */
+.switch{position:relative;width:52px;height:44px;flex:none}
 .switch input{opacity:0;width:100%;height:100%;margin:0;cursor:pointer;position:absolute;z-index:1}
-.switch span{position:absolute;top:0;right:0;bottom:0;left:0;background:var(--line);border-radius:999px;transition:.15s}
-.switch span::after{content:"";position:absolute;width:24px;height:24px;left:3px;top:3px;background:#fff;border-radius:50%;transition:.15s}
-.switch input:checked+span{background:var(--brand)} .switch input:checked+span::after{left:25px}
-.switch input:focus-visible+span{outline:3px solid var(--brand);outline-offset:2px}
-.devices{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:12px}
-.device{text-align:left;cursor:pointer;margin:0;display:block;width:100%}
-.device:hover{border-color:var(--brand)}
-.device .name{font-weight:700;font-size:17px;overflow-wrap:anywhere}
-.controls{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin:14px 0}
-.chip{border:1px solid var(--line);background:var(--card);border-radius:999px;padding:6px 12px;font-size:14px;font-weight:600;cursor:pointer}
-.chip.on{background:var(--brand);border-color:var(--brand);color:var(--brand-ink)}
-input[type=search],input[type=text],select{border:1px solid var(--line);background:var(--card);border-radius:10px;padding:8px 12px;min-width:0}
-.item{border-top:1px solid var(--line);padding:12px 0}
+.switch span{position:absolute;top:6px;right:0;bottom:6px;left:0;background:var(--field-line);border-radius:999px;transition:.15s}
+.switch span::after{content:"";position:absolute;width:24px;height:24px;left:4px;top:4px;background:var(--knob);border-radius:50%;transition:.15s}
+.switch input:checked+span{background:var(--accent)}
+.switch input:checked+span::after{left:24px;background:var(--knob-on)}
+.switch input:focus-visible+span{outline:var(--focus-w) solid var(--focus);outline-offset:2px}
+
+input[type=search],input[type=text],input[type=time],select{min-height:44px;border:1px solid var(--field-line);background:var(--field-bg);color:var(--ink);
+  border-radius:var(--r-md);padding:8px 12px;min-width:0;max-width:100%}
+input[type=search]:focus,input[type=text]:focus,input[type=time]:focus,select:focus{border-color:var(--accent);box-shadow:0 0 0 3px var(--focus-halo)}
+::placeholder{color:var(--muted);opacity:1}
+.fld{display:block;margin:0 0 16px;font-size:var(--fs-small);font-weight:500;color:var(--ink-2)}
+.fld input[type=text],.fld select{display:block;width:100%;max-width:420px;margin-top:6px;font-size:var(--fs-body);font-weight:400}
+.fld input[type=time]{display:block;margin-top:6px;font-size:var(--fs-body);font-weight:400}
+label.check{display:flex;gap:10px;align-items:center;min-height:44px;padding:4px 0;border-top:1px solid var(--line-2);cursor:pointer;
+  font-size:var(--fs-body);font-weight:400;color:var(--ink)}
+label.check:first-of-type{border-top:0}
+label.check input{width:20px;height:20px;flex:none;margin:0;accent-color:var(--accent)}
+
+.chip{min-height:44px;border:1px solid var(--line-strong);background:var(--surface);color:var(--ink-2);border-radius:var(--r-pill);padding:0 14px;
+  font-size:var(--fs-small);font-weight:500;cursor:pointer}
+.chip:hover{border-color:var(--field-line)}
+.chip.on{background:var(--accent);border-color:var(--accent);color:var(--on-accent);font-weight:600}
+.controls{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin:12px 0}
+.daychips{display:flex;gap:6px;flex-wrap:wrap;margin:6px 0}
+
+.chips{list-style:none;margin:12px 0 0;padding:0;display:flex;flex-wrap:wrap;gap:8px}
+.tag{display:inline-flex;align-items:center;gap:6px;min-height:32px;padding:0 2px 0 10px;border:1px solid var(--danger-line);background:var(--danger-soft);
+  color:var(--ink);border-radius:var(--r-md);font-size:var(--fs-small);font-weight:500}
+.tag.static{padding-right:10px}
+.tag>.ico{width:14px;height:14px;color:var(--danger)}
+.tag-from{color:var(--muted);font-weight:400}
+.tag-x{position:relative;display:inline-flex;align-items:center;justify-content:center;width:32px;height:32px;padding:0;border:0;background:none;
+  color:inherit;border-radius:var(--r-sm);cursor:pointer}
+.tag-x::before{content:"";position:absolute;top:-6px;right:-6px;bottom:-6px;left:-6px}
+.tag-x:hover{background:var(--danger-line)}
+.tag-x .ico{width:14px;height:14px}
+
+.svcgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(100%,170px),1fr));gap:8px;margin:6px 0 12px}
+.svc{display:flex;flex-direction:column;align-items:flex-start;min-height:44px;border:1px solid var(--line-strong);background:var(--surface);color:var(--ink);
+  border-radius:var(--r-md);padding:8px 12px;cursor:pointer;text-align:left;font-weight:600;font-size:var(--fs-small)}
+.svc small{font-weight:500;color:var(--muted);font-size:var(--fs-xs)}
+.svc:hover{border-color:var(--field-line)}
+.svc.on{background:var(--danger-soft);border-color:var(--danger-line);color:var(--danger-soft-ink)}
+.svc.on small{color:var(--danger-soft-ink)}
+.svc:disabled{cursor:default}
+.cat{font-size:var(--fs-xs);font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.06em;margin:14px 0 6px}
+
+.sched{display:flex;flex-wrap:wrap;align-items:center;gap:8px 12px;background:var(--surface-2);border-radius:var(--r-md);padding:10px 12px;margin:8px 0}
+.sched b{font-weight:600}
+
+.list{list-style:none;margin:0;padding:0}
+.item{padding:var(--pad-row);border-top:1px solid var(--line-2)}
 .item:first-child{border-top:0}
-.item .top{display:flex;gap:12px;align-items:center}
-.item .info{flex:1;min-width:0}
-.item .title{font-weight:650;overflow-wrap:anywhere}
-.badge{display:inline-block;font-size:12.5px;font-weight:700;padding:2px 8px;border-radius:999px;background:var(--grey-soft);color:var(--muted);margin-left:6px;vertical-align:1px;white-space:nowrap}
-.badge.junk{background:var(--red-soft);color:var(--red)} .badge.suspect{background:var(--amber-soft);color:var(--amber)}
-.badge.blocked{background:var(--brand-soft);color:var(--brand)}
+.item .top{display:flex;flex-wrap:wrap;gap:8px 12px;align-items:center}
+.item .info{flex:1 1 200px;min-width:0}
+.item .title{font-weight:600;overflow-wrap:anywhere;font-size:var(--fs-body);margin:0;display:inline}
+.item-actions{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
 .hosts{margin:8px 0 0 14px;padding-left:12px;border-left:2px solid var(--line)}
 .hosts .item{padding:8px 0}
-.hosts .title{font-weight:500;font-family:ui-monospace,Menlo,monospace;font-size:14px}
-.expand{background:none;border:0;color:var(--brand);font-size:14px;font-weight:600;padding:2px 0;cursor:pointer}
-.empty{text-align:center;padding:28px 10px;color:var(--muted)}
-.ipbox{font:700 28px ui-monospace,Menlo,monospace;background:var(--brand-soft);color:var(--brand);padding:10px 18px;border-radius:12px;display:inline-block;margin:6px 0 10px;user-select:all}
-details{border-top:1px solid var(--line);padding:10px 0} details:first-of-type{border-top:0}
-summary{font-weight:650;cursor:pointer} details ol{margin:8px 0 4px;padding-left:22px} details li{margin:4px 0}
-.modal{position:fixed;top:0;right:0;bottom:0;left:0;background:rgba(0,0,0,.45);display:flex;align-items:center;justify-content:center;padding:16px;z-index:10}
-.modal .card{max-width:440px;width:100%;margin:0}
-.modal input{width:100%;margin:6px 0 4px}
-.modal .row{justify-content:flex-end;margin-top:14px}
-.svcgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:8px;margin:6px 0 12px}
-.svc{display:flex;flex-direction:column;border:1px solid var(--line);background:var(--card);border-radius:10px;padding:8px 12px;cursor:pointer;text-align:left;font-weight:650;font-size:15px}
-.svc small{font-weight:600;color:var(--muted);font-size:12.5px}
-.svc:hover{border-color:var(--brand)}
-.svc.on{background:var(--red-soft);border-color:var(--red);color:var(--red)} .svc.on small{color:var(--red)}
-.svc:disabled{cursor:default}
-.cat{font-size:13px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.04em;margin-top:10px}
-label.check{display:flex;gap:10px;align-items:center;padding:9px 0;border-top:1px solid var(--line);cursor:pointer}
-label.check:first-of-type{border-top:0} label.check input{width:20px;height:20px;flex:none}
-.note{background:var(--amber-soft);color:var(--amber);border-radius:10px;padding:10px 14px;margin:12px 0}
-.killbtn{border-color:var(--red);color:var(--red)}
-.banner.flex{display:flex;gap:12px;align-items:center;flex-wrap:wrap}
-.fld{display:block;font-weight:650;margin:0 0 16px}
-.fld input[type=text],.fld select,.fld input[type=time]{display:block;margin-top:6px;font-weight:400}
-.fld input[type=text]{width:100%;max-width:360px}
-input[type=time]{border:1px solid var(--line);background:var(--card);border-radius:10px;padding:8px 12px}
-.daychips{display:flex;gap:6px;flex-wrap:wrap;margin:6px 0}
-[hidden]{display:none!important}
+.hosts .title{font-weight:500;font-family:var(--font-mono);font-size:13px}
+.expand{display:inline-flex;align-items:center;min-height:44px;background:none;border:0;color:var(--accent);font-size:var(--fs-small);font-weight:600;padding:0;cursor:pointer}
+.empty{text-align:center;padding:28px 12px;color:var(--muted)}
+
+.avatar{display:inline-flex;align-items:center;justify-content:center;flex:none;width:36px;height:36px;border-radius:8px;
+  background:var(--accent-soft);color:var(--accent-soft-ink);font-size:13px;font-weight:600;line-height:1}
+.avatar.unknown{background:none;border:1px dashed var(--dashed);color:var(--muted)}
+.avatar.sm{width:32px;height:32px}
+.avatar.moon{background:var(--warn-soft);color:var(--warn)}
+.avatar.lg{display:none}
+.avatar .ico{width:18px;height:18px}
+
+.pagehead{display:flex;flex-wrap:wrap;align-items:center;gap:8px 16px;margin:4px 0 16px}
+.pagehead .actions{display:flex;flex-wrap:wrap;gap:8px}
+.sugg{display:block}
+.sugg .btn{margin-left:8px}
+.group-pick{margin:0 0 16px}
+.group-pick select{min-width:180px}
+
+.tile{font:inherit;color:inherit;cursor:pointer;text-align:left;width:100%;margin:0}
+.tile .name{font-weight:600;color:var(--ink);overflow-wrap:anywhere}
+.tile-main{min-width:0;display:flex;flex-direction:column}
+.tile-main .meta{display:block}
+.tile-figs{font-size:var(--fs-small);color:var(--muted)}
+.tile-figs b{color:var(--ink);font-weight:600}
+.tile-badges .badge{margin:4px 6px 0 0}
+.tile-badges:empty{display:none}
+.tile .go{color:var(--accent);width:16px;height:16px}
+.thead{display:none}
+
+.home-stats{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin-top:16px}
+.stat{background:var(--surface-2);border-radius:var(--r-md);padding:12px}
+.stat b{display:block;font-size:24px;font-weight:600;font-variant-numeric:tabular-nums;color:var(--ink)}
+.stat span{font-size:var(--fs-small);color:var(--muted)}
+
+.bigcode{display:inline-block;font-family:var(--font-mono);font-size:24px;font-weight:600;letter-spacing:.04em;font-variant-numeric:tabular-nums;
+  background:var(--surface-2);color:var(--ink);padding:10px 16px;border-radius:var(--r-md);margin:6px 0 12px;user-select:all;overflow-wrap:anywhere}
+details{border-top:1px solid var(--line-2)}
+details:first-of-type{border-top:0}
+summary{min-height:44px;display:flex;align-items:center;justify-content:space-between;font-weight:600;cursor:pointer;list-style:none}
+summary::-webkit-details-marker{display:none}
+summary::after{content:"";flex:none;width:8px;height:8px;border-right:2px solid var(--muted);border-bottom:2px solid var(--muted);
+  transform:rotate(45deg);margin:0 6px 4px 12px;transition:transform .15s}
+details[open] summary::after{transform:rotate(225deg);margin-bottom:-4px}
+details ol{margin:0 0 12px;padding-left:22px}
+details li{margin:4px 0}
+.opt{font-weight:400}
+
+.page-title{margin:4px 0 16px}
+.quick{font-weight:400}
+.times{align-items:flex-start}
+.hint{margin-top:-8px}
+.form-actions{justify-content:flex-end;margin-top:8px}
+
+/* The Appearance chooser: real radio buttons, each inside a large label. The swatches are fixed
+   colours, so each one shows its own look whatever look is in use. */
+.themes{border:0;margin:0;padding:0;display:grid;gap:8px;min-width:0}
+.theme-opt{display:flex;gap:12px;align-items:center;min-height:56px;padding:10px 14px;border:1px solid var(--line-strong);border-radius:var(--r-md);
+  cursor:pointer;background:var(--surface)}
+.theme-opt:hover{border-color:var(--field-line)}
+.theme-opt input{accent-color:var(--accent);width:20px;height:20px;flex:none;margin:0}
+.theme-opt input:checked ~ .theme-text b{color:var(--accent)}
+.theme-text{display:flex;flex-direction:column;min-width:0}
+.theme-text b{font-weight:600}
+.swatch{display:inline-flex;border:1px solid var(--line);border-radius:6px;overflow:hidden;flex:none}
+.swatch i{display:block;width:14px;height:28px}
+.swatch-calm i:nth-child(1){background:#f4f3ef} .swatch-calm i:nth-child(2){background:#0e6b62} .swatch-calm i:nth-child(3){background:#1d1c1a}
+.swatch-household i:nth-child(1){background:#FAF7F2} .swatch-household i:nth-child(2){background:#6B2E5F} .swatch-household i:nth-child(3){background:#0F766E}
+.swatch-control i:nth-child(1){background:#0E1116} .swatch-control i:nth-child(2){background:#F5B83D} .swatch-control i:nth-child(3){background:#E6EAF0}
+
+.modal{position:fixed;top:0;right:0;bottom:0;left:0;background:var(--overlay);display:flex;align-items:center;justify-content:center;padding:16px;z-index:60}
+.modal .card{max-width:440px;width:100%;margin:0;padding:24px;box-shadow:var(--shadow-raise)}
+.modal input{width:100%;margin:8px 0 4px}
+.modal .row{justify-content:flex-end;margin-top:16px}
+
+/* The page frame: header, section tabs, the whole-house controls, the day's figures and the view.
+   Each look places these with grid areas of the same names. */
+.shell>.top{grid-area:top;display:flex;align-items:center;flex-wrap:wrap;gap:8px 12px}
+.logo{display:flex;align-items:center;gap:8px;font-size:16px;font-weight:600;letter-spacing:-.01em;color:var(--ink)}
+.logo-mark{width:22px;height:22px;color:var(--accent)}
+.tabs{grid-area:tabs;display:flex}
+.tab{display:flex;align-items:center;gap:10px;min-height:44px;padding:0 12px;border:0;background:none;color:var(--ink-2);font-size:14px;font-weight:500;
+  cursor:pointer;white-space:nowrap;border-radius:var(--r-md)}
+.strip{grid-area:strip;display:none}
+.fig-label,.fig-num{display:block}
+.house{grid-area:house}
+.house-title{display:flex;align-items:center;gap:8px;margin:0 0 4px}
+.house-note{margin:0 0 10px;font-size:var(--fs-small);color:var(--muted)}
+.content{grid-area:content;min-width:0}
+
+/* ===== Calm: sections down the side, one quiet surface for the view ===== */
+[data-theme="calm"] .shell{max-width:1200px;margin:0 auto;display:grid;grid-template-columns:248px minmax(0,1fr);
+  grid-template-rows:auto auto auto 1fr;grid-template-areas:"top content" "tabs content" "house content" ". content";align-items:start}
+[data-theme="calm"] .shell>.top{padding:20px 16px 8px}
+[data-theme="calm"] .shell>.top .spacer{display:none}
+[data-theme="calm"] .appearance-link{flex-basis:100%;justify-content:flex-start;margin-left:-10px;padding:0 10px;font-size:13px}
+[data-theme="calm"] .tabs{flex-direction:column;gap:2px;padding:0 16px 16px}
+[data-theme="calm"] .tab{width:100%;text-align:left}
+[data-theme="calm"] .tab:hover{background:var(--chip-bg)}
+[data-theme="calm"] .tab[aria-current="page"]{background:var(--accent-soft);color:var(--accent-soft-ink);font-weight:600}
+[data-theme="calm"] .house{margin:0 16px;border-top:1px solid var(--line);padding-top:16px;display:grid;gap:14px}
+[data-theme="calm"] .pause-box .house-title,[data-theme="calm"] .pause-box .house-note{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap}
+[data-theme="calm"] .pause-box .btn{width:100%;justify-content:flex-start;font-size:13px;white-space:normal;text-align:left;padding:8px 10px}
+[data-theme="calm"] .kill-box{border:1px solid var(--danger-line);background:var(--danger-soft);border-radius:10px;padding:12px}
+[data-theme="calm"] .kill-box .house-title{font-size:13px;color:var(--danger)}
+[data-theme="calm"] .kill-box .house-title .ico{width:16px;height:16px}
+[data-theme="calm"] .kill-box .house-note{font-size:12.5px;margin:0 0 10px}
+[data-theme="calm"] .kill-box .house-note.small{margin:8px 0 0}
+[data-theme="calm"] .kill-box .btn{width:100%;font-size:13px}
+[data-theme="calm"] .content{padding:20px 16px 56px}
+[data-theme="calm"] #view{background:var(--surface);border:1px solid var(--line);border-radius:12px;padding:20px}
+[data-theme="calm"] #view .card{background:none;border:0;border-top:1px solid var(--line-2);border-radius:0;padding:16px 0;margin:0;box-shadow:none}
+[data-theme="calm"] #view .card:first-child{border-top:0;padding-top:0}
+[data-theme="calm"] #view .card.list,[data-theme="calm"] .members .list,[data-theme="calm"] .rows{border:1px solid var(--line);border-radius:8px;padding:0;margin:0 0 12px;overflow:hidden}
+[data-theme="calm"] .tiles{background:var(--surface);border:1px solid var(--line);border-radius:10px;overflow:hidden;margin:0 0 12px}
+[data-theme="calm"] .tile{display:grid;grid-template-columns:36px minmax(0,1fr) auto 16px;gap:4px 14px;align-items:center;min-height:64px;padding:12px 16px;
+  border:0;border-top:1px solid var(--line-2);background:none}
+[data-theme="calm"] .tile:first-child{border-top:0}
+[data-theme="calm"] .tile:hover{background:var(--surface-2)}
+[data-theme="calm"] .tile .avatar{grid-column:1;grid-row:1 / span 2}
+[data-theme="calm"] .tile-main{grid-column:2;grid-row:1}
+[data-theme="calm"] .tile-figs{grid-column:3;grid-row:1;text-align:right}
+[data-theme="calm"] .tile-badges{grid-column:2 / span 2;grid-row:2}
+[data-theme="calm"] .tile .go{grid-column:4;grid-row:1 / span 2}
+[data-theme="calm"] .chip{border-radius:8px;font-size:13px}
+[data-theme="calm"] .group-delete{background:none;border-color:transparent;text-decoration:underline;text-underline-offset:2px;padding:0 4px}
+[data-theme="calm"] .members .avatar{width:32px;height:32px}
+[data-theme="calm"] .members .others .avatar{background:var(--chip-bg);color:var(--ink-2)}
+[data-theme="calm"] .members .others .avatar.unknown{background:none;color:var(--muted)}
+[data-theme="calm"] .members .item{padding:8px 12px}
+@media (max-width:760px){
+  [data-theme="calm"] .shell{grid-template-columns:minmax(0,1fr);grid-template-rows:none;grid-template-areas:"top" "tabs" "house" "content"}
+  [data-theme="calm"] .tabs{flex-direction:row;flex-wrap:wrap;gap:4px}
+  [data-theme="calm"] .tab{flex:1 1 auto;width:auto}
+  [data-theme="calm"] .house{grid-template-columns:minmax(0,1fr)}
+  [data-theme="calm"] .kill-box .house-note:not(.small){display:none}
+  [data-theme="calm"] .content{padding:16px 16px 48px}
+  [data-theme="calm"] #view{padding:16px}
+  [data-theme="calm"] .tile{grid-template-columns:36px minmax(0,1fr) 16px}
+  [data-theme="calm"] .tile-figs{grid-column:2;grid-row:2;text-align:left}
+  [data-theme="calm"] .tile-badges{grid-column:2;grid-row:3}
+  [data-theme="calm"] .tile .avatar{grid-row:1 / span 3}
+  [data-theme="calm"] .tile .go{grid-column:3;grid-row:1 / span 3}
+}
+
+/* ===== Household: a white band on top, people-first cards, the house controls on the right ===== */
+[data-theme="household"] .shell{display:grid;grid-template-columns:minmax(0,1fr) 300px;grid-template-areas:"top top" "tabs tabs" "content house";
+  column-gap:24px;max-width:1120px;margin:0 auto;padding:0 16px;align-items:start}
+[data-theme="household"] .shell>.top{background:var(--surface);box-shadow:0 0 0 100vmax var(--surface);-webkit-clip-path:inset(0 -100vmax);clip-path:inset(0 -100vmax);padding:16px 0 8px}
+[data-theme="household"] .logo{font-family:var(--font-head);font-size:19px}
+[data-theme="household"] .logo-mark{width:26px;height:26px}
+[data-theme="household"] .pill{background:var(--ok-soft);color:var(--ok-ink);font-size:13px;font-weight:600}
+[data-theme="household"] .pill.warn{background:var(--warn-soft);color:var(--warn)}
+[data-theme="household"] .pill.bad{background:var(--danger-soft);color:var(--danger-soft-ink)}
+[data-theme="household"] .tabs{background:var(--surface);box-shadow:0 0 0 100vmax var(--surface), 0 1px 0 100vmax var(--line);
+  -webkit-clip-path:inset(0 -100vmax -1px);clip-path:inset(0 -100vmax -1px);flex-wrap:wrap;gap:4px;padding:8px 0 12px}
+[data-theme="household"] .tab{padding:0 16px;border-radius:999px;color:var(--muted);font-size:15px}
+[data-theme="household"] .tab:hover{background:var(--chip-bg)}
+[data-theme="household"] .tab[aria-current="page"]{background:var(--accent-soft);color:var(--accent-soft-ink);font-weight:600}
+[data-theme="household"] .tab .ico{display:none}
+[data-theme="household"] .switch input:checked+span{background:var(--ok)}
+[data-theme="household"] .content{padding:24px 0 56px}
+[data-theme="household"] .house{display:grid;gap:16px;align-content:start;padding-top:24px}
+[data-theme="household"] .pause-box,[data-theme="household"] .kill-box{background:var(--surface);border:1px solid var(--line);border-radius:20px;padding:20px;box-shadow:var(--shadow-card)}
+[data-theme="household"] .house-title{font-family:var(--font-head);font-size:18px;gap:12px;margin-bottom:8px}
+[data-theme="household"] .kill-box .house-title .ico{width:40px;height:40px;padding:11px;border-radius:50%;background:var(--danger-soft);color:var(--danger)}
+[data-theme="household"] .house .btn{width:100%;justify-content:center;min-height:48px;border-radius:12px;white-space:normal;text-align:center;font-size:15px}
+[data-theme="household"] .kill-box .btn{border-width:1.5px;font-weight:600}
+[data-theme="household"] .kill-box .house-note.small{text-align:center;font-size:13px;margin:8px 0 0}
+[data-theme="household"] h1{font-family:var(--font-head)}
+[data-theme="household"] .btn.primary,[data-theme="household"] .btn.soft{font-size:15px}
+[data-theme="household"] .rules{padding:0;overflow:hidden}
+[data-theme="household"] .rules .part{padding:20px 24px}
+[data-theme="household"] .rules .part.foot{background:var(--surface-2);font-size:13px;padding:12px 24px}
+[data-theme="household"] .tag{border-radius:999px;background:var(--accent-soft);border-color:var(--accent-line);color:var(--accent-soft-ink);font-weight:600}
+[data-theme="household"] .tag>.ico{color:var(--accent)}
+[data-theme="household"] .tag-from{color:var(--accent-soft-ink)}
+[data-theme="household"] .tag-x{border-radius:50%}
+[data-theme="household"] .tag-x:hover{background:var(--accent-line)}
+[data-theme="household"] .svc{border-radius:16px}
+[data-theme="household"] .sched{border-radius:16px;padding:12px 16px}
+[data-theme="household"] .stat{border-radius:16px}
+[data-theme="household"] .avatar{border-radius:50%}
+[data-theme="household"] .avatar.moon{border-radius:12px;width:44px;height:44px}
+[data-theme="household"] .avatar.lg{display:inline-flex;width:56px;height:56px;background:var(--accent);color:var(--on-accent);font-family:var(--font-head);font-size:24px}
+[data-theme="household"] .avatar.lg.unknown{background:none;color:var(--muted)}
+[data-theme="household"] .btn.back{color:var(--accent);font-size:14px}
+[data-theme="household"] .tiles{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(100%,260px),1fr));gap:12px;margin:0 0 16px}
+[data-theme="household"] .tile{display:grid;grid-template-columns:48px minmax(0,1fr);gap:4px 14px;align-items:center;background:var(--surface);
+  border:1px solid var(--line);border-radius:20px;padding:20px;box-shadow:var(--shadow-card)}
+[data-theme="household"] .tile:hover{border-color:var(--tile-hover-line);box-shadow:var(--shadow-raise)}
+[data-theme="household"] .tile .avatar{width:48px;height:48px;font-family:var(--font-head);font-size:18px;grid-row:1}
+[data-theme="household"] .tile .name{font-family:var(--font-head);font-size:18px}
+[data-theme="household"] .tile-figs,[data-theme="household"] .tile-badges{grid-column:1 / -1}
+[data-theme="household"] .tile-figs{margin-top:8px}
+[data-theme="household"] .tile .go{display:none}
+[data-theme="household"] .card.list{padding:0}
+[data-theme="household"] .members .list{display:grid;gap:10px;margin:12px 0}
+[data-theme="household"] .members .list .item{background:var(--surface-2);border:0;border-radius:16px;padding:12px 16px}
+[data-theme="household"] .members .others{grid-template-columns:repeat(auto-fit,minmax(min(100%,300px),1fr))}
+[data-theme="household"] .members .others .item{background:var(--surface);border:1px solid var(--line)}
+[data-theme="household"] .members .others .item.unknown{border-style:dashed;border-color:var(--dashed)}
+[data-theme="household"] .members .avatar{width:40px;height:40px;border-radius:12px}
+[data-theme="household"] .members .others .avatar{background:var(--chip-bg);color:var(--ink-2)}
+[data-theme="household"] .members .others .avatar.unknown{background:none;color:var(--muted)}
+[data-theme="household"] .list.schedules{background:none;border:0;box-shadow:none;display:grid;gap:12px;overflow:visible}
+[data-theme="household"] .list.schedules .item{background:var(--surface);border:1px solid var(--line);border-radius:20px;padding:16px 20px;box-shadow:var(--shadow-card)}
+[data-theme="household"] .bigcode{font-size:26px;background:var(--accent-soft);border-radius:14px}
+[data-theme="household"] .fld{font-size:14px;font-weight:600}
+[data-theme="household"] .modal .card{padding:28px}
+[data-theme="household"] .shell.no-house{grid-template-columns:minmax(0,1fr);grid-template-areas:"top" "tabs" "content"}
+@media (max-width:860px){
+  [data-theme="household"] .shell{grid-template-columns:minmax(0,1fr);grid-template-areas:"top" "tabs" "house" "content"}
+  [data-theme="household"] .house{grid-template-columns:repeat(auto-fit,minmax(min(100%,260px),1fr));padding-top:16px}
+  [data-theme="household"] .house-note:not(.small){display:none}
+  [data-theme="household"] .content{padding-top:16px}
+}
+
+/* ===== Control room: always dark, dense rows, the day's figures across the top ===== */
+[data-theme="control"] .shell{display:grid;grid-template-columns:minmax(0,1fr) auto;grid-template-areas:"top top" "strip house" "tabs tabs" "content content"}
+[data-theme="control"] .shell.no-house .strip{grid-column:1 / -1}
+[data-theme="control"] .shell>.top{min-height:56px;border-bottom:1px solid var(--line-2);padding:6px var(--band-pad)}
+[data-theme="control"] .pill{background:none;border:1px solid var(--ok-line);color:var(--ok-ink)}
+[data-theme="control"] .pill::before{content:"";width:6px;height:6px;border-radius:50%;background:var(--ok)}
+[data-theme="control"] .pill.warn{border-color:var(--accent-line);color:var(--warn)}
+[data-theme="control"] .pill.warn::before{background:var(--warn)}
+[data-theme="control"] .pill.bad{border-color:var(--danger-line);color:var(--danger)}
+[data-theme="control"] .pill.bad::before{background:var(--danger)}
+[data-theme="control"] .strip{display:flex;flex-wrap:wrap;background:var(--surface-2);border-bottom:1px solid var(--line-2);padding-left:var(--band-pad)}
+[data-theme="control"] .fig{flex:1 1 9rem;padding:12px 16px;border-left:1px solid var(--line-2)}
+[data-theme="control"] .fig:first-child{border-left:0;padding-left:0}
+[data-theme="control"] .fig-label{font-family:var(--font-mono);font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted)}
+[data-theme="control"] .fig-num{font-family:var(--font-mono);font-size:20px;font-weight:500;color:var(--ink);font-variant-numeric:tabular-nums}
+[data-theme="control"] .fig:nth-child(2) .fig-num{color:var(--accent)}
+[data-theme="control"] .house{display:flex;flex-wrap:wrap;gap:8px;align-items:center;justify-content:flex-end;max-width:36rem;
+  background:var(--surface-2);border-bottom:1px solid var(--line-2);padding:10px var(--band-pad) 10px 16px}
+[data-theme="control"] .pause-box .house-title,[data-theme="control"] .pause-box .house-note,
+[data-theme="control"] .kill-box .house-note.small{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap}
+[data-theme="control"] .pause-box .btn{background:none;font-size:13px;white-space:normal;text-align:left}
+[data-theme="control"] .kill-box{display:flex;flex-wrap:wrap;align-items:center;gap:4px 12px;padding:4px 4px 4px 12px;border:1px solid var(--danger-line);
+  border-radius:8px;background:#160F10}
+[data-theme="control"] .kill-box .house-title{font-family:var(--font-mono);font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:var(--danger);margin:0}
+[data-theme="control"] .kill-box .house-title .ico{display:none}
+[data-theme="control"] .kill-box .house-note{flex:1 1 12rem;margin:0;font-size:13px;color:var(--body-2)}
+[data-theme="control"] .kill-box .btn{background:none;font-size:13px;border-color:var(--danger-line)}
+[data-theme="control"] .kill-box .btn:hover{border-color:var(--danger-hover);background:#2A1715}
+[data-theme="control"] .tabs{flex-wrap:wrap;border-bottom:1px solid var(--line-2);padding:0 var(--band-pad)}
+[data-theme="control"] .tab{min-height:48px;padding:0 14px;color:var(--muted);border-bottom:2px solid transparent;border-radius:0}
+[data-theme="control"] .tab:hover{color:var(--ink)}
+[data-theme="control"] .tab[aria-current="page"]{color:var(--ink);border-bottom-color:var(--accent);font-weight:600}
+[data-theme="control"] .tab .ico{display:none}
+[data-theme="control"] .content{padding:20px var(--band-pad) 48px}
+[data-theme="control"] .btn{background:none;font-size:13px}
+[data-theme="control"] .btn:hover{background:var(--row-hover);border-color:var(--dashed)}
+[data-theme="control"] .btn.primary{background:var(--accent);color:var(--on-accent)}
+[data-theme="control"] .btn.primary:hover{background:var(--accent-hover)}
+[data-theme="control"] .btn.danger{background:var(--danger);color:var(--on-danger)}
+[data-theme="control"] .btn.danger-outline{border-color:var(--danger-line)}
+[data-theme="control"] .btn.danger-outline:hover{border-color:var(--danger-hover);background:#2A1715}
+[data-theme="control"] .btn.soft{background:none;border-color:var(--accent-line);color:var(--accent)}
+[data-theme="control"] .btn.link{color:#FFD27A}
+[data-theme="control"] .btn.link.danger-text{color:var(--danger)}
+[data-theme="control"] .btn.link,[data-theme="control"] .btn.link:hover{background:none}
+[data-theme="control"] .btn.back{color:var(--muted)}
+[data-theme="control"] .switch span{background:#232A33;border:1px solid var(--field-line)}
+[data-theme="control"] .switch span::after{top:3px;left:3px}
+[data-theme="control"] .switch input:checked+span{border-color:var(--accent)}
+[data-theme="control"] .switch input:checked+span::after{left:23px}
+[data-theme="control"] .mono,[data-theme="control"] .addr{font-family:var(--font-mono);font-size:13px}
+[data-theme="control"] .addr{color:var(--body-2)}
+[data-theme="control"] .pagehead{align-items:baseline}
+[data-theme="control"] .pagehead .meta:not(.sugg){font-family:var(--font-mono)}
+[data-theme="control"] .chip{border-radius:4px;font-size:13px}
+[data-theme="control"] .tag{border-radius:4px;color:var(--danger-soft-ink);font-size:13px}
+[data-theme="control"] .tag-from{color:var(--muted)}
+[data-theme="control"] .svc{border-radius:6px}
+[data-theme="control"] .cat{font-family:var(--font-mono);font-size:11px;letter-spacing:.08em}
+[data-theme="control"] .home-stats{display:none}
+[data-theme="control"] .rules{display:flex;flex-wrap:wrap;gap:16px;background:none;border:0;padding:0;box-shadow:none;overflow:visible}
+[data-theme="control"] .rules .part{flex:1 1 17rem;min-width:0;background:var(--surface);border:1px solid var(--line);border-radius:10px;padding:16px}
+[data-theme="control"] .rules .part.svcs{flex:1.4 1 20rem}
+[data-theme="control"] .rules .part.svcs.open{flex-basis:100%}
+[data-theme="control"] .rules .part.foot{flex-basis:100%;background:none;border:0;padding:0;font-size:13px}
+[data-theme="control"] .sched{background:var(--surface-3);border:1px solid var(--line-2)}
+[data-theme="control"] .sched .avatar,[data-theme="control"] .list.schedules .avatar.moon{display:none}
+[data-theme="control"] .thead{display:grid;grid-template-columns:minmax(0,2fr) minmax(0,1.6fr) 16px;gap:16px;padding:8px 16px;background:var(--surface-2);
+  font-size:12px;font-weight:500;color:var(--muted);border:1px solid var(--line);border-bottom-color:var(--line-2);border-radius:10px 10px 0 0}
+[data-theme="control"] .tiles{background:var(--surface);border:1px solid var(--line);border-radius:10px;overflow:hidden;margin:0 0 16px}
+[data-theme="control"] .thead + .tiles{border-top:0;border-radius:0 0 10px 10px}
+[data-theme="control"] .tile{display:grid;grid-template-columns:minmax(0,2fr) minmax(0,1.6fr) 16px;gap:2px 16px;align-items:center;min-height:52px;
+  padding:8px 16px;border:0;border-top:1px solid var(--line-2);background:none}
+[data-theme="control"] .tile:first-child{border-top:0}
+[data-theme="control"] .tile:hover{background:var(--row-hover)}
+[data-theme="control"] .tile .avatar{display:none}
+[data-theme="control"] .tile-main{grid-column:1;grid-row:1}
+[data-theme="control"] .tile-figs{grid-column:2;grid-row:1 / span 2}
+[data-theme="control"] .tile-figs b{color:var(--accent);font-weight:500}
+[data-theme="control"] .tile-badges{grid-column:1;grid-row:2}
+[data-theme="control"] .tile .go{grid-column:3;grid-row:1 / span 2}
+[data-theme="control"] .list .item{min-height:52px}
+[data-theme="control"] .card.list .item:hover,[data-theme="control"] .rows .item:hover{background:var(--row-hover)}
+[data-theme="control"] .rows,[data-theme="control"] .members .list{border:1px solid var(--line);border-radius:10px;overflow:hidden;margin:0 0 12px}
+[data-theme="control"] .members h3{font-family:var(--font-mono);font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);
+  background:var(--surface-2);border:1px solid var(--line-2);border-radius:6px;padding:8px 12px}
+[data-theme="control"] .members .avatar{display:none}
+[data-theme="control"] .members .suggested-name{border-bottom:1px dashed #6B5520}
+[data-theme="control"] .bigcode{font-size:32px;font-weight:500;color:var(--accent);background:none;padding:0}
+[data-theme="control"] .fld{font-size:13px;font-weight:500}
+[data-theme="control"] .theme-opt{background:none}
+@media (max-width:1180px){
+  [data-theme="control"] .shell{grid-template-columns:minmax(0,1fr);grid-template-areas:"top" "strip" "house" "tabs" "content"}
+  [data-theme="control"] .shell.no-house .strip{grid-column:auto}
+  [data-theme="control"] .strip{padding:0 16px}
+  [data-theme="control"] .fig{flex:1 1 30%;padding:10px 8px}
+  [data-theme="control"] .house{max-width:none;justify-content:flex-start;padding:10px 16px}
+  [data-theme="control"] .kill-box{width:100%}
+}
+@media (max-width:640px){
+  [data-theme="control"] .thead{display:none}
+  [data-theme="control"] .thead + .tiles{border-top:1px solid var(--line);border-radius:10px}
+  [data-theme="control"] .tile{grid-template-columns:minmax(0,1fr) 16px}
+  [data-theme="control"] .tile-main{grid-column:1;grid-row:1}
+  [data-theme="control"] .tile-badges{grid-column:1;grid-row:2}
+  [data-theme="control"] .tile-figs{grid-column:1;grid-row:3}
+  [data-theme="control"] .tile .go{grid-column:2;grid-row:1 / span 3}
+}
+
+/* Phones: 16px text in boxes stops iPhones zooming in; long button labels may wrap. */
+@media (max-width:760px){
+  input[type=search],input[type=text],input[type=time],select{font-size:16px}
+}
+@media (max-width:480px){
+  .btn{white-space:normal;text-align:center;padding-top:6px;padding-bottom:6px}
+  .home-stats{gap:8px}
+  .stat{padding:10px}
+  .stat b{font-size:20px}
+  .item .info{flex-basis:100%}
+}
+
 /* Safari before 14.1 ignores 'gap' on flex rows. The script adds 'nogap' to the page when the
    browser cannot do it, and these margins space the rows out instead. */
-.nogap header>*,.nogap .logo>*,.nogap nav>*,.nogap .banner.warn>*,.nogap .row>*,.nogap .controls>*,
-.nogap .item .top>*,.nogap label.check>*,.nogap .banner.flex>*,.nogap .daychips>*{margin-right:10px}
-.nogap header>:last-child,.nogap .logo>:last-child,.nogap nav>:last-child,.nogap .banner.warn>:last-child,
-.nogap .row>:last-child,.nogap .controls>:last-child,.nogap .item .top>:last-child,.nogap label.check>:last-child,
-.nogap .banner.flex>:last-child,.nogap .daychips>:last-child{margin-right:0}
-.nogap .row>*,.nogap .controls>*,.nogap .daychips>*,.nogap .banner.warn>*,.nogap .banner.flex>*{margin-top:3px;margin-bottom:3px}
-@media (max-width:560px){.stats{grid-template-columns:1fr}.item .top{flex-wrap:wrap}.item .info{flex-basis:100%}}
+.nogap .top>*,.nogap .logo>*,.nogap .tabs>*,.nogap .notice.flex>*,.nogap .row>*,.nogap .controls>*,.nogap .pagehead>*,
+.nogap .item .top>*,.nogap .item-actions>*,.nogap label.check>*,.nogap .daychips>*,.nogap .chips>*,.nogap .theme-opt>*,.nogap .sched>*{margin-right:10px}
+.nogap .top>:last-child,.nogap .logo>:last-child,.nogap .tabs>:last-child,.nogap .notice.flex>:last-child,.nogap .row>:last-child,
+.nogap .controls>:last-child,.nogap .pagehead>:last-child,.nogap .item .top>:last-child,.nogap .item-actions>:last-child,
+.nogap label.check>:last-child,.nogap .daychips>:last-child,.nogap .chips>:last-child,.nogap .theme-opt>:last-child,.nogap .sched>:last-child{margin-right:0}
+.nogap .row>*,.nogap .controls>*,.nogap .daychips>*,.nogap .notice.flex>*,.nogap .chips>*,.nogap .item-actions>*{margin-top:3px;margin-bottom:3px}
+.nogap .btn>.ico,.nogap .tab>.ico{margin-right:8px}
 </style>
 </head>
 <body>
-<div class="wrap">
-  <header>
-    <div class="logo">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="color:var(--brand)"><path d="M12 3l8 3v6c0 4.5-3.2 8-8 9-4.8-1-8-4.5-8-9V6l8-3z"/><path d="M9 12l2 2 4-4"/></svg>
-      QuietNet
-    </div>
+<div class="shell">
+  <header class="top">
+    <div class="logo"><svg class="ico logo-mark" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3l8 3v6c0 4.5-3.2 8-8 9-4.8-1-8-4.5-8-9V6l8-3z"/><path d="M9 12l2 2 4-4"/></svg>QuietNet</div>
     <span id="pill" class="pill">Starting…</span>
     <span class="spacer"></span>
-    <button class="btn killbtn" id="killBtn" data-act="kill">Kill switch</button>
-    <button class="btn" id="pauseBtn" data-act="pause">Pause advert blocking for 10 minutes</button>
+    <button class="btn ghost appearance-link" data-act="appearance"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 6h10M18 6h2M4 12h4M12 12h8M4 18h12M20 18h0"/><circle cx="16" cy="6" r="2"/><circle cx="10" cy="12" r="2"/><circle cx="18" cy="18" r="2"/></svg>Appearance</button>
   </header>
-  <nav>
-    <button data-act="tab" data-tab="home">Devices</button>
-    <button data-act="tab" data-tab="groups">Groups</button>
-    <button data-act="tab" data-tab="schedules">Schedules</button>
-    <button data-act="tab" data-tab="rules">Blocked list</button>
-    <button data-act="tab" data-tab="setup">Set up a device</button>
+  <nav class="tabs" aria-label="Sections">
+    <button class="tab" data-act="tab" data-tab="home"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8M12 16v4"/></svg>Devices</button>
+    <button class="tab" data-act="tab" data-tab="groups"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="9" cy="8" r="3.5"/><path d="M2.5 20c.6-3.5 3.2-5.5 6.5-5.5s5.9 2 6.5 5.5"/><path d="M16 4.5a3.5 3.5 0 0 1 0 7M18 14.8c2 .7 3.2 2.5 3.5 5.2"/></svg>Groups</button>
+    <button class="tab" data-act="tab" data-tab="schedules"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>Schedules</button>
+    <button class="tab" data-act="tab" data-tab="rules"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M5.6 5.6l12.8 12.8"/></svg>Blocked list</button>
+    <button class="tab" data-act="tab" data-tab="setup"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>Set up a device</button>
   </nav>
-  <div id="banners"></div>
-  <main id="view"></main>
+  <section class="strip" id="strip" aria-label="The last 24 hours"></section>
+  <section class="house" aria-label="Whole house">
+    <div class="pause-box" id="pauseBox">
+      <h2 class="house-title">Advert blocking</h2>
+      <p class="house-note">Something stopped working? Pause it for a moment and see if that fixes it.</p>
+      <button class="btn" id="pauseBtn" data-act="pause"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 5v14M15 5v14"/></svg>Pause advert blocking for 10 minutes</button>
+    </div>
+    <div class="kill-box" id="killBox">
+      <h2 class="house-title"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 2v10"/><path d="M18.4 6.6a9 9 0 1 1-12.8 0"/></svg>Kill switch</h2>
+      <p class="house-note" id="killNote">Stops the internet for every device that uses QuietNet, until you turn it back on.</p>
+      <button class="btn danger-outline" id="killBtn" data-act="kill" aria-haspopup="dialog" aria-describedby="killNote">Stop all internet&hellip;</button>
+      <p class="house-note small">You will be asked to confirm.</p>
+    </div>
+  </section>
+  <div class="content"><div id="banners"></div><main id="view"></main></div>
 </div>
 <div id="modal" class="modal" hidden></div>
 
@@ -143,6 +657,8 @@ input[type=time]{border:1px solid var(--line);background:var(--card);border-radi
    - Buttons carry data-act="name"; one click listener at the bottom looks the name up in `actions`.
      To add a button: give it data-act (plus any data-... values it needs) and add a function to `actions`.
    - Switches, selects and text boxes are handled by the "change" and "input" listeners at the bottom.
+   - The markup uses shared class names only, never colours or inline styles: each of the three looks
+     (themes) in the style sheet lays the same markup out its own way.
 
    THE ONE RULE THAT MUST NOT BE BROKEN
    Every value that came from the server or from a person goes through esc() (or num() for numbers)
@@ -155,13 +671,39 @@ input[type=time]{border:1px solid var(--line);background:var(--card);border-radi
    The relay inserts a script after the opening head tag, setting window.QN_API_BASE, and a bar after
    the opening body tag. It finds them by plain text search, so keep exactly one of each, written
    in lower case with no attributes (and do not spell them out in comments like this one). Keep the X-QuietNet header in api(): the relay
-   refuses calls without it. tests/test_packaging.py checks these. */
+   refuses calls without it. tests/test_packaging.py checks these.
+   The look (theme) comes from the qn_theme cookie, read by the small script before the style sheet; see setTheme(). */
 const S = {tab:'home', device:null, hours:24, filter:'all', search:'', sort:'n', open:new Set(),
            status:null, devices:[], activity:[], activityKey:'', activityMark:'', rules:null,
            services:[], groups:[], ctl:{}, group:null, svcOpen:false, schedules:[], edit:null, cloud:null};
 const $ = id => document.getElementById(id);
 const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const num = n => Number(n || 0).toLocaleString();
+
+// The three looks. The choice is a display preference kept in a cookie for a year; it is checked
+// against this list wherever it is read, and anything else means calm. It never reaches the server's API.
+const THEMES = ['calm', 'household', 'control'];
+const THEME_CHOICES = [
+  ['calm', 'Calm', 'Plain and quiet, with the sections down the side. Follows your device\'s light or dark setting.'],
+  ['household', 'Household', 'Warmer and roomier, with devices and groups shown as large cards. Follows light or dark.'],
+  ['control', 'Control room', 'Dark and compact, with the day\'s figures across the top. Always dark.']];
+function currentTheme(){ const t = document.documentElement.getAttribute('data-theme'); return THEMES.indexOf(t) >= 0 ? t : 'calm'; }
+function setTheme(t){
+  if(THEMES.indexOf(t) < 0) t = 'calm';
+  document.documentElement.setAttribute('data-theme', t);
+  document.cookie = 'qn_theme=' + t + '; Path=/; Max-Age=31536000; SameSite=Lax' + (location.protocol === 'https:' ? '; Secure' : '');
+}
+
+// Small line icons. They are decoration beside words, so screen readers skip them.
+const svg = (paths, cls) => `<svg class="ico${cls ? ' ' + cls : ''}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${paths}</svg>`;
+const ICON = {
+  back: svg('<path d="M15 6l-6 6 6 6"/>'),
+  go: svg('<path d="M9 6l6 6-6 6"/>', 'go'),
+  device: svg('<rect x="7" y="2.5" width="10" height="19" rx="2"/><path d="M11 18h2"/>'),
+  slash: svg('<circle cx="12" cy="12" r="9"/><path d="M5.6 5.6l12.8 12.8"/>'),
+  x: svg('<path d="M6 6l12 12M18 6L6 18"/>'),
+  moon: svg('<path d="M20 14.5A8 8 0 1 1 9.5 4a6.5 6.5 0 0 0 10.5 10.5z"/>'),
+};
 
 // Empty when opened directly on the Pi; set to "/pi/<id>" by the cloud relay so the
 // very same dashboard drives a remote Pi. The relay also needs a header it can check.
@@ -189,6 +731,16 @@ function deviceName(d){
 }
 // Is the name shown for this device one the network suggested, rather than one someone gave it?
 function suggested(d){ return !d.name && !d.this_computer && !!d.hint; }
+// A device nobody has named and the network gave no name for: it is shown with a device outline.
+function unknownDevice(d){ return !d.name && !d.this_computer && !d.hint; }
+// Up to two capital letters for a round "avatar": the first letter of each of the first two words.
+function initials(name){
+  return String(name || '').trim().split(/\s+/).filter(Boolean).slice(0, 2).map(w => Array.from(w)[0]).join('').toUpperCase();
+}
+function avatar(d, extra){
+  return unknownDevice(d) ? `<span class="avatar unknown${extra || ''}" aria-hidden="true">${ICON.device}</span>`
+    : `<span class="avatar${extra || ''}" aria-hidden="true">${esc(initials(deviceName(d)))}</span>`;
+}
 // The muted lines under a device's name when nobody has named it yet: where the suggested name came
 // from and what the device said it is (or a note about it). On the device page (`inCard` false)
 // there is also a "Use this name" button. On the device list each card is already a button, and a
@@ -197,9 +749,9 @@ function suggested(d){ return !d.name && !d.this_computer && !!d.hint; }
 function suggestionLines(d, inCard){
   if(d.name || d.this_computer) return '';
   const via = d.hint_source === 'router' ? 'the router' : d.hint_source;
-  const use = inCard ? '' : ` <button class="btn link" data-act="usehint" data-ip="${esc(d.ip)}">Use this name</button>`;
-  return (suggested(d) ? `<div class="muted small">Suggested name${via ? ', found through ' + esc(via) : ''}${use}</div>` : '')
-    + (d.hint_detail ? `<div class="muted small">${esc(d.hint_detail)}</div>` : '');
+  const use = inCard ? '' : ` <button class="btn soft" data-act="usehint" data-ip="${esc(d.ip)}">Use this name</button>`;
+  return (suggested(d) ? `<span class="meta sugg">Suggested name${via ? ', found through ' + esc(via) : ''}${use}</span>` : '')
+    + (d.hint_detail ? `<span class="meta sugg">${esc(d.hint_detail)}</span>` : '');
 }
 
 /* ---------- pop-up questions ---------- */
@@ -208,7 +760,7 @@ function ask({title, text, input, ok='OK', danger=false, cancel='Cancel'}){
     const m = $('modal');
     m.innerHTML = `<div class="card" role="dialog" aria-modal="true" aria-label="${esc(title)}">
       <h2>${esc(title)}</h2><p class="muted">${esc(text || '')}</p>
-      ${input !== undefined ? `<input type="text" id="mInput" maxlength="40" value="${esc(input)}">` : ''}
+      ${input !== undefined ? `<input type="text" id="mInput" maxlength="40" value="${esc(input)}" aria-label="${esc(title)}">` : ''}
       <div class="row">${cancel ? `<button class="btn" id="mNo">${esc(cancel)}</button>` : ''}
       <button class="btn ${danger ? 'danger' : 'primary'}" id="mYes">${esc(ok)}</button></div></div>`;
     m.hidden = false;
@@ -224,31 +776,45 @@ const oops = e => ask({title:'That didn\'t work', text:e.message, cancel:''});
 /* ---------- top of page ---------- */
 function renderChrome(){
   const st = S.status;
-  document.querySelectorAll('nav button').forEach(b => b.classList.toggle('on', b.dataset.tab === S.tab));
+  document.querySelectorAll('.tabs .tab').forEach(b => {
+    const on = b.dataset.tab === S.tab;
+    b.classList.toggle('on', on);
+    if(on) b.setAttribute('aria-current', 'page'); else b.removeAttribute('aria-current');
+  });
   if(!st) return;
-  const pill = $('pill'), pb = $('pauseBtn');
+  const pill = $('pill');
   let banners = '';
   if(!st.dns_ok){
     pill.textContent = 'Not working'; pill.className = 'pill bad';
-    banners += `<div class="banner"><b>QuietNet couldn't start its filter.</b> Another program on this computer is
+    banners += `<div class="notice danger"><b>QuietNet couldn't start its filter.</b> Another program on this computer is
       probably already using the same connection (port ${esc(st.dns_port)}). Close QuietNet, restart the computer and
       try again. <span class="small">Technical detail: ${esc(st.dns_error)}</span></div>`;
   } else if(st.kill){
     pill.textContent = 'Internet stopped'; pill.className = 'pill bad';
-    banners += `<div class="banner flex"><span><b>The kill switch is ON.</b> The internet is stopped for every device
+    banners += `<div class="notice danger flex"><span><b>The kill switch is ON.</b> The internet is stopped for every device
       that uses QuietNet, until you turn it back on.</span>
       <button class="btn" data-act="unkill">Turn the internet back on</button></div>`;
   } else if(st.paused_for > 0){
     pill.textContent = 'Paused'; pill.className = 'pill warn';
-    banners += `<div class="banner warn"><span><b>Advert blocking is paused</b> for another
-      ${Math.ceil(st.paused_for/60)} min. Blocked services and switched-off devices stay blocked.</span>
+    banners += `<div class="notice warn flex"><span><b>Advert blocking is paused</b> for another
+      ${num(Math.ceil(st.paused_for/60))} min. Blocked services and switched-off devices stay blocked.</span>
       <button class="btn" data-act="resume">Turn advert blocking back on now</button></div>`;
   } else {
     pill.textContent = 'Protecting your home'; pill.className = 'pill';
   }
-  pb.hidden = st.paused_for > 0 || !st.dns_ok || st.kill;
-  $('killBtn').hidden = st.kill || !st.dns_ok;
+  const noPause = st.paused_for > 0 || !st.dns_ok || !!st.kill, noKill = !!st.kill || !st.dns_ok;
+  $('pauseBox').hidden = noPause;
+  $('killBox').hidden = noKill;
+  document.querySelector('.house').hidden = noPause && noKill;
+  document.querySelector('.shell').classList.toggle('no-house', noPause && noKill);
   if($('banners').innerHTML !== banners) $('banners').innerHTML = banners;
+  // The day's figures (shown across the top by the control room look; the others show them on the Devices page).
+  const t = st.today || {}, pct = t.total ? Math.round(100 * t.blocked / t.total) : 0;
+  const strip = `<div class="fig"><span class="fig-label">Requests, last 24 hours</span><span class="fig-num">${num(t.total)}</span></div>
+    <div class="fig"><span class="fig-label">Blocked, last 24 hours</span><span class="fig-num">${num(t.blocked)}</span></div>
+    <div class="fig"><span class="fig-label">Junk share</span><span class="fig-num">${num(pct)}%</span></div>`;
+  const el = $('strip');
+  if(el.dataset.h !== strip){ el.innerHTML = strip; el.dataset.h = strip; }
 }
 
 /* ---------- internet switch + service blocking, for a device, a group or the whole house ---------- */
@@ -264,56 +830,74 @@ function controls(scope, what){
       return `<button class="svc ${x.on ? 'on' : ''}" data-act="svc" data-scope="${esc(scope)}" data-s="${esc(v.id)}"
         data-on="${x.on ? '' : '1'}" aria-pressed="${!!x.on}">${esc(v.name)}<small>${x.on ? 'Blocked — tap to allow' : 'Allowed'}</small></button>`;
     }).join('') + '</div>').join('');
+  // A service blocked here can be allowed again from its tag; one blocked for a group or the whole
+  // house is shown, with where it is blocked, but is changed there.
+  const tag = v => {
+    const x = c.services[v.id];
+    return x.on ? `<li class="tag">${ICON.slash}<span>${esc(v.name)}</span><button class="tag-x" data-act="svc" data-scope="${esc(scope)}"
+        data-s="${esc(v.id)}" data-on="" aria-label="Allow ${esc(v.name)}">${ICON.x}</button></li>`
+      : `<li class="tag static">${ICON.slash}<span>${esc(v.name)} <span class="tag-from">blocked ${esc(x.from)}</span></span></li>`;
+  };
   const isOff = c.off || c.off_from;
-  const net = scope === 'all' ? '' : `<div class="row" style="margin-bottom:16px">
-    <label class="switch"><input type="checkbox" id="netSwitch" data-scope="${esc(scope)}" ${c.off ? '' : 'checked'} aria-label="Internet for ${what}"><span></span></label>
-    <div style="flex:1;min-width:200px"><h2>Internet for ${what} is ${isOff ? 'OFF' : 'on'}</h2>
-    <div class="muted small">${c.off_from && !c.off ? 'Switched off ' + esc(c.off_from) + '.' : (c.off ? 'Switch back on to let ' + what + ' use the internet again.' : 'Switch this off to stop ' + what + ' reaching anything at all.')}</div></div></div>`;
-  return `<div class="card">${net}
-    <div class="row"><div style="flex:1;min-width:200px"><h2>Block apps and services for ${what}</h2>
-      <div class="muted small">${blocked.length ? 'Blocked: ' + blocked.map(v => esc(v.name)).join(', ') : 'Nothing blocked.'}</div></div>
-      <button class="btn" data-act="svctoggle">${S.svcOpen ? 'Done' : 'Choose services'}</button></div>${grid}
-    <p class="small" style="margin:12px 0 0">Want this to happen automatically, like at bedtime?
-      <button class="btn link" data-act="schednew" data-scope="${esc(scope)}">Set a schedule</button></p></div>`;
+  const net = scope === 'all' ? '' : `<div class="part net">
+    <div class="grow"><h2>Internet for ${what} is ${isOff ? 'OFF' : 'on'}</h2>
+    <p class="meta">${c.off_from && !c.off ? 'Switched off ' + esc(c.off_from) + '.' : (c.off ? 'Switch back on to let ' + what + ' use the internet again.' : 'Switch this off to stop ' + what + ' reaching anything at all.')}</p></div>
+    <label class="switch"><input type="checkbox" id="netSwitch" data-scope="${esc(scope)}" ${c.off ? '' : 'checked'} aria-label="Internet for ${what}"><span></span></label></div>`;
+  const scheds = S.schedules.filter(x => x.scope === scope).map(x => `<div class="sched">
+    <span class="avatar sm moon" aria-hidden="true">${ICON.moon}</span>
+    <div class="grow"><b>${esc(x.name)}</b>${x.active ? '<span class="badge danger">On right now</span>' : ''}${x.enabled ? '' : '<span class="badge">Not in use</span>'}
+      <div class="meta">${esc(daysText(x.days))}, <span class="mono">${esc(x.start)}</span> to <span class="mono">${esc(x.end)}</span>${x.start > x.end ? ' next morning' : ''} · ${esc(whatText(x))}</div></div>
+    <button class="btn" data-act="schededit" data-id="${esc(x.id)}">Change</button></div>`).join('');
+  return `<section class="card rules" aria-label="Rules for ${what}">${net}
+    <div class="part svcs${S.svcOpen ? ' open' : ''}">
+      <div class="row"><div class="grow"><h2>Block apps and services for ${what}</h2>
+        <p class="meta">${blocked.length ? 'Blocked:' : 'Nothing blocked.'}</p></div>
+        <button class="btn" data-act="svctoggle">${S.svcOpen ? 'Done' : 'Choose services'}</button></div>
+      ${blocked.length ? `<ul class="chips">${blocked.map(tag).join('')}</ul>` : ''}${grid}</div>
+    <div class="part sched-part"><h2>Schedules</h2>${scheds}
+      <p class="meta">Want this to happen automatically, like at bedtime?
+        <button class="btn link" data-act="schednew" data-scope="${esc(scope)}">Set a schedule</button></p></div>
+    <p class="part foot meta">Blocks, schedules and the kill switch take a couple of minutes to bite.</p></section>`;
 }
 
 /* ---------- Devices (home) ---------- */
 function viewHome(){
   const st = S.status || {today:{}};
-  const pct = st.today.total ? Math.round(100 * st.today.blocked / st.today.total) : 0;
-  const cards = S.devices.map(d => `
-    <button class="card device" data-act="open" data-ip="${esc(d.ip)}">
-      <div class="name">${esc(deviceName(d))}</div>
-      <div class="muted small">${esc(d.ip)}${d.hint && d.name ? ' · ' + esc(d.hint) : ''}${d.mac ? ' · ' + esc(d.mac) : ''}</div>
-      ${suggestionLines(d, true)}
-      <div class="small" style="margin-top:8px">${d.last
-        ? `${num(d.n)} requests today · <b>${num(d.nb)} blocked</b> · active ${ago(d.last)}`
-        : '<span class="muted">Not using QuietNet yet</span>'}</div>
-      ${d.off ? '<span class="badge junk" style="margin:6px 0 0">Internet off</span>' : ''}
-      ${d.enforced ? '<span class="badge blocked" style="margin:6px 0 0">Live-enforced</span>' : ''}
-      ${d.group ? `<span class="badge" style="margin:6px 0 0">${esc(groupName(d.group))}</span>` : ''}
+  const today = st.today || {};
+  const pct = today.total ? Math.round(100 * today.blocked / today.total) : 0;
+  const tiles = S.devices.map(d => `
+    <button class="tile" data-act="open" data-ip="${esc(d.ip)}">
+      ${avatar(d)}
+      <span class="tile-main"><span class="name">${esc(deviceName(d))}</span>
+        <span class="meta addr">${esc(d.ip)}${d.hint && d.name ? ' · ' + esc(d.hint) : ''}${d.mac ? ' · ' + esc(d.mac) : ''}</span>
+        ${suggestionLines(d, true)}</span>
+      <span class="tile-figs">${d.last
+        ? `${num(d.n)} requests today · <b>${num(d.nb)} blocked</b> · active ${esc(ago(d.last))}`
+        : '<span class="muted">Not using QuietNet yet</span>'}</span>
+      <span class="tile-badges">${d.off ? '<span class="badge danger">Internet off</span>' : ''}${d.enforced ? '<span class="badge accent">Live-enforced</span>' : ''}${d.group ? `<span class="badge">${esc(groupName(d.group))}</span>` : ''}</span>
+      ${ICON.go}
     </button>`).join('');
   const scanning = st.scan && st.scan.state === 'scanning';
   return `
   <div class="card">
     <div class="row">
+      <div class="grow"><h2>Block known adverts and trackers automatically</h2>
+      <p class="meta">QuietNet knows about ${num(st.junk_count)} junk addresses.
+        ${st.community && !st.community.installed ? '<button class="btn link" data-act="tab" data-tab="rules">Get the full list</button>' : ''}</p></div>
       <label class="switch"><input type="checkbox" id="junkSwitch" ${st.junk_on ? 'checked' : ''} aria-label="Block known adverts and trackers automatically"><span></span></label>
-      <div style="flex:1;min-width:200px"><h2>Block known adverts and trackers automatically</h2>
-      <div class="muted small">QuietNet knows about ${num(st.junk_count)} junk addresses.
-        ${st.community && !st.community.installed ? '<button class="btn link" data-act="tab" data-tab="rules">Get the full list</button>' : ''}</div></div>
     </div>
-    <div class="stats">
-      <div class="stat"><b>${num(st.today.total)}</b><span class="muted small">requests in the last 24 hours</span></div>
-      <div class="stat"><b>${num(st.today.blocked)}</b><span class="muted small">blocked</span></div>
-      <div class="stat"><b>${pct}%</b><span class="muted small">of traffic was junk</span></div>
+    <div class="home-stats">
+      <div class="stat"><b>${num(today.total)}</b><span>requests in the last 24 hours</span></div>
+      <div class="stat"><b>${num(today.blocked)}</b><span>blocked</span></div>
+      <div class="stat"><b>${num(pct)}%</b><span>of traffic was junk</span></div>
     </div>
   </div>
-  <div class="row"><div style="flex:1;min-width:200px"><h2>Your devices</h2>
-    <p class="muted">Pick a device to see what it has been talking to, or to block things for it.</p></div>
+  <div class="row section-head"><div class="grow"><h2>Your devices</h2>
+    <p class="meta">Pick a device to see what it has been talking to, or to block things for it.</p></div>
     <button class="btn" data-act="scan" ${scanning ? 'disabled' : ''}>${scanning ? 'Looking… (about 10 seconds)' : 'Find devices on my network'}</button></div>
-  ${st.scan && st.scan.capped ? `<p class="muted small" style="margin:0 0 12px">Your network is large, so only the ${num(st.scan.addresses)} addresses nearest this computer ${scanning ? 'are being' : 'were'} checked.
+  ${st.scan && st.scan.capped ? `<p class="meta">Your network is large, so only the ${num(st.scan.addresses)} addresses nearest this computer ${scanning ? 'are being' : 'were'} checked.
     Devices further away appear here once they use QuietNet.</p>` : ''}
-  ${cards ? `<div class="devices">${cards}</div>` : `<div class="card empty">
+  ${tiles ? `<div class="thead" aria-hidden="true"><span>Device</span><span>Today</span><span></span></div><div class="tiles">${tiles}</div>` : `<div class="card empty">
     <p><b>No devices yet.</b></p><p>QuietNet can only see devices that have been pointed at it.</p>
     <button class="btn primary" data-act="tab" data-tab="setup">Show me how to set up a device</button></div>`}`;
 }
@@ -323,25 +907,24 @@ function enforceCard(d){
   const e = (S.status || {}).enforcer || {};
   if(!d.last) return '';                       // device isn't using QuietNet yet, nothing to enforce
   if(!e.available) return `<div class="card"><h2>Cut live connections</h2>
-    <p class="muted small">${esc(e.reason || "Not available on this computer.")}</p></div>`;
+    <p class="meta">${esc(e.reason || "Not available on this computer.")}</p></div>`;
   return `<div class="card"><div class="row">
-    <label class="switch"><input type="checkbox" id="enforceSwitch" ${d.enforced ? 'checked' : ''} aria-label="Cut live connections for this device"><span></span></label>
-    <div style="flex:1;min-width:200px"><h2>Cut live connections${d.enforced ? '<span class="badge junk">On</span>' : ''}</h2>
-    <div class="muted small">Normally a block only stops new connections. Turn this on and blocks, bedtimes and the kill switch
+    <div class="grow"><h2>Cut live connections${d.enforced ? '<span class="badge danger">On</span>' : ''}</h2>
+    <p class="meta">Normally a block only stops new connections. Turn this on and blocks, bedtimes and the kill switch
       also stop things that are <b>already running</b> on this device (like a Disney+ video mid-stream). QuietNet steers this
       device through itself and drops only what's blocked for it. Takes a few seconds to bite.
-      It works on IPv4 only, so a connection this device already has over IPv6 is not cut.</div>
-    ${d.enforced && (e.problem || (e.problems || {})[d.ip]) ? `<p class="small" style="margin:10px 0 0;color:#b42318"><b>Not working yet:</b> ${esc(e.problem || e.problems[d.ip])}</p>` : ''}</div></div></div>`;
+      It works on IPv4 only, so a connection this device already has over IPv6 is not cut.</p>
+    ${d.enforced && (e.problem || (e.problems || {})[d.ip]) ? `<p class="small err-text"><b>Not working yet:</b> ${esc(e.problem || e.problems[d.ip])}</p>` : ''}</div>
+    <label class="switch"><input type="checkbox" id="enforceSwitch" ${d.enforced ? 'checked' : ''} aria-label="Cut live connections for this device"><span></span></label></div></div>`;
 }
 
-/* ---------- One device ---------- */
 function statusBadges(x){
   let out = '';
-  if(x.v === 'junk') out += '<span class="badge junk">Advert / tracker</span>';
-  else if(x.v === 'suspect') out += '<span class="badge suspect">Possibly junk</span>';
-  if(x.b) out += `<span class="badge blocked">${x.why === 'you' ? 'Blocked by you' : x.why === 'service' || x.why === 'schedule' ? 'Blocked · ' + esc(x.svc)
+  if(x.v === 'junk') out += '<span class="badge danger">Advert / tracker</span>';
+  else if(x.v === 'suspect') out += '<span class="badge warn">Possibly junk</span>';
+  if(x.b) out += `<span class="badge accent">${x.why === 'you' ? 'Blocked by you' : x.why === 'service' || x.why === 'schedule' ? 'Blocked · ' + esc(x.svc)
     : x.why === 'off' ? 'Internet off' : x.why === 'kill' ? 'Kill switch' : 'Blocked automatically'}</span>`;
-  else if(x.some_blocked) out += '<span class="badge blocked">Partly blocked</span>';
+  else if(x.some_blocked) out += '<span class="badge accent">Partly blocked</span>';
   else if(x.why === 'allowed') out += '<span class="badge">Allowed by you</span>';
   return out;
 }
@@ -366,32 +949,35 @@ function activityList(){
     const open = S.open.has(g.base), many = g.hosts.length > 1 || g.hosts[0].d !== g.base;
     const hosts = open ? `<div class="hosts">${g.hosts.map(h => `
       <div class="item"><div class="top"><div class="info"><span class="title">${esc(h.d)}</span>${statusBadges(h)}
-        <div class="muted small">${h.n === 1 ? 'once' : num(h.n) + ' times'} · last ${ago(h.last)}</div></div>${blockBtn(h, h.d)}</div></div>`).join('')}</div>` : '';
+        <div class="meta">${h.n === 1 ? 'once' : num(h.n) + ' times'} · last ${esc(ago(h.last))}</div></div>${blockBtn(h, h.d)}</div></div>`).join('')}</div>` : '';
     return `<div class="item"><div class="top">
       <div class="info"><span class="title">${esc(g.owner || g.base)}</span>${statusBadges(g)}
-        <div class="muted small">${g.owner ? esc(g.base) + ' · ' : ''}contacted ${g.n === 1 ? 'once' : num(g.n) + ' times'}${g.nb ? ' (' + num(g.nb) + ' blocked)' : ''} · last ${ago(g.last)}</div>
+        <div class="meta">${g.owner ? esc(g.base) + ' · ' : ''}contacted ${g.n === 1 ? 'once' : num(g.n) + ' times'}${g.nb ? ' (' + num(g.nb) + ' blocked)' : ''} · last ${esc(ago(g.last))}</div>
         ${many ? `<button class="expand" data-act="expand" data-b="${esc(g.base)}" aria-expanded="${open}">${open ? 'Hide' : 'Show'} ${num(g.hosts.length)} address${g.hosts.length > 1 ? 'es' : ''}</button>` : ''}
       </div>${blockBtn(g, g.base)}</div>${hosts}</div>`;
   }).join('');
 }
 function viewDevice(){
   const d = S.devices.find(x => x.ip === S.device) || {ip:S.device, name:''};
-  const chip = (id, label) => `<button class="chip ${S.filter === id ? 'on' : ''}" data-act="filter" data-f="${id}">${label}</button>`;
+  const chip = (id, label) => `<button class="chip ${S.filter === id ? 'on' : ''}" data-act="filter" data-f="${id}" aria-pressed="${S.filter === id}">${label}</button>`;
   return `
-  <button class="btn link" data-act="back">← All devices</button>
-  <div class="row" style="margin:6px 0 2px"><h1>${esc(deviceName(d))}</h1>
-    <button class="btn link" data-act="rename">Rename</button></div>
-  <div class="muted">${esc(d.ip)}${d.hint && !suggested(d) ? ' · ' + esc(d.hint) : ''}${d.mac ? ' · ' + esc(d.mac) : ''}</div>
-  ${suggestionLines(d, false)}
-  <div class="row" style="margin:10px 0 14px"><label for="groupSel">Group:</label>
+  <button class="btn link back" data-act="back">${ICON.back}All devices</button>
+  <div class="pagehead">
+    ${avatar(d, ' lg')}
+    <div class="grow"><h1>${esc(deviceName(d))}</h1>
+      <div class="meta addr">${esc(d.ip)}${d.hint && !suggested(d) ? ' · ' + esc(d.hint) : ''}${d.mac ? ' · ' + esc(d.mac) : ''}</div>
+      ${suggestionLines(d, false)}</div>
+    <div class="actions"><button class="btn" data-act="rename">Rename</button></div>
+  </div>
+  <div class="row group-pick"><label for="groupSel">Group</label>
     <select id="groupSel"><option value="">None</option>${S.groups.map(g =>
       `<option value="${esc(g.id)}" ${d.group === g.id ? 'selected' : ''}>${esc(g.name)}</option>`).join('')}</select>
     ${S.groups.length ? '' : '<button class="btn link" data-act="tab" data-tab="groups">Create a group</button>'}</div>
-  ${d.last ? '' : `<div class="note"><b>This device isn't using QuietNet yet</b>, so nothing can be seen or blocked for it.
+  ${d.last ? '' : `<div class="notice warn"><b>This device isn't using QuietNet yet</b>, so nothing can be seen or blocked for it.
     <button class="btn link" data-act="tab" data-tab="setup">Show me how to set it up</button></div>`}
   ${controls('device:' + S.device, 'this device')}
   ${enforceCard(d)}
-  <h2>What it has been talking to</h2>
+  <h2 class="list-head">What it has been talking to</h2>
   <div class="controls">
     ${chip('all','Everything')}${chip('junk','Adverts &amp; suspicious')}${chip('blocked','Blocked')}
     <span class="spacer"></span>
@@ -400,38 +986,63 @@ function viewDevice(){
     <select id="sort" aria-label="Sort by"><option value="n">Most contacted first</option><option value="last">Most recent first</option></select>
     <input type="search" id="search" placeholder="Search…" aria-label="Search" value="${esc(S.search)}">
   </div>
-  <div class="card" id="list">${activityList()}</div>
-  <p class="small muted">This list updates by itself every few seconds.
+  <div class="card flush list" id="list">${activityList()}</div>
+  <p class="meta">This list updates by itself every few seconds.
     <button class="btn link" data-act="clear">Forget this device's history</button></p>`;
 }
 
 /* ---------- Groups ---------- */
 function viewGroups(){
-  const cards = S.groups.map(g => `
-    <button class="card device" data-act="opengroup" data-id="${esc(g.id)}">
-      <div class="name">${esc(g.name)}</div>
-      <div class="muted small">${num(g.members.length)} device${g.members.length === 1 ? '' : 's'}</div>
-      <div class="small" style="margin-top:8px">${num(g.services)} service${g.services === 1 ? '' : 's'} blocked</div>
-      ${g.off ? '<span class="badge junk" style="margin:6px 0 0">Internet off</span>' : ''}
+  const tiles = S.groups.map(g => `
+    <button class="tile" data-act="opengroup" data-id="${esc(g.id)}">
+      <span class="avatar" aria-hidden="true">${esc(initials(g.name))}</span>
+      <span class="tile-main"><span class="name">${esc(g.name)}</span>
+        <span class="meta">${num(g.members.length)} device${g.members.length === 1 ? '' : 's'}</span></span>
+      <span class="tile-figs">${num(g.services)} service${g.services === 1 ? '' : 's'} blocked</span>
+      <span class="tile-badges">${g.off ? '<span class="badge danger">Internet off</span>' : ''}</span>
+      ${ICON.go}
     </button>`).join('');
-  return `<div class="row"><div style="flex:1;min-width:200px"><h2>Groups</h2>
-    <p class="muted">Put devices together — for example "Kids" or "TVs" — and control them all at once.</p></div>
+  return `<div class="row section-head"><div class="grow"><h2>Groups</h2>
+    <p class="meta">Put devices together — for example "Kids" or "TVs" — and control them all at once.</p></div>
     <button class="btn primary" data-act="newgroup">New group</button></div>
-    ${cards ? `<div class="devices">${cards}</div>` : '<div class="card empty">No groups yet.</div>'}`;
+    ${tiles ? `<div class="thead" aria-hidden="true"><span>Group</span><span>Blocked</span><span></span></div><div class="tiles">${tiles}</div>`
+      : '<div class="card empty">No groups yet.</div>'}`;
 }
 function viewGroup(){
   const g = S.groups.find(x => x.id === S.group);
   if(!g) return viewGroups();
-  const members = S.devices.map(d => `<label class="check">
-    <input type="checkbox" class="member" data-ip="${esc(d.ip)}" ${d.group === g.id ? 'checked' : ''}>
-    <span><b>${esc(deviceName(d))}</b> <span class="muted small">${esc(d.ip)}${d.group && d.group !== g.id ? ' · currently in ' + esc(groupName(d.group)) : ''}</span></span></label>`).join('');
-  return `<button class="btn link" data-act="groupback">← All groups</button>
-    <div class="row" style="margin:6px 0 12px"><h1>${esc(g.name)}</h1>
-      <button class="btn link" data-act="grouprename">Rename</button>
-      <button class="btn link" data-act="groupdelete">Delete group</button></div>
+  // One row per device: those in the group can be taken out; the rest can be added (and named first).
+  const row = (d, inGroup) => {
+    const meta = `<span class="addr">${esc(d.ip)}</span>` + (inGroup
+      ? (d.last ? ' · active ' + esc(ago(d.last)) : '')
+      : (d.hint_detail ? ' · ' + esc(d.hint_detail) : '') + (d.group && d.group !== g.id ? ' · currently in ' + esc(groupName(d.group)) : ''));
+    const buttons = inGroup
+      ? `<button class="btn" data-act="member" data-ip="${esc(d.ip)}" data-in="">Remove from group</button>`
+      : (suggested(d) ? `<button class="btn soft" data-act="usehint" data-ip="${esc(d.ip)}">Use this name</button>` : '')
+        + (unknownDevice(d) ? `<button class="btn" data-act="rename" data-ip="${esc(d.ip)}">Name it</button>` : '')
+        + `<button class="btn" data-act="member" data-ip="${esc(d.ip)}" data-in="1" aria-label="Add ${esc(deviceName(d))} to this group">Add</button>`;
+    return `<li class="item${unknownDevice(d) ? ' unknown' : ''}"><div class="top">${avatar(d)}
+      <div class="info"><span class="title${!inGroup && suggested(d) ? ' suggested-name' : ''}">${esc(deviceName(d))}</span>${!inGroup && suggested(d) ? '<span class="badge accent">Suggested name</span>' : ''}
+        <div class="meta">${meta}</div></div>
+      <div class="item-actions">${buttons}</div></div></li>`;
+  };
+  const inside = S.devices.filter(d => d.group === g.id), others = S.devices.filter(d => d.group !== g.id);
+  return `<button class="btn link back" data-act="groupback">${ICON.back}All groups</button>
+    <div class="pagehead"><span class="avatar lg" aria-hidden="true">${esc(initials(g.name))}</span>
+      <div class="grow"><h1>${esc(g.name)}</h1>
+        <div class="meta">${num(g.members.length)} device${g.members.length === 1 ? '' : 's'} · ${num(g.services)} service${g.services === 1 ? '' : 's'} blocked</div></div>
+      <div class="actions"><button class="btn" data-act="grouprename">Rename</button>
+        <button class="btn danger-outline group-delete" data-act="groupdelete">Delete group</button></div></div>
     ${controls('group:' + g.id, 'this group')}
-    <div class="card"><h2>Devices in this group</h2>
-      ${members || '<div class="empty">No devices found yet. Press "Find devices on my network" on the Devices page.</div>'}</div>`;
+    <section class="card members" aria-labelledby="membersTitle">
+      <h2 id="membersTitle">Devices in this group</h2>
+      <p class="meta">Everything above applies to these devices.</p>
+      <ul class="list">${inside.map(d => row(d, true)).join('') || '<li class="empty">No devices in this group yet.</li>'}</ul>
+      <h3>Add a device to ${esc(g.name)}</h3>
+      <ul class="list others">${others.map(d => row(d, false)).join('')
+        || `<li class="empty">${S.devices.length ? 'Every device QuietNet knows is already in this group.' : 'No devices found yet.'}</li>`}</ul>
+      <p class="meta">Not seeing a device? Use <button class="btn link" data-act="tab" data-tab="home">Find devices on my network</button> on the Devices page.</p>
+    </section>`;
 }
 
 /* ---------- Schedules ---------- */
@@ -454,19 +1065,20 @@ function whatText(x){
 }
 function viewSchedules(){
   if(S.edit) return scheduleForm();
-  const cards = S.schedules.map(x => `<div class="card"><div class="row">
+  const rows = S.schedules.map(x => `<div class="item"><div class="top">
     <label class="switch"><input type="checkbox" class="schedOn" data-id="${esc(x.id)}" ${x.enabled ? 'checked' : ''} aria-label="Use the ${esc(x.name)} schedule"><span></span></label>
-    <div style="flex:1;min-width:200px"><h2>${esc(x.name)}${x.active ? '<span class="badge junk">On right now</span>' : ''}${x.enabled ? '' : '<span class="badge">Not in use</span>'}</h2>
-      <div>${esc(scopeText(x.scope))} · ${esc(daysText(x.days))}, ${esc(x.start)} to ${esc(x.end)}${x.start > x.end ? ' next morning' : ''}</div>
-      <div class="muted small">${esc(whatText(x))}</div></div>
-    <button class="btn" data-act="schededit" data-id="${esc(x.id)}">Change</button>
-    <button class="btn link" data-act="scheddelete" data-id="${esc(x.id)}">Delete</button></div></div>`).join('');
-  return `<div class="row"><div style="flex:1;min-width:200px"><h2>Schedules</h2>
-    <p class="muted">Block things automatically at set times — bedtime, homework, school nights.
+    <span class="avatar sm moon" aria-hidden="true">${ICON.moon}</span>
+    <div class="info"><h2 class="title">${esc(x.name)}</h2>${x.active ? '<span class="badge danger">On right now</span>' : ''}${x.enabled ? '' : '<span class="badge">Not in use</span>'}
+      <div>${esc(scopeText(x.scope))} · ${esc(daysText(x.days))}, <span class="mono">${esc(x.start)}</span> to <span class="mono">${esc(x.end)}</span>${x.start > x.end ? ' next morning' : ''}</div>
+      <div class="meta">${esc(whatText(x))}</div></div>
+    <div class="item-actions"><button class="btn" data-act="schededit" data-id="${esc(x.id)}">Change</button>
+    <button class="btn link danger-text" data-act="scheddelete" data-id="${esc(x.id)}">Delete</button></div></div></div>`).join('');
+  return `<div class="row section-head"><div class="grow"><h2>Schedules</h2>
+    <p class="meta">Block things automatically at set times — bedtime, homework, school nights.
       Times go by this computer's clock (it's ${esc((S.status || {}).clock || '')} now).</p></div>
     <button class="btn primary" data-act="schednew" data-preset="bedtime">Add a bedtime</button>
     <button class="btn" data-act="schednew">New schedule</button></div>
-    ${cards || '<div class="card empty">No schedules yet. "Add a bedtime" is a good place to start.</div>'}`;
+    ${rows ? `<div class="card flush list schedules">${rows}</div>` : '<div class="card empty">No schedules yet. "Add a bedtime" is a good place to start.</div>'}`;
 }
 function scheduleForm(){
   const e = S.edit;
@@ -477,8 +1089,8 @@ function scheduleForm(){
       const on = e.services.includes(v.id);
       return `<button class="svc ${on ? 'on' : ''}" data-act="schedsvc" data-s="${esc(v.id)}" aria-pressed="${on}">${esc(v.name)}<small>${on ? 'Will be blocked' : 'Allowed'}</small></button>`;
     }).join('') + '</div>').join('');
-  return `<button class="btn link" data-act="schedcancel">← All schedules</button>
-  <h1 style="margin:6px 0 14px">${e.id ? 'Change schedule' : 'New schedule'}</h1>
+  return `<button class="btn link back" data-act="schedcancel">${ICON.back}All schedules</button>
+  <h1 class="page-title">${e.id ? 'Change schedule' : 'New schedule'}</h1>
   <div class="card">
     <label class="fld">Name<input type="text" id="sName" maxlength="40" placeholder="Bedtime" value="${esc(e.name)}"></label>
     <label class="fld">Who is it for?<select id="sScope">${opt('all', 'Whole house')}
@@ -486,16 +1098,16 @@ function scheduleForm(){
       ${S.devices.length ? `<optgroup label="Devices">${S.devices.map(d => opt('device:' + d.ip, deviceName(d) + ' (' + d.ip + ')')).join('')}</optgroup>` : ''}</select></label>
     <div class="fld">Which days?
       <div class="daychips">${DAYS.map((d, i) => `<button class="chip ${e.days.includes(i) ? 'on' : ''}" data-act="schedday" data-d="${i}" aria-pressed="${e.days.includes(i)}">${d}</button>`).join('')}</div>
-      <div class="small" style="font-weight:400">Quick picks: ${Object.keys(DAYSETS).map(k => `<button class="btn link" data-act="scheddays" data-k="${esc(k)}">${esc(k)}</button>`).join('')}</div></div>
-    <div class="row" style="align-items:flex-start">
+      <div class="meta quick">Quick picks: ${Object.keys(DAYSETS).map(k => `<button class="btn link" data-act="scheddays" data-k="${esc(k)}">${esc(k)}</button>`).join('')}</div></div>
+    <div class="row times">
       <label class="fld">Starts at<input type="time" id="sStart" value="${esc(e.start)}"></label>
       <label class="fld">Ends at<input type="time" id="sEnd" value="${esc(e.end)}"></label></div>
-    <p class="muted small" id="sHint" style="margin-top:-8px">${overnightHint(e)}</p>
+    <p class="meta hint" id="sHint">${overnightHint(e)}</p>
     <div class="fld">What should be blocked?
-      <label class="check" style="font-weight:400"><input type="radio" name="sWhat" value="off" ${e.off ? 'checked' : ''}> All internet</label>
-      <label class="check" style="font-weight:400"><input type="radio" name="sWhat" value="svc" ${e.off ? '' : 'checked'}> Only the apps and services I choose</label></div>
+      <label class="check"><input type="radio" name="sWhat" value="off" ${e.off ? 'checked' : ''}> All internet</label>
+      <label class="check"><input type="radio" name="sWhat" value="svc" ${e.off ? '' : 'checked'}> Only the apps and services I choose</label></div>
     ${grid}
-    <div class="row" style="justify-content:flex-end;margin-top:8px">
+    <div class="row form-actions">
       <button class="btn" data-act="schedcancel">Cancel</button>
       <button class="btn primary" data-act="schedsave">Save schedule</button></div>
   </div>`;
@@ -507,27 +1119,27 @@ function overnightHint(e){
 /* ---------- Blocked list ---------- */
 function viewRules(){
   const r = S.rules || {blocked:[], allowed:[]}, c = (S.status || {}).community || {};
-  const rows = (list, label) => list.length ? list.map(x => `
-    <div class="item"><div class="top"><div class="info"><span class="title">${esc(x.d)}</span>
-      <div class="muted small">${x.owner ? esc(x.owner) + ' · ' : ''}added ${ago(x.ts)}</div></div>
-      <button class="btn" data-act="forget" data-d="${esc(x.d)}">${label}</button></div></div>`).join('')
+  const rows = (list, label) => list.length ? `<div class="list rows">${list.map(x => `
+    <div class="item"><div class="top"><div class="info"><span class="title mono">${esc(x.d)}</span>
+      <div class="meta">${x.owner ? esc(x.owner) + ' · ' : ''}added ${esc(ago(x.ts))}</div></div>
+      <button class="btn" data-act="forget" data-d="${esc(x.d)}">${label}</button></div></div>`).join('')}</div>`
     : '<div class="empty">Nothing here yet.</div>';
   let listInfo = c.installed
-    ? `Installed: ${num(c.count)} junk addresses, last updated ${ago(c.updated)}.`
+    ? `Installed: ${num(c.count)} junk addresses, last updated ${esc(ago(c.updated))}.`
     : 'Not downloaded yet. QuietNet is using its small built-in list.';
   if(c.state === 'downloading') listInfo = 'Downloading… this takes a few seconds.';
   if(c.state === 'error') listInfo = 'The download didn\'t work — check the internet connection and try again. (' + esc(c.error) + ')';
   return `
   ${controls('all', 'the whole house')}
   <div class="card"><h2>Block an address yourself</h2>
-    <p class="muted small">Type a website or address, for example <i>ads.example.com</i>. Everything under it is blocked too.</p>
-    <div class="row"><input type="text" id="addBox" placeholder="example.com" style="flex:1" aria-label="Address to block">
+    <p class="meta">Type a website or address, for example <i>ads.example.com</i>. Everything under it is blocked too.</p>
+    <div class="row"><input type="text" id="addBox" class="grow" placeholder="example.com" aria-label="Address to block">
       <button class="btn primary" data-act="add">Block</button></div></div>
   <div class="card"><h2>Blocked by you</h2>${rows(r.blocked, 'Unblock')}</div>
   <div class="card"><h2>Always allowed</h2>
-    <p class="muted small">Addresses you unblocked even though they're on the junk list.</p>${rows(r.allowed, 'Remove')}</div>
+    <p class="meta">Addresses you unblocked even though they're on the junk list.</p>${rows(r.allowed, 'Remove')}</div>
   <div class="card"><h2>The full junk list</h2>
-    <p class="muted small">A free list of well over 100,000 known advert and tracker addresses, kept up to date by volunteers
+    <p class="meta">A free list of well over 100,000 known advert and tracker addresses, kept up to date by volunteers
       (the StevenBlack list). Downloading it makes automatic blocking far more thorough.</p>
     <p class="small">${listInfo}</p>
     <button class="btn ${c.installed ? '' : 'primary'}" data-act="getlist" ${c.state === 'downloading' ? 'disabled' : ''}>
@@ -541,17 +1153,29 @@ function cloudCard(){
   if(c.paired){
     const label = {online:'Connected', connecting:'Connecting…', off:'Off',
                    error:'Problem — ' + (c.detail || 'trying again')}[c.state] || c.state;
-    return `<div class="card"><h2>Remote access${c.state === 'online' ? '<span class="badge blocked">On</span>' : ''}</h2>
+    return `<div class="card"><h2>Remote access${c.state === 'online' ? '<span class="badge accent">On</span>' : ''}</h2>
       <p>This QuietNet is linked to your online account. Status: <b>${esc(label)}</b>.</p>
-      <p class="muted small">Open your relay website and sign in to control this from anywhere — no router changes needed.</p>
-      <button class="btn" data-act="cloudforget">Unlink</button></div>`;
+      <p class="meta">Open your relay website and sign in to control this from anywhere — no router changes needed.</p>
+      <button class="btn danger-outline" data-act="cloudforget">Unlink</button></div>`;
   }
-  return `<div class="card"><h2>Remote access <span class="muted" style="font-weight:400">(optional)</span></h2>
-    <p class="muted small">Control this QuietNet from outside your home. On your relay website, sign in and choose
+  return `<div class="card"><h2>Remote access <span class="muted opt">(optional)</span></h2>
+    <p class="meta">Control this QuietNet from outside your home. On your relay website, sign in and choose
       <b>Add a QuietNet</b>, then type the web address and pairing code it shows you here.</p>
     <label class="fld">Relay web address<input type="text" id="clRelay" placeholder="your-relay.up.railway.app" value="${esc(c.relay || '')}"></label>
     <label class="fld">Pairing code<input type="text" id="clCode" placeholder="ABCD-1234"></label>
     <button class="btn primary" data-act="cloudpair">Link this QuietNet</button></div>`;
+}
+// The Appearance chooser: last on this page, and reached from the Appearance button in the header.
+function appearanceCard(){
+  const now = currentTheme();
+  return `<section class="card" id="appearance" aria-labelledby="appearanceTitle">
+    <h2 id="appearanceTitle">Appearance</h2>
+    <p class="meta">How these pages look in this browser. It changes nothing on your network.</p>
+    <fieldset class="themes"><legend class="sr-only">Choose a look</legend>
+    ${THEME_CHOICES.map(([id, name, text]) => `<label class="theme-opt"><input type="radio" name="qnTheme" value="${esc(id)}" ${now === id ? 'checked' : ''}>
+      <span class="swatch swatch-${esc(id)}" aria-hidden="true"><i></i><i></i><i></i></span>
+      <span class="theme-text"><b>${esc(name)}</b><span class="meta">${esc(text)}</span></span></label>`).join('')}
+    </fieldset></section>`;
 }
 function viewSetup(){
   const ip = esc((S.status || {}).ip || '…');
@@ -560,9 +1184,9 @@ function viewSetup(){
   ${cloudCard()}
   <div class="card"><h2>How to point a device at QuietNet</h2>
     <p>Every device has a setting called <b>DNS</b>. Change it to this number and QuietNet can see and filter that device:</p>
-    <div class="ipbox">${ip}</div>
-    <p class="muted small">To undo it at any time, set DNS back to <b>Automatic</b> on the device.</p>
-    ${step('iPhone or iPad', ['Open <b>Settings</b> → <b>Wi-Fi</b>.', 'Tap the ⓘ next to your home Wi-Fi.', 'Tap <b>Configure DNS</b> → <b>Manual</b>.', 'Delete any numbers already there, tap <b>Add Server</b> and type <b>' + ip + '</b>.', 'Tap <b>Save</b>.'])}
+    <div class="bigcode">${ip}</div>
+    <p class="meta">To undo it at any time, set DNS back to <b>Automatic</b> on the device.</p>
+    ${step('iPhone or iPad', ['Open <b>Settings</b> → <b>Wi-Fi</b>.', 'Tap the (i) button next to your home Wi-Fi.', 'Tap <b>Configure DNS</b> → <b>Manual</b>.', 'Delete any numbers already there, tap <b>Add Server</b> and type <b>' + ip + '</b>.', 'Tap <b>Save</b>.'])}
     ${step('Android phone or tablet', ['Open <b>Settings</b> → <b>Network &amp; internet</b> → <b>Internet</b> (or <b>Wi-Fi</b>).', 'Tap the cog next to your home Wi-Fi, then the pencil / <b>Advanced</b>.', 'Change <b>IP settings</b> to <b>Static</b> and type <b>' + ip + '</b> in <b>DNS 1</b>. Leave the rest as it is.', 'Save. Also check <b>Settings → Network → Private DNS</b> is <b>Off</b>.'])}
     ${step('Smart TV, streaming stick or games console', ['Open the TV\'s <b>Network</b> settings and choose your connection.', 'Look for <b>Advanced</b>, <b>Manual</b> or <b>DNS settings</b>.', 'Set <b>DNS</b> (or "Primary DNS") to <b>' + ip + '</b>. Leave everything else on automatic.'])}
     ${step('Windows PC', ['Open <b>Settings</b> → <b>Network &amp; internet</b> → <b>Wi-Fi</b> → <b>Hardware properties</b>.', 'Next to <b>DNS server assignment</b> choose <b>Edit</b> → <b>Manual</b>.', 'Turn on <b>IPv4</b> and type <b>' + ip + '</b> as the <b>Preferred DNS</b>. Save.'])}
@@ -571,13 +1195,14 @@ function viewSetup(){
   </div>
   <div class="card"><h2>Good to know</h2>
     <p><b>Keep this computer on.</b> Devices pointed at QuietNet need it running. If it's off or asleep, they won't be able to load anything.</p>
-    <p><b>Something stopped working?</b> Press <i>Pause advert blocking for 10 minutes</i> at the top. If that fixes it, look at the device's list for something recently blocked and unblock it.</p>
+    <p><b>Something stopped working?</b> Press <i>Pause advert blocking for 10 minutes</i>, next to the kill switch. If that fixes it, look at the device's list for something recently blocked and unblock it.</p>
     <p><b>What QuietNet can and can't see.</b> It sees <i>which addresses</i> a device contacts (like <i>ads.example.com</i>), not the pages, messages or passwords — those stay private. It can't remove adverts that come from the same address as the real content (YouTube adverts are the well-known example).</p>
     <p><b>Blocks, schedules and the kill switch take a couple of minutes to bite.</b> They stop a device finding addresses, so something already playing — a video, a game in progress — can carry on for a short while. If an app still works long after, look in the device's list for what it's using and block that too.</p>
     <p><b>Devices are recognised by their number</b> (like 192.168.1.23). If your router gives a device a new number, its name, group and blocks won't follow it — "reserving" the number in your router avoids that.</p>
     <p><b>The number above can change</b> if your router hands this computer a new one. If devices suddenly stop working, come back here and check it. Your router can usually "reserve" the number so it stays put.</p>
-    <p class="muted small">Everyone in the house should know this is running — it records which services each device talks to. History is kept for 30 days on this computer only.</p>
-  </div>`;
+    <p class="meta">Everyone in the house should know this is running — it records which services each device talks to. History is kept for 30 days on this computer only.</p>
+  </div>
+  ${appearanceCard()}`;
 }
 
 /* ---------- drawing & refreshing ---------- */
@@ -612,7 +1237,10 @@ async function refresh(hard, tick){
     const jobs = [api('/api/status').then(x => S.status = x)];
     const ctl = scope => api('/api/controls?scope=' + encodeURIComponent(scope)).then(x => S.ctl[scope] = x);
     if(!S.services.length) jobs.push(api('/api/services').then(x => S.services = x));
-    if(S.tab === 'schedules') jobs.push(api('/api/schedules').then(x => S.schedules = x));
+    // Schedules are listed on their own tab and, for the scope shown, beside a device's, a group's
+    // or the whole house's rules.
+    if(S.tab === 'schedules' || S.tab === 'rules' || (S.tab === 'home' && S.device) || (S.tab === 'groups' && S.group))
+      jobs.push(api('/api/schedules').then(x => S.schedules = x));
     if(S.tab === 'setup') jobs.push(api('/api/cloud').then(x => S.cloud = x).catch(() => {}));
     if(S.tab === 'home' || S.tab === 'groups' || S.tab === 'schedules')
       jobs.push(api('/api/devices').then(x => S.devices = x), api('/api/groups').then(x => S.groups = x));
@@ -649,6 +1277,14 @@ async function refresh(hard, tick){
 
 const actions = {
   tab(d){ S.tab = d.tab; S.device = null; S.group = null; S.svcOpen = false; S.edit = null; refresh(true); },
+  // Open the Appearance chooser at the end of "Set up a device", with the current look focused.
+  appearance(){
+    S.tab = 'setup'; S.device = null; S.group = null; S.svcOpen = false; S.edit = null;
+    refresh(true).then(() => {
+      const f = $('appearance');
+      if(f){ f.scrollIntoView(); const r = f.querySelector('input:checked'); if(r) r.focus(); }
+    });
+  },
   async kill(){
     const yes = await ask({title:'Stop all internet now?', ok:'Stop the internet', danger:true,
       text:'Every device that uses QuietNet will lose its internet until you turn it back on from this dashboard. It can take a couple of minutes to bite.'});
@@ -663,7 +1299,14 @@ const actions = {
               end: bedtime || d.scope ? '07:00' : '18:00', off: bedtime || !!d.scope, services: []};
     S.tab = 'schedules'; S.device = null; S.group = null; refresh(true);
   },
-  schededit(d){ S.edit = JSON.parse(JSON.stringify(S.schedules.find(x => x.id === +d.id))); render(); },
+  // Also reached from a device's, group's or the whole house's rules, so it moves to the Schedules
+  // tab (which fetches the devices and groups the form lists).
+  schededit(d){
+    const x = S.schedules.find(v => v.id === +d.id);
+    if(!x) return;
+    S.edit = JSON.parse(JSON.stringify(x));
+    S.tab = 'schedules'; S.device = null; S.group = null; S.svcOpen = false; refresh(true);
+  },
   schedcancel(){ S.edit = null; refresh(true); },
   schedday(d){ const i = +d.d, e = S.edit; e.days = e.days.includes(i) ? e.days.filter(x => x !== i) : [...e.days, i]; render(); },
   scheddays(d){ S.edit.days = [...DAYSETS[d.k]]; render(); },
@@ -699,6 +1342,8 @@ const actions = {
     if(!yes) return;
     await api('/api/group-delete', {id:S.group}).catch(oops); S.group = null; refresh(true);
   },
+  // Put a device into the open group (data-in="1") or take it out (data-in="").
+  async member(d){ await api('/api/device-group', {ip:d.ip, group:d.in ? S.group : null}).catch(oops); refresh(true); },
   open(d){ S.device = d.ip; S.activity = []; S.activityKey = ''; S.open.clear(); S.search = ''; S.filter = 'all'; S.svcOpen = false; refresh(true); },
   back(){ S.device = null; refresh(true); },
   filter(d){ S.filter = d.f; render(); },
@@ -718,11 +1363,13 @@ const actions = {
     if(!v.trim()) return;
     try{ await api('/api/block', {domain:v}); $('addBox').value = ''; refresh(true); }catch(e){ oops(e); }
   },
-  async rename(){
-    const d = S.devices.find(x => x.ip === S.device) || {};
-    const name = await ask({title:'Name this device', text:'For example "Living room TV" or "Sam\'s iPad".', input:d.name || '', ok:'Save'});
+  // The open device, or (from a group's "Name it" button) the device the button names.
+  async rename(d){
+    const ip = (d && d.ip) || S.device;
+    const dev = S.devices.find(x => x.ip === ip) || {};
+    const name = await ask({title:'Name this device', text:'For example "Living room TV" or "Sam\'s iPad".', input:dev.name || '', ok:'Save'});
     if(name === null) return;
-    await api('/api/device-name', {ip:S.device, name}).catch(oops); refresh(true);
+    await api('/api/device-name', {ip, name}).catch(oops); refresh(true);
   },
   async usehint({ip}){
     const d = S.devices.find(x => x.ip === ip);
@@ -755,11 +1402,11 @@ document.addEventListener('click', e => {
   if(t && actions[t.dataset.act]) actions[t.dataset.act](t.dataset);
 });
 document.addEventListener('change', async e => {
+  if(e.target.name === 'qnTheme'){ setTheme(e.target.value); return; }   // a look only: nothing is sent anywhere
   if(e.target.id === 'junkSwitch'){ await api('/api/junk-switch', {on:e.target.checked}).catch(oops); refresh(); }
   if(e.target.id === 'enforceSwitch'){ await api('/api/enforce', {ip:S.device, on:e.target.checked}).catch(oops); refresh(true); }
   if(e.target.id === 'netSwitch'){ await api('/api/internet', {scope:e.target.dataset.scope, off:!e.target.checked}).catch(oops); refresh(true); }
   if(e.target.id === 'groupSel'){ await api('/api/device-group', {ip:S.device, group:e.target.value ? +e.target.value : null}).catch(oops); e.target.blur(); refresh(true); }
-  if(e.target.classList.contains('member')){ await api('/api/device-group', {ip:e.target.dataset.ip, group:e.target.checked ? S.group : null}).catch(oops); refresh(true); }
   if(e.target.classList.contains('schedOn')){ await api('/api/schedule-enable', {id:+e.target.dataset.id, on:e.target.checked}).catch(oops); refresh(true); }
   if(S.edit){
     if(e.target.id === 'sScope') S.edit.scope = e.target.value;
