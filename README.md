@@ -127,6 +127,7 @@ After that, sign in to the relay from anywhere to control your Pi. Only your acc
 - Devices are recognised by their network number (IP address). Reserve each device's number in your router so its name and rules stay with it.
 - History is stored only on this computer, in the `data` folder, for 30 days. Tell the people in your home that it's running.
 - The dashboard can only be opened on the computer QuietNet runs on.
+- **Appearance.** The dashboard and the relay's pages come in three looks: **Calm** (the default, with the sections down the side), **Household** (warmer, with devices and groups as large cards) and **Control room** (dark and compact, with the day's figures across the top). Calm and Household follow your device's light or dark setting; Control room is always dark. Choose one under **Appearance**, at the end of **Set up a device** or from the Appearance button at the top of the dashboard, and on the relay's home page. The choice is remembered by that browser only (in a cookie), and changes nothing on your network. The pages use the fonts already on your device; nothing is downloaded.
 
 ## Built from scratch
 

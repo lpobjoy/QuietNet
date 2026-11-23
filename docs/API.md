@@ -164,12 +164,15 @@ A network address is the last entry of `X-Forwarded-For` (added by the host's pr
 | `GET /` | Your QuietNets, with pairing codes for those not yet paired. A code older than 15 minutes is replaced when this page is opened. Each waiting QuietNet also shows the one-line install command with this relay's address and the code (the address from `QUIETNET_RELAY_URL`, `RAILWAY_PUBLIC_DOMAIN` or the `Host` header, used only if it is a plain address; otherwise a placeholder to replace) |
 | `POST /pis/new` | Form field `name`. Creates a QuietNet and a pairing code. `403` with a page saying so when the account already has 10 QuietNets, paired or waiting |
 | `POST /pis/<id>/delete` | Removes one of your QuietNets. Its Pi is locked out at once |
-| `GET /pi/<id>/` | The dashboard page, set to call this Pi |
+| `POST /theme` | Form field `theme`: `calm`, `household` or `control` (anything else saves `calm`). Sets the `qn_theme` cookie (below) and redirects (`303`) to `/`, always. Redirects to `/login`, setting nothing, if not signed in. Offered by the Appearance card on `/` |
+| `GET /pi/<id>/` | The dashboard page, set to call this Pi, with a bar across the top naming the Pi, saying whether it is online, and offering a way back and a sign-out button |
 | `GET` or `POST /pi/<id>/api/…` | Passed to the Pi. Needs the header `X-QuietNet: 1` |
 
-**Forms from another website.** `POST /login`, `/signup`, `/logout`, `/pis/new` and `/pis/<id>/delete` are refused with `403` when the request's `Sec-Fetch-Site` header is `cross-site` or `same-site`, with the message "That form was sent from another website, so it was refused. Open this relay's own page and try again." (on the sign-in form for `/login` and `/signup`, on a short "Refused" page for the others). Requests without the header are handled as usual. This does not apply to `/pi/…` or `/agent/…`.
+**Forms from another website.** `POST /login`, `/signup`, `/logout`, `/pis/new`, `/theme` and `/pis/<id>/delete` are refused with `403` when the request's `Sec-Fetch-Site` header is `cross-site` or `same-site`, with the message "That form was sent from another website, so it was refused. Open this relay's own page and try again." (on the sign-in form for `/login` and `/signup`, on a short "Refused" page for the others). Requests without the header are handled as usual. This does not apply to `/pi/…` or `/agent/…`.
 
 The session cookie is `qn_session`, valid for 14 days, `HttpOnly` and `SameSite=Lax`, and `Secure` when the request arrived over HTTPS. Its value is `user.number.expiry.signature`; a cookie from before session numbers (three parts) counts as signed out.
+
+**The look (theme) cookie.** `qn_theme=calm|household|control; SameSite=Lax; Path=/; Max-Age=31536000`, plus `Secure` over HTTPS. It is not `HttpOnly`, because the dashboard's own script reads it to pick its look; it holds nothing secret. It is a display preference only: wherever it is read it is checked against the three names, and anything else means `calm`. Every relay page (signed in or out, and error pages) is drawn in that look (`<html data-theme="...">`); with no cookie, `calm`. The dashboard under `/pi/<id>/` is on the same website, so the same cookie sets its look. The relay's pages carry no scripts.
 
 Relayed calls can fail in these ways:
 

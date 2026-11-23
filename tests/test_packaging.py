@@ -347,6 +347,140 @@ class DashboardContract(unittest.TestCase):
         self.assertIn("It works on IPv4 only", card)
 
 
+class DashboardThemes(unittest.TestCase):
+    """The dashboard has three looks (calm, household, control), picked under Appearance and kept
+    in the qn_theme cookie. These checks read the page; nothing is run in a browser."""
+
+    THEMES = ("calm", "household", "control")
+
+    @classmethod
+    def setUpClass(cls):
+        cls.page = read("static", "index.html")
+        cls.css = cls.page[cls.page.index("<style>"):cls.page.index("</style>")]
+        main = cls.page.index("const S = {")
+        cls.main_script = cls.page[cls.page.rindex("<script>", 0, main):cls.page.rindex("</script>")]
+        early = cls.page[:cls.page.index("<style>")]
+        cls.early_script = early[early.index("<script>"):early.index("</script>")]
+
+    def theme_from_cookie(self, cookie):
+        """What the early script would pick for this cookie text, using its own pattern."""
+        pattern = re.search(r"var m = /(.+?)/\.exec\(document\.cookie", self.early_script).group(1)
+        m = re.search(pattern, cookie)
+        return m.group(1) if m else "calm"
+
+    def test_the_page_picks_its_theme_before_the_style_sheet_loads(self):
+        self.assertIn("qn_theme", self.early_script)
+        self.assertIn("setAttribute('data-theme'", self.early_script)
+
+    def test_the_early_theme_script_accepts_only_the_three_themes(self):
+        self.assertIn("qn_theme=(calm|household|control)", self.early_script)
+        self.assertIn("m ? m[1] : 'calm'", self.early_script)
+
+    def test_a_saved_theme_is_used(self):
+        self.assertEqual(self.theme_from_cookie("a=1; qn_theme=control; b=2"), "control")
+        self.assertEqual(self.theme_from_cookie("qn_theme=household"), "household")
+
+    def test_an_unknown_theme_in_the_cookie_means_calm(self):
+        for cookie in ("", "qn_theme=", "qn_theme=neon", "qn_theme=controlx", "qn_theme=\"><script>", "xqn_theme=control"):
+            self.assertEqual(self.theme_from_cookie(cookie), "calm", cookie)
+
+    def test_the_page_starts_in_the_calm_theme(self):
+        self.assertIn('<html lang="en" data-theme="calm">', self.page)
+
+    def test_each_theme_has_its_own_colours(self):
+        self.assertIn(':root, [data-theme="calm"]{', self.css)
+        for theme in ("household", "control"):
+            block = self.css[self.css.index('[data-theme="%s"]{' % theme):]
+            self.assertIn("--accent:", block[:block.index("}")], theme)
+
+    def test_the_light_and_dark_themes_follow_the_device_setting(self):
+        darks = re.findall(r"@media \(prefers-color-scheme: dark\)\{\s*([^{]+)\{", self.css)
+        self.assertEqual(len(darks), 2)
+        self.assertIn(':not([data-theme="household"]):not([data-theme="control"])', darks[0])
+        self.assertIn('[data-theme="household"]', darks[1])
+        control = self.css[self.css.index('[data-theme="control"]{'):]
+        self.assertIn("color-scheme:dark", control[:control.index("}")])
+
+    def test_the_appearance_section_offers_the_three_themes(self):
+        self.assertIn('name="qnTheme"', self.main_script)
+        choices = self.main_script[self.main_script.index("const THEME_CHOICES"):]
+        choices = choices[:choices.index("]];")]
+        self.assertEqual(tuple(re.findall(r"\['(\w+)', '", choices)), self.THEMES)
+        self.assertIn("const THEMES = ['calm', 'household', 'control'];", self.main_script)
+
+    def test_the_header_has_a_way_to_the_appearance_section(self):
+        self.assertIn('data-act="appearance"', self.page)
+        self.assertIn("appearance(){", self.main_script)
+        self.assertIn('id="appearance"', self.main_script)
+
+    def test_picking_a_theme_switches_at_once_without_asking_the_server(self):
+        listener = self.main_script[self.main_script.index("e.target.name === 'qnTheme'"):]
+        self.assertIn("setTheme(e.target.value)", listener[:listener.index("\n")])
+        set_theme = self.main_script[self.main_script.index("function setTheme"):]
+        set_theme = set_theme[:set_theme.index("\n}")]
+        self.assertNotIn("api(", set_theme)
+        self.assertIn("if(THEMES.indexOf(t) < 0) t = 'calm';", set_theme)
+
+    def test_the_theme_choice_is_kept_for_a_year_across_the_site(self):
+        set_theme = self.main_script[self.main_script.index("function setTheme"):]
+        set_theme = set_theme[:set_theme.index("\n}")]
+        for part in ("'qn_theme=' + t", "Path=/", "Max-Age=31536000", "SameSite=Lax", "'; Secure'"):
+            self.assertIn(part, set_theme)
+
+    def test_the_page_loads_no_fonts_from_other_websites(self):
+        for outside in ("@import", "fonts.googleapis", "url(http", "@font-face", "http://", "https://"):
+            self.assertNotIn(outside, self.page, outside)
+
+    def test_the_views_carry_no_fixed_colours(self):
+        # Colours live in the theme blocks of the style sheet; the markup only names classes.
+        self.assertNotIn('style="', self.page)
+        self.assertEqual(re.findall(r"#[0-9a-fA-F]{6}\b", self.main_script), [])
+
+    def test_the_head_and_body_tags_stay_bare(self):
+        # The relay finds these with a plain text replace, so neither may carry attributes.
+        self.assertEqual(re.findall(r"<head\b[^>]*>", self.page, flags=re.I), ["<head>"])
+        self.assertEqual(re.findall(r"<body\b[^>]*>", self.page, flags=re.I), ["<body>"])
+
+    def test_the_relay_bar_colours_are_defined_by_every_theme(self):
+        for token in ("--bar-bg:", "--bar-ink:", "--bar-muted:", "--bar-line:", "--bar-dot:"):
+            self.assertEqual(self.css.count(token), 5, token)   # calm, calm dark, household, household dark, control
+
+    def test_icons_are_hidden_from_screen_readers(self):
+        for tag in re.findall(r"<svg[^>]*>", self.page):
+            self.assertIn('aria-hidden="true"', tag)
+
+    def rule(self, selector):
+        """The declarations of the style rule whose selector list is exactly this text."""
+        m = re.search(r"(?:^|[}\n])\s*" + re.escape(selector) + r"\{([^}]*)\}", self.css)
+        self.assertIsNotNone(m, selector)
+        return m.group(1)
+
+    def test_the_focus_ring_on_a_row_in_a_clipped_list_is_drawn_inside_the_row(self):
+        for theme in ("calm", "control"):
+            self.assertIn("overflow:hidden", self.rule('[data-theme="%s"] .tiles' % theme))
+        body = self.rule('[data-theme="calm"] .tiles .tile:focus-visible,[data-theme="control"] .tiles .tile:focus-visible')
+        self.assertIn("outline-offset:calc(-1 * var(--focus-w) - 2px)", body)
+
+    def test_household_gives_the_whole_width_to_the_page_when_the_house_controls_are_hidden(self):
+        body = self.rule('[data-theme="household"] .shell.no-house')
+        self.assertIn("grid-template-columns:minmax(0,1fr)", body)
+        self.assertNotIn("house", body.split("grid-template-areas:")[1])
+
+    def test_the_control_room_only_sets_the_address_line_in_monospace(self):
+        self.assertNotIn('[data-theme="control"] .pagehead .meta{', self.css)
+        self.assertIn("font-family:var(--font-mono)", self.rule('[data-theme="control"] .pagehead .meta:not(.sugg)'))
+
+    def test_the_control_room_stacks_its_figures_above_the_house_controls_below_laptop_width(self):
+        m = re.search(r"@media \(max-width:(\d+)px\)\{\s*\[data-theme=\"control\"\] \.shell\{", self.css)
+        self.assertIsNotNone(m)
+        self.assertGreaterEqual(int(m.group(1)), 1180)
+
+    def test_household_leaves_room_under_the_header_for_the_focus_ring(self):
+        body = self.rule('[data-theme="household"] .shell>.top')
+        pad = re.search(r"padding:\d+px \d+(?:px)? (\d+)px", body)
+        self.assertGreaterEqual(int(pad.group(1)), 6)
+
+
 class Readme(unittest.TestCase):
     def test_the_readme_does_not_send_people_to_an_address_that_is_refused(self):
         # The dashboard answers on localhost only (see test_dashboard_api.Guards).

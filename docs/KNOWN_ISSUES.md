@@ -1,6 +1,6 @@
 # Known issues
 
-Two reviews have been made: of version 0.5 on 21 November 2026, and a second, deeper pass the same day covering security, the software QuietNet depends on, and efficiency. A third, on 22 November, looked at the enforcer, the relay and the DNS filter, followed by an independent check of its fixes and a live test of the enforcer between two containers. A fourth, also on 22 November, looked again at every part (the DNS filter, the database, the relay, the Pi's link to it, the enforcer's firewall check, the dashboard page and the packaging) and fixed 32 points. On 23 November the open issues themselves were worked through: nine were closed (6, 8, 19, 20, 22, 80, 81, 82 and 83), five were narrowed (5, 7, 12, 21 and 78, each now stating only what is left), and one new point was found while checking the fixes (84). An independent check of those fixes the same day found eleven more faults in them, all fixed (see "Faults in the 23 November fixes" under Fixed), and closed 84. Later on 23 November a one-line installer was added; its open points are 85 to 88. This file lists what is still open, then what has been fixed.
+Two reviews have been made: of version 0.5 on 21 November 2026, and a second, deeper pass the same day covering security, the software QuietNet depends on, and efficiency. A third, on 22 November, looked at the enforcer, the relay and the DNS filter, followed by an independent check of its fixes and a live test of the enforcer between two containers. A fourth, also on 22 November, looked again at every part (the DNS filter, the database, the relay, the Pi's link to it, the enforcer's firewall check, the dashboard page and the packaging) and fixed 32 points. On 23 November the open issues themselves were worked through: nine were closed (6, 8, 19, 20, 22, 80, 81, 82 and 83), five were narrowed (5, 7, 12, 21 and 78, each now stating only what is left), and one new point was found while checking the fixes (84). An independent check of those fixes the same day found eleven more faults in them, all fixed (see "Faults in the 23 November fixes" under Fixed), and closed 84. Later on 23 November a one-line installer was added; its open points are 85 to 88. Device names followed (89), then three selectable looks for the dashboard and the relay (90). This file lists what is still open, then what has been fixed.
 
 The numbers are referred to from tests and other documents. Keep them stable.
 
@@ -124,6 +124,20 @@ Since 23 November the relay gives up root at start-up (see below). The Pi contai
 ### 12. Minor
 
 - The enforcer drops addresses handed out in the last six hours. A service that moves to new addresses is covered as soon as the device looks them up through QuietNet.
+- The look (theme) cookie `qn_theme` on the Pi's own dashboard (`localhost:8377`) is shared with every other page served from `localhost`, whatever the port, because browsers do not keep cookies apart by port. Harmless: it is only a display choice, checked against the three names wherever it is read.
+- Like the relay's other forms, the Appearance form (`POST /theme`) relies on `Sec-Fetch-Site` against other websites; a browser that does not send it could be made to change its own look. Harmless: it changes only how the pages look, in that browser.
+
+### 90. The three looks: what differs from the mockups, and what is untried
+
+Added on 23 November (Calm, Household and Control room, on the dashboard and the relay). Not faults, but gaps to know about:
+
+- **System fonts, not the mockups' fonts.** The mockups use Inter, Space Grotesk and JetBrains Mono, loaded from Google Fonts. QuietNet loads nothing from other websites and ships no font files, so the pages use fonts already on the device: the system's own sans-serif (San Francisco, Segoe UI or Roboto) for text, a rounded system face for Household's headings where there is one (Apple devices; elsewhere the plain sans-serif), and the system's monospace face for addresses. The pages therefore look close to the mockups but not identical, and differ a little from one platform to another.
+- **The choice belongs to the browser, not the account.** It is a cookie (`qn_theme`), so each browser and device remembers its own, and signing in elsewhere does not bring it along. The Pi's own dashboard (`localhost:8377`) and the relay are different websites, so a look chosen on one is not carried to the other; the relay and the dashboard opened through it do share one.
+- **The relay's sign-in pages cannot change the look.** Choosing one needs a signed-in person (`POST /theme`); signed out, the pages use whatever the cookie already says, else Calm.
+- **Control room has no light version.** It is always dark, whatever the device is set to.
+- **With scripts switched off the dashboard shows Calm** for every choice, because its look is picked by a small script. The dashboard needs scripts to work at all, so this matters little. The relay's pages are drawn in the chosen look on the server and need no script.
+- **The kill switch has no "arm, then switch" step** as in the Control room group mockup: it keeps the confirmation dialog every look has, so it behaves the same in all three.
+- **Not yet tried in a real browser on every platform.** The tests check the page's text (the early script, each look's colours, no outside requests, no inline styles), not how it is drawn. Older Safari (12 to 14.0), Firefox on Android and Windows high-contrast mode in particular are untried; see [Testing](TESTING.md) for the manual checks.
 
 ## Software QuietNet depends on
 

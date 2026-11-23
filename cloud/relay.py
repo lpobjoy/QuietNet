@@ -108,7 +108,7 @@ EMAIL_RE = re.compile(r"[^@\s]+@[^@\s]+\.[^@\s]+")
 # never by the relay.
 INSTALL_URL = os.environ.get("QUIETNET_INSTALL_URL") or "https://raw.githubusercontent.com/lpobjoy/QuietNet/main/install.sh"
 RELAY_PLACEHOLDER = "https://your-relay-address"
-GETTING_STARTED = ('<p class="muted">No QuietNets yet. To get started: name your Pi below and press '
+GETTING_STARTED = ('<p>No QuietNets yet. To get started: name your Pi below and press '
                    '<b>Create pairing code</b>, then run the one line shown here on the Pi. It installs '
                    'QuietNet and links it to this account.</p>')
 # A plain host name or address, with an optional port: letters, digits, dots and dashes only.
@@ -653,30 +653,359 @@ bridge = Bridge()
 big_answers = BigAnswers(BIG_ANSWER_BUDGET)
 
 
+# ------------------------------------------------------------------ looks (themes)
+
+# The looks a person can pick for these pages; the first is the default. The choice is kept in a
+# 'qn_theme' cookie, which is shared with the dashboard opened through this relay (same website).
+# It is a display preference only: it is checked against this list wherever it is read, and never
+# used for anything else.
+THEMES = ("calm", "household", "control")
+THEME_COOKIE_DAYS = 365
+# (id, name shown, one-line description). The dashboard's Appearance section uses the same words.
+THEME_CHOICES = (
+    ("calm", "Calm", "Plain and quiet, with the sections down the side. Follows your device's light or dark setting."),
+    ("household", "Household", "Warmer and roomier, with devices and groups shown as large cards. Follows light or dark."),
+    ("control", "Control room", "Dark and compact, with the day's figures across the top. Always dark."),
+)
+
+
+def theme_name(value):
+    """The theme to use for a cookie or form value: the value itself if it is one of THEMES, else
+    'calm'. The value comes from the browser, so nothing else is ever done with it."""
+    return value if value in THEMES else THEMES[0]
+
+
+# Small line drawings used on the pages. Each is decorative (the words beside it say the same),
+# so it is hidden from screen readers.
+ICON_PATHS = {
+    "logo": '<path d="M12 3l7 3v5c0 4.5-3 8.5-7 10-4-1.5-7-5.5-7-10V6l7-3z"/><path d="M9 12l2 2 4-4"/>',
+    "lock": '<rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/>',
+    "monitor": '<rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8M12 16v4"/>',
+    "moon": '<path d="M20 14.5A8 8 0 0 1 9.5 4a8 8 0 1 0 10.5 10.5z"/>',
+    "chip": ('<rect x="6" y="6" width="12" height="12" rx="2"/>'
+             '<path d="M9 2v4M15 2v4M9 18v4M15 18v4M2 9h4M2 15h4M18 9h4M18 15h4"/>'),
+    "right": '<path d="M9 6l6 6-6 6"/>',
+    "left": '<path d="M15 6l-6 6 6 6"/>',
+}
+
+
+def icon(name, css="ico"):
+    """One of ICON_PATHS as an inline drawing, hidden from screen readers, sized by its CSS class."""
+    return ('<svg class="%s" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" '
+            'stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">%s</svg>'
+            % (html.escape(css), ICON_PATHS[name]))
+
+
 # ------------------------------------------------------------------ small HTML pages
 
-PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
+# The style sheet for every relay page, holding all three looks. It is written against colour
+# names (custom properties such as --accent) that each look sets; the dashboard uses the same names.
+# Calm is also the look when no theme is named. Calm and Household follow the device's light or dark
+# setting; Control room is always dark. Text colours were chosen to give at least 4.5:1 contrast.
+RELAY_CSS = """
+:root,[data-theme="calm"]{color-scheme:light dark;
+--bg:#f4f3ef;--surface:#ffffff;--surface-2:#f4f3ef;--chip-bg:#efede7;--field-bg:#ffffff;--top-bg:#ffffff;
+--ink:#1d1c1a;--ink-2:#3d3a35;--body-2:#3d3a35;--muted:#5e5a53;--line:#e0ddd5;--line-2:#e0ddd5;--line-strong:#e0ddd5;
+--field-line:#8a857b;--accent:#0e6b62;--accent-hover:#0a4f48;--on-accent:#ffffff;--accent-soft:#e1eeeb;
+--accent-soft-ink:#0a524b;--accent-line:#b9d6d1;--ok:#0e6b62;--ok-ink:#0a524b;--ok-soft:#e1eeeb;
+--warn:#7a4a07;--warn-dot:#b7791f;--warn-soft:#fbf1dc;--danger:#a33222;--danger-soft:#fbf3f1;
+--danger-soft-ink:#a33222;--danger-line:#e9cfc8;--focus:#0e6b62;--focus-halo:#cfe5e1;
+--code-bg:#f4f3ef;--code-ink:#1d1c1a;--code-line:#e0ddd5;--shadow-card:none;--shadow-raise:0 8px 24px rgba(29,28,26,.12);
+--font-body:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;--font-head:var(--font-body);
+--font-mono:ui-monospace,"SF Mono",SFMono-Regular,Menlo,Consolas,monospace;
+--fs-body:15px;--fs-small:13px;--fs-xs:12.5px;--fs-h1:24px;--fs-h2:15px;--fs-h3:13px;--head-weight:600;--head-track:-0.02em;
+--r-sm:4px;--r-md:8px;--r-lg:12px;--r-btn:8px;--r-pill:999px;--gap:12px;--pad-card:20px;--focus-w:2px;
+--wrap:800px;--wrap-wide:1040px}
+@media (prefers-color-scheme:dark){:root,[data-theme="calm"]{
+--bg:#161513;--surface:#1f1e1b;--surface-2:#2a2925;--chip-bg:#2a2925;--field-bg:#161513;--top-bg:#1f1e1b;
+--ink:#ecebe6;--ink-2:#d2cfc7;--body-2:#d2cfc7;--muted:#a9a49a;--line:#3a3832;--line-2:#3a3832;--line-strong:#48453e;
+--field-line:#7a756b;--accent:#5fc4b6;--accent-hover:#7dd3c7;--on-accent:#0b2522;--accent-soft:#1d3633;
+--accent-soft-ink:#9fded4;--accent-line:#2f5a54;--ok:#5fc4b6;--ok-ink:#9fded4;--ok-soft:#1d3633;
+--warn:#e6b25a;--warn-dot:#e6b25a;--warn-soft:#3a2d12;--danger:#f0907f;--danger-soft:#3a1f1b;
+--danger-soft-ink:#f0907f;--danger-line:#5c2e27;--focus:#5fc4b6;--focus-halo:#234541;
+--code-bg:#161513;--code-ink:#ecebe6;--code-line:#3a3832;--shadow-raise:0 8px 24px rgba(0,0,0,.5)}}
+[data-theme="household"]{color-scheme:light dark;
+--bg:#FAF7F2;--surface:#FFFFFF;--surface-2:#FBF8F4;--chip-bg:#F3EDE7;--field-bg:#FFFFFF;--top-bg:transparent;
+--ink:#2A2125;--ink-2:#2A2125;--body-2:#2A2125;--muted:#5E5156;--line:#E8E0D8;--line-2:#EFE8E1;--line-strong:#E0D6CD;
+--field-line:#94878D;--accent:#6B2E5F;--accent-hover:#4A1F42;--on-accent:#FFFFFF;--accent-soft:#F3E8F0;
+--accent-soft-ink:#4A1F42;--accent-line:#D9B8D1;--ok:#0F766E;--ok-ink:#0F766E;--ok-soft:#E1F2EF;
+--warn:#7A4B2A;--warn-dot:#B7791F;--warn-soft:#F4ECE4;--danger:#A3302A;--danger-soft:#FBEDEC;
+--danger-soft-ink:#A3302A;--danger-line:#E6C9C6;--focus:#6B2E5F;--focus-halo:#D9B8D1;
+--code-bg:#2A2125;--code-ink:#F6EFE9;--code-line:#2A2125;--shadow-card:0 1px 2px rgba(42,33,37,.04);
+--shadow-raise:0 1px 2px rgba(42,33,37,.04),0 8px 24px rgba(42,33,37,.06);
+--font-head:ui-rounded,"SF Pro Rounded",system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+--fs-body:16px;--fs-small:14px;--fs-xs:13px;--fs-h1:32px;--fs-h2:20px;--fs-h3:15px;--head-weight:600;--head-track:-0.02em;
+--r-sm:6px;--r-md:12px;--r-lg:20px;--r-btn:999px;--r-pill:999px;--gap:16px;--pad-card:20px 24px;--focus-w:3px;
+--wrap:880px;--wrap-wide:1040px}
+@media (prefers-color-scheme:dark){[data-theme="household"]{
+--bg:#1C1619;--surface:#261E22;--surface-2:#2F262A;--chip-bg:#33282E;--field-bg:#1C1619;--top-bg:transparent;
+--ink:#F6EFE9;--ink-2:#F6EFE9;--body-2:#F6EFE9;--muted:#C2B4BA;--line:#3D3237;--line-2:#362C31;--line-strong:#4A3D43;
+--field-line:#857479;--accent:#E3B5D8;--accent-hover:#EDC8E3;--on-accent:#2A1025;--accent-soft:#3E2639;
+--accent-soft-ink:#F0D3E8;--accent-line:#5A3A52;--ok:#5EC4B6;--ok-ink:#8FD9CE;--ok-soft:#1E3532;
+--warn:#E8B48C;--warn-dot:#E8B48C;--warn-soft:#3A2A1E;--danger:#F2948C;--danger-soft:#3A1F1E;
+--danger-soft-ink:#F2948C;--danger-line:#5C3431;--focus:#E3B5D8;--focus-halo:#5A3A52;
+--code-bg:#120E10;--code-ink:#F6EFE9;--code-line:#3D3237;--shadow-card:none;--shadow-raise:0 8px 24px rgba(0,0,0,.5)}}
+[data-theme="control"]{color-scheme:dark;
+--bg:#0E1116;--surface:#151A21;--surface-2:#11151B;--chip-bg:#1B222B;--field-bg:#0B0E12;--top-bg:#0A0C10;
+--ink:#E6EAF0;--ink-2:#C9D2DC;--body-2:#B4BFCC;--muted:#9AA6B5;--line:#2A333F;--line-2:#222A35;--line-strong:#2F3946;
+--field-line:#5C6878;--accent:#F5B83D;--accent-hover:#FFD27A;--on-accent:#14110A;--accent-soft:#2A2210;
+--accent-soft-ink:#F5B83D;--accent-line:#5C4A1E;--ok:#4ADE80;--ok-ink:#7EE2A8;--ok-soft:#10241A;
+--warn:#F5B83D;--warn-dot:#F5B83D;--warn-soft:#2A2210;--danger:#FF8A80;--danger-soft:#1E1415;
+--danger-soft-ink:#FFB4AC;--danger-line:#5A2E2A;--focus:#F5B83D;--focus-halo:transparent;
+--code-bg:#0B0E12;--code-ink:#E6EAF0;--code-line:#2A333F;--shadow-card:none;--shadow-raise:0 12px 32px rgba(0,0,0,.6);
+--font-head:var(--font-body);
+--fs-body:15px;--fs-small:13px;--fs-xs:11px;--fs-h1:22px;--fs-h2:15px;--fs-h3:14px;--head-weight:600;--head-track:-0.01em;
+--r-sm:4px;--r-md:6px;--r-lg:10px;--r-btn:6px;--r-pill:999px;--gap:16px;--pad-card:16px;--focus-w:2px;--wrap:72rem;--wrap-wide:60rem}
+
+*,*::before,*::after{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%;text-size-adjust:100%}
+body{margin:0;min-height:100vh;display:flex;flex-direction:column;background:var(--bg);color:var(--ink);
+font-family:var(--font-body);font-size:var(--fs-body);line-height:1.5;-webkit-font-smoothing:antialiased}
+h1,h2,h3{margin:0;font-family:var(--font-head);font-weight:var(--head-weight);letter-spacing:var(--head-track);color:var(--ink)}
+h1{font-size:var(--fs-h1);line-height:1.2}h2{font-size:var(--fs-h2);line-height:1.3}h3{font-size:var(--fs-h3);line-height:1.35}
+p{margin:0}b{font-weight:600}
+a{color:var(--accent);text-underline-offset:2px}a:hover{color:var(--accent-hover)}
+:focus-visible{outline:var(--focus-w) solid var(--focus);outline-offset:2px}
+.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
+.ico{width:18px;height:18px;flex:none}
+.wrap{width:100%;max-width:var(--wrap);margin:0 auto;padding:0 16px}
+.wrap.wide{max-width:var(--wrap-wide)}
+main.wrap{flex:1 0 auto;padding-top:28px;padding-bottom:40px}
+.mt{margin-top:16px}
+p.mt a{display:inline-flex;align-items:center;min-height:44px}
+.top{background:var(--top-bg);border-bottom:1px solid var(--line)}
+.topin{display:flex;align-items:center;flex-wrap:wrap;gap:8px 10px;min-height:56px}
+.topin .grow{flex:1 1 auto}
+.logo-mark{width:24px;height:24px;color:var(--accent)}
+.brand{font-family:var(--font-head);font-weight:600;font-size:17px;letter-spacing:-0.01em;color:var(--ink)}
+.foot{border-top:1px solid var(--line);color:var(--muted);font-size:13px;padding:18px 0 28px}
+.meta{font-size:var(--fs-small);color:var(--muted)}
+.grow{flex:1 1 220px;min-width:0}
+
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:8px;min-height:44px;padding:0 16px;margin:0;
+border:1px solid var(--line-strong);border-radius:var(--r-btn);background:var(--surface);color:var(--ink-2);
+font:inherit;font-size:14px;font-weight:500;line-height:1.2;text-decoration:none;cursor:pointer}
+.btn:hover{border-color:var(--field-line);color:var(--ink)}
+.btn.primary{background:var(--accent);border-color:var(--accent);color:var(--on-accent);font-weight:600}
+.btn.primary:hover{background:var(--accent-hover);border-color:var(--accent-hover);color:var(--on-accent)}
+.btn.danger-outline{border-color:var(--danger);color:var(--danger)}
+.btn.danger-outline:hover{background:var(--danger-soft);color:var(--danger)}
+.btn.ghost{background:transparent;border-color:transparent;color:var(--ink-2)}
+.btn.ghost:hover{background:var(--chip-bg);color:var(--ink)}
+.btn.full{width:100%}
+form.inline{margin:0}
+
+.card{background:var(--surface);border:1px solid var(--line);border-radius:var(--r-lg);padding:var(--pad-card);
+box-shadow:var(--shadow-card);margin:0 0 var(--gap)}
+.card.narrow{max-width:480px}
+.card.narrow h1{margin-bottom:8px}
+.card.empty{color:var(--muted)}
+.notice{border:1px solid transparent;border-radius:var(--r-md);padding:10px 14px;margin:14px 0;font-size:14px}
+.notice.info{background:var(--accent-soft);color:var(--accent-soft-ink);border-color:var(--accent-line)}
+.notice.danger{background:var(--danger-soft);color:var(--danger-soft-ink);border-color:var(--danger-line)}
+
+.fld{margin:0 0 16px}
+.fld label{display:block;font-size:14px;font-weight:600;color:var(--ink);margin:0 0 6px}
+.lblrow{display:flex;flex-wrap:wrap;align-items:baseline;justify-content:space-between;gap:4px 8px}
+input[type=email],input[type=password],input[type=text],input:not([type]){display:block;width:100%;min-height:44px;
+padding:10px 12px;margin:0;border:1px solid var(--field-line);border-radius:var(--r-md);background:var(--field-bg);
+color:var(--ink);font:inherit}
+input::placeholder{color:var(--muted);opacity:1}
+input:focus{border-color:var(--accent);box-shadow:0 0 0 3px var(--focus-halo)}
+
+.auth{display:flex;flex-wrap:wrap;gap:48px;align-items:flex-start;justify-content:space-between;padding:8px 0 24px}
+.intro{flex:1 1 340px;max-width:440px}
+.intro h1{font-size:28px;line-height:1.2;margin-bottom:12px}
+.lead{font-size:15px;color:var(--muted);margin-bottom:22px}
+.points{list-style:none;margin:0;padding:0;display:grid;gap:14px}
+.points li{display:flex;gap:12px;align-items:flex-start;font-size:14px;color:var(--ink-2)}
+.pt-ico{display:inline-flex;align-items:center;justify-content:center;flex:none;color:var(--accent)}
+.authcard{flex:1 1 320px;max-width:400px;padding:28px 24px}
+.authcard h2{font-size:20px;margin-bottom:4px}
+.authcard form{margin-top:20px}
+.switch-auth{margin-top:12px}
+.switch-auth a{display:inline-flex;align-items:center;min-height:44px}
+
+.pagehead{margin:0 0 20px}
+.pagehead h1{margin-bottom:4px}
+.eyebrow{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
+.thead{display:none}
+.pis{background:none;border:0;padding:0;box-shadow:none;border-radius:0}
+.pirow{display:flex;align-items:center;gap:12px;min-height:64px;padding:12px 16px;margin:0 0 8px;background:var(--surface);
+border:1px solid var(--line);border-radius:10px;color:var(--ink);text-decoration:none}
+.pirow:hover{border-color:var(--accent);color:var(--ink)}
+.avatar{display:inline-flex;align-items:center;justify-content:center;flex:none;width:36px;height:36px;border-radius:8px;
+background:var(--accent-soft);color:var(--accent)}
+.pi-main{flex:1 1 auto;min-width:0;display:flex;flex-direction:column}
+.name{font-weight:600;overflow-wrap:anywhere}
+.status{display:inline-flex;align-items:center;gap:6px;font-size:13px;color:var(--muted)}
+.status.wait{color:var(--warn)}
+.go{display:inline-flex;align-items:center;gap:2px;flex:none;font-size:14px;font-weight:500;color:var(--accent)}
+.dot{display:inline-block;width:8px;height:8px;border-radius:50%;flex:none;background:var(--muted)}
+.dot.on{background:var(--ok)}
+.dot.wait{background:transparent;border:2px solid var(--warn-dot)}
+
+.pending{padding:0;overflow:hidden;border-radius:10px}
+.pending-head{display:flex;flex-wrap:wrap;align-items:center;gap:12px;padding:14px 16px;border-bottom:1px solid var(--line)}
+.pending-head .avatar{background:var(--chip-bg);color:var(--muted)}
+.pending-head h2{overflow-wrap:anywhere}
+.pending-body{padding:16px}
+.paircode{display:flex;flex-direction:column;align-items:flex-start;gap:4px;margin:0 0 18px}
+.label{font-size:12px;color:var(--muted)}
+.bigcode{font-family:var(--font-mono);font-size:24px;font-weight:600;letter-spacing:.12em;line-height:1.3;color:var(--ink);
+font-variant-numeric:tabular-nums;overflow-wrap:anywhere}
+.steps h3{margin:20px 0 4px}.steps h3:first-child{margin-top:0}
+.steps p{margin:0 0 8px}
+.cmd{display:block;margin:10px 0;padding:12px 14px;background:var(--code-bg);color:var(--code-ink);border:1px solid var(--code-line);
+border-radius:var(--r-md);font:13px/1.6 var(--font-mono);white-space:pre-wrap;overflow-wrap:anywhere;word-break:break-all;
+user-select:all;-webkit-user-select:all}
+.pairvals{margin:10px 0 0;display:grid;gap:6px}
+.pairvals div{display:flex;flex-wrap:wrap;align-items:baseline;gap:2px 12px}
+.pairvals dt{min-width:9rem;font-size:13px;color:var(--muted)}
+.pairvals dd{margin:0;min-width:0}
+code.inline{font-family:var(--font-mono);font-size:13px;background:var(--chip-bg);color:var(--ink);padding:2px 6px;
+border-radius:var(--r-sm);overflow-wrap:anywhere}
+
+.add{border-top:1px solid var(--line);padding-top:24px;margin:24px 0}
+.add h2{margin-bottom:4px}
+.addform{display:flex;flex-wrap:wrap;align-items:flex-end;gap:12px;margin-top:14px}
+.addform .fld{margin:0;max-width:360px}
+.appearance h2{margin-bottom:4px}
+.themes{border:0;margin:16px 0;padding:0;min-width:0;display:grid;gap:8px}
+.theme-opt{display:flex;align-items:center;gap:12px;min-height:56px;padding:10px 14px;border:1px solid var(--line-strong);
+border-radius:var(--r-md);background:var(--surface);cursor:pointer}
+.theme-opt:hover{border-color:var(--field-line)}
+.theme-opt input{accent-color:var(--accent);width:20px;height:20px;flex:none;margin:0}
+.theme-text{display:flex;flex-direction:column;min-width:0}
+.theme-text b{color:var(--ink)}
+.theme-opt input:checked~.theme-text b{color:var(--accent)}
+.swatch{display:inline-flex;flex:none;border:1px solid var(--line);border-radius:6px;overflow:hidden}
+.swatch i{display:block;width:14px;height:28px}
+.swatch-calm i:nth-child(1){background:#f4f3ef}.swatch-calm i:nth-child(2){background:#0e6b62}.swatch-calm i:nth-child(3){background:#1d1c1a}
+.swatch-household i:nth-child(1){background:#FAF7F2}.swatch-household i:nth-child(2){background:#6B2E5F}.swatch-household i:nth-child(3){background:#0F766E}
+.swatch-control i:nth-child(1){background:#0E1116}.swatch-control i:nth-child(2){background:#F5B83D}.swatch-control i:nth-child(3){background:#E6EAF0}
+
+[data-theme="household"] .top{border-bottom:0}
+[data-theme="household"] .topin{padding:20px 16px 4px;min-height:0}
+[data-theme="household"] .brand{font-size:20px}
+[data-theme="household"] .logo-mark{width:28px;height:28px}
+[data-theme="household"] .foot{border-top:0}
+[data-theme="household"] .btn{font-size:15px}
+[data-theme="household"] .btn.danger-outline{border-color:var(--danger-line)}
+[data-theme="household"] .btn.full,[data-theme="household"] .addform .btn{border-radius:12px;min-height:48px}
+[data-theme="household"] input[type=email],[data-theme="household"] input[type=password],
+[data-theme="household"] input[type=text],[data-theme="household"] input:not([type]){min-height:48px;border-radius:12px}
+[data-theme="household"] .intro h1{font-size:40px;line-height:1.1;max-width:14ch;margin-bottom:16px}
+[data-theme="household"] .lead{font-size:17px}
+[data-theme="household"] .points li{align-items:center;font-size:15px}
+[data-theme="household"] .pt-ico{width:32px;height:32px;border-radius:50%;background:var(--ok-soft);color:var(--ok-ink)}
+[data-theme="household"] .points li:nth-child(2) .pt-ico{background:var(--accent-soft);color:var(--accent)}
+[data-theme="household"] .points li:nth-child(3) .pt-ico{background:var(--warn-soft);color:var(--warn)}
+[data-theme="household"] .authcard{max-width:440px;padding:32px;box-shadow:var(--shadow-raise)}
+[data-theme="household"] .card h2,[data-theme="household"] .add h2{font-size:20px}
+[data-theme="household"] .pirow{border-radius:var(--r-lg);padding:16px 20px;gap:16px;box-shadow:var(--shadow-card);margin-bottom:12px}
+[data-theme="household"] .pirow .avatar{width:48px;height:48px;border-radius:14px;background:var(--ok-soft);color:var(--ok-ink)}
+[data-theme="household"] .pirow .name{font-family:var(--font-head);font-size:20px;letter-spacing:-0.01em}
+[data-theme="household"] .status{font-size:14px}
+[data-theme="household"] .status.on{color:var(--ok-ink);font-weight:600}
+[data-theme="household"] .status.wait{font-weight:600}
+[data-theme="household"] .go{min-height:44px;padding:0 18px;border-radius:var(--r-pill);background:var(--accent);color:var(--on-accent);font-weight:600}
+[data-theme="household"] .pirow:hover .go{background:var(--accent-hover)}
+[data-theme="household"] .pending{border-radius:var(--r-lg)}
+[data-theme="household"] .pending-head{padding:18px 24px;border-bottom-color:var(--line-2)}
+[data-theme="household"] .pending-head .avatar{width:48px;height:48px;border-radius:14px;background:var(--warn-soft);color:var(--warn)}
+[data-theme="household"] .pending-body{padding:20px 24px 24px}
+[data-theme="household"] .paircode{background:var(--accent-soft);border-radius:14px;padding:16px 20px}
+[data-theme="household"] .paircode .label{color:var(--accent-soft-ink);font-weight:600;font-size:13px}
+[data-theme="household"] .paircode .meta{color:var(--accent-soft-ink)}
+[data-theme="household"] .bigcode{font-size:26px;letter-spacing:.08em}
+[data-theme="household"] .cmd{font-size:14px;border-radius:12px;padding:14px 16px}
+[data-theme="household"] .add{border:1px dashed var(--field-line);border-radius:var(--r-lg);padding:24px}
+[data-theme="household"] .theme-opt{border-radius:16px}
+
+[data-theme="control"] .top{border-bottom-color:var(--line-2)}
+[data-theme="control"] .topin{min-height:52px}
+[data-theme="control"] .brand{font-size:15px}
+[data-theme="control"] .foot{border-top-color:var(--line-2)}
+[data-theme="control"] .btn{background:transparent;font-size:13px}
+[data-theme="control"] .btn:hover{background:#1B222B;border-color:#3A4553}
+[data-theme="control"] .btn.primary{background:var(--accent);border-color:var(--accent)}
+[data-theme="control"] .btn.primary:hover{background:var(--accent-hover);border-color:var(--accent-hover)}
+[data-theme="control"] .btn.danger-outline{border-color:var(--danger-line)}
+[data-theme="control"] .btn.danger-outline:hover{background:#2A1715;border-color:#FF6B5E}
+[data-theme="control"] input::placeholder{color:#8A95A3}
+[data-theme="control"] .intro h1{font-size:28px}
+[data-theme="control"] .lead{color:var(--body-2)}
+[data-theme="control"] .points{gap:0;border-top:1px solid var(--line-2)}
+[data-theme="control"] .points li{border-bottom:1px solid var(--line-2);padding:12px 0;color:var(--body-2)}
+[data-theme="control"] .pt-ico{display:none}
+[data-theme="control"] .authcard{max-width:26rem}
+[data-theme="control"] .eyebrow,[data-theme="control"] .thead{font:500 var(--fs-xs)/1.4 var(--font-mono);text-transform:uppercase;
+letter-spacing:.08em;color:var(--muted)}
+[data-theme="control"] .pis .eyebrow{position:static;width:auto;height:auto;margin:0;overflow:visible;clip:auto;white-space:normal;
+display:block;padding:10px 16px;background:var(--surface-2);border-bottom:1px solid var(--line-2)}
+[data-theme="control"] .pis{background:var(--surface);border:1px solid var(--line);border-radius:var(--r-lg);overflow:hidden}
+[data-theme="control"] .thead{display:grid;grid-template-columns:minmax(0,2fr) minmax(0,1fr) 6rem;gap:12px;
+padding:8px 16px 8px 44px;border-bottom:1px solid var(--line-2)}
+[data-theme="control"] .pirow{display:grid;grid-template-columns:16px minmax(0,2fr) minmax(0,1fr) 6rem;gap:12px;
+min-height:52px;padding:8px 16px;margin:0;border:0;border-radius:0;background:none}
+[data-theme="control"] .pirow+.pirow{border-top:1px solid var(--line-2)}
+[data-theme="control"] .pirow:hover{background:#1B222B}
+[data-theme="control"] .pirow:focus-visible{outline-offset:-4px}
+[data-theme="control"] .pirow .avatar{width:16px;height:16px;background:none;color:var(--muted)}
+[data-theme="control"] .pirow .avatar .ico{width:16px;height:16px}
+[data-theme="control"] .pi-main{display:contents}
+[data-theme="control"] .status.on{color:var(--ok-ink)}
+[data-theme="control"] .dot.on{box-shadow:0 0 0 3px rgba(74,222,128,.18)}
+[data-theme="control"] .go{justify-content:flex-end}
+[data-theme="control"] .pending-head{border-bottom-color:var(--line-2)}
+[data-theme="control"] .pending-head .avatar{width:32px;height:32px;border-radius:var(--r-md)}
+[data-theme="control"] .pending-body{display:flex;flex-wrap:wrap;padding:0}
+[data-theme="control"] .paircode{flex:1 1 16rem;margin:0;padding:16px;border-right:1px solid var(--line-2);background:#0F1318}
+[data-theme="control"] .paircode .label{font:500 var(--fs-xs)/1.4 var(--font-mono);text-transform:uppercase;letter-spacing:.08em}
+[data-theme="control"] .bigcode{font-size:32px;font-weight:500;color:var(--accent)}
+[data-theme="control"] .steps{flex:3 1 26rem;min-width:0;padding:16px}
+[data-theme="control"] .steps p{color:var(--body-2)}
+[data-theme="control"] .steps p.meta{color:var(--muted)}
+[data-theme="control"] .pairvals{gap:0;border:1px solid var(--line);border-radius:6px;overflow:hidden}
+[data-theme="control"] .pairvals div{padding:8px 12px}
+[data-theme="control"] .pairvals div+div{border-top:1px solid var(--line-2)}
+[data-theme="control"] .pairvals code.inline{background:none;padding:0}
+[data-theme="control"] .add{background:var(--surface);border:1px solid var(--line);border-radius:var(--r-lg);padding:var(--pad-card)}
+[data-theme="control"] .swatch{border-radius:4px}
+
+@media (max-width:760px){
+input[type=email],input[type=password],input[type=text],input:not([type]){font-size:16px}
+.auth{gap:28px}
+[data-theme="household"] .intro h1{font-size:32px}
+[data-theme="household"] .pirow{flex-wrap:wrap}
+[data-theme="control"] .paircode{border-right:0;border-bottom:1px solid var(--line-2)}
+[data-theme="control"] .thead{display:none}
+[data-theme="control"] .pirow{grid-template-columns:16px minmax(0,1fr) auto;row-gap:0}
+[data-theme="control"] .pirow .status{grid-column:2;grid-row:2}
+[data-theme="control"] .pirow .go{grid-column:3;grid-row:1/span 2}
+}
+"""
+
+# The page layout. The relay's pages carry no scripts at all. The look comes from data-theme,
+# which page() fills from the visitor's validated theme choice.
+PAGE = """<!doctype html><html lang="en" data-theme="{theme}"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1"><title>QuietNet</title>
-<style>:root{{color-scheme:light dark}}body{{margin:0;font:16px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
-background:#f4f6f5;color:#17231f}}@media(prefers-color-scheme:dark){{body{{background:#111715;color:#e8efec}}
-.card{{background:#1b2421!important;border-color:#2e3a36!important}}input{{background:#111715;color:#e8efec;border-color:#2e3a36}}}}
-.wrap{{max-width:560px;margin:0 auto;padding:40px 16px}}.brand{{font-weight:700;font-size:22px;color:#0f766e;margin-bottom:20px}}
-.card{{background:#fff;border:1px solid #dfe5e2;border-radius:14px;padding:24px;margin-bottom:16px}}
-h1{{font-size:22px;margin:0 0 4px}}label{{display:block;font-weight:650;margin:14px 0 4px}}
-input{{width:100%;box-sizing:border-box;padding:10px 12px;border:1px solid #dfe5e2;border-radius:10px;font:inherit}}
-.btn{{display:inline-block;margin-top:18px;background:#0f766e;color:#fff;border:0;border-radius:10px;padding:11px 18px;font:inherit;font-weight:650;cursor:pointer;text-decoration:none}}
-.muted{{color:#5d6b66;font-size:14px}}.note{{background:#e0f2ef;color:#0f5f58;border-radius:10px;padding:10px 14px;margin:12px 0}}.err{{background:#fde8e6;color:#b42318;border-radius:10px;padding:10px 14px;margin:12px 0}}
-.dev{{display:flex;align-items:center;gap:12px;border:1px solid #dfe5e2;border-radius:12px;padding:14px;margin:10px 0;text-decoration:none;color:inherit}}
-.dev:hover{{border-color:#0f766e}}.dot{{width:10px;height:10px;border-radius:50%;background:#9aa9a3;flex:none}}.dot.on{{background:#0f766e}}
-.linkbtn{{background:none;border:0;padding:0;font:inherit;color:#5d6b66;font-size:14px;text-decoration:underline;cursor:pointer}}
-.row{{display:flex;gap:10px;align-items:center;justify-content:space-between;flex-wrap:wrap}}.code{{font:700 26px ui-monospace,Menlo,monospace;letter-spacing:3px;background:#e0f2ef;color:#0f766e;padding:10px 16px;border-radius:10px;display:inline-block}}
-.cmd{{font:600 13px/1.5 ui-monospace,Menlo,monospace;letter-spacing:0;display:block;word-break:break-all;user-select:all;-webkit-user-select:all}}
-a{{color:#0f766e}}</style></head><body><div class="wrap"><div class="brand">QuietNet</div>{body}</div></body></html>"""
+<style>{css}</style></head><body>
+<header class="top"><div class="{wrap} topin">{logo}<span class="brand">QuietNet</span><span class="grow"></span>{header_extra}</div></header>
+<main class="{wrap}">{body}</main>
+<footer class="foot"><div class="{wrap}">QuietNet relay. Pages showing your home's activity are never cached.</div></footer>
+</body></html>"""
 
 
-def page(body):
-    """Wrap a fragment of HTML in the site's page layout."""
-    return PAGE.format(body=body)
+def page(body, theme="calm", header_extra="", wide=False):
+    """Wrap a fragment of HTML in the site's page layout.
+
+    `theme` must be one of THEMES; anything else is treated as calm (it is checked here as well as
+    where it is read, since it comes from the browser). `header_extra` is HTML for the right of the
+    header (the sign-out button). `wide` gives the sign-in pages their wider, two-column layout."""
+    return PAGE.format(theme=theme_name(theme), css=RELAY_CSS, wrap="wrap wide" if wide else "wrap",
+                       logo=icon("logo", "ico logo-mark"), header_extra=header_extra, body=body)
 
 
 # ------------------------------------------------------------------ web server
@@ -868,11 +1197,17 @@ class Relay(BaseHTTPRequestHandler):
         token = self.cookie("qn_session")
         return read_session(token) if token else None
 
-    def set_cookie(self, token, name="qn_session", seconds=SESSION_HOURS * 3600):
+    def theme(self):
+        """The look this browser asked for, from its 'qn_theme' cookie: one of THEMES, else calm."""
+        return theme_name(self.cookie("qn_theme") or "")
+
+    def set_cookie(self, token, name="qn_session", seconds=SESSION_HOURS * 3600, http_only=True):
         """Queue a cookie to go out with this answer. An empty session token signs out.
         HttpOnly keeps page scripts from reading it; SameSite=Lax keeps other sites from sending it
-        with their own form posts; Secure is added whenever the request came over HTTPS."""
-        flags = "HttpOnly; SameSite=Lax; Path=/; Max-Age=%d" % seconds
+        with their own form posts; Secure is added whenever the request came over HTTPS.
+        The theme cookie is the one exception to HttpOnly: the dashboard's own script reads it to
+        pick its look, and it holds nothing secret (only 'calm', 'household' or 'control')."""
+        flags = ("HttpOnly; " if http_only else "") + "SameSite=Lax; Path=/; Max-Age=%d" % seconds
         if self.secure():
             flags += "; Secure"
         self._cookies = getattr(self, "_cookies", []) + ["%s=%s; %s" % (name, token, flags)]
@@ -883,10 +1218,10 @@ class Relay(BaseHTTPRequestHandler):
         self.set_cookie(make_session(uid))
         self.set_cookie(known_device_token(uid, pw_record), name="qn_known", seconds=KNOWN_DEVICE_DAYS * 86400)
 
-    def sign_out_form(self, label="Sign out", css="linkbtn"):
+    def sign_out_form(self, label="Sign out", css="btn ghost"):
         """A sign-out button: a form that posts to /logout with this session's sign-out token."""
         token = sign_out_token(self.cookie("qn_session") or "")
-        return ('<form method="post" action="/logout" style="margin:0"><input type="hidden" name="token" value="%s">'
+        return ('<form class="inline" method="post" action="/logout"><input type="hidden" name="token" value="%s">'
                 '<button class="%s" type="submit">%s</button></form>') % (
             html.escape(token), html.escape(css), html.escape(label))
 
@@ -895,9 +1230,9 @@ class Relay(BaseHTTPRequestHandler):
         any website can send a browser to an address."""
         if not self.user():
             return self.redirect("/login")
-        return self.send_html('<div class="card"><h1>Sign out?</h1><p class="muted">You will need your password '
-                              'to sign in again.</p>%s<p class="muted" style="margin-top:16px"><a href="/">Back to '
-                              'your QuietNets</a></p></div>' % self.sign_out_form("Sign out", "btn"))
+        return self.send_html('<div class="card narrow"><h1>Sign out?</h1><p class="meta">You will need your '
+                              'password to sign in again.</p><div class="mt">%s</div><p class="mt"><a href="/">Back '
+                              'to your QuietNets</a></p></div>' % self.sign_out_form("Sign out", "btn primary"))
 
     def sign_out(self):
         """POST /logout: sign the account out everywhere (every browser holding one of its session
@@ -920,15 +1255,35 @@ class Relay(BaseHTTPRequestHandler):
         for c in getattr(self, "_cookies", []):
             self.send_header("Set-Cookie", c)
 
-    def send_html(self, body, code=200):
-        """Send a page (the fragment is wrapped in the site layout), with any queued cookies."""
-        data = page(body).encode()
+    def send_html(self, body, code=200, header_extra="", wide=False):
+        """Send a page (the fragment is wrapped in the site layout, in this browser's chosen look),
+        with any queued cookies. `header_extra` and `wide` are as for page()."""
+        data = page(body, self.theme(), header_extra, wide).encode()
         self.send_response(code)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(data)))
         self.send_cookies()
         self.end_headers()
         self.wfile.write(data)
+
+    def send_auth(self, body, code=200):
+        """Send a sign-in or create-account page (from auth_form), in the wider layout it needs."""
+        return self.send_html(body, code, wide=True)
+
+    ERROR_TEXT = {404: ("Page not found", "There is nothing at this address.")}
+
+    def send_error(self, code, message=None, explain=None):
+        """Send an error answer as a page in the relay's own look, rather than the plain one Python
+        gives. The words are escaped by Python's own send_error, as before. An error can come before
+        the request's headers have been read, so the look falls back to calm then."""
+        if message is None and explain is None and code in self.ERROR_TEXT:
+            message, explain = self.ERROR_TEXT[code]
+        theme = self.theme() if getattr(self, "headers", None) is not None else THEMES[0]
+        body = ('<div class="card narrow"><h1>%(message)s</h1><p class="meta">%(explain)s (Error %(code)d.)</p>'
+                '<p class="mt"><a href="/">Go to your QuietNets</a></p></div>')
+        # The page's style sheet holds % signs, which the format Python fills in would misread.
+        self.error_message_format = page("QN-ERROR-BODY", theme).replace("%", "%%").replace("QN-ERROR-BODY", body)
+        super().send_error(code, message, explain)
 
     def send_json(self, obj, code=200):
         """Send `obj` as a JSON answer with the given status."""
@@ -960,7 +1315,7 @@ class Relay(BaseHTTPRequestHandler):
         raw = self.raw_body or b""
         return {k: v[0] for k, v in parse_qs(raw.decode("utf-8", "ignore")).items()}
 
-    FORM_POSTS = ("/login", "/signup", "/logout", "/pis/new")      # and /pis/<id>/delete
+    FORM_POSTS = ("/login", "/signup", "/logout", "/pis/new", "/theme")      # and /pis/<id>/delete
     CROSS_SITE = ("That form was sent from another website, so it was refused. Open this relay's own page "
                   "and try again.")
 
@@ -997,9 +1352,9 @@ class Relay(BaseHTTPRequestHandler):
         if p.startswith("/pi/"):
             return self.pi_request("GET", p, url.query)
         if p == "/signup" and not signup_allowed():
-            return self.send_html(self.auth_form("login", "New accounts are switched off on this relay."))
+            return self.send_auth(self.auth_form("login", "New accounts are switched off on this relay."))
         if p in ("/login", "/signup"):
-            return self.send_html(self.auth_form(p[1:]))
+            return self.send_auth(self.auth_form(p[1:]))
         if p == "/logout":
             return self.sign_out_page()
         if p == "/" :
@@ -1020,9 +1375,11 @@ class Relay(BaseHTTPRequestHandler):
             return
         if p in self.FORM_POSTS or (p.startswith("/pis/") and p.endswith("/delete")):
             if self.from_another_site():
-                return self.send_html(self.auth_form("login", self.CROSS_SITE) if p in ("/login", "/signup")
-                                      else '<div class="card"><h1>Refused</h1><p>%s</p><p><a href="/">Back to '
-                                           'your QuietNets</a></p></div>' % html.escape(self.CROSS_SITE), 403)
+                if p in ("/login", "/signup"):
+                    return self.send_auth(self.auth_form("login", self.CROSS_SITE), 403)
+                return self.send_html('<div class="card narrow"><h1>Refused</h1><div class="notice danger" '
+                                      'role="alert">%s</div><p class="mt"><a href="/">Back to your QuietNets</a>'
+                                      '</p></div>' % html.escape(self.CROSS_SITE), 403)
         if p == "/agent/pair":
             return self.agent_pair()
         if p == "/agent/respond":
@@ -1037,6 +1394,8 @@ class Relay(BaseHTTPRequestHandler):
             return self.sign_out()
         if p == "/pis/new":
             return self.new_pi()
+        if p == "/theme":
+            return self.choose_theme()
         if p.startswith("/pis/") and p.endswith("/delete"):
             return self.delete_pi(p.split("/")[2])
         self.send_error(404)
@@ -1044,20 +1403,39 @@ class Relay(BaseHTTPRequestHandler):
     # -- accounts -------------------------------------------------------
 
     def auth_form(self, mode, error="", note=""):
-        """The sign-in or sign-up form (`mode` is 'login' or 'signup'), with an optional error or note."""
-        other = "signup" if mode == "login" else "login"
-        title = "Sign in" if mode == "login" else "Create your account"
-        switch = ('Already have an account? <a href="/login">Sign in</a>' if mode != "login"
+        """The sign-in or sign-up page (`mode` is 'login' or 'signup'), with an optional error or note:
+        a short description of QuietNet beside the form."""
+        login = mode == "login"
+        title = "Sign in" if login else "Create your account"
+        help_line = ("Use the email and password for your relay account." if login
+                     else "Choose your email and a password of at least 8 characters.")
+        switch = ('Already have an account? <a href="/login">Sign in</a>' if not login
                   else 'New here? <a href="/signup">Create an account</a>' if signup_allowed() else "")
-        err = '<div class="err">%s</div>' % html.escape(error) if error else ""
-        err += '<div class="note">%s</div>' % html.escape(note) if note else ""
-        return """<div class="card"><h1>%s</h1><p class="muted">Reach your home QuietNet from anywhere.</p>%s
-            <form method="post" action="/%s">
-            <label>Email</label><input name="email" type="email" autocomplete="email" required>
-            <label>Password</label><input name="password" type="password" autocomplete="%s" minlength="8" required>
-            <button class="btn" type="submit">%s</button></form>
-            <p class="muted" style="margin-top:16px">%s</p></div>""" % (
-            title, err, mode, "current-password" if mode == "login" else "new-password", title, switch)
+        err = '<div class="notice danger" role="alert">%s</div>' % html.escape(error) if error else ""
+        err += '<div class="notice info" role="status">%s</div>' % html.escape(note) if note else ""
+        points = "".join('<li><span class="pt-ico" aria-hidden="true">%s</span><span>%s</span></li>' % (icon(i), t) for i, t in (
+            ("lock", "Your household's activity stays on your Pi. The relay only passes your pages through."),
+            ("monitor", "One account can reach several QuietNets, such as home and a relative's house."),
+            ("moon", "Bedtimes switch things off by themselves.")))
+        return """<div class="auth">
+  <section class="intro">
+    <h1>Reach your home QuietNet from anywhere.</h1>
+    <p class="lead">QuietNet runs on a Raspberry Pi at home. It shows what each device looks up, blocks adverts and trackers, and lets you switch off chosen apps and services for each device or group, with bedtimes and a household kill switch.</p>
+    <ul class="points">%s</ul>
+  </section>
+  <section class="card authcard" aria-labelledby="authTitle">
+    <h2 id="authTitle">%s</h2>
+    <p class="meta">%s</p>%s
+    <form method="post" action="/%s">
+      <div class="fld"><label for="email">Email</label><input id="email" name="email" type="email" autocomplete="email" required></div>
+      <div class="fld"><div class="lblrow"><label for="password">Password</label><span class="meta">At least 8 characters</span></div>
+        <input id="password" name="password" type="password" autocomplete="%s" minlength="8" required></div>
+      <button class="btn primary full" type="submit">%s</button>
+    </form>
+    %s
+  </section>
+</div>""" % (points, title, help_line, err, mode, "current-password" if login else "new-password", title,
+             '<p class="switch-auth meta">%s</p>' % switch if switch else "")
 
     def do_signup(self):
         """Create an account, if sign-up is allowed, the details are acceptable and the email is new,
@@ -1066,11 +1444,11 @@ class Relay(BaseHTTPRequestHandler):
         f = self.body_form()
         email, pw = f.get("email", "").strip().lower(), f.get("password", "")
         if not signup_allowed():
-            return self.send_html(self.auth_form("login", "New accounts are switched off on this relay."), 403)
+            return self.send_auth(self.auth_form("login", "New accounts are switched off on this relay."), 403)
         if throttle.blocked("signup", SIGNUP_LIMIT_OVERALL):
-            return self.send_html(self.auth_form("signup", TOO_MANY), 429)
+            return self.send_auth(self.auth_form("signup", TOO_MANY), 429)
         if not EMAIL_RE.fullmatch(email) or len(email) > 254 or len(pw) < 8:
-            return self.send_html(self.auth_form("signup", "Enter a valid email and a password of at least 8 characters."))
+            return self.send_auth(self.auth_form("signup", "Enter a valid email and a password of at least 8 characters."))
         throttle.fail("signup")         # every try counts towards the hourly limit, new email or not
         record = hash_pw(pw)            # done either way, so both answers take as long
         # In 'first' mode the check above and this insert are far apart (the hash takes a moment), so
@@ -1084,7 +1462,7 @@ class Relay(BaseHTTPRequestHandler):
             pass                        # the email already has an account: leave it exactly as it is
         # The same answer whether or not the email already had an account, so this form can't be used
         # to find out who has one. Nobody is signed in here; signing in proves the password.
-        return self.send_html(self.auth_form("login", note=SIGNUP_DONE))
+        return self.send_auth(self.auth_form("login", note=SIGNUP_DONE))
 
     def do_login(self):
         """Check an email and password and sign in. Wrong guesses are counted, per account
@@ -1106,7 +1484,7 @@ class Relay(BaseHTTPRequestHandler):
                        or throttle.blocked("login-tries:" + email, LOGIN_TRIES_PER_EMAIL)
                        or throttle.blocked("login-from:" + address, LOGIN_TRIES_PER_ADDRESS))
         if blocked:
-            return self.send_html(self.auth_form("login", TOO_MANY), 429)
+            return self.send_auth(self.auth_form("login", TOO_MANY), 429)
         # Every attempt counts here, right or wrong: checking a password costs real processor time,
         # and anyone can make an account and sign in to it correctly over and over.
         if trusted:
@@ -1115,7 +1493,7 @@ class Relay(BaseHTTPRequestHandler):
             throttle.fail("login-tries:" + email)
             throttle.fail("login-from:" + address)
         if not password_checks.acquire(timeout=PASSWORD_CHECK_WAIT):
-            return self.send_html(self.auth_form("login", "The relay is busy. Please try again in a moment."), 503)
+            return self.send_auth(self.auth_form("login", "The relay is busy. Please try again in a moment."), 503)
         try:
             if row:
                 good = check_pw(pw, row[1])
@@ -1130,13 +1508,31 @@ class Relay(BaseHTTPRequestHandler):
             else:
                 throttle.fail("login:" + email)
                 throttle.fail("login")
-            return self.send_html(self.auth_form("login", "Wrong email or password."))
+            return self.send_auth(self.auth_form("login", "Wrong email or password."))
         throttle.clear("login:" + email)
         throttle.clear("login-known:" + email)
         self.signed_in_as(row[0])
         self.redirect("/")
 
     # -- device list / pairing -----------------------------------------
+
+    def theme_form(self):
+        """The Appearance card on the home page: the three looks as radio buttons, the current one
+        ticked, in a form that posts to /theme (the relay's pages have no scripts, so it has a button)."""
+        current = self.theme()
+        options = "".join(
+            '<label class="theme-opt"><input type="radio" name="theme" value="%s"%s>'
+            '<span class="swatch swatch-%s" aria-hidden="true"><i></i><i></i><i></i></span>'
+            '<span class="theme-text"><b>%s</b><span class="meta">%s</span></span></label>' % (
+                html.escape(tid), " checked" if tid == current else "", html.escape(tid),
+                html.escape(name), html.escape(words))
+            for tid, name, words in THEME_CHOICES)
+        return ('<section class="card appearance" id="appearance" aria-labelledby="appearanceTitle">'
+                '<h2 id="appearanceTitle">Appearance</h2>'
+                '<p class="meta">How these pages, and your QuietNets\' pages opened from here, look in this browser.</p>'
+                '<form method="post" action="/theme"><fieldset class="themes"><legend class="sr-only">Choose a look'
+                '</legend>%s</fieldset><button class="btn" type="submit">Use this look</button></form></section>'
+                % options)
 
     def home(self):
         """The signed-in home page: your QuietNets, with a pairing code for each one not yet
@@ -1145,7 +1541,7 @@ class Relay(BaseHTTPRequestHandler):
         if not uid:
             return self.redirect("/login")
         pis = sql("SELECT id,name,paired,last_seen FROM pis WHERE user_id=? ORDER BY created", (uid,))
-        rows = ""
+        paired_rows, waiting = "", ""
         now = time.time()
         address, guessed = relay_address(self.headers.get("Host"))
         for pid, name, paired, seen in pis:
@@ -1156,30 +1552,49 @@ class Relay(BaseHTTPRequestHandler):
                     # so the code on screen is always one that works.
                     code = new_pair_code()
                     sql("UPDATE pis SET code=?, code_ts=? WHERE id=? AND paired=0", (code, now, pid), commit=True)
-                rows += """<div class="card"><div class="row"><div><b>%s</b><div class="muted">Waiting to be paired</div></div>
-                    <form method="post" action="/pis/%s/delete"><button class="btn" style="background:#b42318">Remove</button></form></div>
-                    <p style="margin:12px 0 6px"><b>New Pi?</b> Run this one line on it:</p>
-                    <div class="code cmd">%s</div>%s
-                    <p class="muted" style="margin-top:8px">It needs Raspberry Pi OS or another Debian-style Linux, and installs
-                    Docker if it is missing (it asks first). The code works once and for %d minutes.</p>
-                    <p class="muted" style="margin-top:12px"><b>Pi already running QuietNet?</b> On the Pi's own QuietNet page,
-                    open <b>Remote access</b>, enter this relay's web address and this code:</p><div class="code">%s</div>
-                    <p class="muted" style="margin-top:8px">Reload this page for a new code.</p></div>""" % (
-                    html.escape(name), pid, html.escape(install_command(address, code)),
-                    ('<p class="muted" style="margin-top:6px">Replace %s with this relay\'s web address.</p>'
-                     % html.escape(address)) if guessed else "",
-                    PAIR_CODE_MINUTES, html.escape(code))
+                waiting += """<section class="card pending" aria-labelledby="pi-%(pid)s">
+  <div class="pending-head"><span class="avatar" aria-hidden="true">%(chip)s</span>
+    <div class="grow"><h2 id="pi-%(pid)s">%(name)s</h2><div class="status wait"><span class="dot wait" aria-hidden="true"></span>Waiting to be paired</div></div>
+    <form class="inline" method="post" action="/pis/%(pid)s/delete"><button class="btn danger-outline" type="submit">Remove</button></form></div>
+  <div class="pending-body">
+    <div class="paircode"><span class="label">Pairing code</span><span class="bigcode">%(code)s</span>
+      <span class="meta">Works once, for %(minutes)d minutes. Reload this page for a new code.</span></div>
+    <div class="steps">
+      <h3>New Pi? Run this one line on it</h3>
+      <p class="meta">It needs Raspberry Pi OS or another Debian-style Linux, and installs Docker if it is missing (it asks first).</p>
+      <pre class="cmd">%(command)s</pre>%(guessed)s
+      <h3>Pi already running QuietNet?</h3>
+      <p>On the Pi's own QuietNet page, open <b>Remote access</b>, enter this relay's web address and this code:</p>
+      <dl class="pairvals"><div><dt>Relay web address</dt><dd><code class="inline">%(address)s</code></dd></div><div><dt>Pairing code</dt><dd><code class="inline">%(code)s</code></dd></div></dl>
+    </div>
+  </div>
+</section>""" % {
+                    "pid": html.escape(pid), "chip": icon("chip"), "name": html.escape(name),
+                    "code": html.escape(code), "minutes": PAIR_CODE_MINUTES,
+                    "command": html.escape(install_command(address, code)), "address": html.escape(address),
+                    "guessed": ('<p class="meta">Replace %s with this relay\'s web address.</p>'
+                                % html.escape(address)) if guessed else ""}
             else:
-                online = seen and (now - seen) < OFFLINE_AFTER
-                rows += """<a class="dev" href="/pi/%s/"><span class="dot %s"></span>
-                    <span style="flex:1"><b>%s</b><div class="muted">%s</div></span><span class="muted">Open &rsaquo;</span></a>""" % (
-                    pid, "on" if online else "", html.escape(name), "Online" if online else "Offline")
-        return self.send_html("""<div class="row"><h1 style="margin:0">Your QuietNets</h1>
-            %s</div>%s
-            <form method="post" action="/pis/new"><label>Add a QuietNet</label>
-            <input name="name" placeholder="e.g. Home Pi" required>
-            <button class="btn" type="submit">Create pairing code</button></form>""" % (
-            self.sign_out_form(), rows or GETTING_STARTED))
+                online = bool(seen) and (now - seen) < OFFLINE_AFTER
+                paired_rows += ('<a class="pirow" href="/pi/%s/"><span class="avatar" aria-hidden="true">%s</span>'
+                                '<span class="pi-main"><b class="name">%s</b><span class="status %s"><span class="dot %s" '
+                                'aria-hidden="true"></span>%s</span></span><span class="go">Open%s</span></a>') % (
+                    html.escape(pid), icon("chip"), html.escape(name), "on" if online else "off",
+                    "on" if online else "off", "Online" if online else "Offline", icon("right"))
+        listed = ""
+        if paired_rows:
+            listed += ('<section class="card flush pis" aria-labelledby="pairedTitle"><h2 id="pairedTitle" '
+                       'class="eyebrow">Paired</h2><div class="thead" aria-hidden="true"><span>Name</span>'
+                       '<span>Status</span><span></span></div>%s</section>' % paired_rows)
+        listed += waiting
+        body = """<div class="pagehead"><h1>Your QuietNets</h1><p class="meta">Open one to see its devices, groups and schedules.</p></div>
+%s
+<section class="add" aria-labelledby="addTitle"><h2 id="addTitle">Add a QuietNet</h2>
+  <p class="meta">Give it a name and you will get a pairing code for it.</p>
+  <form method="post" action="/pis/new" class="addform"><div class="fld grow"><label for="piname">Name</label><input id="piname" name="name" placeholder="e.g. Home Pi" required maxlength="40"></div>
+  <button class="btn primary" type="submit">Create pairing code</button></form></section>
+%s""" % (listed or '<div class="card empty">%s</div>' % GETTING_STARTED, self.theme_form())
+        return self.send_html(body, header_extra=self.sign_out_form("Sign out", "btn ghost"))
 
     def new_pi(self):
         """Create a QuietNet entry for the signed-in user, with a fresh pairing code. Each account
@@ -1188,9 +1603,9 @@ class Relay(BaseHTTPRequestHandler):
         if not uid:
             return self.redirect("/login")
         if sql("SELECT COUNT(*) FROM pis WHERE user_id=?", (uid,), one=True)[0] >= MAX_PIS_PER_ACCOUNT:
-            return self.send_html('<div class="card"><h1>No room for another QuietNet</h1><p>This account already '
-                                  'has %d QuietNets, the most it can hold. Remove one before adding another.</p>'
-                                  '<p><a href="/">Back to your QuietNets</a></p></div>'
+            return self.send_html('<div class="card narrow"><h1>No room for another QuietNet</h1><p>This account '
+                                  'already has %d QuietNets, the most it can hold. Remove one before adding another.'
+                                  '</p><p class="mt"><a href="/">Back to your QuietNets</a></p></div>'
                                   % int(MAX_PIS_PER_ACCOUNT), 403)
         name = (self.body_form().get("name", "").strip() or "My QuietNet")[:40]
         pid = secrets.token_hex(8)
@@ -1198,6 +1613,16 @@ class Relay(BaseHTTPRequestHandler):
         sql("INSERT INTO pis(id,user_id,name,token,code,paired,created,last_seen,code_ts) VALUES(?,?,?,?,?,0,?,0,?)",
             (pid, uid, name, "", new_pair_code(), now, now), commit=True)
         self.redirect("/")
+
+    def choose_theme(self):
+        """POST /theme: remember which look this browser wants (a cookie only; nothing is stored
+        here), then go back to the home page. Only for a signed-in person; an unknown value saves
+        calm. The page to go back to is always the home page, never one named in the form."""
+        if not self.user():
+            return self.redirect("/login")
+        self.set_cookie(theme_name(self.body_form().get("theme", "")), name="qn_theme",
+                        seconds=THEME_COOKIE_DAYS * 86400, http_only=False)
+        return self.redirect("/")
 
     def delete_pi(self, pid):
         """Remove one of the signed-in user's QuietNets. Its token stops working at once."""
@@ -1324,7 +1749,8 @@ class Relay(BaseHTTPRequestHandler):
             return self.redirect("/login") if method == "GET" and rest == "/" else self.send_error(404)
 
         if rest == "/" and method == "GET":        # serve the dashboard, pointed at this Pi
-            return self.serve_dashboard(pid, pi[2])
+            return self.serve_dashboard(pid, pi[2], bool(pi[4]) and bool(pi[5])
+                                        and time.time() - pi[5] < OFFLINE_AFTER)
         if not rest.startswith("/api/"):
             return self.send_error(404)
         # Only our own dashboard sends this header; browsers won't add it cross-site. Blocks CSRF.
@@ -1353,21 +1779,34 @@ class Relay(BaseHTTPRequestHandler):
         finally:
             big_answers.give_back(resp.get("ticket"))     # the answer has gone (or never will): free its room
 
-    def serve_dashboard(self, pid, name):
+    def serve_dashboard(self, pid, name, online=False):
         """Send the dashboard page, with two additions: a script telling it to send its API
-        calls to '/pi/<id>/...', and a bar across the top with the Pi's name and a way back."""
+        calls to '/pi/<id>/...', and a bar across the top with the Pi's name, whether it is online,
+        and a way back. The bar's colours come from the dashboard's own look (its --bar- colours),
+        with calm's as the fallback."""
         if not DASHBOARD:
             return self.send_error(500)
         with open(DASHBOARD, encoding="utf-8") as f:
             html_text = f.read()
         inject = ('<script>window.QN_API_BASE=%s;</script>' % json.dumps("/pi/" + pid)
-                  + '<style>#qnbar{position:sticky;top:0;z-index:50;background:#0f766e;color:#fff;'
-                    'padding:8px 16px;font:600 14px -apple-system,sans-serif;display:flex;gap:14px;align-items:center}'
-                    '#qnbar a{color:#fff}#qnbar button{background:none;border:0;padding:0;color:#fff;'
-                    'font:inherit;text-decoration:underline;cursor:pointer}</style>')
-        bar = ('<div id="qnbar"><a href="/">&lsaquo; My QuietNets</a>'
-               '<span style="flex:1">%s &mdash; remote</span>%s</div>') % (
-            html.escape(name), self.sign_out_form(css="qnsignout"))
+                  + '<style>#qnbar{position:sticky;top:0;z-index:50;background:var(--bar-bg,#23221f);color:var(--bar-ink,#f4f3ef);'
+                    'border-bottom:1px solid var(--bar-line,#4a4842);padding:0 16px;font:500 13px/1.4 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;'
+                    'display:flex;flex-wrap:wrap;gap:4px 12px;align-items:center;min-height:44px}'
+                    '#qnbar a{color:inherit;text-decoration:none;display:inline-flex;align-items:center;gap:4px;min-height:44px}'
+                    '#qnbar a:hover{text-decoration:underline}#qnbar svg{width:16px;height:16px;flex:none}'
+                    '#qnbar .qnsep{width:1px;height:16px;background:var(--bar-line,#4a4842)}'
+                    '#qnbar .qnhere{display:inline-flex;align-items:center;gap:8px;min-width:0;overflow-wrap:anywhere}'
+                    '#qnbar .qnst{color:var(--bar-muted,#c9c5bc);display:inline-flex;align-items:center;gap:5px}'
+                    '#qnbar .qndot{width:7px;height:7px;border-radius:50%;background:var(--bar-dot,#5fc4b6)}'
+                    '#qnbar .qndot.off{background:var(--bar-muted,#c9c5bc)}'
+                    '#qnbar .qngrow{flex:1}#qnbar form{margin:0}#qnbar button{min-height:44px;background:none;border:0;padding:0 8px;color:inherit;'
+                    'font:inherit;text-decoration:underline;text-underline-offset:2px;cursor:pointer}'
+                    '#qnbar :focus-visible{outline:2px solid currentColor;outline-offset:2px}</style>')
+        bar = ('<div id="qnbar"><a href="/">%s Your QuietNets</a><span class="qnsep" aria-hidden="true"></span>'
+               '<span class="qnhere"><b>%s</b><span class="qnst"><span class="qndot%s" aria-hidden="true"></span>%s</span></span>'
+               '<span class="qngrow"></span>%s</div>') % (
+            icon("left"), html.escape(name), "" if online else " off", "Online" if online else "Offline",
+            self.sign_out_form(css="qnsignout"))
         html_text = html_text.replace("<head>", "<head>" + inject, 1).replace("<body>", "<body>" + bar, 1)
         data = html_text.encode()
         self.send_response(200)

@@ -63,6 +63,7 @@ Each of these is the only thing standing between a hostile web page, or a strang
 - **`decision()` runs for every lookup.** Keep it free of database calls and anything slow.
 - **The order of checks in `decision()` is behaviour people rely on.** It is tabulated in `docs/ARCHITECTURE.md`; change the two together.
 - **The dashboard page is edited by the relay with a plain text replace** on the opening `head` and `body` tags. Keep exactly one of each, lower case, no attributes.
+- **The three looks (themes) must each stay complete.** The dashboard's style sheet and the relay's `RELAY_CSS` set every colour and size name for each look under `[data-theme="..."]`, with Calm as the root default (the font stacks `--font-body` and `--font-mono` are shared from the root on purpose). A new colour or size name goes into all three looks (and Calm's and Household's dark sets), the markup stays free of fixed colours and inline styles, and nothing is loaded from other websites: no font files, `@import` or outside addresses. Theme names are checked against `calm`, `household` and `control` wherever the `qn_theme` cookie is read.
 - **History queries must use an index.** `queries` can hold a month of a household's lookups. A test checks the query plans.
 - **`cloud/relay.py` is deployed without the other programs.** It cannot import them.
 - **Python 3.9 must still work** for the programs: the macOS launcher prefers the Python that Apple supplies. Avoid newer syntax such as `match` or `X | Y` type hints at run time.
