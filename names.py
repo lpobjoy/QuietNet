@@ -5,8 +5,9 @@ Devices tell the network about themselves in several ways. This module listens f
 each of them, and suggests the best name found:
 
   - DHCP: when a device joins the network it usually broadcasts its own name (and often what
-    software it runs) while asking the router for an address. Heard by listening on port 67 (a
-    Raspberry Pi only: it needs admin rights). Nothing is ever sent on that port.
+    software it runs) while asking the router for an address. Heard only when a device joins or
+    rejoins: lease renewals go straight to the router. On a Raspberry Pi, read from a filtered
+    copy of arriving packets without taking port 67. Nothing is ever sent on that port.
   - Bonjour (mDNS): Apple devices, many printers, TVs, smart speakers and Linux computers answer
     "what is the name of this address?" on port 5353, and announce themselves there too.
   - Windows network (NetBIOS): Windows computers, many network drives and Samba answer a
@@ -23,7 +24,6 @@ No outside packages: Python's standard library only. Used by server.py (Namer, r
 minutes from its hint_refresher thread). Explained in docs/ARCHITECTURE.md, "Device names".
 """
 import collections
-import http.client
 import ipaddress
 import re
 import socket
@@ -39,6 +39,7 @@ NETBIOS_WAIT = 2.0           # the same for Windows network answers
 SSDP_WAIT = 1.5              # the same for UPnP answers (before fetching their descriptions)
 FETCH_SECONDS = 2.0          # the most one UPnP description download may take
 MAX_DESCRIPTION = 64 * 1024  # the largest UPnP description read; real ones are a few kilobytes
+MAX_HEADERS = 16 * 1024      # the most header bytes read before a UPnP description
 MAX_PACKET = 9000            # the most read from one network packet
 MAX_ANSWERS = 512            # the most packets read in one listening window
 MAX_RECORDS = 64             # the most records read from one Bonjour packet
@@ -67,6 +68,22 @@ MEANINGLESS = ("local", "localhost", "localdomain", "home", "lan", "internal", "
 
 M_SEARCH = (b"M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\nMAN: \"ssdp:discover\"\r\n"
             b"MX: 1\r\nST: ssdp:all\r\n\r\n")
+# The system's packet filter for the DHCP listener (open_dhcp_packet_listener), in the classic
+# filter language, one (operation, jump if true, jump if false, value) per step. Each packet
+# starts at its IPv4 header. Passes UDP packets to port 67 that are whole or the first piece of
+# one; drops everything else before it reaches the program.
+SO_ATTACH_FILTER = 26
+DHCP_FILTER = (
+    (0x30, 0, 0, 9),         # 0: load the protocol byte
+    (0x15, 0, 6, 17),        # 1: UDP? if not, drop (step 8)
+    (0x28, 0, 0, 6),         # 2: load the fragment field
+    (0x45, 4, 0, 0x1FFF),    # 3: a later piece of a split packet? drop (step 8)
+    (0xB1, 0, 0, 0),         # 4: note the IPv4 header's length
+    (0x48, 0, 0, 2),         # 5: load the destination port, just after the header
+    (0x15, 0, 1, DHCP_PORT), # 6: port 67? if not, drop (step 8)
+    (0x06, 0, 0, 0xFFFF),    # 7: keep the packet
+    (0x06, 0, 0, 0),         # 8: drop it
+)
 # The NetBIOS name "*" (asking for every name a computer has), in NetBIOS's own spelling.
 NBSTAT_NAME = b"\x20" + b"CK" + b"AA" * 15 + b"\x00"
 
@@ -90,6 +107,21 @@ def is_address(text):
         return False
 
 
+def looks_generated(text):
+    """Is this network-style name one a machine made up rather than one a person would know?
+    Two kinds are recognised:
+      - names that are all hexadecimal digits once dashes, underscores and colons are taken out,
+        at least 12 of them: identity numbers (UUIDs, which Google Cast devices use as their
+        Bonjour name) and bare hardware addresses;
+      - names whose last part, after a dash or underscore, is 12 or more hexadecimal digits: a
+        word followed by the hardware address, such as 'Sonos-000E58A1B2C3'.
+    Ordinary words such as 'DESKTOP-4F2K1JQ' or 'RX-V685' are not caught."""
+    compact = re.sub(r"[-_:]", "", text)
+    if len(compact) >= 12 and re.fullmatch(r"[0-9A-Fa-f]+", compact):
+        return True
+    return bool(re.search(r"[-_][0-9A-Fa-f]{12,}$", text))
+
+
 def tidy_name(text, home_domain=""):
     """Turn a name heard from the network into one for people, or '' if nothing useful is left.
 
@@ -103,7 +135,9 @@ def tidy_name(text, home_domain=""):
          'DESKTOP-4F2K1JQ' and 'RX-V685' stay as they are).
       3. Names with spaces (friendly names such as 'Living Room TV') are kept as they are.
       4. At most MAX_NAME characters. A bare IP address, or a word such as 'localhost' that every
-         device could say, counts as no name."""
+         device could say, counts as no name.
+      5. A name made by a machine rather than a person counts as no name (looks_generated), so the
+         next source's friendly name wins: a Chromecast's 'e2a5c5b2-8c4b-...' or 'Sonos-000E58A1B2C3'."""
     text = printable(text, 256).strip(" .")
     if text and " " not in text and not is_address(text):
         low = text.lower()
@@ -113,6 +147,8 @@ def tidy_name(text, home_domain=""):
                 text = text[:-len(end)]
                 break
         text = text.split(".")[0]
+        if looks_generated(text):
+            return ""
         parts = text.split("-")
         if len(parts) > 1 and all(len(p) >= 3 and p[0].isalpha() for p in parts):
             text = " ".join(parts)
@@ -284,10 +320,11 @@ def is_answer(data):
 
 def learn_from_mdns(data, source, wanted):
     """What one Bonjour answer from `source` says about the devices in `wanted`:
-    {ip: {"name": ..., "model": ...}}. Three kinds of record are used:
-      - an answer to 'which name has this address?' (a pointer from a reverse name), for that address;
-      - a device announcing its own address ('Lewiss-iPhone.local is 192.168.1.54'), only when the
-        address is the one the packet came from: a device may name itself, not others;
+    {ip: {"name": ..., "model": ...}}. Three kinds of record are used, and each only about the
+    address the packet came from: a device may name itself, never another device. (So a Mac that
+    is asleep, whose Bonjour Sleep Proxy answers for it, is not named by that answer.)
+      - an answer to 'which name has this address?' (a pointer from a reverse name);
+      - a device announcing its own address ('Lewiss-iPhone.local is 192.168.1.54');
       - the device-information record ('Lewis's MacBook Pro._device-info._tcp.local', with
         'model=MacBookPro18,3'), for the address the packet came from. Its first part is the name
         the owner gave the device, which reads better than the network name, so it is preferred."""
@@ -297,7 +334,7 @@ def learn_from_mdns(data, source, wanted):
     for rtype, owner, value in read_records(data):
         if rtype == 12 and value:
             ip = address_of_reverse(owner)
-            if ip in wanted:
+            if ip == source and ip in wanted:
                 found.setdefault(ip, {}).setdefault("name", ".".join(label_text(l) for l in value))
         elif rtype == 1 and value == source and source in wanted and owner:
             found.setdefault(source, {}).setdefault("name", ".".join(label_text(l) for l in owner))
@@ -361,32 +398,63 @@ def vendor_words(vendor):
     return "Software: " + vendor if vendor else ""
 
 
+def read_dhcp_options(data, pos, end, options):
+    """Read DHCP options from data[pos:end] into `options` ({code: value bytes}), keeping the first
+    value seen for each code. At most 512 steps; stops at the end marker or at any option whose
+    length runs past `end`."""
+    end = min(end, len(data))
+    for _ in range(512):
+        if pos >= end:
+            break
+        code = data[pos]
+        if code == 0:
+            pos += 1
+            continue
+        if code == 255 or pos + 1 >= end:
+            break
+        n = data[pos + 1]
+        if pos + 2 + n > end:
+            break
+        options.setdefault(code, bytes(data[pos + 2:pos + 2 + n]))
+        pos += 2 + n
+
+
+def dhcp_from_ip_packet(packet):
+    """The DHCP message inside one IPv4 packet heard by the packet listener, or None if the packet
+    is not a whole (unfragmented) UDP packet to port 67. Every length is checked against the packet."""
+    if len(packet) < 28 or packet[0] >> 4 != 4 or packet[9] != 17:
+        return None
+    head = (packet[0] & 0x0F) * 4
+    if head < 20 or int.from_bytes(packet[6:8], "big") & 0x3FFF:   # more fragments, or not the first
+        return None
+    udp = packet[head:head + 8]
+    if len(udp) < 8 or int.from_bytes(udp[2:4], "big") != DHCP_PORT:
+        return None
+    length = int.from_bytes(udp[4:6], "big")
+    if length < 8:
+        return None
+    return bytes(packet[head + 8:head + length])
+
+
 def parse_dhcp(data):
     """What a device said about itself in a DHCP request it broadcast when joining the network:
     {"mac", "name", "vendor"}, or None if this isn't a readable request from a device (offers and
     answers from a DHCP server are ignored), or it names nothing.
 
     Only 'discover', 'request' and 'inform' messages are used. The options are read with a fixed
-    limit on how many, and every length is checked against the packet."""
+    limit on how many, and every length is checked against the packet. A device short of room may
+    say (option 52, 'overload') that more options are in the packet's 'file' field, its 'server
+    name' field, or both; those are read too, in that order, with the same checks."""
     if len(data) < 240 or data[0] != 1 or data[1] != 1 or data[2] != 6 or data[236:240] != b"\x63\x82\x53\x63":
         return None
     mac = ":".join("%02x" % b for b in data[28:34])
-    options, pos = {}, 240
-    for _ in range(512):
-        if pos >= len(data):
-            break
-        code = data[pos]
-        if code == 0:
-            pos += 1
-            continue
-        if code == 255 or pos + 1 >= len(data):
-            break
-        n = data[pos + 1]
-        value = data[pos + 2:pos + 2 + n]
-        if len(value) < n:
-            break
-        options.setdefault(code, bytes(value))
-        pos += 2 + n
+    options = {}
+    read_dhcp_options(data, 240, len(data), options)
+    overload = options.get(52, b"")[:1]
+    if overload in (b"\x01", b"\x03"):
+        read_dhcp_options(data, 108, 236, options)          # the 'file' field
+    if overload in (b"\x02", b"\x03"):
+        read_dhcp_options(data, 44, 108, options)           # the 'server name' field
     if options.get(53, b"")[:1] not in (b"\x01", b"\x03", b"\x08"):
         return None
     name = printable(options.get(12, b"").decode("utf-8", "replace"), 64)
@@ -448,43 +516,81 @@ def parse_description(body):
     return out
 
 
-def fetch_description(url, ip, timeout=FETCH_SECONDS, connect=http.client.HTTPConnection):
+def fetch_description(url, ip, timeout=FETCH_SECONDS, connect=socket.create_connection):
     """Download and read a UPnP description (see parse_description), or None. Only from the
     device's own address (location_allowed); redirects are not followed (anything but '200 OK' is
-    refused); at most MAX_DESCRIPTION bytes; and the whole download must finish within `timeout`
-    seconds, however slowly the device drips its answer."""
+    refused); at most MAX_HEADERS bytes of headers and MAX_DESCRIPTION of description; and the
+    whole exchange, from connecting to the last byte, must finish within `timeout` seconds,
+    however slowly the device drips its answer.
+
+    The request is made over a plain connection rather than with http.client, because a time
+    limit there applies to each read, not to the whole answer: a device sending one byte at a
+    time could keep it going for hours. Here the time left is set again before every read. The
+    request asks for HTTP/1.0, so the answer comes whole rather than in pieces; an answer sent
+    in pieces anyway ('chunked') is refused. `connect` is socket.create_connection, which the
+    tests replace."""
     if not location_allowed(url, ip):
         return None
     parts = urlsplit(url)
     path = (parts.path or "/") + ("?" + parts.query if parts.query else "")
     if any(ord(ch) < 33 or ord(ch) > 126 for ch in path):
         return None
+    port = parts.port or 80
     end = time.monotonic() + timeout
-    conn = connect(ip, parts.port or 80, timeout=timeout)
+    request = ("GET %s HTTP/1.0\r\nHost: %s:%d\r\nUser-Agent: QuietNet\r\nConnection: close\r\n\r\n"
+               % (path, ip, port)).encode("ascii")
+    sock = None
     try:
-        conn.request("GET", path, headers={"User-Agent": "QuietNet", "Connection": "close"})
-        resp = conn.getresponse()
-        if resp.status != 200:
-            return None
-        length = resp.getheader("Content-Length", "")
-        if length.isdigit() and int(length) > MAX_DESCRIPTION:
-            return None
-        body = b""
-        read = getattr(resp, "read1", resp.read)
+        sock = connect((ip, port), timeout)
+        sock.settimeout(max(0.01, end - time.monotonic()))
+        sock.sendall(request)
+        data, head = b"", None
         while True:
-            if time.monotonic() > end:
+            left = end - time.monotonic()
+            if left <= 0:
                 return None
-            chunk = read(8192)
+            sock.settimeout(left)
+            chunk = sock.recv(8192)
             if not chunk:
                 break
-            body += chunk
-            if len(body) > MAX_DESCRIPTION:
+            data += chunk
+            if head is None:
+                if b"\r\n\r\n" in data:
+                    head, data = data.split(b"\r\n\r\n", 1)
+                    if not description_headers_ok(head):
+                        return None
+                elif len(data) > MAX_HEADERS:
+                    return None
+            if head is not None and len(data) > MAX_DESCRIPTION:
                 return None
-    except (OSError, http.client.HTTPException, ValueError):
+        if head is None:
+            return None
+    except (OSError, ValueError):
         return None
     finally:
-        conn.close()
-    return parse_description(body)
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass
+    return parse_description(data)
+
+
+def description_headers_ok(head):
+    """May the answer with these headers (the bytes before the blank line) be read on? Only a
+    '200 OK' answer, not sent in pieces, and not declaring itself bigger than MAX_DESCRIPTION."""
+    lines = head.decode("latin-1").split("\r\n")
+    status = lines[0].split()
+    if len(status) < 2 or not status[0].upper().startswith("HTTP/1.") or status[1] != "200":
+        return False
+    for line in lines[1:]:
+        key, _, value = line.partition(":")
+        key, value = key.strip().lower(), value.strip().lower()
+        if key == "transfer-encoding" and value != "identity":
+            return False
+        if key == "content-length" and value.isdigit() and int(value) > MAX_DESCRIPTION:
+            return False
+    return True
 
 
 # ------------------------------------------------------------------ putting it together
@@ -575,16 +681,19 @@ class Namer:
 
     The network is reached only through make_socket and connect, which the tests replace."""
 
-    def __init__(self, reverse=None, make_socket=socket.socket, connect=http.client.HTTPConnection,
-                 domain_file="/etc/resolv.conf"):
-        """`reverse` is the reverse-lookup function (ip -> name or ''), supplied by server.py."""
+    def __init__(self, reverse=None, make_socket=socket.socket, connect=socket.create_connection,
+                 domain_file="/etc/resolv.conf", packet_capture=None):
+        """`reverse` is the reverse-lookup function (ip -> name or ''), supplied by server.py.
+        `packet_capture` says whether the DHCP listener reads packets without holding port 67
+        (see open_dhcp_listener); by default it does wherever the system offers it (Linux)."""
         self.reverse = reverse
+        self.packet_capture = hasattr(socket, "AF_PACKET") if packet_capture is None else packet_capture
         self.make_socket = make_socket
         self.connect = connect
         self.domain_file = domain_file
         self.lock = threading.Lock()
         self.heard_dhcp = collections.OrderedDict()      # hardware address -> what it said when joining
-        self.heard_mdns = collections.OrderedDict()      # ip -> what it announced over Bonjour
+        self.heard_mdns = collections.OrderedDict()      # ip -> {"when", "mac", "said"}: its Bonjour announcement
         self.descriptions = collections.OrderedDict()    # UPnP description address -> (when, what it said)
         self.cache = collections.OrderedDict()           # ip -> {"mac", "by": {source key: (when, entry)}}
         self.busy = {}                                   # source key -> its thread from the last round
@@ -637,9 +746,11 @@ class Namer:
                     slot = {"mac": mac, "by": {}}
                 slot["mac"] = mac or slot["mac"]
                 for key, found in results.items():
-                    entry = found.get(ip)
-                    if entry:
-                        slot["by"][key] = (now, entry)
+                    entry = dict(found.get(ip) or {})
+                    when = entry.pop("_when", now)       # when it was heard, if not just now
+                    old = slot["by"].get(key)
+                    if entry and (old is None or old[0] <= when):
+                        slot["by"][key] = (when, entry)
                 slot["by"] = {k: v for k, v in slot["by"].items() if now - v[0] < KEEP_SECONDS}
                 remember(self.cache, ip, slot)
             for ip in [ip for ip, slot in self.cache.items() if not slot["by"] and ip not in devices]:
@@ -722,11 +833,30 @@ class Namer:
                     self._collect(sock, deadline, MDNS_WAIT, heard)
             except OSError:
                 pass
-        with self.lock:
-            for ip in devices:
-                for k, v in self.heard_mdns.get(ip, {}).items():
-                    found.setdefault(ip, {}).setdefault(k, v)
+        found.update(self._announced(devices, found))
         return found
+
+    def _announced(self, devices, found):
+        """What the Bonjour listener heard from each device in `devices` ({ip: hardware address}),
+        as {ip: entry}, for the devices `found` has nothing on. An announcement is used only while
+        it is younger than KEEP_SECONDS, and only for the device that made it: it is tied to the
+        hardware address that had the address when it was heard (or, if that wasn't known yet, in
+        the first round after), and dropped once a different device has the address. Each entry
+        carries '_when', the time it was heard, so keeping it does not make it look new."""
+        now, out = time.monotonic(), {}
+        with self.lock:
+            for ip, mac in devices.items():
+                heard = self.heard_mdns.get(ip)
+                if heard is None:
+                    continue
+                if now - heard["when"] >= KEEP_SECONDS or (mac and heard["mac"] and heard["mac"] != mac):
+                    del self.heard_mdns[ip]
+                    continue
+                if mac and not heard["mac"]:
+                    heard["mac"] = mac
+                if ip not in found:
+                    out[ip] = dict(heard["said"], _when=heard["when"])
+        return out
 
     def ask_netbios(self, devices, deadline):
         """Ask each device, on the Windows network port, for its names."""
@@ -753,7 +883,10 @@ class Namer:
     def ask_ssdp(self, devices, deadline):
         """Make one UPnP 'who is there?' call, then download the description of each device that
         answered (only from its own address; see location_allowed). A description is reused for
-        DESCRIPTION_KEEP seconds, and at most MAX_FETCHES are downloaded per round."""
+        DESCRIPTION_KEEP seconds, and at most MAX_FETCHES are downloaded per round. A description
+        address is noted as soon as its download starts, and one that fails is not tried again
+        for DESCRIPTION_KEEP seconds either, so a device that never answers properly costs one
+        download an hour."""
         where = {}
 
         def heard(data, source):
@@ -789,6 +922,8 @@ class Namer:
         def fetch(ip):
             """Download the first readable description this device offered (None if none)."""
             for url in where[ip]:
+                with self.lock:                          # noted at once, so no later round starts it again
+                    remember(self.descriptions, url, (time.monotonic(), {}))
                 desc = fetch_description(url, ip, min(FETCH_SECONDS, max(0.1, deadline - time.monotonic())),
                                          self.connect)
                 with self.lock:
@@ -819,7 +954,8 @@ class Namer:
         Either may be impossible (the port is in use, or needs admin rights, as on a Mac); then
         QuietNet says so once, in the log, and carries on without it."""
         self._listen("bonjour", "Bonjour announcements (port 5353)", self.open_mdns_listener, self.hear_mdns)
-        self._listen("dhcp", "devices joining the network (DHCP, port 67)", self.open_dhcp_listener, self.hear_dhcp)
+        self._listen("dhcp", "devices joining the network (DHCP, port 67)", self.open_dhcp_listener,
+                     self.hear_dhcp_packet if self.packet_capture else self.hear_dhcp)
 
     def _listen(self, key, what, opener, handler):
         """Open one listener and start its thread. Returns True if it is listening."""
@@ -870,9 +1006,20 @@ class Namer:
         return sock
 
     def open_dhcp_listener(self):
-        """A socket that hears DHCP requests devices broadcast when joining the network. Bound to the
-        broadcast address only, so a DHCP server on this computer still gets every request sent
-        straight to it. Nothing is ever sent from it."""
+        """A socket that hears DHCP requests devices broadcast when joining the network. Nothing is
+        ever sent from it.
+
+        Where the system offers it (Linux, so the Pi), this reads a copy of the packets arriving
+        at this computer (a 'packet socket', which the container's NET_RAW permission allows),
+        with a filter in the system that passes only UDP packets to port 67. It never takes port
+        67, so a DHCP server on the Pi (dnsmasq, a hotspot) can still start after QuietNet. If
+        that can't be opened, there is no DHCP listener: binding port 67 instead would stop such
+        a server starting.
+
+        Elsewhere (a Mac, where it needs admin rights anyway) it is bound to the broadcast address
+        and port 67 only, so a DHCP server on the computer still gets every request sent straight to it."""
+        if self.packet_capture:
+            return self.open_dhcp_packet_listener()
         sock = self.make_socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -883,6 +1030,29 @@ class Namer:
             raise
         return sock
 
+    def open_dhcp_packet_listener(self):
+        """The packet socket described in open_dhcp_listener: IPv4 packets only, filtered by the
+        system to UDP packets for port 67 (DHCP_FILTER), so the program is not woken for the
+        household's other traffic. If the filter can't be attached the socket is closed and the
+        error passed on: reading every packet in Python would load the Pi for nothing."""
+        sock = self.make_socket(getattr(socket, "AF_PACKET", 17), socket.SOCK_DGRAM, socket.htons(0x0800))
+        try:
+            import ctypes                                 # only needed here, and only on Linux
+            code = b"".join(struct.pack("HBBI", *ins) for ins in DHCP_FILTER)
+            buf = ctypes.create_string_buffer(code, len(code))
+            prog = struct.pack("HP", len(DHCP_FILTER), ctypes.addressof(buf))
+            sock.setsockopt(socket.SOL_SOCKET, SO_ATTACH_FILTER, prog)
+        except OSError:
+            sock.close()
+            raise
+        return sock
+
+    def hear_dhcp_packet(self, packet, source):
+        """Keep what one DHCP request says, from a whole IPv4 packet heard by the packet listener."""
+        data = dhcp_from_ip_packet(packet)
+        if data is not None:
+            self.hear_dhcp(data, source)
+
     def hear_mdns(self, data, source):
         """Keep what one Bonjour announcement says about the device that sent it."""
         if not usable_address(source):
@@ -890,9 +1060,12 @@ class Namer:
         learnt = learn_from_mdns(data, source, {source}).get(source)
         if learnt:
             with self.lock:
-                entry = dict(self.heard_mdns.get(source, {}))
-                entry.update(learnt)
-                remember(self.heard_mdns, source, entry)
+                slot = self.cache.get(source)
+                mac = slot["mac"] if slot else ""          # who had this address at the last round
+                old = self.heard_mdns.get(source)
+                said = dict(old["said"]) if old and (not mac or not old["mac"] or old["mac"] == mac) else {}
+                said.update(learnt)
+                remember(self.heard_mdns, source, {"when": time.monotonic(), "mac": mac, "said": said})
 
     def hear_dhcp(self, data, source):
         """Keep what one DHCP request says, by the hardware address of the device that sent it."""

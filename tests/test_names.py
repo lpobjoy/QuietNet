@@ -65,6 +65,13 @@ def dhcp_packet(kind=1, options=b"", op=1, mac=b"\xaa\xbb\xcc\x00\x11\x22"):
     return head + bytes([53, 1, kind]) + options + b"\xff"
 
 
+def ip_udp_packet(payload, port=67, protocol=17, fragment=0):
+    """An IPv4 packet from 0.0.0.0 to 255.255.255.255 carrying `payload` in UDP to `port`."""
+    udp = struct.pack(">HHHH", 68, port, 8 + len(payload), 0) + payload
+    return struct.pack(">BBHHHBBH4s4s", 0x45, 0, 20 + len(udp), 0, fragment, 64, protocol, 0,
+                       bytes(4), b"\xff" * 4) + udp
+
+
 class FakeSocket:
     """Stands in for a UDP socket: records what is sent and hands back queued answers, then
     behaves as if the time ran out. Nothing reaches the network."""
@@ -146,8 +153,13 @@ class ReadingNames(unittest.TestCase):
 
 class Bonjour(unittest.TestCase):
     def test_an_answer_about_an_address_names_that_device(self):
-        found = names.learn_from_mdns(ptr_answer(PHONE, "Lewiss-iPhone.local"), "192.168.1.1", {PHONE})
+        found = names.learn_from_mdns(ptr_answer(PHONE, "Lewiss-iPhone.local"), PHONE, {PHONE})
         self.assertEqual(found, {PHONE: {"name": "Lewiss-iPhone.local"}})
+
+    def test_an_answer_about_another_devices_address_is_ignored(self):
+        # Anyone hearing the question could answer it; only the device itself is believed.
+        found = names.learn_from_mdns(ptr_answer(PHONE, "Dads-Laptop.local"), "192.168.1.99", {PHONE, "192.168.1.99"})
+        self.assertEqual(found, {})
 
     def test_an_answer_about_a_device_not_asked_about_is_ignored(self):
         self.assertEqual(names.learn_from_mdns(ptr_answer(PC, "x.local"), PC, {PHONE}), {})
@@ -231,9 +243,49 @@ class Dhcp(unittest.TestCase):
         broken[236] = 0
         self.assertIsNone(names.parse_dhcp(bytes(broken)))
 
+    def test_a_name_in_the_file_field_is_read_when_the_device_says_so(self):
+        packet = bytearray(dhcp_packet(3, b"\x34\x01\x01"))
+        field = b"\x0c\x08Den-Roku\xff"
+        packet[108:108 + len(field)] = field
+        self.assertEqual(names.parse_dhcp(bytes(packet))["name"], "Den-Roku")
+
+    def test_a_name_in_the_server_name_field_is_read_when_the_device_says_so(self):
+        packet = bytearray(dhcp_packet(3, b"\x34\x01\x02"))
+        field = b"\x0c\x08Den-Roku\xff"
+        packet[44:44 + len(field)] = field
+        self.assertEqual(names.parse_dhcp(bytes(packet))["name"], "Den-Roku")
+
+    def test_the_file_field_is_not_read_unless_the_device_says_so(self):
+        packet = bytearray(dhcp_packet(3, b"\x3c\x03abc"))
+        field = b"\x0c\x08Den-Roku\xff"
+        packet[108:108 + len(field)] = field
+        self.assertEqual(names.parse_dhcp(bytes(packet))["name"], "")
+
+    def test_an_option_in_the_file_field_may_not_run_past_it(self):
+        packet = bytearray(dhcp_packet(3, b"\x34\x01\x01\x3c\x01x"))
+        packet[230:233] = b"\x0c\x20A"                                   # says 32 bytes, 6 left
+        self.assertEqual(names.parse_dhcp(bytes(packet))["name"], "")
+
     def test_a_packet_full_of_padding_does_not_hang(self):
         packet = dhcp_packet(1, b"\x00" * 60000)
         self.assertIsNone(names.parse_dhcp(packet))                      # no name before the limit
+
+    def test_the_dhcp_message_is_taken_from_a_whole_packet_to_port_67(self):
+        message = dhcp_packet(3, b"\x0c\x02tv")
+        self.assertEqual(names.dhcp_from_ip_packet(ip_udp_packet(message)), message)
+
+    def test_a_packet_to_another_port_or_not_udp_gives_no_dhcp_message(self):
+        message = dhcp_packet(3, b"\x0c\x02tv")
+        self.assertIsNone(names.dhcp_from_ip_packet(ip_udp_packet(message, port=68)))
+        self.assertIsNone(names.dhcp_from_ip_packet(ip_udp_packet(message, protocol=6)))
+
+    def test_a_piece_of_a_split_packet_gives_no_dhcp_message(self):
+        self.assertIsNone(names.dhcp_from_ip_packet(ip_udp_packet(dhcp_packet(3), fragment=0x2000)))
+
+    def test_a_cut_short_or_rubbish_packet_gives_no_dhcp_message(self):
+        packet = ip_udp_packet(dhcp_packet(3))
+        for junk in (b"", packet[:24], b"\x60" + packet[1:], b"\x4f" + packet[1:]):
+            self.assertIsNone(names.dhcp_from_ip_packet(junk))
 
     def test_common_software_labels_are_put_in_plain_words(self):
         self.assertEqual(names.vendor_words("MSFT 5.0"), "Runs Windows")
@@ -295,6 +347,19 @@ class DescriptionServer(BaseHTTPRequestHandler):
             return
         body = {"/good": self.GOOD, "/huge": b"<root>" + b"x" * (names.MAX_DESCRIPTION + 10) + b"</root>",
                 "/entity": b'<!DOCTYPE r [<!ENTITY a "b">]><root><device><friendlyName>&a;</friendlyName></device></root>'}.get(self.path)
+        if self.path == "/drip-headers":
+            self.wfile.write(b"HTTP/1.1 200 OK\r\n")
+            for _ in range(40):
+                try:
+                    self.wfile.write(b"X")
+                    self.wfile.flush()
+                except OSError:
+                    return
+                time.sleep(0.1)
+            return
+        if self.path == "/chunked":
+            self.wfile.write(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\n<root\r\n0\r\n\r\n")
+            return
         if self.path == "/slow":
             self.send_response(200)
             self.end_headers()
@@ -348,6 +413,14 @@ class FetchingDescriptions(unittest.TestCase):
     def test_a_description_with_entities_is_refused_after_download(self):
         self.assertIsNone(self.fetch("/entity"))
 
+    def test_a_device_dripping_its_headers_is_given_up_on_in_time(self):
+        start = time.monotonic()
+        self.assertIsNone(self.fetch("/drip-headers", timeout=0.5))
+        self.assertLess(time.monotonic() - start, 1.5)
+
+    def test_an_answer_sent_in_pieces_is_refused(self):
+        self.assertIsNone(self.fetch("/chunked"))
+
     def test_a_device_dripping_its_answer_is_given_up_on_in_time(self):
         start = time.monotonic()
         self.assertIsNone(self.fetch("/slow", timeout=0.5))
@@ -376,6 +449,18 @@ class Tidying(unittest.TestCase):
 
     def test_markup_stays_plain_text(self):
         self.assertEqual(names.tidy_name("<img src=x onerror=alert(1)>"), "<img src=x onerror=alert(1)>")
+
+    def test_an_identity_number_is_no_name(self):
+        self.assertEqual(names.tidy_name("e2a5c5b2-8c4b-c9d4-b6a7-1234abcd5678.local"), "")
+        self.assertEqual(names.tidy_name("001A2B3C4D5E"), "")
+
+    def test_a_word_followed_by_a_hardware_address_is_no_name(self):
+        self.assertEqual(names.tidy_name("Sonos-000E58A1B2C3.local"), "")
+        self.assertEqual(names.tidy_name("android-1a2b3c4d5e6f7a8b"), "")
+
+    def test_short_codes_and_ordinary_words_are_not_taken_for_machine_names(self):
+        for text in ("DESKTOP-4F2K1JQ", "RX-V685", "Cafe", "ACE2"):
+            self.assertEqual(names.tidy_name(text), text)
 
     def test_an_address_or_nothing_is_no_name(self):
         for text in ("", "   ", "192.168.1.54", ".local", "\x00\x01"):
@@ -419,6 +504,10 @@ class Choosing(unittest.TestCase):
     def test_a_source_with_only_a_useless_name_gives_way_to_the_next(self):
         self.assertEqual(names.choose({"dhcp": {"name": "192.168.1.9"}, "dns": {"name": "tv"}})["source"], "router")
 
+    def test_a_machine_made_bonjour_name_gives_way_to_the_upnp_friendly_name(self):
+        by = {"mdns": {"name": "e2a5c5b2-8c4b-c9d4-b6a7-1234abcd5678.local"}, "ssdp": {"name": "Living Room TV"}}
+        self.assertEqual(names.choose(by)["name"], "Living Room TV")
+
     def test_the_owners_bonjour_name_is_preferred_to_the_network_name(self):
         self.assertEqual(names.choose({"mdns": {"name": "Lewiss-MacBook-Pro.local", "friendly": "Lewis's Mac"}})["name"], "Lewis's Mac")
 
@@ -432,7 +521,7 @@ class Choosing(unittest.TestCase):
 def quiet_namer(**kw):
     """A Namer whose network is FakeSocket, with no resolver settings and no reverse lookups."""
     return names.Namer(reverse=kw.pop("reverse", None), make_socket=FakeSocket, connect=kw.pop("connect", mock.Mock()),
-                       domain_file="/nonexistent/resolv.conf")
+                       domain_file="/nonexistent/resolv.conf", packet_capture=kw.pop("packet_capture", False))
 
 
 class Rounds(unittest.TestCase):
@@ -470,6 +559,22 @@ class Rounds(unittest.TestCase):
             found = namer.ask_ssdp({TV: "", PHONE: ""}, time.monotonic() + 1)
         self.assertEqual(found, {TV: {"name": "Den"}})
         self.assertEqual(fetched, [("http://192.168.1.60:1400/xml/device_description.xml", TV)])
+
+    def test_a_description_being_fetched_is_not_fetched_again_by_the_next_round(self):
+        loc = b"HTTP/1.1 200 OK\r\nLOCATION: http://192.168.1.60/d.xml\r\n\r\n"
+        FakeSocket.replier = lambda data, where: [(loc, TV)]
+        namer = quiet_namer()
+        started, release = [], threading.Event()
+
+        def stuck(url, ip, timeout, connect):
+            started.append(url)
+            release.wait(2)
+            return None
+        self.addCleanup(release.set)
+        with mock.patch.object(names, "fetch_description", stuck):
+            namer.ask_ssdp({TV: ""}, time.monotonic() + 0.2)
+            namer.ask_ssdp({TV: ""}, time.monotonic() + 0.2)
+        self.assertEqual(started, ["http://192.168.1.60/d.xml"])
 
     def test_a_slow_source_does_not_hold_up_the_round(self):
         namer = quiet_namer()
@@ -557,7 +662,63 @@ class Listeners(unittest.TestCase):
     def test_bonjour_announcements_are_added_to_the_answers(self):
         namer = quiet_namer()
         namer.hear_mdns(answer_packet([record("tv.local", 1, socket.inet_aton(TV))]), TV)
-        self.assertEqual(namer.ask_mdns({TV: ""}, time.monotonic() + 0.1), {TV: {"name": "tv.local"}})
+        found = namer.ask_mdns({TV: ""}, time.monotonic() + 0.1)
+        self.assertEqual(found[TV]["name"], "tv.local")
+
+    def test_a_bonjour_announcement_is_not_passed_to_the_next_device_on_the_address(self):
+        namer = quiet_namer()
+        namer.sources = [("mdns", namer.ask_mdns)]
+        iphone, pc = "aa:aa:aa:aa:aa:aa", "00:11:22:33:44:55"
+        namer.round({PHONE: iphone}, budget=0.3)
+        namer.hear_mdns(answer_packet([record("Lewiss-iPhone.local", 1, socket.inet_aton(PHONE))]), PHONE)
+        self.assertEqual(namer.round({PHONE: iphone}, budget=0.3)[PHONE]["name"], "Lewiss iPhone")
+        self.assertNotIn(PHONE, namer.round({PHONE: pc}, budget=0.3))
+
+    def test_a_bonjour_announcement_heard_before_the_device_was_known_is_tied_to_it_at_the_next_round(self):
+        namer = quiet_namer()
+        namer.hear_mdns(answer_packet([record("tv.local", 1, socket.inet_aton(TV))]), TV)
+        namer.ask_mdns({TV: "aa:aa:aa:aa:aa:aa"}, time.monotonic() + 0.1)
+        self.assertEqual(namer.ask_mdns({TV: "00:11:22:33:44:55"}, time.monotonic() + 0.1), {})
+
+    def test_a_bonjour_announcement_older_than_the_keeping_time_is_dropped(self):
+        namer = quiet_namer()
+        namer.hear_mdns(answer_packet([record("tv.local", 1, socket.inet_aton(TV))]), TV)
+        namer.heard_mdns[TV]["when"] -= names.KEEP_SECONDS + 1
+        self.assertEqual(namer.ask_mdns({TV: ""}, time.monotonic() + 0.1), {})
+        self.assertNotIn(TV, namer.heard_mdns)
+
+    def test_keeping_a_bonjour_announcement_does_not_make_it_look_new(self):
+        namer = quiet_namer()
+        namer.sources = [("mdns", namer.ask_mdns)]
+        namer.hear_mdns(answer_packet([record("tv.local", 1, socket.inet_aton(TV))]), TV)
+        namer.heard_mdns[TV]["when"] -= 1000
+        heard = namer.heard_mdns[TV]["when"]
+        namer.round({TV: ""}, budget=0.3)
+        self.assertEqual(namer.cache[TV]["by"]["mdns"][0], heard)
+
+    def test_the_dhcp_listener_on_linux_reads_packets_without_taking_port_67(self):
+        namer = quiet_namer(packet_capture=True)
+        sock = namer.open_dhcp_listener()
+        self.assertIsNone(sock.bound)
+        self.assertIn(names.SO_ATTACH_FILTER, [o[1] for o in sock.options])
+        self.assertEqual(sock.sent, [])
+
+    def test_a_dhcp_listener_without_its_packet_filter_is_not_opened(self):
+        namer = quiet_namer(packet_capture=True)
+        with mock.patch.object(FakeSocket, "setsockopt", side_effect=OSError(1, "Operation not permitted")):
+            with self.assertRaises(OSError):
+                namer.open_dhcp_listener()
+
+    def test_the_packet_listener_names_a_device_joining(self):
+        namer = quiet_namer(packet_capture=True)
+        namer.hear_dhcp_packet(ip_udp_packet(dhcp_packet(3, b"\x0c\x0dLewiss-iPhone")), "eth0")
+        self.assertEqual(namer.heard_dhcp["aa:bb:cc:00:11:22"]["name"], "Lewiss-iPhone")
+
+    def test_the_packet_filter_jumps_stay_inside_it(self):
+        for n, (code, jt, jf, _) in enumerate(names.DHCP_FILTER):
+            if code & 0x07 == 0x05:                                      # a jump
+                self.assertLess(n + 1 + max(jt, jf), len(names.DHCP_FILTER))
+        self.assertEqual(names.DHCP_FILTER[-1], (0x06, 0, 0, 0))
 
     def test_the_tables_of_things_heard_are_capped(self):
         namer = quiet_namer()

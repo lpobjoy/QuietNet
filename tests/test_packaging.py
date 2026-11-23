@@ -287,6 +287,11 @@ class DashboardContract(unittest.TestCase):
         for raw in ('"${g.id}"', '"${x.id}"', '"${x.v}"', '"${x.on}"', "${g.services} service", "${g.members.length} device"):
             self.assertNotIn(raw, self.page, raw)
 
+    def test_every_control_is_a_real_button_that_keyboards_can_reach(self):
+        # A span playing a button inside a device card can't be reached with Tab, and Enter on
+        # the card opens the device instead.
+        self.assertNotIn('role="button"', self.page)
+
     def test_the_page_loads_nothing_from_other_websites(self):
         self.assertEqual(re.findall(r"""(?:src|href)=["']https?://""", self.page), [])
 

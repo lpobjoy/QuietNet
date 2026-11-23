@@ -190,16 +190,15 @@ function deviceName(d){
 // Is the name shown for this device one the network suggested, rather than one someone gave it?
 function suggested(d){ return !d.name && !d.this_computer && !!d.hint; }
 // The muted lines under a device's name when nobody has named it yet: where the suggested name came
-// from, with a "Use this name" control, and what the device said it is (or a note about it).
-// `inCard` is true on the device list, where each card is already a button: a button can't hold
-// another, so there the control is a span that the click listener still finds by its data-act.
+// from and what the device said it is (or a note about it). On the device page (`inCard` false)
+// there is also a "Use this name" button. On the device list each card is already a button, and a
+// button can't hold another that keyboards and screen readers can reach, so there the lines are
+// plain text and the card opens the device page, where the button is.
 function suggestionLines(d, inCard){
   if(d.name || d.this_computer) return '';
   const via = d.hint_source === 'router' ? 'the router' : d.hint_source;
-  const use = inCard
-    ? `<span class="btn link" role="button" data-act="usehint" data-ip="${esc(d.ip)}">Use this name</span>`
-    : `<button class="btn link" data-act="usehint" data-ip="${esc(d.ip)}">Use this name</button>`;
-  return (suggested(d) ? `<div class="muted small">Suggested name${via ? ', found through ' + esc(via) : ''} ${use}</div>` : '')
+  const use = inCard ? '' : ` <button class="btn link" data-act="usehint" data-ip="${esc(d.ip)}">Use this name</button>`;
+  return (suggested(d) ? `<div class="muted small">Suggested name${via ? ', found through ' + esc(via) : ''}${use}</div>` : '')
     + (d.hint_detail ? `<div class="muted small">${esc(d.hint_detail)}</div>` : '');
 }
 
