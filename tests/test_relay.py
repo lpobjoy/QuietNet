@@ -760,8 +760,209 @@ class Relaying(RelayCase):
         status, text, _ = b.get("/pi/%s/" % pid)
         self.assertEqual(status, 200)
         self.assertIn('window.QN_API_BASE="/pi/%s";' % pid, text)
-        self.assertIn("Home &lt;Pi&gt; &mdash; remote", text)
+        self.assertIn("<b>Home &lt;Pi&gt;</b>", text)
         self.assertNotIn("Home <Pi>", text)
+
+
+# ------------------------------------------------------------------ looks (themes)
+
+class Looks(RelayCase):
+    """The three looks (Calm, Household, Control room), chosen on the home page and kept in a cookie."""
+
+    def with_theme(self, browser, value):
+        """Give a browser a theme cookie alongside any session cookie it already holds."""
+        browser.cookie = "; ".join(c for c in (browser.cookie, "qn_theme=" + value) if c)
+        return browser
+
+    def choose(self, browser, theme, headers=None):
+        """Post the Appearance form. Returns (status, Location, the Set-Cookie line or None).
+        The browser keeps its session cookie (the helper Browser would otherwise swap it out)."""
+        session = browser.cookie
+        status, _, r = browser.post("/theme", form={"theme": theme}, headers=headers)
+        browser.cookie = session
+        return status, r.getheader("Location"), r.getheader("Set-Cookie")
+
+    def test_pages_use_the_calm_theme_when_none_is_chosen(self):
+        self.assertIn('<html lang="en" data-theme="calm">', Browser(self.port).get("/login")[1])
+
+    def test_pages_use_the_theme_saved_in_the_cookie(self):
+        text = self.with_theme(self.signed_in(), "household").get("/")[1]
+        self.assertIn('data-theme="household"', text)
+
+    def test_signed_out_pages_use_the_theme_saved_in_the_cookie(self):
+        for path in ("/login", "/signup"):
+            text = self.with_theme(Browser(self.port), "control").get(path)[1]
+            self.assertIn('data-theme="control"', text, path)
+
+    def test_an_unknown_theme_in_the_cookie_shows_calm(self):
+        for value in ('"><script>alert(1)</script>', "CONTROL", "dark", ""):
+            text = self.with_theme(Browser(self.port), value).get("/login")[1]
+            self.assertIn('data-theme="calm"', text, value)
+            self.assertNotIn("<script", text, value)
+
+    def test_choosing_a_theme_saves_it_and_returns_home(self):
+        status, where, cookie = self.choose(self.signed_in(), "household")
+        self.assertEqual((status, where), (303, "/"))
+        self.assertTrue(cookie.startswith("qn_theme=household;"), cookie)
+        for flag in ("SameSite=Lax", "Path=/", "Max-Age=31536000"):
+            self.assertIn(flag, cookie)
+
+    def test_the_chosen_theme_is_shown_on_the_next_page(self):
+        b = self.signed_in()
+        cookie = self.choose(b, "control")[2]
+        b.cookie = "; ".join((b.cookie, cookie.split(";")[0]))
+        self.assertIn('data-theme="control"', b.get("/")[1])
+
+    def test_the_theme_cookie_can_be_read_by_the_dashboard(self):
+        self.assertNotIn("HttpOnly", self.choose(self.signed_in(), "calm")[2])
+
+    def test_the_theme_cookie_is_marked_secure_over_https(self):
+        cookie = self.choose(self.signed_in(), "calm", headers={"X-Forwarded-Proto": "https"})[2]
+        self.assertIn("Secure", cookie)
+
+    def test_the_theme_cookie_is_not_marked_secure_over_plain_http(self):
+        self.assertNotIn("Secure", self.choose(self.signed_in(), "calm")[2])
+
+    def test_choosing_a_theme_needs_a_signed_in_person(self):
+        status, where, cookie = self.choose(Browser(self.port), "household")
+        self.assertEqual((status, where, cookie), (303, "/login", None))
+
+    def test_a_theme_choice_sent_from_another_website_is_refused(self):
+        for site in ("cross-site", "same-site"):
+            status, _, cookie = self.choose(self.signed_in(), "control", headers={"Sec-Fetch-Site": site})
+            self.assertEqual((status, cookie), (403, None), site)
+            relay.sql("DELETE FROM users", commit=True)
+
+    def test_an_unknown_theme_choice_saves_calm(self):
+        for value in ("purple", '"><b>x', ""):
+            self.assertTrue(self.choose(self.signed_in(), value)[2].startswith("qn_theme=calm;"), value)
+            relay.sql("DELETE FROM users", commit=True)
+
+    def test_the_home_page_offers_the_three_themes_with_the_current_one_ticked(self):
+        text = self.with_theme(self.signed_in(), "household").get("/")[1]
+        self.assertIn('action="/theme"', text)
+        for theme in relay.THEMES:
+            self.assertIn('name="theme" value="%s"' % theme, text)
+        self.assertEqual(re.findall(r'name="theme" value="(\w+)" checked', text), ["household"])
+
+    def test_with_no_theme_chosen_calm_is_ticked(self):
+        text = self.signed_in().get("/")[1]
+        self.assertEqual(re.findall(r'name="theme" value="(\w+)" checked', text), ["calm"])
+
+    def test_the_relay_page_holds_all_three_themes(self):
+        for selector in (':root,[data-theme="calm"]', '[data-theme="household"]', '[data-theme="control"]'):
+            self.assertIn(selector, relay.RELAY_CSS)
+
+    def test_calm_and_household_follow_the_device_and_control_is_always_dark(self):
+        dark = relay.RELAY_CSS.split("@media (prefers-color-scheme:dark)")[1:]
+        self.assertTrue(any('[data-theme="calm"]' in d.split("}}")[0] for d in dark))
+        self.assertTrue(any('[data-theme="household"]' in d.split("}}")[0] for d in dark))
+        self.assertIn('[data-theme="control"]{color-scheme:dark;', relay.RELAY_CSS)
+
+    def relay_pages(self):
+        """The text of every kind of relay page: signed out, signed in with a paired and a waiting
+        Pi, sign-out, refused, and an error page."""
+        b = self.signed_in()
+        self.paired_pi(b)
+        b.post("/pis/new", form={"name": "Gran's"})
+        pages = [Browser(self.port).get("/login")[1], Browser(self.port).get("/signup")[1],
+                 b.get("/")[1], b.get("/logout")[1], Browser(self.port).get("/nope")[1],
+                 b.post("/pis/new", form={"name": "x"}, headers={"Sec-Fetch-Site": "cross-site"})[1]]
+        return pages
+
+    def test_the_relay_pages_load_nothing_from_other_websites(self):
+        for text in self.relay_pages():
+            self.assertEqual(re.findall(r'(?:src|href|action)="(?:https?:)?//', text), [])
+            self.assertNotIn("@import", text)
+            self.assertNotIn("url(", text)
+            self.assertNotIn("<link", text)
+
+    def test_the_relay_pages_carry_no_scripts(self):
+        for text in self.relay_pages():
+            self.assertNotIn("<script", text.lower())
+
+    def test_the_relay_pages_carry_no_emoji(self):
+        for text in self.relay_pages():
+            self.assertEqual(NoEmoji.EMOJI.findall(text), [])
+
+    def test_the_error_page_uses_the_chosen_theme(self):
+        status, text, _ = self.with_theme(Browser(self.port), "control").get("/nope")
+        self.assertEqual(status, 404)
+        self.assertIn('data-theme="control"', text)
+        self.assertIn("Page not found", text)
+
+    def test_the_sign_out_button_is_in_the_page_header(self):
+        text = self.signed_in().get("/")[1]
+        header = text.split('<header class="top">', 1)[1].split("</header>", 1)[0]
+        self.assertIn('action="/logout"', header)
+
+    def test_the_relay_bar_uses_the_dashboard_theme_colours(self):
+        b = self.signed_in()
+        pid, _ = self.paired_pi(b)
+        text = b.get("/pi/%s/" % pid)[1]
+        self.assertIn("background:var(--bar-bg,", text)
+        self.assertIn("color:var(--bar-ink,", text)
+
+    def test_the_relay_bar_says_whether_the_pi_is_online(self):
+        b = self.signed_in()
+        pid, _ = self.paired_pi(b)
+        self.assertIn('<span class="qndot" aria-hidden="true"></span>Online', b.get("/pi/%s/" % pid)[1])
+        relay.sql("UPDATE pis SET last_seen=? WHERE id=?", (time.time() - relay.OFFLINE_AFTER - 5, pid), commit=True)
+        self.assertIn('<span class="qndot off" aria-hidden="true"></span>Offline', b.get("/pi/%s/" % pid)[1])
+
+    def test_the_relay_bar_leaves_the_dashboards_head_and_body_tags_alone(self):
+        b = self.signed_in()
+        pid, _ = self.paired_pi(b)
+        text = b.get("/pi/%s/" % pid)[1]
+        self.assertIn("<head><script>window.QN_API_BASE=", text)
+        self.assertIn('<body><div id="qnbar">', text)
+
+    def test_pi_ids_on_the_home_page_are_escaped(self):
+        b = self.signed_in()
+        uid = relay.sql("SELECT id FROM users", one=True)[0]
+        for pid, paired in (('p"><b>1', 1), ('w"><b>2', 0)):
+            relay.sql("INSERT INTO pis(id,user_id,name,token,code,paired,created,last_seen,code_ts) "
+                      "VALUES(?,?,?,?,?,?,?,?,?)", (pid, uid, "Pi", "", "ABC123", paired, time.time(),
+                                                   time.time(), time.time()), commit=True)
+        text = b.get("/")[1]
+        self.assertNotIn('p"><b>1', text)
+        self.assertNotIn('w"><b>2', text)
+        self.assertIn('href="/pi/p&quot;&gt;&lt;b&gt;1/"', text)
+        self.assertIn('action="/pis/w&quot;&gt;&lt;b&gt;2/delete"', text)
+
+    def test_the_theme_names_are_the_same_as_the_dashboards(self):
+        with open(os.path.join(ROOT, "static", "index.html"), encoding="utf-8") as f:
+            page = f.read()
+        listed = re.search(r"const THEMES = \[([^\]]*)\]", page).group(1)
+        self.assertEqual(re.findall(r"'([a-z]+)'", listed), list(relay.THEMES))
+        early = re.search(r"qn_theme=\(([a-z|]+)\)", page).group(1)
+        self.assertEqual(early.split("|"), list(relay.THEMES))
+        self.assertEqual([t[0] for t in relay.THEME_CHOICES], list(relay.THEMES))
+        self.assertEqual(relay.theme_name("household"), "household")
+        self.assertEqual(relay.theme_name("nonsense"), "calm")
+
+    def css_blocks(self):
+        """Map each look's selector block in RELAY_CSS (light and dark sets) to the custom properties it sets."""
+        css = relay.RELAY_CSS
+        found = {}
+        for dark, sel in ((False, r':root,\[data-theme="calm"\]\{'), (False, r'\[data-theme="household"\]\{'),
+                          (False, r'\[data-theme="control"\]\{'),
+                          (True, r'@media \(prefers-color-scheme:dark\)\{:root,\[data-theme="calm"\]\{'),
+                          (True, r'@media \(prefers-color-scheme:dark\)\{\[data-theme="household"\]\{')):
+            m = re.search(sel + r"([^}]*)\}", css)
+            found[(dark, sel)] = set(re.findall(r"(--[a-z0-9-]+):", m.group(1)))
+        return list(found.values())
+
+    def test_each_relay_look_sets_every_colour_and_size_that_calm_sets(self):
+        calm, household, control, calm_dark, household_dark = self.css_blocks()
+        shared = {"--font-body", "--font-mono"}          # the font stacks are shared from the root on purpose
+        self.assertEqual(calm - shared - household, set(), "household")
+        self.assertEqual(calm - shared - control, set(), "control")
+        self.assertEqual(calm_dark - household_dark, set(), "household dark")
+
+    def test_the_control_room_paired_rows_show_their_focus_ring_inside_the_table(self):
+        # The table clips anything drawn outside it, so the ring is drawn inside each row.
+        self.assertIn('[data-theme="control"] .pirow:focus-visible{outline-offset:-4px}', relay.RELAY_CSS)
 
 
 # ------------------------------------------------------------------ hardening
