@@ -212,6 +212,7 @@ class State:
     scan_info = {}          # what the last scan covered: {"network", "addresses", "capped"}
     rules_version = 0       # goes up whenever a rule changes; the enforcer's plan cache watches it
     plan_cache = {}         # see enforcement_plan
+    shared_left = {}        # enforced device ip -> {"count", "names"}: addresses left to the name block (see enforcement_plan)
     router = ""           # the home router's address, for home-network names ('' = not known)
     router_checked = None   # when (time.monotonic()) the router's address was last looked up
     v6_own = set()          # this computer's own IPv6 addresses (see refresh_ipv6_view)
@@ -856,6 +857,16 @@ def learn_enforced_mac(ip, mac):
             db.commit()
 
 
+def label_of(domain):
+    """The friendly name to show for a blocked name on the device page: the service it belongs to
+    (YouTube for www.youtube.com), or the name itself when it belongs to none."""
+    for s in suffixes(domain):
+        svc = S.dom2svc.get(s)
+        if svc:
+            return S.svc_names.get(svc, domain)
+    return domain
+
+
 def enforcement_plan():
     """What the enforcer should drop, per enforced device: reuses the normal rules.
     {victim_ip: {"off": all-internet?, "ips": {addresses to drop}, "mac": hardware address or ''}}
@@ -864,6 +875,14 @@ def enforcement_plan():
     Otherwise the addresses of names blocked by you, by a service block or by a schedule are cut.
     Pausing advert blocking pauses it here too.
 
+    Shared addresses: big services answer many names from the same front doors (youtube.com and
+    Google search, Classroom and Gmail all come from Google's; Cloudflare and Fastly carry many
+    sites each). Dropping such an address would cut sites the device is allowed. So an address a
+    blocked name was given is not dropped for a device if a name that device is allowed was given
+    the same address in the last RESOLVED_HOURS. Those names are still blocked by DNS; only the
+    address-level cut is left out. How many addresses were spared, and for which blocked things, is
+    kept per device in S.shared_left for the device page. Devices cut off entirely are unaffected.
+
     This runs every two seconds, and the answer for a given name and device only changes when a
     rule does. So each name's answer is remembered (in S.plan_cache) and worked out again only
     for names not seen before, or when a rule, the pause, the schedules in force or the set of
@@ -871,6 +890,7 @@ def enforcement_plan():
     with db_lock:                                      # copies: other threads change these while we work
         victims = {ip: S.enforced_mac.get(ip, "") for ip in S.enforced}
     if not victims:
+        S.shared_left = {}
         return {}
     with resolved_lock:
         names = list(S.resolved)
@@ -886,23 +906,63 @@ def enforcement_plan():
             # A made-up name only comes back blocked for one of the 'everything' reasons.
             blocked, why, _ = decision("quietnet.invalid", victim, paused)
             cache["off"][victim] = blocked and why in ("kill", "off", "schedule")
-    cut = {}                                           # name -> the enforced devices it is cut for
+    # name -> (devices it is cut for, devices it is allowed for)
+    cut = {}
     for domain in names:
-        who = cache["cut"].get(domain)
-        if who is None:
-            who = frozenset(v for v in victims if not cache["off"][v]
-                            and decision(domain, v, paused)[1] in ENFORCE_WHY)
-        cut[domain] = who
+        entry = cache["cut"].get(domain)
+        if entry is None:
+            cut_for, allowed_for = set(), set()
+            for v in victims:
+                if cache["off"][v]:
+                    continue
+                blocked, why, _ = decision(domain, v, paused)
+                if why in ENFORCE_WHY:
+                    cut_for.add(v)
+                elif not blocked:
+                    allowed_for.add(v)
+            entry = (frozenset(cut_for), frozenset(allowed_for))
+        cut[domain] = entry
     cache["cut"] = cut                                 # names that have been forgotten drop out here
     plan = {v: {"off": cache["off"][v], "ips": set(), "mac": mac} for v, mac in victims.items()}
+    recent = now - RESOLVED_HOURS * 3600
+    wanted = {}                                        # device -> {address to drop: the blocked names it came from}
     with resolved_lock:
-        for domain, who in cut.items():
-            ipmap = S.resolved.get(domain) if who else None
+        for domain, (cut_for, _) in cut.items():
+            ipmap = S.resolved.get(domain) if cut_for else None
             if not ipmap:
                 continue
-            ips = [ip for ip, ts in ipmap.items() if now - ts < RESOLVED_HOURS * 3600 and ":" not in ip]
-            for v in who:
-                plan[v]["ips"].update(ips)
+            ips = [ip for ip, ts in ipmap.items() if ts > recent and ":" not in ip]
+            for v in cut_for:
+                mine = wanted.setdefault(v, {})
+                for ip in ips:
+                    mine.setdefault(ip, set()).add(domain)
+        # Which of those addresses an allowed name was also given: one pass over the remembered
+        # names, each checked against the (small) set of addresses about to be dropped.
+        to_drop = set()
+        for mine in wanted.values():
+            to_drop.update(mine)
+        allowed_at = {}                                # address -> devices a name given it is allowed for
+        if to_drop:
+            for domain, ipmap in S.resolved.items():
+                entry = cut.get(domain)
+                if not entry or not entry[1]:
+                    continue
+                for ip in to_drop.intersection(ipmap):
+                    if ipmap[ip] > recent:
+                        allowed_at.setdefault(ip, set()).update(entry[1])
+    shared = {}
+    for v, mine in wanted.items():
+        spared, why = 0, set()
+        for ip, blocked_names in mine.items():
+            if v in allowed_at.get(ip, ()):
+                spared += 1
+                why.update(blocked_names)
+            else:
+                plan[v]["ips"].add(ip)
+        if spared:
+            labels = sorted({label_of(d) for d in why})
+            shared[v] = {"count": spared, "names": labels[:5]}
+    S.shared_left = shared                             # one entry per enforced device at most
     return plan
 
 
@@ -2023,7 +2083,8 @@ def api_status():
                       "state": S.list_state, "error": S.list_error},
         "today": {"total": total, "blocked": blocked},
         "scan": dict(S.scan_info, state=S.scan_state, ts=S.scan_ts),
-        "enforcer": ENF.status() if ENF else {"available": False, "reason": "", "active": False},
+        "enforcer": dict(ENF.status() if ENF else {"available": False, "reason": "", "active": False},
+                         shared=dict(S.shared_left)),
         "ipv6": ipv6_dns_view(now),
     }
 
@@ -2386,7 +2447,8 @@ class Web(BaseHTTPRequestHandler):
         elif url.path == "/api/cloud":
             self.send_json(CA.status() if CA else {"configured": False, "paired": False, "state": "off"})
         elif url.path == "/api/enforcer":
-            self.send_json(ENF.status() if ENF else {"available": False, "reason": "not started", "active": False})
+            self.send_json(dict(ENF.status() if ENF else {"available": False, "reason": "not started", "active": False},
+                                shared=dict(S.shared_left)))
         elif url.path == "/api/controls":
             scope = qs.get("scope", [""])[0]
             if not SCOPE.fullmatch(scope):

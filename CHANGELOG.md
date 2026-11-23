@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+Shared addresses and "Cut live connections" (23 November):
+- **Fixed: blocking YouTube on a device with "Cut live connections" on also cut Google search, Classroom, Docs and Gmail.** They share Google's front-door addresses, and the same could happen with sites on Cloudflare, Fastly or Akamai. An address is no longer dropped for a device if a site that device is allowed was given the same address in the last six hours. The blocked service is still blocked by name, and addresses only it uses (YouTube's video servers) are still dropped; bedtime, the kill switch and the internet switch still cut everything. The device's "Cut live connections" card says when some addresses were left to the name block; new `shared` in `GET /api/enforcer` and in `enforcer` in `GET /api/status`.
+
 Other DNS services (23 November):
 - **Fixed: a device could get round every name block by using another DNS server.** The well-known encrypted DNS services (Google's `dns.google`, Cloudflare's `cloudflare-dns.com`, Quad9, OpenDNS, NextDNS, CleanBrowsing, AdGuard, Mullvad, DNS.SB and Control D, with every name beneath them) now get the blocked answer for every device, paused or not, so Android's Private DNS or a browser's secure DNS set to one of them falls back to ordinary DNS. The list is `OTHER_DNS_SERVICES` in `server.py`. The device page and the device list say "tried to use another DNS service"; new `other_dns` in `GET /api/devices` and `/api/activity`.
 - **New: for devices with "Cut live connections" on, ordinary DNS sent to any other server (8.8.8.8, the router) is answered by QuietNet,** and Private DNS and DNS over QUIC (port 853) are dropped. Only the `nft` tool does the redirect; `GET /api/enforcer` has a new `dns_redirect` to say whether it is on. On Linux, answers now leave from the address each lookup was sent to, which the redirect needs.

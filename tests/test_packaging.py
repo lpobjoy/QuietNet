@@ -399,6 +399,27 @@ class DashboardIPv6Setup(unittest.TestCase):
         self.assertIn("${v6Warning(false)}", self.setup)
 
 
+class DashboardSharedAddresses(unittest.TestCase):
+    """The device page's note that some of a blocked service's addresses are left to the name
+    block because sites the device is allowed share them. Reads the page's script only."""
+
+    @classmethod
+    def setUpClass(cls):
+        page = read("static", "index.html")
+        cls.note = page[page.index("function sharedNote("):page.index("function enforceCard(")]
+        cls.card = page[page.index("function enforceCard("):page.index("function statusBadges(")]
+
+    def test_the_live_cut_card_shows_the_shared_address_note(self):
+        self.assertIn("${sharedNote(d, e)}", self.card)
+
+    def test_the_shared_address_note_escapes_the_names_and_the_count(self):
+        self.assertIn(".map(esc)", self.note)
+        self.assertIn("${num(sh.count)}", self.note)
+
+    def test_the_shared_address_note_says_what_happened_in_plain_words(self):
+        self.assertIn("addresses are shared with sites this device is allowed, so those connections are left to the name block", self.note)
+
+
 class DashboardThemes(unittest.TestCase):
     """The dashboard has three looks (calm, household, control), picked under Appearance and kept
     in the qn_theme cookie. These checks read the page; nothing is run in a browser."""

@@ -33,7 +33,7 @@ A **scope** is `all`, `group:<id>` or `device:<ip>`.
 | `GET /api/schedules` | All schedules, each with `"active"` (in force right now) |
 | `GET /api/controls?scope=<scope>` | Switches for one scope, and what it inherits. `400` if the scope is badly formed |
 | `GET /api/cloud` | Remote access state: `{"configured", "paired", "relay", "name", "state", "detail"}` |
-| `GET /api/enforcer` | `{"available", "reason", "problem", "problems", "active", "backend", "gateway", "dns_redirect"}`. `dns_redirect` is `true` when a steered device's ordinary DNS sent to another server is redirected to QuietNet (the `nft` tool only; with `iptables` it is `false`). `problem` says why all steering is paused right now (forwarding off, or another firewall in the way or impossible to check), or `""`. `problems` is `{device address: text}` for devices left alone, e.g. because a different device now has the address |
+| `GET /api/enforcer` | `{"available", "reason", "problem", "problems", "active", "backend", "gateway", "dns_redirect"}`. `dns_redirect` is `true` when a steered device's ordinary DNS sent to another server is redirected to QuietNet (the `nft` tool only; with `iptables` it is `false`). `problem` says why all steering is paused right now (forwarding off, or another firewall in the way or impossible to check), or `""`. `problems` is `{device address: text}` for devices left alone, e.g. because a different device now has the address. `shared` is `{device address: {"count", "names"}}` for enforced devices with addresses left to the DNS block because a site the device is allowed shares them: `count` addresses, and up to five blocked services or names (`names`). Escape both before display |
 
 `/api/status`:
 
@@ -45,7 +45,7 @@ A **scope** is `all`, `group:<id>` or `device:<ip>`.
   "community": {"installed": true, "count": 74100, "updated": 1795000000.0, "state": "idle", "error": ""},
   "today": {"total": 18234, "blocked": 2101},
   "scan": {"state": "idle", "ts": 1795000000.0, "network": "192.168.1.0/24", "addresses": 254, "capped": false},
-  "enforcer": {"available": false, "reason": "…", "active": false},
+  "enforcer": {"available": false, "reason": "…", "active": false, "shared": {}},
   "ipv6": {"dns_address": "fd12:3456::60", "listening": true, "router_heard": 1795000000.0,
            "router_dns": ["fe80::1"], "router_dns_not_ours": ["fe80::1"]}
 }

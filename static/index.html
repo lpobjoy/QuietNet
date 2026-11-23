@@ -912,6 +912,17 @@ function otherDnsNotice(d){
     which would let it get round QuietNet. QuietNet stopped it. Check its settings: on Android, Private DNS should be Off
     or Automatic; in Chrome, Edge or Firefox, secure DNS (DNS over HTTPS) should be off.</div>`;
 }
+// Blocked things whose addresses are shared with sites this device is allowed (Google's front doors
+// serve YouTube and Classroom alike) are left to the name block, so allowed sites keep working.
+// e.shared[ip] is {count, names} from enforcement_plan; every part is escaped.
+function sharedNote(d, e){
+  const sh = (e.shared || {})[d.ip];
+  if(!d.enforced || !sh || !sh.count) return '';
+  const names = (sh.names || []).map(esc);
+  const who = names.length ? (names.length > 1 ? names.slice(0, -1).join(', ') + ' and ' + names[names.length - 1] : names[0]) : 'the blocked sites';
+  return `<p class="small muted">Some of ${who}'s addresses are shared with sites this device is allowed, so those connections are left to the name block
+    (${num(sh.count)} ${sh.count === 1 ? 'address' : 'addresses'}). New connections to them are still blocked.</p>`;
+}
 function enforceCard(d){
   const e = (S.status || {}).enforcer || {};
   if(!d.last) return '';                       // device isn't using QuietNet yet, nothing to enforce
@@ -923,7 +934,8 @@ function enforceCard(d){
       also stop things that are <b>already running</b> on this device (like a Disney+ video mid-stream). QuietNet steers this
       device through itself and drops only what's blocked for it. Takes a few seconds to bite.
       It works on IPv4 only, so a connection this device already has over IPv6 is not cut.</p>
-    ${d.enforced && (e.problem || (e.problems || {})[d.ip]) ? `<p class="small err-text"><b>Not working yet:</b> ${esc(e.problem || e.problems[d.ip])}</p>` : ''}</div>
+    ${d.enforced && (e.problem || (e.problems || {})[d.ip]) ? `<p class="small err-text"><b>Not working yet:</b> ${esc(e.problem || e.problems[d.ip])}</p>` : ''}
+    ${sharedNote(d, e)}</div>
     <label class="switch"><input type="checkbox" id="enforceSwitch" ${d.enforced ? 'checked' : ''} aria-label="Cut live connections for this device"><span></span></label></div></div>`;
 }
 

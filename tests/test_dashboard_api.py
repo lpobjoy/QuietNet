@@ -957,7 +957,7 @@ class EnforceAndCloud(Api):
         real = server.ENF
         server.ENF = None
         try:
-            self.assertEqual(self.get("/api/enforcer")[1], {"available": False, "reason": "not started", "active": False})
+            self.assertEqual(self.get("/api/enforcer")[1], {"available": False, "reason": "not started", "active": False, "shared": {}})
         finally:
             server.ENF = real
 
