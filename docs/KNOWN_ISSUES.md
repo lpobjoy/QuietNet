@@ -108,7 +108,8 @@ The relay now keeps a licence per account and can enforce it (`QUIETNET_LICENCE_
 - **No way to pay or renew yet.** The paused page has no Renew button and the Licence card no billing buttons; licences come only from the owner's command line until payments are added. The wording still says "Renew at q3n.net", as the design asks.
 - **"Blocking is paused for an hour", not "until 14:35".** The relay doesn't know the Pi's time zone, so the result page after the second rescue button gives no clock time.
 - **Downloads don't take seats yet.** Seats in use are only the account's paired Pis. Installs that downloaded but never paired, and the 60-day expiry of seats, come with downloads.
-- **The gate's "once an hour" is kept in memory.** After a restart the same would-be refusal can be logged again straight away. `licence_log` is never trimmed; it grows by at most one row an hour for each account and kind of refusal, plus one row per rescue and per owner command.
+- **The gate's "once an hour" is kept in memory.** After a restart the same would-be refusal can be logged again straight away. `licence_log` keeps the newest 1000 lines per account that the account itself caused (gate notes, at most one an hour for each kind of refusal, and rescues, at most 20 an hour); the owner's own lines are always kept, so the oldest gate notes and rescues of a busy account are dropped.
+- **Waiting Pis beyond the free seats still get codes.** While the licence allows pairing and paired Pis leave a seat free, the home page gives every waiting Pi a fresh code, even when there are more waiting Pis than free seats (they can be left from before the gate was on). Pairing them stops at the seats: the first to pair take the free seats and the rest are refused with the seats sentence.
 - **The legacy licences end 90 days after the first start.** Grant the owner's own account `--plan owner` (no end) before switching the gate on, or its Pis will pause when the legacy licence ends.
 - **The Pi's side isn't built yet.** Pis before 0.6 ignore the licence in poll answers and send no install id or agent header, so they get the older rescue call (kill switch off only) and every copy of them pairs as a separate Pi.
 
@@ -204,6 +205,20 @@ The Python security fixes published during 2026 were checked against the modules
 This check used the published release notes. It is not a scan of the built image, which needs a tool such as `docker scout` or `trivy` run against the image itself.
 
 ## Fixed
+
+### Found in the check of the relay licence build (24 November)
+
+Independent reviewers checked the first phase of licences on the relay, and a second reviewer confirmed each fault. All were fixed the same day.
+
+| Problem | What was done |
+| --- | --- |
+| **Rescue presses had no limit**, and each wrote a licence log row, so one account pressing in a loop (answered at once when its Pi is offline) could fill the relay's disk | Each account may press 20 times an hour (`RESCUE_LIMIT_PER_ACCOUNT`); beyond that the answer is `429`, with nothing sent and nothing logged. `licence_log` also keeps only the newest 1000 lines per account that the account caused, always keeping the owner's own |
+| **Pairing several codes at the same moment could go past the seats**, since the seat count and marking the Pi paired were separate steps; one code sent twice at once could also pair twice | `agent_pair` counts the seats, looks again at any entry being replaced, and marks the Pi paired while holding `db_lock`, and only updates an entry still unpaired with its code in date |
+| **The home page contradicted itself** when a waiting Pi held a seat: "Pis: 1 of 2" on the Licence card, but "both are in use" in place of the add form | The refusal names waiting Pis ("1 is paired and 1 is waiting to be paired"), on the home page and from `POST /pis/new`, and the card adds "(1 waiting to be paired)" |
+| **Pairing codes were still shown when pairing would be refused** (gate on, no current licence or every seat paired), with a working-looking install line | A waiting Pi shows why in place of its code, and its code is not renewed |
+| **No warning before a licence ended** (design 4.4 asks for one at 7 days) | The Licence card warns in the last 7 days, except for plans that renew by themselves |
+| **A blank `--reason` gave exit status 1**, which is documented for an unknown email | It is now a wrong command (2), like a missing one |
+| Tests and docs: the agent-header test could pass with "3" stored as 3; the "nothing reached the Pi" checks could never fail; the relay tests took on a developer's `QUIETNET_LICENCE_GATE` and `QUIETNET_LATEST`; the docs said the home page goes through `licence_gate()`, left `/pi/<id>/rescue` and `/theme` out of the cross-site list, and gave the wrong default for `--seats` on a re-grant | Each fixed |
 
 ### Found in the robustness review (23 November)
 

@@ -143,6 +143,10 @@ PAIR_LIMIT_PER_ADDRESS = (20, 10 * 60)
 PAIR_LIMIT_OVERALL = (200, 10 * 60)
 PAIR_LIMIT_PER_ACCOUNT = (20, 24 * 3600)    # successful pairings per account per day
 SIGNUP_LIMIT_OVERALL = (10, 60 * 60)
+# Rescue presses per account per hour, whatever their outcome. Each one writes a licence log line,
+# so without a limit one account could fill the relay's disk by pressing in a loop.
+RESCUE_LIMIT_PER_ACCOUNT = (20, 60 * 60)
+LICENCE_LOG_KEEP = 1000     # licence log lines kept per account besides the owner's own (see log_licence)
 EMAIL_RE = re.compile(r"[^@\s]+@[^@\s]+\.[^@\s]+")
 
 # The one-line installer shown on the home page for a new Pi. It is fetched from GitHub by the Pi,
@@ -453,8 +457,8 @@ class Throttle:
     Names used for wrong guesses: "login:<email>" (per account), "login" (all accounts together),
     "login-known:<email>" (a browser that signed in before), "pair-from:<address>" and "pair"
     (overall). Names that count every attempt, right or wrong: "login-tries:<email>",
-    "login-from:<address>", "login-known-tries:<email>", "paired:<user id>" (successful pairings)
-    and "signup". The overall limits cannot be dodged by changing network address, because they do
+    "login-from:<address>", "login-known-tries:<email>", "paired:<user id>" (successful pairings),
+    "rescue:<user id>" (rescue presses) and "signup". The overall limits cannot be dodged by changing network address, because they do
     not depend on the caller's address at all."""
 
     MAX_NAMES = 10000           # names remembered at once; beyond this the oldest half are forgotten
@@ -889,9 +893,20 @@ def seats_promised(uid, now):
 
 
 def log_licence(uid, lid, what, now=None):
-    """Add one line to the licence log for account `uid` (licence `lid`, '' if it has none)."""
-    sql("INSERT INTO licence_log(licence_id,user_id,at,what) VALUES(?,?,?,?)",
-        (lid or "", uid, time.time() if now is None else now, what), commit=True)
+    """Add one line to the licence log for account `uid` (licence `lid`, '' if it has none).
+
+    Lines written because of what an account's own browser or Pi did (gate notes, rescues) are kept
+    to the newest LICENCE_LOG_KEEP per account, so no account can grow the log without end. The
+    owner's own lines (grants and changes from the command line, and the legacy grant) are few and
+    always kept: they start with 'Owner ' or 'Legacy licence' and are never written here."""
+    with db_lock:
+        db.execute("INSERT INTO licence_log(licence_id,user_id,at,what) VALUES(?,?,?,?)",
+                   (lid or "", uid, time.time() if now is None else now, what))
+        db.execute("DELETE FROM licence_log WHERE user_id=? AND what NOT LIKE 'Owner %' AND what NOT LIKE "
+                   "'Legacy licence%' AND rowid NOT IN (SELECT rowid FROM licence_log WHERE user_id=? AND what "
+                   "NOT LIKE 'Owner %' AND what NOT LIKE 'Legacy licence%' ORDER BY at DESC, rowid DESC LIMIT ?)",
+                   (uid, uid, LICENCE_LOG_KEEP))
+        db.commit()
 
 
 # What each gate guards, for the log.
@@ -961,6 +976,38 @@ def seats_full(seats, then):
     else:
         words = "Your licence covers %d Pis and all of them are in use." % seats
     return words + " " + then
+
+
+def pis_are(n, what):
+    """'1 is paired', '2 are paired' or 'none are paired', for the seat sentences."""
+    if n <= 0:
+        return "none are " + what
+    return "%d %s %s" % (n, "is" if n == 1 else "are", what)
+
+
+def no_free_seat(seats, paired, promised, then):
+    """Why a new Pi can't be added: every seat is taken. When paired Pis alone fill the seats, the
+    seats_full() sentence; when Pis waiting to be paired (with a code still in date) make up the
+    rest, a sentence that names them, so it agrees with 'Pis: 1 of 2' on the Licence card. Followed
+    by `then`."""
+    if paired >= seats:
+        return seats_full(seats, then)
+    covers = "1 Pi" if seats == 1 else "%d Pis" % seats
+    return "Your licence covers %s: %s and %s. %s" % (
+        covers, pis_are(paired, "paired"), pis_are(promised - paired, "waiting to be paired"), then)
+
+
+def ending_soon(info, now):
+    """The warning shown in a licence's last 7 days, or '' when none is due. Given for active
+    (with an end date), trial and cancelling licences, but not for plans that renew by themselves
+    (names starting 'home-'), whose sentence already says when they renew."""
+    until = info["until"]
+    if info["state"] not in ("active", "trial", "cancelling") or not until or not 0 < until - now <= 7 * 86400:
+        return ""
+    if info["state"] == "active" and info["plan"].startswith("home-"):
+        return ""
+    return ("Your QuietNet licence ends on %s. Filtering at home carries on; remote access and updates stop "
+            "unless it's renewed." % long_date(until))
 
 
 def ended_on(info):
@@ -1197,6 +1244,7 @@ box-shadow:var(--shadow-card);margin:0 0 var(--gap)}
 .notice{border:1px solid transparent;border-radius:var(--r-md);padding:10px 14px;margin:14px 0;font-size:14px}
 .notice.info{background:var(--accent-soft);color:var(--accent-soft-ink);border-color:var(--accent-line)}
 .notice.danger{background:var(--danger-soft);color:var(--danger-soft-ink);border-color:var(--danger-line)}
+.notice.warn{background:var(--warn-soft);color:var(--warn);border-color:var(--warn-dot)}
 
 .fld{margin:0 0 16px}
 .fld label{display:block;font-size:14px;font-weight:600;color:var(--ink);margin:0 0 6px}
@@ -1932,25 +1980,33 @@ class Relay(BaseHTTPRequestHandler):
                 '</legend>%s</fieldset><button class="btn" type="submit">Use this look</button></form></section>'
                 % options)
 
-    def licence_card(self, uid, info):
-        """The Licence card on the home page: one sentence for the licence's state, and how many of
-        its seats are in use."""
+    def licence_card(self, uid, info, now):
+        """The Licence card on the home page: one sentence for the licence's state, a warning in its
+        last 7 days (see ending_soon), and how many of its seats are in use, with any Pis waiting to
+        be paired (with a code still in date) named after it."""
         lid = ('<p class="meta">Licence %s</p>' % html.escape(info["id"])) if info["id"] else ""
+        soon = ending_soon(info, now)
+        warn = ('<div class="notice warn" role="status">%s</div>' % html.escape(soon)) if soon else ""
+        used = seats_used(uid)
+        waiting = seats_promised(uid, now) - used
+        more = (" (%d waiting to be paired)" % waiting) if waiting > 0 else ""
         return ('<section class="card licence" aria-labelledby="licenceTitle"><h2 id="licenceTitle">Licence</h2>'
-                '<p class="mt">%s</p><p class="meta mt">Pis: %s of %s</p>%s</section>') % (
-            html.escape(licence_sentence(info)), html.escape(str(seats_used(uid))),
-            html.escape(str(info["seats"])), lid)
+                '<p class="mt">%s</p>%s<p class="meta mt">Pis: %s of %s%s</p>%s</section>') % (
+            html.escape(licence_sentence(info)), warn, html.escape(str(used)),
+            html.escape(str(info["seats"])), html.escape(more), lid)
 
     def add_pi_section(self, uid, info, now):
         """The 'Add a QuietNet' part of the home page: the form, or, when the licence gate is on and
         a new Pi isn't allowed, a plain sentence saying why in its place. With the gate off the form
-        is always shown (adding is then let through, and noted, by new_pi)."""
+        is always shown (adding is then let through, and noted, by new_pi). The same checks as
+        new_pi, with the same wording, but nothing is logged: this only decides what to show."""
         refusal = ""
         if gate_on():
+            promised = seats_promised(uid, now)
             if not info["pair"]:
                 refusal = ADD_NEEDS_LICENCE
-            elif seats_promised(uid, now) >= info["seats"]:
-                refusal = seats_full(info["seats"], "Remove one to add another.")
+            elif promised >= info["seats"]:
+                refusal = no_free_seat(info["seats"], seats_used(uid), promised, "Remove one to add another.")
         if refusal:
             return ('<section class="add" aria-labelledby="addTitle"><h2 id="addTitle">Add a QuietNet</h2>'
                     '<p class="mt">%s</p></section>' % html.escape(refusal))
@@ -1963,7 +2019,11 @@ class Relay(BaseHTTPRequestHandler):
         """The signed-in home page: your QuietNets, with a pairing code for each one not yet
         paired, and the Licence card. A code that has expired is replaced here, so the page never
         shows a dead one. With the licence gate on and remote access not allowed, a paired Pi says
-        'Remote access paused' instead of Online or Offline, and opens the paused page."""
+        'Remote access paused' instead of Online or Offline, and opens the paused page.
+
+        With the gate on and pairing not allowed (no current licence, or paired Pis already fill the
+        seats), a Pi waiting to be paired shows why in place of its code and install line, and its
+        code is not renewed: a code that pairing would refuse must not look as if it works."""
         uid = self.user()
         if not uid:
             return self.redirect("/login")
@@ -1972,20 +2032,30 @@ class Relay(BaseHTTPRequestHandler):
         now = time.time()
         info = account_licence(uid, now)
         paused = gate_on() and not info["remote"]
+        no_pairing = ""
+        if gate_on():
+            if not info["pair"]:
+                no_pairing = ADD_NEEDS_LICENCE
+            elif seats_used(uid) >= info["seats"]:
+                no_pairing = seats_full(info["seats"], "Remove one to pair this one.")
         address, guessed = relay_address(self.headers.get("Host"))
         for pid, name, paired, seen in pis:
             if not paired:
+                head = """<section class="card pending" aria-labelledby="pi-%(pid)s">
+  <div class="pending-head"><span class="avatar" aria-hidden="true">%(chip)s</span>
+    <div class="grow"><h2 id="pi-%(pid)s">%(name)s</h2><div class="status wait"><span class="dot wait" aria-hidden="true"></span>Waiting to be paired</div></div>
+    <form class="inline" method="post" action="/pis/%(pid)s/delete"><button class="btn danger-outline" type="submit">Remove</button></form></div>
+""" % {"pid": html.escape(pid), "chip": icon("chip"), "name": html.escape(name)}
+                if no_pairing:
+                    waiting += head + '  <p class="mt">%s</p>\n</section>' % html.escape(no_pairing)
+                    continue
                 code, code_ts = sql("SELECT code, code_ts FROM pis WHERE id=?", (pid,), one=True)
                 if now - (code_ts or 0) > PAIR_CODE_MINUTES * 60:
                     # The old code has expired. Looking at this page is what issues a new one,
                     # so the code on screen is always one that works.
                     code = new_pair_code()
                     sql("UPDATE pis SET code=?, code_ts=? WHERE id=? AND paired=0", (code, now, pid), commit=True)
-                waiting += """<section class="card pending" aria-labelledby="pi-%(pid)s">
-  <div class="pending-head"><span class="avatar" aria-hidden="true">%(chip)s</span>
-    <div class="grow"><h2 id="pi-%(pid)s">%(name)s</h2><div class="status wait"><span class="dot wait" aria-hidden="true"></span>Waiting to be paired</div></div>
-    <form class="inline" method="post" action="/pis/%(pid)s/delete"><button class="btn danger-outline" type="submit">Remove</button></form></div>
-  <div class="pending-body">
+                waiting += head + """  <div class="pending-body">
     <div class="paircode"><span class="label">Pairing code</span><span class="bigcode">%(code)s</span>
       <span class="meta">Works once, for %(minutes)d minutes. Reload this page for a new code.</span></div>
     <div class="steps">
@@ -1998,7 +2068,6 @@ class Relay(BaseHTTPRequestHandler):
     </div>
   </div>
 </section>""" % {
-                    "pid": html.escape(pid), "chip": icon("chip"), "name": html.escape(name),
                     "code": html.escape(code), "minutes": PAIR_CODE_MINUTES,
                     "command": html.escape(install_command(address, code)), "address": html.escape(address),
                     "guessed": ('<p class="meta">Replace %s with this relay\'s web address.</p>'
@@ -2021,7 +2090,7 @@ class Relay(BaseHTTPRequestHandler):
 %s
 %s
 %s
-%s""" % (listed or '<div class="card empty">%s</div>' % GETTING_STARTED, self.licence_card(uid, info),
+%s""" % (listed or '<div class="card empty">%s</div>' % GETTING_STARTED, self.licence_card(uid, info, now),
          self.add_pi_section(uid, info, now), self.theme_form())
         return self.send_html(body, header_extra=self.sign_out_form("Sign out", "btn ghost"))
 
@@ -2043,8 +2112,10 @@ class Relay(BaseHTTPRequestHandler):
         refusal = ""
         if not licence_gate(uid, "add", info["pair"], info, now):
             refusal = ADD_NEEDS_LICENCE
-        elif info["pair"] and not licence_gate(uid, "add-seats", seats_promised(uid, now) < info["seats"], info, now):
-            refusal = seats_full(info["seats"], "Remove one to add another.")
+        elif info["pair"]:
+            promised = seats_promised(uid, now)
+            if not licence_gate(uid, "add-seats", promised < info["seats"], info, now):
+                refusal = no_free_seat(info["seats"], seats_used(uid), promised, "Remove one to add another.")
         if refusal:
             return self.send_html('<div class="card narrow"><h1>Can\'t add a QuietNet</h1><p>%s</p>'
                                   '<p class="mt"><a href="/">Back to your QuietNets</a></p></div>'
@@ -2120,17 +2191,43 @@ class Relay(BaseHTTPRequestHandler):
         info = account_licence(uid, now)
         if not licence_gate(uid, "pair", info["pair"], info, now):
             return self.send_json({"error": PAIR_NEEDS_LICENCE, "licence": info["state"]}, 403)
-        if info["pair"] and not licence_gate(uid, "pair-seats", seats_used(uid, replaced) < info["seats"], info, now):
+        token = secrets.token_hex(24)
+        # The seat count and the write happen together, holding db_lock (which every use of the
+        # database takes), so several codes paired at the same moment can't each see a free seat,
+        # and one code sent twice at once pairs only once.
+        outcome = "paired"
+        with db_lock:
+            still = []
+            for old_id in replaced:     # look again: the old entry may have come back online, or gone
+                old = db.execute("SELECT last_seen FROM pis WHERE id=? AND user_id=? AND paired=1",
+                                 (old_id, uid)).fetchone()
+                if old and old[0] and now - old[0] < OFFLINE_AFTER:
+                    outcome = "same identity"
+                elif old:
+                    still.append(old_id)
+            replaced = still
+            if outcome == "paired" and info["pair"] and not licence_gate(
+                    uid, "pair-seats", seats_used(uid, replaced) < info["seats"], info, now):
+                outcome = "seats"
+            if outcome == "paired":
+                done = db.execute("UPDATE pis SET paired=1, token=?, code='', last_seen=?, install_id=? "
+                                  "WHERE id=? AND paired=0 AND code_ts>?",
+                                  (token_record(token), now, install, row[0], now - PAIR_CODE_MINUTES * 60))
+                if done.rowcount != 1:
+                    db.rollback()
+                    outcome = "used"
+                else:
+                    for old_id in replaced:
+                        db.execute("DELETE FROM pis WHERE id=? AND user_id=?", (old_id, uid))
+                    db.commit()
+        if outcome == "same identity":
+            return self.send_json({"error": SAME_IDENTITY}, 403)
+        if outcome == "seats":
             return self.send_json({"error": seats_full(info["seats"], "Remove one at q3n.net, then pair again."),
                                    "licence": info["state"]}, 403)
+        if outcome == "used":
+            return self.send_json({"error": "That pairing code is wrong, already used, or has expired."}, 400)
         throttle.fail("paired:%d" % uid)
-        token = secrets.token_hex(24)
-        with db_lock:
-            db.execute("UPDATE pis SET paired=1, token=?, code='', last_seen=?, install_id=? WHERE id=?",
-                       (token_record(token), now, install, row[0]))
-            for old_id in replaced:
-                db.execute("DELETE FROM pis WHERE id=? AND user_id=?", (old_id, uid))
-            db.commit()
         for old_id in replaced:
             bridge.forget(old_id)
         self.send_json({"ok": True, "id": row[0], "token": token})      # the only time the token itself is sent
@@ -2336,7 +2433,9 @@ class Relay(BaseHTTPRequestHandler):
         The form's 'what' must be 'internet-on' or 'pause-hour'; anything else is refused with 400.
         The call itself comes only from RESCUE_CALLS, picked by 'what' and the Pi's agent kind:
         nothing from the browser goes into its path or body. Each rescue is written to the licence
-        log, and the page says what happened, including when the Pi isn't connected."""
+        log, and the page says what happened, including when the Pi isn't connected. An account may
+        press at most RESCUE_LIMIT_PER_ACCOUNT times an hour; beyond that the answer is 429, with
+        nothing sent and nothing logged."""
         uid = self.user()
         if not uid:
             return self.redirect("/login")
@@ -2351,6 +2450,15 @@ class Relay(BaseHTTPRequestHandler):
             return self.send_html('<div class="card narrow"><h1>Not sent</h1><p>That isn\'t one of the rescue '
                                   'buttons, so nothing was sent to your Pi.</p>%s</div>'
                                   % self.back_links(pid, pi[2]), 400)
+        name = "rescue:%d" % uid
+        if throttle.blocked(name, RESCUE_LIMIT_PER_ACCOUNT):
+            # Over the limit: nothing is sent and nothing is logged, so pressing in a loop can't
+            # grow the licence log.
+            return self.send_html('<div class="card narrow"><h1>Not sent</h1><p>%s</p>%s</div>' % (
+                html.escape("That's a lot of rescue presses in the last hour, so this one wasn't sent. Please wait "
+                            "a few minutes and try again."), self.back_links(pid, pi[2])), 429,
+                header_extra=self.sign_out_form("Sign out", "btn ghost"))
+        throttle.fail(name)
         now = time.time()
         online = bool(pi[4]) and bool(pi[5]) and now - pi[5] < OFFLINE_AFTER
         if not online:
@@ -2573,6 +2681,14 @@ def whole_number(low, high):
     return check
 
 
+def some_text(text):
+    """An argument type that accepts any text except a blank one (so a blank --reason is a wrong
+    command, exit status 2, like a missing one)."""
+    if not text.strip():
+        raise argparse.ArgumentTypeError("the reason can't be blank, so the log says why")
+    return text
+
+
 def licence_parser():
     """The arguments the licence command line takes (see the box above)."""
     parser = LicenceParser(prog="python relay.py licence", description="Look at or change one account's licence.")
@@ -2589,7 +2705,7 @@ def licence_parser():
                        help="how many Pis it covers (default: as it was, or %d)" % DEFAULT_SEATS)
     revoke = actions.add_parser("revoke", help="switch an account's licence off")
     revoke.add_argument("email")
-    revoke.add_argument("--reason", required=True)
+    revoke.add_argument("--reason", required=True, type=some_text)
     restore = actions.add_parser("restore", help="switch a revoked licence back on")
     restore.add_argument("email")
     seats = actions.add_parser("seats", help="change how many Pis a licence covers")
@@ -2689,9 +2805,7 @@ def cmd_revoke(args, out):
     """licence revoke: switch the licence off (state revoked) with a reason, keeping its plan and dates.
     The account's Pis stay paired and keep filtering; the rescue buttons still work."""
     uid, email = account_by_email(args.email)
-    reason = args.reason.strip()[:200]
-    if not reason:
-        raise CommandProblem("Give a reason with --reason, so the log says why. Nothing was changed.")
+    reason = args.reason.strip()[:200]      # never blank: some_text refused that already
     row = licence_needed(uid, email)
     change_licence(uid, row["id"], "state='revoked', reason=?", (reason,), "Owner revoked the licence: %s" % reason)
     print("%s: licence %s is revoked. Remote access is paused while the licence gate is on; the Pis keep filtering "

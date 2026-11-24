@@ -12,6 +12,15 @@ Licences on the relay, first phase (relay only; nothing changes on the Pi):
 - **New: a Licence card on the home page** with one sentence per state and "Pis: N of M"; paused Pis say "Remote access paused".
 - **New: the owner's command line**, `python relay.py licence show|grant|revoke|restore|seats`, which gives up root before opening the database. Documented in `cloud/README.md` with the go-live steps; manual checks in `docs/TESTING.md`; gaps in known issue 94.
 
+Check of the relay licence build (24 November). Each is in `docs/KNOWN_ISSUES.md`, "Found in the check of the relay licence build":
+- **Fixed: rescue presses had no limit.** Each account may press 20 times an hour; beyond that `429`, nothing sent and nothing logged. `licence_log` keeps the newest 1000 lines per account that the account caused (the owner's own lines are always kept).
+- **Fixed: pairing several codes at once could go past the seats**, and one code sent twice at once could pair twice. The seat count and the pairing now happen together.
+- **Fixed: a seat held by a waiting Pi was described as "in use"**, contradicting "Pis: 1 of 2". The refusal now names waiting Pis, and the Licence card adds "(1 waiting to be paired)".
+- **Fixed: pairing codes were shown when pairing would be refused.** With the gate on and no current licence, or every seat paired, a waiting Pi shows why instead, and its code is not renewed.
+- **New: a warning on the Licence card in a licence's last 7 days** (not for plans that renew by themselves).
+- **Fixed: a blank `--reason` exited with 1**; it is now a wrong command (2).
+- Tests: the agent-header test checks each value on its own; "nothing reached the Pi" is checked with a stand-in for the bridge; the relay tests no longer take on a developer's `QUIETNET_LICENCE_GATE` or `QUIETNET_LATEST`. Docs corrected: which checks log, the cross-site form list, and `--seats` on a re-grant.
+
 Second check of the robustness review's fixes (23 November). Each is in `docs/KNOWN_ISSUES.md`, "Faults in the robustness review's fixes":
 - Two devices that swap addresses each keep their own rules (they used to swap rules). A device whose rules can't be moved to its new address has them applied there, live cut included, until the owner sorts it out.
 - Rules move onto an address left with only a name or a departed visitor's group; a moved device no longer inherits the visitors' group.

@@ -224,12 +224,8 @@ class FirstStart(unittest.TestCase):
 # ------------------------------------------------------------------ shared helpers for the live tests
 
 class LicenceCase(RelayCase):
-    """A RelayCase with helpers for licences, the gate and Pis that send the agent header."""
-
-    def setUp(self):
-        super().setUp()
-        self.limit("LICENCE_GATE", "off")
-        self.limit("LATEST", "")
+    """A RelayCase with helpers for licences, the gate and Pis that send the agent header. RelayCase
+    already switches the gate off and clears QUIETNET_LATEST for each test."""
 
     def gate(self, on=True):
         """Switch the licence gate on (or off) for the rest of the test."""
@@ -293,10 +289,10 @@ class LicenceCase(RelayCase):
         """The licence log for an account, oldest first."""
         return [r[0] for r in relay.sql("SELECT what FROM licence_log WHERE user_id=? ORDER BY at", (self.uid(email),))]
 
-    def queued(self, pid):
-        """The calls waiting in the bridge for a Pi."""
-        with relay.bridge.lock:
-            return list(relay.bridge.queues.get(pid, []))
+    def bridge_unused(self):
+        """A stand-in for the bridge's call, to check that a request never reached the Pi: use it as
+        `with self.bridge_unused() as call:`, then `call.assert_not_called()`."""
+        return mock.patch.object(relay.bridge, "call", return_value=None)
 
 
 # ------------------------------------------------------------------ the off switch and its log
@@ -352,6 +348,25 @@ class GateSwitch(LicenceCase):
         relay.licence_gate(uid, "remote", False, info, now=1000.0 + 3600)
         self.assertEqual(len(self.log_lines()), 2)
 
+    def test_the_licence_log_keeps_only_the_newest_lines_an_account_caused(self):
+        self.limit("LICENCE_LOG_KEEP", 3)
+        uid = self.make_account()
+        for n in range(6):
+            relay.log_licence(uid, "", "Rescue %d." % n, now=1000.0 + n)
+        self.assertEqual(self.log_lines(), ["Rescue 3.", "Rescue 4.", "Rescue 5."])
+
+    def test_the_licence_log_never_drops_the_owners_own_lines(self):
+        self.limit("LICENCE_LOG_KEEP", 2)
+        uid = self.make_account()
+        relay.sql("INSERT INTO licence_log(licence_id,user_id,at,what) VALUES('',?,1.0,'Owner granted the licence.')",
+                  (uid,), commit=True)
+        relay.sql("INSERT INTO licence_log(licence_id,user_id,at,what) VALUES('',?,2.0,'Legacy licence given.')",
+                  (uid,), commit=True)
+        for n in range(5):
+            relay.log_licence(uid, "", "Rescue %d." % n, now=1000.0 + n)
+        self.assertEqual(self.log_lines(), ["Owner granted the licence.", "Legacy licence given.",
+                                            "Rescue 3.", "Rescue 4."])
+
     def test_with_the_gate_on_refusals_are_noted_too(self):
         self.gate(on=True)
         b = self.signed_in()
@@ -404,8 +419,10 @@ class RemoteGate(LicenceCase):
 
     def test_a_paused_call_never_reaches_the_pi(self):
         self.licence(state="expired")
-        self.b.post("/pi/%s/api/kill" % self.pid, data={"on": True}, headers={"X-QuietNet": "1"})
-        self.assertEqual(self.queued(self.pid), [])
+        with self.bridge_unused() as call:
+            status = self.b.post("/pi/%s/api/kill" % self.pid, data={"on": True}, headers={"X-QuietNet": "1"})[0]
+        self.assertEqual(status, 402)
+        call.assert_not_called()
 
     def test_another_accounts_pi_is_still_not_found_whatever_the_licences(self):
         relay.sql("DELETE FROM licences", commit=True)
@@ -525,6 +542,91 @@ class HomePage(LicenceCase):
         text = self.signed_in().get("/")[1]
         self.assertIn('action="/pis/new"', text)
 
+    def waiting_pi(self, name="Waiting", age=16 * 60):
+        """Add a Pi waiting to be paired straight to the database, its code `age` seconds old.
+        Returns (id, code, code time)."""
+        pid, code, ts = "w" + name.lower(), relay.new_pair_code(), time.time() - age
+        relay.sql("INSERT INTO pis(id,user_id,name,token,code,paired,created,last_seen,code_ts) "
+                  "VALUES(?,?,?,'',?,0,?,0,?)", (pid, self.uid(), name, code, time.time(), ts), commit=True)
+        return pid, code, ts
+
+    def test_a_seat_held_by_a_waiting_pi_is_named_as_waiting_not_in_use(self):
+        self.gate(on=True)
+        b = self.signed_in()
+        self.licence(seats=2)
+        self.paired_pi(b, "One")
+        self.waiting_pi()
+        text = b.get("/")[1]
+        self.assertIn("Your licence covers 2 Pis: 1 is paired and 1 is waiting to be paired. Remove one to add "
+                      "another.", text)
+        self.assertNotIn("both are in use", text)
+        self.assertIn("Pis: 1 of 2 (1 waiting to be paired)", text)
+
+    def test_adding_a_pi_gives_the_same_waiting_sentence_as_the_home_page(self):
+        self.gate(on=True)
+        b = self.signed_in()
+        self.licence(seats=2)
+        self.paired_pi(b, "One")
+        self.waiting_pi(age=0)
+        status, text, _ = b.post("/pis/new", form={"name": "Three"})
+        self.assertEqual(status, 403)
+        self.assertIn("1 is paired and 1 is waiting to be paired.", text)
+
+    def check_waiting_pi_shows(self, words, b):
+        """Load the home page and check a waiting Pi with an old code shows `words` in place of a code,
+        and that its code was not renewed."""
+        pid, code, ts = self.waiting_pi()
+        text = b.get("/")[1]
+        self.assertIn(words, text)
+        self.assertIn("Waiting to be paired", text)
+        self.assertNotIn('class="bigcode"', text)
+        self.assertNotIn("install.sh", text)
+        self.assertEqual(relay.sql("SELECT code, code_ts FROM pis WHERE id=?", (pid,), one=True), (code, ts))
+
+    def test_with_the_gate_on_and_no_current_licence_a_waiting_pi_shows_why_instead_of_a_code(self):
+        self.gate(on=True)
+        b = self.signed_in()
+        self.licence(state="revoked")
+        self.check_waiting_pi_shows("Adding a Pi needs a current licence.", b)
+
+    def test_with_the_gate_on_and_every_seat_paired_a_waiting_pi_shows_why_instead_of_a_code(self):
+        self.gate(on=True)
+        b = self.signed_in()
+        self.licence(seats=1)
+        self.paired_pi(b, "One")
+        self.check_waiting_pi_shows("Your licence covers 1 Pi and it is in use. Remove one to pair this one.", b)
+
+    def test_with_the_gate_off_a_waiting_pi_always_gets_a_fresh_code(self):
+        b = self.signed_in()
+        self.licence(state="revoked")
+        pid, code, _ = self.waiting_pi()
+        text = b.get("/")[1]
+        self.assertIn('class="bigcode"', text)
+        self.assertIn("install.sh", text)
+        self.assertNotEqual(relay.sql("SELECT code FROM pis WHERE id=?", (pid,), one=True)[0], code)
+
+    def test_a_licence_ending_within_seven_days_is_warned_about(self):
+        b = self.signed_in()
+        end = time.time() + 3 * DAY
+        self.licence(plan="gift", period_end=end)
+        self.assertIn("Your QuietNet licence ends on %s. Filtering at home carries on; remote access and updates "
+                      "stop unless it&#x27;s renewed." % relay.long_date(end), b.get("/")[1])
+
+    def test_a_licence_ending_later_than_seven_days_is_not_warned_about(self):
+        b = self.signed_in()
+        self.licence(plan="gift", period_end=time.time() + 30 * DAY)
+        self.assertNotIn("Your QuietNet licence ends on", b.get("/")[1])
+
+    def test_a_cancelling_licence_is_warned_about_in_its_last_week(self):
+        b = self.signed_in()
+        self.licence(plan="home-monthly", period_end=time.time() + 3 * DAY, cancel=1)
+        self.assertIn("Your QuietNet licence ends on", b.get("/")[1])
+
+    def test_a_licence_that_renews_by_itself_is_not_warned_about(self):
+        b = self.signed_in()
+        self.licence(plan="home-monthly", period_end=time.time() + 3 * DAY)
+        self.assertNotIn("Your QuietNet licence ends on", b.get("/")[1])
+
 
 # ------------------------------------------------------------------ adding Pis and seats
 
@@ -551,7 +653,7 @@ class AddingPis(LicenceCase):
         b.post("/pis/new", form={"name": "Waiting"})
         status, text, _ = b.post("/pis/new", form={"name": "Three"})
         self.assertEqual(status, 403)
-        self.assertIn("Your licence covers 2 Pis and both are in use.", text)
+        self.assertIn("Your licence covers 2 Pis: 1 is paired and 1 is waiting to be paired.", text)
 
     def test_a_waiting_pi_whose_code_has_expired_does_not_take_a_seat(self):
         self.gate(on=True)
@@ -591,6 +693,49 @@ class PairingGate(LicenceCase):
         self.assertEqual(status, 403)
         self.assertEqual(json.loads(text), {"error": "Your licence covers 1 Pi and it is in use. Remove one at "
                                                      "q3n.net, then pair again.", "licence": "active"})
+
+    def live_codes(self, n):
+        """Add `n` Pis waiting to be paired, each with a code still in date, straight to the database
+        (as several old entries renewed on the home page could leave them). Returns the codes."""
+        codes = []
+        for i in range(n):
+            code = relay.new_pair_code()
+            relay.sql("INSERT INTO pis(id,user_id,name,token,code,paired,created,last_seen,code_ts) "
+                      "VALUES(?,?,?,'',?,0,?,0,?)", ("live%d" % i, self.uid(), "Pi %d" % i, code, time.time(),
+                                                     time.time()), commit=True)
+            codes.append(code)
+        return codes
+
+    def pair_at_once(self, codes):
+        """Send one pairing request per code, all released at the same moment. Returns the statuses."""
+        start, statuses = threading.Barrier(len(codes)), []
+
+        def send(code):
+            """Wait for the others, then pair with `code`."""
+            pi = Browser(self.port)
+            start.wait(5)
+            statuses.append(pi.post("/agent/pair", data={"code": code})[0])
+
+        threads = [threading.Thread(target=send, args=(code,), daemon=True) for code in codes]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(10)
+        return sorted(statuses)
+
+    def test_pairing_several_codes_at_once_never_goes_over_the_seats(self):
+        self.signed_in()
+        self.licence(seats=2)
+        self.gate(on=True)
+        statuses = self.pair_at_once(self.live_codes(4))
+        self.assertEqual(statuses, [200, 200, 403, 403])
+        self.assertEqual(relay.sql("SELECT COUNT(*) FROM pis WHERE paired=1", one=True)[0], 2)
+
+    def test_one_code_sent_twice_at_once_pairs_only_once(self):
+        self.signed_in()
+        self.licence(seats=2)
+        code = self.live_codes(1)[0]
+        self.assertEqual(self.pair_at_once([code, code]), [200, 400])
 
     def test_two_seats_are_described_as_both_in_use(self):
         self.assertEqual(relay.seats_full(2, "Remove one at q3n.net, then pair again."),
@@ -765,9 +910,11 @@ class PollAnswers(LicenceCase):
         self.assertEqual(relay.sql("SELECT agent FROM pis WHERE id=?", (self.pid,), one=True)[0], 2)
 
     def test_any_agent_header_but_2_counts_as_agent_1(self):
-        for value in ("2", "3", "two", "", None):
-            self.poll(self.token, agent=value)
-        self.assertEqual(relay.sql("SELECT agent FROM pis WHERE id=?", (self.pid,), one=True)[0], 1)
+        for value in ("3", "two", "", " 2x", "22", None):
+            with self.subTest(agent=value):
+                relay.sql("UPDATE pis SET agent=2 WHERE id=?", (self.pid,), commit=True)
+                self.poll(self.token, agent=value)
+                self.assertEqual(relay.sql("SELECT agent FROM pis WHERE id=?", (self.pid,), one=True)[0], 1)
 
     def test_the_agent_kind_is_written_only_when_it_changes(self):
         self.poll(self.token, agent="2")
@@ -846,10 +993,11 @@ class Rescue(LicenceCase):
         self.assertIsInstance(seen["body"], str)
 
     def test_an_unknown_rescue_choice_is_refused_with_400_and_nothing_is_sent(self):
-        for what in ("", "kill", "internet-off", "/api/enforce", "pause-day"):
-            status, _, _ = self.b.post("/pi/%s/rescue" % self.pid, form={"what": what})
-            self.assertEqual(status, 400, what)
-        self.assertEqual(self.queued(self.pid), [])
+        with self.bridge_unused() as call:
+            for what in ("", "kill", "internet-off", "/api/enforce", "pause-day"):
+                status, _, _ = self.b.post("/pi/%s/rescue" % self.pid, form={"what": what})
+                self.assertEqual(status, 400, what)
+        call.assert_not_called()
 
     def test_nothing_from_the_browser_reaches_the_rescue_call(self):
         self.new_pi()
@@ -859,28 +1007,31 @@ class Rescue(LicenceCase):
 
     def test_another_accounts_pi_gives_404_for_a_rescue(self):
         stranger = self.signed_in("hannah@example.com")
-        status, _, _ = stranger.post("/pi/%s/rescue" % self.pid, form={"what": "internet-on"})
+        with self.bridge_unused() as call:
+            status, _, _ = stranger.post("/pi/%s/rescue" % self.pid, form={"what": "internet-on"})
         self.assertEqual(status, 404)
-        self.assertEqual(self.queued(self.pid), [])
+        call.assert_not_called()
 
     def test_a_signed_out_rescue_is_sent_to_sign_in(self):
         status, _, r = Browser(self.port).post("/pi/%s/rescue" % self.pid, form={"what": "internet-on"})
         self.assertEqual((status, r.getheader("Location")), (303, "/login"))
 
     def test_a_rescue_sent_from_another_website_is_refused(self):
-        status, text, _ = self.b.post("/pi/%s/rescue" % self.pid, form={"what": "internet-on"},
-                                      headers={"Sec-Fetch-Site": "cross-site"})
+        with self.bridge_unused() as call:
+            status, text, _ = self.b.post("/pi/%s/rescue" % self.pid, form={"what": "internet-on"},
+                                          headers={"Sec-Fetch-Site": "cross-site"})
         self.assertEqual(status, 403)
         self.assertIn("another website", text)
-        self.assertEqual(self.queued(self.pid), [])
+        call.assert_not_called()
 
     def test_a_rescue_to_a_pi_that_is_not_connected_says_so(self):
         relay.sql("UPDATE pis SET last_seen=? WHERE id=?", (time.time() - 120, self.pid), commit=True)
-        status, text, _ = self.b.post("/pi/%s/rescue" % self.pid, form={"what": "internet-on"})
+        with self.bridge_unused() as call:
+            status, text, _ = self.b.post("/pi/%s/rescue" % self.pid, form={"what": "internet-on"})
         self.assertEqual(status, 503)
         self.assertIn("Your Pi isn&#x27;t connected to q3n.net right now, so this couldn&#x27;t be sent. "
                       "Is it switched on?", text)
-        self.assertEqual(self.queued(self.pid), [])
+        call.assert_not_called()
 
     def test_each_rescue_is_written_to_the_licence_log(self):
         self.new_pi()
@@ -893,16 +1044,30 @@ class Rescue(LicenceCase):
     def test_only_the_two_fixed_calls_get_through_to_a_paused_pi(self):
         self.licence(state="expired")
         api = {"X-QuietNet": "1"}
-        tries = [self.b.post("/pi/%s/api/rescue" % self.pid, data={"what": "internet-on"}, headers=api),
-                 self.b.post("/pi/%s/api/kill" % self.pid, data={"on": False}, headers=api),
-                 self.b.post("/pi/%s/api/pause" % self.pid, data={"minutes": 60}, headers=api),
-                 self.b.post("/pi/%s/api/enforce" % self.pid, data={"ip": "1.2.3.4", "on": True}, headers=api),
-                 self.b.post("/pi/%s/rescue/api/kill" % self.pid, form={"what": "internet-on"}),
-                 self.b.post("/pi/%s/rescue/" % self.pid, form={"what": "internet-on"}),
-                 self.b.get("/pi/%s/rescue" % self.pid),
-                 self.b.get("/pi/%s/api/status" % self.pid, headers=api)]
+        with self.bridge_unused() as call:
+            tries = [self.b.post("/pi/%s/api/rescue" % self.pid, data={"what": "internet-on"}, headers=api),
+                     self.b.post("/pi/%s/api/kill" % self.pid, data={"on": False}, headers=api),
+                     self.b.post("/pi/%s/api/pause" % self.pid, data={"minutes": 60}, headers=api),
+                     self.b.post("/pi/%s/api/enforce" % self.pid, data={"ip": "1.2.3.4", "on": True}, headers=api),
+                     self.b.post("/pi/%s/rescue/api/kill" % self.pid, form={"what": "internet-on"}),
+                     self.b.post("/pi/%s/rescue/" % self.pid, form={"what": "internet-on"}),
+                     self.b.get("/pi/%s/rescue" % self.pid),
+                     self.b.get("/pi/%s/api/status" % self.pid, headers=api)]
         self.assertEqual([t[0] for t in tries], [402, 402, 402, 402, 404, 404, 404, 402])
-        self.assertEqual(self.queued(self.pid), [])
+        call.assert_not_called()
+
+    def test_rescue_presses_are_capped_per_account_and_the_extra_ones_are_not_logged(self):
+        relay.sql("UPDATE pis SET last_seen=0 WHERE id=?", (self.pid,), commit=True)      # offline: answered at once
+        for n in range(20):
+            status = self.b.post("/pi/%s/rescue" % self.pid, form={"what": "pause-hour"})[0]
+            self.assertEqual(status, 503, n)
+            self.assertEqual(len([line for line in self.log_lines() if line.startswith("Rescue")]), n + 1)
+        with self.bridge_unused() as call:
+            status, text, _ = self.b.post("/pi/%s/rescue" % self.pid, form={"what": "pause-hour"})
+        self.assertEqual(status, 429)
+        self.assertIn("a lot of rescue presses", text)
+        call.assert_not_called()
+        self.assertEqual(len([line for line in self.log_lines() if line.startswith("Rescue")]), 20)
 
     def test_the_rescue_page_carries_the_protective_headers(self):
         relay.sql("UPDATE pis SET last_seen=0 WHERE id=?", (self.pid,), commit=True)
@@ -1063,7 +1228,7 @@ class CommandLine(unittest.TestCase):
     def test_revoke_needs_a_reason(self):
         self.run_command("grant", "owner@example.com", "--plan", "owner")
         self.assertEqual(self.run_command("revoke", "owner@example.com")[0], 2)
-        self.assertEqual(self.run_command("revoke", "owner@example.com", "--reason", "  ")[0], 1)
+        self.assertEqual(self.run_command("revoke", "owner@example.com", "--reason", "  ")[0], 2)
         self.assertEqual(self.stored()["state"], "active")
 
     def test_the_command_line_gives_up_root_before_it_opens_the_database(self):

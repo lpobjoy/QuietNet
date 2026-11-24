@@ -38,7 +38,7 @@ python relay.py licence restore <email>
 python relay.py licence seats <email> N
 ```
 
-`--days` left out, or 0, means no end date. `--seats` is how many Pis it covers (default 2). `revoke` keeps the plan and dates and records the reason; `restore` makes it active again with the same end date. The account is found by its current email. Every change is written to the licence's log, which `show` prints. Like the relay itself, the command gives up root before opening the database, so the database stays writable by the running relay.
+`--days` left out, or 0, means no end date. `--seats` is how many Pis it covers, 1 to 10; left out, it keeps the licence's current seats (2 for a new licence). `revoke` keeps the plan and dates and records the reason; `restore` makes it active again with the same end date. The account is found by its current email. Every change is written to the licence's log, which `show` prints. A wrong command (including a missing or blank `--reason`) exits with status 2; an unknown email, or changing a licence the account doesn't have, exits with 1. Like the relay itself, the command gives up root before opening the database, so the database stays writable by the running relay.
 
 **Going live, in order:**
 

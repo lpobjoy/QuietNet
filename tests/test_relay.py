@@ -98,6 +98,8 @@ class RelayCase(unittest.TestCase):
         relay.sql("DELETE FROM throttle", commit=True)
         self.limit("big_answers", relay.BigAnswers(relay.BIG_ANSWER_BUDGET))
         self.limit("SIGNUP", "open")        # most tests make several accounts; SignupSwitch tests the others
+        self.limit("LICENCE_GATE", "off")   # the gate's own tests switch it on; a developer's QUIETNET_LICENCE_GATE must not leak in
+        self.limit("LATEST", "")            # likewise QUIETNET_LATEST, so poll answers carry only the licence
 
     def limit(self, name, value):
         """Change one of the relay's limits for the length of a test."""
