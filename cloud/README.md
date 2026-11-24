@@ -14,6 +14,8 @@ It uses only the Python standard library.
    - Variable `RAILWAY_DOCKERFILE_PATH` = `cloud/Dockerfile`. Railway then builds the relay's
      container from that file, with the repository's top folder as the build context, which the
      file needs.
+   - **Builder** Dockerfile (the service's Settings, under Build). Railway picks it by itself once
+     it finds the file, but a service first built some other way can keep Railpack, so set it.
    - **Healthcheck path** `/healthz` (the service's Settings, under Deploy). A new deploy only takes
      over once the relay answers there.
    - **Restart policy** On Failure, which is Railway's default.
@@ -41,7 +43,7 @@ live in the service on Railway itself, and this page is where they are written d
 
 | Setting | Value | Where on Railway |
 | --- | --- | --- |
-| How to build | With Docker, from `cloud/Dockerfile` | Variable `RAILWAY_DOCKERFILE_PATH=cloud/Dockerfile` |
+| How to build | With Docker, from `cloud/Dockerfile` | Variable `RAILWAY_DOCKERFILE_PATH=cloud/Dockerfile`, and Settings, Build: builder Dockerfile |
 | Build context | The repository's top folder | Railway's default. `railway up` uploads from where it is run |
 | Start command | None. The Dockerfile's `CMD ["python3", "relay.py"]` starts the relay | Settings, Deploy: leave the start command empty |
 | Health check | `/healthz`, which answers `{"ok": true}` | Settings, Deploy: healthcheck path |
@@ -57,8 +59,11 @@ settings, so setting the same values now changes nothing:
 1. Set `RAILWAY_DOCKERFILE_PATH=cloud/Dockerfile` on the service. From the folder linked to the
    project, `railway variable set RAILWAY_DOCKERFILE_PATH=cloud/Dockerfile --skip-deploys` does it
    without starting a deploy. On the website, the variable waits until you press Deploy.
-2. In the service's Settings, under Deploy: set the healthcheck path to `/healthz`, check the restart
-   policy is On Failure and the start command is empty.
+2. In the service's Settings, under Build: set the builder to Dockerfile. Under Deploy: set the
+   healthcheck path to `/healthz`, check the restart policy is On Failure and the start command is
+   empty. Railway holds changes made on its website until you press the Deploy button on the banner
+   it shows. That redeploys what is running now, `railway.json` and all, which is safe. Until then
+   `railway config pull --json` doesn't list the new values, and the build log shows no health check.
 3. Optional: `railway config migrate status`, from the linked folder, lists any service that still
    has a config file path set. If this one does, clear it in the service's Settings (the config file
    path field); after 1 December Railway ignores it anyway. `railway config migrate cutover` also
