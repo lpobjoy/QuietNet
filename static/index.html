@@ -1176,9 +1176,13 @@ function dnsAnnounceSwitch(st){
       Otherwise your router carries on naming its own IPv6 DNS server, each device chooses between the two, and devices
       marked "Can bypass over IPv6" still can. QuietNet never offers itself as a router, hands out no addresses and changes
       nothing on your router. It holds back, and says why here, while a Wi-Fi range extender is in use (over IPv6 it can't
-      yet tell the devices behind one apart, so one could get another's rules), while your router hands out IPv6 without
-      naming an IPv6 DNS server of its own (Android phones could drop off Wi-Fi each time QuietNet stopped announcing), and
-      after a restart until it has listened to your router for long enough to know. If this computer loses power without
+      tell the devices behind one apart, so it would refuse their lookups or give them only your whole-house rules; on a
+      QuietNet whose data has not yet been moved to the new device records, one could get another's rules), while one
+      hardware address shows signs of several devices behind it (an extender it has not recognised yet), while your
+      router hands out IPv6 addresses one by one, by DHCPv6 (this announcement would tell devices the opposite, and a
+      Windows computer may then give its address up), while your router hands out IPv6 without naming an IPv6 DNS server
+      of its own (Android phones could drop off Wi-Fi each time QuietNet stopped announcing), and after a restart until
+      it has listened to your router for long enough to know. If this computer loses power without
       warning, devices that chose it, including ones you never set up, may be slow to look names up for up to ${mins}
       minutes. Turning this off, or stopping QuietNet in the ordinary way, tells devices to stop at once.</p>
     ${dnsAnnounceState(a)}</div>

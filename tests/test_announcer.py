@@ -188,7 +188,8 @@ class TheFrame(unittest.TestCase):
 
     def test_quietnets_own_listener_reads_it_as_dns_only_from_something_that_is_not_a_router(self):
         self.assertEqual(server.read_router_advert(self.frame()[54:]),
-                         {"lifetime": 0, "servers": [(ADDR, 600)], "prefixes": [], "mac": ""})
+                         {"lifetime": 0, "servers": [(ADDR, 600)], "prefixes": [], "mac": "",
+                          "managed": False, "other": False})
 
     def test_an_earlier_address_is_only_ever_added_with_a_lifetime_of_zero(self):
         self.assertEqual(dns_servers(self.frame(600, [OTHER])), [(ADDR, 600), (OTHER, 0)])
@@ -1548,11 +1549,96 @@ class InTheServer(Api):
             reason = server.announce_hold_reason(ADDR)
         self.assertIn("could give one device another's rules", reason)
 
+    def router_flags(self, managed=False, other=False, ago=10, lifetime=1800, sender="fe80::1"):
+        """As if this sender announced `ago` seconds ago with these DHCPv6 flags and router lifetime,
+        naming itself as an IPv6 DNS server."""
+        server.note_router_dns([(sender, 600)], time.time() - ago, lifetime, sender=sender, mac="98:99:99:99:99:99",
+                               managed=managed, other=other)
+        for record in server.S.routers_v6.values():
+            record["heard_at"] = time.monotonic() - ago
+        server.S.ra_heard_at = time.monotonic() - ago if server.S.ra_heard_at is not None else None
+
+    def test_a_router_that_hands_out_addresses_by_dhcpv6_holds_the_trial_back_even_though_it_names_a_dns_server(self):
+        # QuietNet's message has that flag clear, which tells a Windows computer the opposite.
+        self.router_flags(managed=True)
+        reason = server.announce_hold_reason(ADDR)
+        self.assertIn("Your router hands out IPv6 addresses one by one, from a DHCPv6 server.", reason)
+        self.assertIn("a Windows computer may then give its address up", reason)
+        self.assertIn("QuietNet is not announcing itself.", reason)
+
+    def test_the_trial_still_announces_when_the_router_only_hands_out_other_settings_by_dhcpv6(self):
+        self.router_flags(other=True)
+        self.assertEqual(server.announce_hold_reason(ADDR), "")
+
+    def test_an_announcer_that_is_not_a_router_does_not_hold_the_trial_back_with_its_dhcpv6_flag(self):
+        self.router_heard()
+        self.router_flags(managed=True, lifetime=0, sender="fe80::9")       # a Thread border router, say
+        self.assertEqual(server.announce_hold_reason(ADDR), "")
+
+    def test_the_dhcpv6_hold_ends_an_hour_after_that_router_was_last_heard(self):
+        self.router_flags(managed=True, ago=server.RA_HOLD_MAX - 60)
+        self.assertIn("DHCPv6", server.announce_hold_reason(ADDR))
+        self.router_flags(managed=True, ago=server.RA_HOLD_MAX + 1)
+        self.assertNotIn("DHCPv6", server.announce_hold_reason(ADDR))
+
+    def test_a_router_that_stops_handing_out_addresses_by_dhcpv6_lifts_the_hold(self):
+        self.router_flags(managed=True)
+        self.assertIn("DHCPv6", server.announce_hold_reason(ADDR))
+        self.router_flags(managed=False)
+        self.assertEqual(server.announce_hold_reason(ADDR), "")
+
+    def test_one_router_of_two_handing_out_addresses_by_dhcpv6_is_enough_to_hold_back(self):
+        self.router_flags(managed=True, sender="fe80::2")
+        self.router_flags(managed=False, sender="fe80::1")
+        self.assertIn("DHCPv6", server.announce_hold_reason(ADDR))
+
+    def test_a_jump_of_the_clock_does_not_lift_the_dhcpv6_hold(self):
+        # A Pi has no clock of its own: the hour is counted by the steady timer.
+        self.router_flags(managed=True)
+        with mock.patch.object(server.time, "time", return_value=time.time() + 10 * 365 * 86400):
+            self.assertIn("DHCPv6", server.announce_hold_reason(ADDR))
+
+    def test_a_router_noticed_handing_out_addresses_by_dhcpv6_while_announcing_calls_the_announcement_off(self):
+        self.router_flags()
+        an = self.wired()
+        an.step()
+        self.router_flags(managed=True)
+        an.step()
+        self.assertEqual(an.status()["state"], "held")
+        self.assertEqual(self.sent, [KNOWN_ANNOUNCEMENT] + [KNOWN_GOODBYE] * 3)
+
+    def test_two_link_local_addresses_under_one_hardware_address_hold_the_trial_back(self):
+        # Several devices may be behind a range extender QuietNet has not recognised (issue 101).
+        self.router_heard()
+        self.assertEqual(server.announce_hold_reason(ADDR), "")
+        with mock.patch.object(server.S, "v6_unclear", frozenset({"aa:bb:cc:00:00:01"})):
+            reason = server.announce_hold_reason(ADDR)
+        self.assertIn("One hardware address here has more than one IPv6 address of the kind each device has only "
+                      "one of", reason)
+        self.assertIn("a Wi-Fi range extender QuietNet has not recognised yet", reason)
+        self.assertIn("it is not announcing itself.", reason)
+
+    def test_the_trial_is_held_back_by_what_the_ipv6_look_itself_found(self):
+        self.router_heard()
+        table = {"fe80::aaaa": ("aa:bb:cc:00:00:01", "fresh"), "fe80::bbbb": ("aa:bb:cc:00:00:01", "stale")}
+        with mock.patch.object(server, "own_ipv6", return_value=(set(), [], "")), \
+                mock.patch.object(server, "neighbour_table", return_value={}), \
+                mock.patch.object(server, "ipv6_neighbour_table", return_value=table):
+            server.refresh_ipv6_view()
+            self.assertIn("has not recognised yet", server.announce_hold_reason(ADDR))
+            del table["fe80::bbbb"]
+            server.refresh_ipv6_view()
+        self.assertEqual(server.announce_hold_reason(ADDR), "")
+
     def test_the_reason_to_hold_back_is_worked_out_without_the_database(self):
         self.router_heard()
         with mock.patch.object(server, "sql", side_effect=AssertionError("asked the database")), \
                 mock.patch.object(server, "db", None):
             self.assertEqual(server.announce_hold_reason(ADDR), "")
+            with mock.patch.object(server.S, "v6_unclear", frozenset({"aa:bb:cc:00:00:01"})):
+                self.assertIn("has not recognised yet", server.announce_hold_reason(ADDR))
+            self.router_flags(managed=True)
+            self.assertIn("DHCPv6", server.announce_hold_reason(ADDR))
 
     def wired(self):
         """An announcer joined to the server's own reason to hold back, with a stand-in card and
@@ -1587,6 +1673,16 @@ class InTheServer(Api):
         with mock.patch.object(server.S, "shared_macs", {"aa:bb:cc:00:00:01"}):
             an.step()
             self.assertEqual(an.status()["state"], "held")
+        self.assertEqual(self.sent, [KNOWN_ANNOUNCEMENT] + [KNOWN_GOODBYE] * 3)
+
+    def test_two_link_local_addresses_noticed_while_announcing_call_the_announcement_off(self):
+        self.router_heard()
+        an = self.wired()
+        an.step()
+        with mock.patch.object(server.S, "v6_unclear", frozenset({"aa:bb:cc:00:00:01"})):
+            an.step()
+            self.assertEqual(an.status()["state"], "held")
+            self.assertIn("has not recognised yet", an.status()["reason"])
         self.assertEqual(self.sent, [KNOWN_ANNOUNCEMENT] + [KNOWN_GOODBYE] * 3)
 
     def test_holding_back_changes_nothing_the_dashboard_says_about_ipv6_and_bypassing(self):
@@ -1764,8 +1860,32 @@ class OnTheDashboard(unittest.TestCase):
     def test_the_switch_says_when_it_holds_back(self):
         text = self.words("dnsAnnounceSwitch")
         self.assertIn("while a Wi-Fi range extender is in use", text)
+        self.assertIn("it would refuse their lookups or give them only your whole-house rules", text)
         self.assertIn("while your router hands out IPv6 without naming an IPv6 DNS server of its own", text)
         self.assertIn("until it has listened to your router for long enough to know", text)
+
+    def test_the_switch_gives_anothers_rules_as_the_reason_only_for_data_not_yet_moved(self):
+        # The reason the Pi sends for a moved household is shown just below, and must not contradict it.
+        text = self.words("dnsAnnounceSwitch")
+        self.assertNotIn("can't yet tell the devices behind one apart, so one could get another's rules", text)
+        self.assertIn("on a QuietNet whose data has not yet been moved to the new device records, one could get "
+                      "another's rules", text)
+
+    def test_the_switch_and_the_pis_own_reason_for_a_range_extender_say_the_same_thing(self):
+        with mock.patch.object(server.S, "shared_macs", {"aa:bb:cc:00:00:01"}), \
+                mock.patch.object(server.S, "devices_ready", True):
+            reason = server.announce_hold_reason(ADDR)
+        self.assertIn("would refuse their lookups or give them only the whole house's rules", reason)
+        self.assertIn("refuse their lookups or give them only your whole-house rules", self.words("dnsAnnounceSwitch"))
+
+    def test_the_switch_says_it_holds_back_for_an_extender_it_has_not_recognised(self):
+        self.assertIn("while one hardware address shows signs of several devices behind it (an extender it has not "
+                      "recognised yet)", self.words("dnsAnnounceSwitch"))
+
+    def test_the_switch_says_it_holds_back_while_the_router_hands_out_addresses_by_dhcpv6(self):
+        text = self.words("dnsAnnounceSwitch")
+        self.assertIn("while your router hands out IPv6 addresses one by one, by DHCPv6", text)
+        self.assertIn("a Windows computer may then give its address up", text)
 
     def test_it_warns_what_happens_if_the_pi_loses_power(self):
         text = self.words("dnsAnnounceSwitch")
@@ -1851,6 +1971,28 @@ class WhatTheDocsSay(unittest.TestCase):
     def test_the_readme_says_devices_never_set_up_may_start_using_quietnet(self):
         self.assertIn("Devices you never set up to use QuietNet may start using it too", self.readme)
         self.assertIn("whole-house rules", self.readme)
+
+    def test_known_issue_101_no_longer_says_an_unrecognised_extenders_addresses_are_always_unmatched(self):
+        self.assertNotIn("with the device tables its IPv6 addresses are unmatched all the same", self.issue)
+        self.assertIn("more than one link-local address", self.issue)
+        self.assertIn("If only one device behind an unrecognised extender has ever spoken to the Pi over IPv6", self.issue)
+
+    def test_known_issue_101_says_answers_leave_from_the_address_that_was_asked(self):
+        self.assertNotIn("the system picks which one each answer leaves from (the newer one", self.issue)
+        self.assertIn("answers each lookup from the address it was sent to", self.issue)
+
+    def test_known_issue_101_says_what_the_dhcpv6_flags_of_the_announcement_mean(self):
+        self.assertIn("The Pi's message has both DHCPv6 flags clear", self.issue)
+        self.assertIn("not tried here", self.issue)
+
+    def test_the_architecture_no_longer_says_extender_devices_are_judged_under_one_devices_rules_whatever_the_data(self):
+        text = " ".join(read("docs", "ARCHITECTURE.md").split())
+        self.assertNotIn("(its devices would be judged under one device's rules over IPv6)", text)
+        self.assertNotIn("With two, the system chooses which one each reply leaves from", text)
+
+    def test_there_are_manual_steps_for_the_routers_dhcpv6_flags_and_for_an_extender_seen_at_one_number(self):
+        self.assertRegex(self.testing, r"\n80\. \*\*The router's DHCPv6 flags\.\*\*")
+        self.assertIn("**The one-number case.**", self.testing)
 
     def test_there_is_a_manual_step_for_a_device_that_was_never_pointed_at_quietnet(self):
         self.assertRegex(self.testing, r"\n\d+\. \*\*A device that was never pointed at QuietNet\.\*\*")

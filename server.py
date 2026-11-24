@@ -297,7 +297,7 @@ class State:
     ra_heard = None         # when (time.time()) the router last announced IPv6 on the home network
     ra_heard_at = None      # the same moment by time.monotonic(), which a change of the clock can't move
     ra_since = None         # when (time.monotonic()) router_advert_listener began listening (None = it isn't)
-    routers_v6 = {}         # real routers heard announcing: link-local address -> {"mac", "heard" (time.time())}
+    routers_v6 = {}         # real routers heard announcing: link-local address -> {"mac", "heard" (time.time()), "heard_at" (time.monotonic()), "managed", "other" (its DHCPv6 flags)}
     router_v6_dns = {}      # IPv6 DNS servers the router names -> when to forget each (time.time())
     other_dns = {}          # device key -> when (time.time()) it last looked up another DNS service
     dev_mac = {}            # older database only: address with rules or a name -> the hardware address they belong to
@@ -332,6 +332,7 @@ class State:
     hub_device = None       # the number of the fixed device that is the home router
     hub_mac = ""            # the home router's hardware address, as last seen at its IPv4 address
     hw_unsettled = frozenset()  # hardware addresses found at two live IPv4 addresses at the last look
+    v6_unclear = frozenset()  # hardware addresses the IPv6 neighbour table lists with more than one link-local address (several_link_local)
     v6_table = {}           # the IPv6 neighbour table as last read by refresh_ipv6_view
     device_seen = {}        # device number -> when it was last seen, waiting to be saved (save_address_use)
     hw_seen = {}            # hardware address -> the same
@@ -868,6 +869,7 @@ def load_devices():
         S.addr_device, S.map4, S.map6, S.addr_use = {}, {}, {}, {}
         S.hw_device, S.addr_only, S.device_kind, S.behind_extender = {}, {}, {}, {}
         S.hw_unsettled, S.device_seen, S.hw_seen = frozenset(), {}, {}
+        S.v6_unclear = frozenset()
         S.pi_device, S.hub_device, S.hub_mac = None, None, ""
         S.dev_first, S.dev_last, S.seeded = {}, {}, False
         with rule_map_lock:
@@ -1044,7 +1046,10 @@ def rebuild_address_map():
 #      address, or when a look confirms it at another address: a device that asked for its old
 #      number back and was refused must not leave its rules on the device that has that number
 #      now;
-#   4. the IPv6 neighbours (S.rules6, from refresh_ipv6_view);
+#   4. the IPv6 neighbours (S.rules6, from refresh_ipv6_view). Never matched there: an address
+#      whose hardware address is a range extender's, is at two live IPv4 addresses at once, or is
+#      listed with more than one link-local address (several_link_local), since several devices
+#      may then be behind one hardware address and nothing says which address is whose;
 #   5. a device known only by that address (S.addr_only): rules kept against a number apply to
 #      lookups from that number while no device known by its hardware address is there. Not the
 #      rules the move set aside for the owner to choose (S.set_aside): those apply to no lookup
@@ -1386,6 +1391,43 @@ def own_address(number, addresses):
     return own if len(own) == 1 else []
 
 
+def several_link_local(table, own=None):
+    """The hardware addresses an IPv6 neighbour table lists with more than one link-local address
+    (the kind starting fe80, of which each device has only one on a network card), as a set.
+    `table` is {address: (hardware address, freshness)} or {address: hardware address}; `own` is
+    this computer's own IPv6 addresses, when the caller has just read them (S.v6_own otherwise).
+
+    Two such addresses under one hardware address are the sign that several devices may be
+    connecting through a Wi-Fi range extender QuietNet has not recognised: the IPv4 looks only
+    notice one when its hardware address is live at two numbers at the same moment, which never
+    happens while only one of the devices behind it talks to this computer over IPv4. So over
+    IPv6 such a hardware address is matched to no device (ipv6_rules, note_ipv6_addresses) and
+    to no IPv4 address (refresh_ipv6_view, which is what an older database judges by and what
+    the history is filed under), is left alone by IPv6 steering (plan6) and holds the
+    announcement trial back (announce_hold_reason): all of them go by this one test.
+
+    A stale entry counts, as it does for everything else read from the IPv6 neighbour table, so
+    one device that changed its link-local address is left unmatched until the old entry goes:
+    the safe direction. Left out: this computer's own addresses, the home router's hardware
+    address (it is the fixed "hub" device however many addresses it has) and the range extenders
+    already recognised (S.shared_macs), which are never matched anyway and have their own reason
+    to hold back. An address that can't be read as an IPv6 address is passed over. Reads memory
+    only."""
+    found = {}
+    own = S.v6_own if own is None else own
+    for addr, entry in (table or {}).items():
+        mac = clean_mac(entry[0] if isinstance(entry, tuple) else entry)
+        if not mac or addr in own or mac == S.hub_mac or mac in S.shared_macs:
+            continue
+        try:
+            parsed = ipaddress.IPv6Address(str(addr).split("%")[0])
+        except ValueError:
+            continue
+        if parsed.is_link_local:
+            found.setdefault(mac, set()).add(parsed)
+    return {mac for mac, addresses in found.items() if len(addresses) > 1}
+
+
 def note_ipv6_addresses(table=None, now=None):
     """Work out which device has which IPv6 address now, from the IPv6 neighbour table as last
     read (S.v6_table; `table` in its place for the tests), and keep S.addr_device, S.addr_rules
@@ -1397,9 +1439,12 @@ def note_ipv6_addresses(table=None, now=None):
     device, and all get that device's rules. A stale entry still counts: a device's own IPv6
     address is not handed on to another.
     Never matched: an address whose hardware address is a range extender's (S.shared_macs), or is
-    unsettled because it is at two live IPv4 addresses at once (S.hw_unsettled). Those lookups are
-    filed under whatever address they were judged under, and get no device's rules. An address
-    built from a hardware address (eui64_mac) proves nothing and is not looked at here."""
+    unsettled because it is at two live IPv4 addresses at once (S.hw_unsettled), or is listed in
+    this very table with more than one link-local address (several_link_local: several devices
+    may be behind a range extender not yet recognised, and nothing says which address is whose).
+    Those lookups are filed under whatever address they were judged under, and get no device's
+    rules; no device is made for such a hardware address here and none is marked as seen. An
+    address built from a hardware address (eui64_mac) proves nothing and is not looked at here."""
     if not S.devices_ready:
         return
     now = time.time() if now is None else now
@@ -1408,6 +1453,10 @@ def note_ipv6_addresses(table=None, now=None):
         if not S.devices_ready:
             return
         known, made = {}, set()
+        unclear = several_link_local(table)
+        # Kept for IPv6 steering and the announcement trial, which must go by the same table as this
+        # record does. refresh_ipv6_view has already noted the same set when this follows a look.
+        S.v6_unclear = frozenset(unclear)
         for addr, entry in (table or {}).items():
             mac, fresh = entry if isinstance(entry, tuple) and len(entry) == 2 else (entry, "")
             mac = clean_mac(mac)
@@ -1415,7 +1464,7 @@ def note_ipv6_addresses(table=None, now=None):
                 continue
             if mac == S.hub_mac:
                 number = S.hub_device
-            elif mac in S.shared_macs or mac in S.hw_unsettled:
+            elif mac in S.shared_macs or mac in S.hw_unsettled or mac in unclear:
                 continue
             else:
                 new = mac not in S.hw_device
@@ -1447,15 +1496,19 @@ def ipv6_rules(table):
     {address: device number}. The same matching as note_ipv6_addresses, but from memory alone
     (S.hw_device), so that the look a lookup may be waiting on (ipv6_look) can publish it without
     waiting for the database. A hardware address never seen before has no device yet and is left
-    out; note_ipv6_addresses makes its device a moment later."""
+    out; note_ipv6_addresses makes its device a moment later. Left out as well, so that their
+    lookups get no device's rules: a range extender's hardware address, one at two live IPv4
+    addresses at once, and one this table lists with more than one link-local address
+    (several_link_local)."""
     known = {}
+    unclear = several_link_local(table)
     for addr, entry in (table or {}).items():
         mac = clean_mac(entry[0] if isinstance(entry, tuple) else entry)
         if not mac or addr in S.v6_own:
             continue
         if mac == S.hub_mac:
             number = S.hub_device
-        elif mac in S.shared_macs or mac in S.hw_unsettled:
+        elif mac in S.shared_macs or mac in S.hw_unsettled or mac in unclear:
             continue
         else:
             number = S.hw_device.get(mac)
@@ -3400,8 +3453,9 @@ def plan6():
         address is listed in "shared") so the steerer can report it and never steer it. A device
         whose hardware address is at two live addresses at once (S.hw_unsettled: its IPv6 addresses
         are matched to no device either), or has more than one link-local address in the neighbour
-        table, is passed with "ll": "" and "unclear": True (it may be behind an extender not yet
-        recognised), so it too is left alone;
+        table (S.v6_unclear, the same test that leaves its IPv6 addresses matched to no device and
+        holds the announcement trial back: several_link_local), is passed with "ll": "" and
+        "unclear": True (it may be behind an extender not yet recognised), so it too is left alone;
       - "our_v6" is a lasting IPv6 address of this computer to answer redirected lookups from (the one
         also offered to devices as a DNS server; '' when there is none, so no redirect is added);
       - "port" is the port QuietNet answers on while it is listening over IPv6 (None otherwise, so no
@@ -3430,7 +3484,7 @@ def plan6():
             continue
         info = by_mac.get(mac) or {}
         lls = info.get("lls") or ([info["ll"]] if info.get("ll") else [])
-        if len(lls) > 1 or (S.devices_ready and mac in S.hw_unsettled):
+        if mac in S.v6_unclear or len(lls) > 1 or (S.devices_ready and mac in S.hw_unsettled):
             # Several link-local addresses, or at two live addresses at once: left alone.
             devices[ip] = {"mac": mac, "ll": "", "unclear": True}
         else:
@@ -5778,7 +5832,12 @@ def refresh_ipv6_view():
     can be held for some seconds while an older household's data is moved (move_to_devices).
 
     IPv6 addresses whose hardware address is a range extender's (S.shared_macs) are noted in
-    S.v6_shared, so each keeps its own share of lookups (share_key).
+    S.v6_shared, so each keeps its own share of lookups (share_key). The hardware addresses listed
+    with more than one link-local address are noted in S.v6_unclear (several_link_local): several
+    devices may be behind a range extender not yet recognised, so their IPv6 addresses are matched
+    to no device and to no IPv4 address (a lookup from one is refused while any device is treated
+    differently, and otherwise filed under its own address), IPv6 steering leaves them alone and
+    the announcement trial holds back.
 
     Whether this computer's home network card has working IPv6 is noted too (S.v6_can_hear), with
     when a look first found that it has (S.v6_hear_since): the hour of listening behind "IPv6 is
@@ -5791,7 +5850,13 @@ def refresh_ipv6_view():
     scanned = read_sql("SELECT ip, mac FROM seen WHERE mac != '' ORDER BY ts") if read_db is not None else []
     by_mac = ipv4_by_hardware_address(neighbour_table(), scanned)
     table6 = ipv6_neighbour_table()
-    matched = {addr: by_mac[mac] for addr, (mac, _) in (table6 or {}).items() if mac in by_mac}
+    # The hardware addresses listed with more than one link-local address: several devices may be
+    # behind each (several_link_local). Their IPv6 addresses are matched to no IPv4 device here, so
+    # their lookups are never filed under, or on an older database judged as, the one device known
+    # at that hardware address; to no device below (ipv6_rules); IPv6 steering leaves them alone;
+    # and the announcement trial holds back.
+    unclear = frozenset(several_link_local(table6 or {}, own))
+    matched = {addr: by_mac[mac] for addr, (mac, _) in (table6 or {}).items() if mac in by_mac and mac not in unclear}
     extenders = S.shared_macs
     shared = frozenset(addr for addr, (mac, _) in (table6 or {}).items() if mac in extenders)
     # Each hardware address's IPv6 addresses, and its link-local one, so IPv6 steering can address a
@@ -5817,6 +5882,7 @@ def refresh_ipv6_view():
     S.v6_by_mac = by_mac
     S.v6_shared = shared
     S.v6_table = table6 or {}               # kept for note_ipv6_addresses, which ipv6_look runs next
+    S.v6_unclear = unclear
     if S.devices_ready:
         # Whose rules a lookup from each IPv6 address gets, from memory alone, so that a lookup
         # waiting on this look finds its device the moment it is woken (see ipv6_rules).
@@ -5877,8 +5943,9 @@ def read_router_advert(data):
     (address text, seconds to keep using it), "prefixes": the address ranges it hands out (option
     3) as (network, seconds valid), "mac": the sender's hardware address as the message itself
     gives it (its source link-layer address, option 1; '' if it gives none, or one that could not
-    belong to a single device)}, or None if the message is not a router announcement or is badly
-    formed.
+    belong to a single device), "managed": whether it tells devices to get their IPv6 addresses
+    from a DHCPv6 server (its M flag), "other": whether it tells them to get other settings from
+    one (its O flag)}, or None if the message is not a router announcement or is badly formed.
 
     The message comes from anyone on the home network, so every length is checked before it is
     used: the fixed 16-byte start, then each option's length byte (in 8-byte units; 0 is not
@@ -5889,7 +5956,8 @@ def read_router_advert(data):
     loopback and IPv4-style addresses are skipped, as no device would use them for DNS."""
     if not isinstance(data, (bytes, bytearray)) or len(data) < 16 or data[0] != 134 or data[1] != 0:
         return None
-    out = {"lifetime": int.from_bytes(data[6:8], "big"), "servers": [], "prefixes": [], "mac": ""}
+    out = {"lifetime": int.from_bytes(data[6:8], "big"), "servers": [], "prefixes": [], "mac": "",
+           "managed": bool(data[5] & 0x80), "other": bool(data[5] & 0x40)}
     at = 16
     while at < len(data):
         if len(data) - at < 2:
@@ -5930,7 +5998,7 @@ def parse_router_advert(data):
     return None if found is None else found["servers"]
 
 
-def note_router_dns(servers, now, router_lifetime=1, prefixes=(), sender="", mac=""):
+def note_router_dns(servers, now, router_lifetime=1, prefixes=(), sender="", mac="", managed=False, other=False):
     """Remember the IPv6 DNS servers named in one router announcement (from read_router_advert),
     each until its stated lifetime runs out, but never more than RA_HOLD_MAX seconds without being
     named again, so a router that stops naming one (IPv6 switched off, say) is forgotten within the
@@ -5946,16 +6014,27 @@ def note_router_dns(servers, now, router_lifetime=1, prefixes=(), sender="", mac
 
     For a real router, the address the announcement came from (`sender`, its link-local address)
     and the hardware address it gave (`mac`) are kept too, in S.routers_v6, for RA_HOLD_MAX seconds
-    after it was last heard and for RA_MAX_SERVERS routers at most. Nothing acts on them yet: they
-    are what anyone on the home network claimed, shown in the status for the owner and kept for
-    the work on steering IPv6. An announcement that gives no hardware address keeps the last one
-    that sender gave."""
+    after it was last heard and for RA_MAX_SERVERS routers at most. They are what anyone on the
+    home network claimed: shown in the status for the owner, and read by plan6(), which takes the
+    most recently heard one that gave a hardware address as the hub for IPv6 steering while that
+    setting is on. They are not yet checked against the home router's IPv4 hardware address
+    (S.hub_mac); known issue 100. An announcement that gives no hardware address keeps the last
+    one that sender gave.
+
+    Kept with them, from that router's latest announcement: whether it tells devices to get their
+    IPv6 addresses from a DHCPv6 server (`managed`) or other settings from one (`other`), and when
+    it was heard by the steady timer ("heard_at"). The announcement trial holds back while a real
+    router heard in the last hour says "addresses from a DHCPv6 server" (announce_hold_reason),
+    because its own message can only say the opposite. An announcer with a router lifetime of 0
+    (a Thread border router, or this computer's own trial message) is never kept here, so its
+    flags count for nothing."""
     with router_dns_lock:
         if router_lifetime > 0:
             S.ra_heard = now
             S.ra_heard_at = time.monotonic()
             if sender:
-                S.routers_v6[sender] = {"mac": mac or S.routers_v6.get(sender, {}).get("mac", ""), "heard": now}
+                S.routers_v6[sender] = {"mac": mac or S.routers_v6.get(sender, {}).get("mac", ""), "heard": now,
+                                        "heard_at": S.ra_heard_at, "managed": bool(managed), "other": bool(other)}
         for addr in [a for a, r in S.routers_v6.items() if now - r["heard"] >= RA_HOLD_MAX]:
             del S.routers_v6[addr]
         while len(S.routers_v6) > RA_MAX_SERVERS:
@@ -6067,7 +6146,7 @@ def router_advert_listener(sock=None):
             found = read_router_advert(data)
             if found is not None:
                 note_router_dns(found["servers"], time.time(), found["lifetime"], found["prefixes"],
-                                sender=str(sender), mac=found["mac"])
+                                sender=str(sender), mac=found["mac"], managed=found["managed"], other=found["other"])
                 # A real router announcing resets a steered device's idea of where the router is, so
                 # wake the enforcer to send the claim again at once (option c2). Only while the setting
                 # is on, and at most once a second, so with it off nothing is changed and a flood of
@@ -6118,7 +6197,8 @@ def ipv6_dns_view(now=None, mono=None):
     own, and the jump when it gets the right time after starting must not count as an hour.
 
     "routers" lists the real routers heard in the last hour (link-local address, the hardware
-    address each gave, when last heard), most recent first. "neighbours_ok" is whether the IPv6
+    address each gave, when last heard, and whether its latest announcement told devices to get
+    addresses ("managed") or other settings ("other") from a DHCPv6 server), most recent first. "neighbours_ok" is whether the IPv6
     neighbour table could be read at the last look (null before the first), and "taking_lookups"
     whether the filter is listening on IPv6 at all; the home page warns when lookups arrive over
     IPv6 but can't be matched to devices."""
@@ -6127,7 +6207,8 @@ def ipv6_dns_view(now=None, mono=None):
     with router_dns_lock:
         named = sorted(a for a, until in S.router_v6_dns.items() if until > now)
         heard, heard_at = S.ra_heard, S.ra_heard_at
-        routers = sorted(({"address": a, "mac": r["mac"], "heard": r["heard"]}
+        routers = sorted(({"address": a, "mac": r["mac"], "heard": r["heard"],
+                           "managed": bool(r.get("managed")), "other": bool(r.get("other"))}
                           for a, r in S.routers_v6.items() if now - r["heard"] < RA_HOLD_MAX),
                          key=lambda r: (-r["heard"], r["address"]))
     ours = S.v6_own if S.dns_ipv6 else set()
@@ -6166,7 +6247,7 @@ def announce_hold_reason(address=""):
     server just now, or '' if it may. `address` is the address it is about to name. The announcer
     asks before every announcement and every 20 seconds between them, and holds back (telling
     devices to stop, if it was announcing) while there is a reason. Reads memory only: no
-    database, no tools. Two things hold it back, each because announcing could cut off or
+    database, no tools. Three things hold it back, each because announcing could cut off or
     disturb a device by accident:
 
     1. A Wi-Fi range extender is known (S.shared_macs). Over IPv6 the devices behind one can't
@@ -6179,6 +6260,11 @@ def announce_hold_reason(address=""):
        by hand; the announcement would invite every device behind the extender to ask over IPv6.
        The hold was written for the first case. It is kept for the second until that has been
        tried on a real network (known issue 101), and the reason given says which applies.
+       An extender QuietNet has not recognised holds it back too: one hardware address listed in
+       the IPv6 neighbour table with more than one link-local address (S.v6_unclear, worked out
+       at each look at the IPv6 neighbours: several_link_local). Only two of the devices behind
+       it need to have spoken to this computer over IPv6; the IPv4 looks would never notice
+       while only one of them uses QuietNet over IPv4.
 
     2. This computer could be the ONLY IPv6 DNS server devices are told of while they have IPv6
        from a router. An Android phone counts its IPv6 as set up once it has an address, a route
@@ -6195,6 +6281,18 @@ def announce_hold_reason(address=""):
        restart, holds it back. A DNS server handed out only by DHCPv6 is never heard here, and
        Android ignores those anyway.
 
+    3. A real router heard in the last hour (RA_HOLD_MAX, by the steady timer) tells devices to
+       get their IPv6 addresses from a DHCPv6 server (its M flag, kept in S.routers_v6). The
+       trial's own message has that flag clear, and for this flag clear is not "nothing to say":
+       it reads "addresses are not handed out by DHCPv6 here". A Windows computer is reported to
+       keep one such setting for the whole network connection, whichever announcer spoke last,
+       and to give its DHCPv6 address up when the flag goes from set to clear, so it could lose
+       and regain its IPv6 address every few minutes. This is checked before the second reason,
+       so it holds even when the router names an IPv6 DNS server. The "other settings from a
+       DHCPv6 server" flag (O) alone does not hold the trial back: the worst reported there is
+       a computer fetching its DHCPv6 DNS servers again, and it keeps the servers named in
+       announcements meanwhile (known issue 101).
+
     This is for the announcer alone. It must never feed ipv6_dns_view(), `hub_off` or the "Can
     bypass over IPv6" labels, and it changes nothing they read."""
     if S.shared_macs:
@@ -6204,10 +6302,20 @@ def announce_hold_reason(address=""):
                     "QuietNet is not announcing itself.")
         return ("Some devices here connect through a Wi-Fi range extender, and over IPv6 QuietNet can't yet tell "
                 "them apart, so announcing could give one device another's rules. QuietNet is not announcing itself.")
+    if S.v6_unclear:
+        return ("One hardware address here has more than one IPv6 address of the kind each device has only one "
+                "of, so several devices may be connecting through a Wi-Fi range extender QuietNet has not "
+                "recognised yet. Over IPv6 it can't tell them apart, so it is not announcing itself.")
     now, mono = time.time(), time.monotonic()
     with router_dns_lock:
         named = [a for a, until in S.router_v6_dns.items() if until > now]
         heard_at = S.ra_heard_at
+        managed = any(r.get("managed") and mono - r.get("heard_at", mono) < RA_HOLD_MAX
+                      for r in S.routers_v6.values())
+    if managed:
+        return ("Your router hands out IPv6 addresses one by one, from a DHCPv6 server. QuietNet's announcement would "
+                "tell devices the opposite, and a Windows computer may then give its address up each time one is "
+                "sent. QuietNet is not announcing itself.")
     ours = set(S.v6_own) | {address}
     since, hear_since = S.ra_since, S.v6_hear_since
     if heard_at is not None and mono - heard_at < RA_HOLD_MAX:

@@ -70,6 +70,7 @@ class Base(unittest.TestCase):
         # Nothing heard from the router about IPv6, and no IPv6 address to give devices.
         server.S.v6_dns, server.S.router_v6_dns, server.S.ra_heard = "", {}, None
         server.S.v6_by_mac = {}
+        server.S.v6_unclear = frozenset()
         server.S.plan_table = (0.0, None)   # no neighbour table left over from another test's plan
         server.S.router_prefixes = {}
         # The announcement listener and the IPv6 watcher are not running, and have never looked.

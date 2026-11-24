@@ -30,6 +30,7 @@ TV, PHONE, LAPTOP = "64:e7:d8:5d:c7:42", "a2:11:22:33:44:55", "3c:22:fb:aa:bb:cc
 EXTENDER = "00:aa:bb:cc:dd:ee"
 OLD_SPOT, NEW_SPOT, OTHER = "192.168.1.65", "192.168.1.67", "192.168.1.70"
 V6_A, V6_B, V6_C = "2a00:23c8:1:2:1111::1", "2a00:23c8:1:2:2222::2", "fe80::1c2d:3e4f:5a6b:7c8d"
+LL_A, LL_B = "fe80::aaaa", "fe80::bbbb"     # two link-local addresses: each device has only one
 
 
 def fresh(mac):
@@ -377,6 +378,134 @@ class AddressesOverIPv6(Devices):
         self.look({OLD_SPOT: fresh(TV), NEW_SPOT: fresh(TV)})
         self.look6({V6_A: fresh(TV)})
         self.assertIsNone(self.device_at(V6_A))
+
+    def test_a_hardware_address_with_two_link_local_addresses_gives_its_ipv6_addresses_to_no_device(self):
+        # Each device has one link-local address, so two under one hardware address may be two
+        # devices behind a range extender QuietNet has not recognised.
+        self.look({OLD_SPOT: fresh(PHONE)})
+        table = {LL_A: fresh(PHONE), LL_B: fresh(PHONE), V6_A: fresh(PHONE)}
+        self.look6(table)
+        self.assertEqual([self.device_at(a) for a in table], [None] * 3)
+        self.assertEqual([server.S.addr_rules.get(a) for a in table], [None] * 3)
+        self.assertEqual(server.ipv6_rules(table), {})
+
+    def test_a_second_device_behind_an_unrecognised_extender_is_not_blocked_by_the_firsts_internet_off_over_ipv6(self):
+        # Only the tablet uses QuietNet over IPv4, so the extender's hardware address is only ever
+        # at one number: never unsettled, never counted as an extender. The laptop asks over IPv6.
+        table4 = {OLD_SPOT: fresh(EXTENDER), ROUTER: fresh(ROUTER_MAC)}
+        for minute in range(6):
+            server.refresh_devices(table4, now=self.now - 600 + 60 * minute)
+        tablet = self.device_at(OLD_SPOT)
+        self.assertEqual((self.kind(tablet), server.S.shared_macs, server.S.hw_unsettled), ("hw", set(), frozenset()))
+        server.set_internet_off("dev:%d" % tablet, True)
+        self.look6({LL_A: fresh(EXTENDER), LL_B: fresh(EXTENDER), V6_A: fresh(EXTENDER)})
+        answer = server.answer_query(query("www.bbc.co.uk"), LL_B + "%wlan0", fake_answer)
+        self.assertEqual(answer[3] & 15, 5)                   # "won't answer": never a blocked answer, which is final
+        with server.db_lock:
+            server.save_history(drain())
+        self.assertEqual(server.sql("SELECT COUNT(*) FROM queries WHERE device=?", (tablet,))[0][0], 0)
+
+    def test_one_hardware_address_at_a_fresh_and_a_stale_number_still_gives_two_link_local_addresses_to_no_device(self):
+        # Once one of the two entries has gone stale the IPv4 looks no longer call it unsettled.
+        server.refresh_devices({OLD_SPOT: fresh(EXTENDER), ROUTER: fresh(ROUTER_MAC)}, now=self.now - 300)
+        both = {OLD_SPOT: fresh(EXTENDER), NEW_SPOT: fresh(EXTENDER), ROUTER: fresh(ROUTER_MAC)}
+        server.refresh_devices(both, now=self.now - 240)
+        server.refresh_devices(dict(both, **{NEW_SPOT: stale(EXTENDER)}), now=self.now - 180)
+        self.assertEqual((server.S.hw_unsettled, server.S.shared_macs), (frozenset(), set()))
+        table = {LL_A: fresh(EXTENDER), LL_B: fresh(EXTENDER)}
+        self.look6(table)
+        self.assertEqual([server.S.addr_rules.get(a) for a in table], [None, None])
+        self.assertEqual(server.ipv6_rules(table), {})
+
+    def test_a_device_with_one_link_local_address_and_several_other_ipv6_addresses_keeps_its_rules(self):
+        self.look({OLD_SPOT: fresh(PHONE)})
+        table = {LL_A: fresh(PHONE), V6_A: fresh(PHONE), V6_B: stale(PHONE)}
+        self.look6(table)
+        phone = self.device_at(OLD_SPOT)
+        self.assertEqual([server.S.addr_rules.get(a) for a in table], [phone] * 3)
+        self.assertEqual(server.ipv6_rules(table), dict.fromkeys(table, phone))
+
+    def test_the_device_is_matched_again_once_only_one_link_local_address_is_listed(self):
+        self.look({OLD_SPOT: fresh(PHONE)})
+        self.look6({LL_A: stale(PHONE), LL_B: fresh(PHONE)}, ago=60)
+        self.assertIsNone(server.S.addr_rules.get(LL_B))
+        self.look6({LL_B: fresh(PHONE)})                      # the old entry has gone from the table
+        self.assertEqual(server.S.addr_rules.get(LL_B), self.device_at(OLD_SPOT))
+
+    def test_the_routers_several_link_local_addresses_still_go_to_the_router(self):
+        self.look({ROUTER: fresh(ROUTER_MAC)})
+        table = {"fe80::1": fresh(ROUTER_MAC), "fe80::2": fresh(ROUTER_MAC)}
+        self.look6(table)
+        self.assertEqual([self.device_at(a) for a in table], [server.S.hub_device] * 2)
+        self.assertEqual(server.ipv6_rules(table), dict.fromkeys(table, server.S.hub_device))
+
+    def test_the_record_of_ipv6_addresses_notes_the_same_hardware_addresses_for_steering_and_the_trial(self):
+        self.look6({LL_A: fresh(PHONE), LL_B: fresh(PHONE)})
+        self.assertEqual(server.S.v6_unclear, {PHONE})
+        self.look6({LL_A: fresh(PHONE)})
+        self.assertEqual(server.S.v6_unclear, frozenset())
+
+    def test_no_device_is_made_for_a_new_hardware_address_with_two_link_local_addresses(self):
+        self.look6({LL_A: fresh(LAPTOP), LL_B: fresh(LAPTOP)})
+        self.assertNotIn(LAPTOP, server.S.hw_device)
+
+    def test_one_link_local_address_written_two_ways_counts_as_one(self):
+        self.assertEqual(server.several_link_local({"fe80::aaaa": fresh(PHONE), "FE80:0:0:0:0:0:0:AAAA": fresh(PHONE)}),
+                         set())
+
+    def test_two_addresses_that_work_beyond_the_home_do_not_make_a_hardware_address_unclear(self):
+        self.assertEqual(server.several_link_local({V6_A: fresh(PHONE), V6_B: fresh(PHONE), LL_A: fresh(PHONE)}), set())
+
+    def test_a_stale_second_link_local_address_still_makes_the_hardware_address_unclear(self):
+        self.assertEqual(server.several_link_local({LL_A: fresh(PHONE), LL_B: stale(PHONE)}), {PHONE})
+
+    def test_a_recognised_range_extender_is_not_listed_among_the_unclear(self):
+        # It is never matched anyway, and has its own reason for the announcement trial to hold back.
+        server.S.shared_macs = {EXTENDER}
+        self.assertEqual(server.several_link_local({LL_A: fresh(EXTENDER), LL_B: fresh(EXTENDER)}), set())
+
+    def test_this_computers_own_link_local_addresses_never_make_a_hardware_address_unclear(self):
+        server.S.v6_own = {LL_A, LL_B}
+        self.assertEqual(server.several_link_local({LL_A: fresh(LAPTOP), LL_B: fresh(LAPTOP)}), set())
+
+    def test_an_entry_that_is_not_an_ipv6_address_is_passed_over_when_counting_link_local_addresses(self):
+        self.assertEqual(server.several_link_local({"not an address": fresh(PHONE), LL_A: fresh(PHONE)}), set())
+
+    def test_the_ipv6_look_notes_which_hardware_addresses_have_two_link_local_addresses(self):
+        table = {LL_A: fresh(PHONE), LL_B: fresh(PHONE), V6_A: fresh(TV)}
+        with mock.patch.object(server, "own_ipv6", return_value=(set(), [], "")), \
+                mock.patch.object(server, "neighbour_table", return_value={}), \
+                mock.patch.object(server, "ipv6_neighbour_table", return_value=table):
+            server.refresh_ipv6_view()
+            self.assertEqual(server.S.v6_unclear, {PHONE})
+            table.pop(LL_A)
+            server.refresh_ipv6_view()
+        self.assertEqual(server.S.v6_unclear, frozenset())
+
+    def test_with_no_device_rules_a_second_devices_lookup_is_filed_under_its_own_address_not_the_firsts(self):
+        # Nothing is refused while no device is treated differently; it must still not land in
+        # the history of the one device known at that hardware address.
+        table4 = {OLD_SPOT: fresh(EXTENDER)}
+        self.look(table4)
+        tablet = self.device_at(OLD_SPOT)
+        with mock.patch.object(server, "own_ipv6", return_value=(set(), [], "")), \
+                mock.patch.object(server, "neighbour_table", return_value=table4), \
+                mock.patch.object(server, "ipv6_neighbour_table",
+                                  return_value={LL_A: fresh(EXTENDER), LL_B: fresh(EXTENDER)}):
+            server.ipv6_look()
+        self.assertEqual(server.S.v6_devices, {})
+        self.lookup(LL_B)
+        (client, device), = server.sql("SELECT client, device FROM queries")
+        self.assertEqual(client, LL_B)
+        self.assertNotEqual(device, tablet)
+
+    def test_an_ipv6_neighbour_table_that_cannot_be_read_leaves_no_hardware_address_unclear(self):
+        server.S.v6_unclear = frozenset({PHONE})
+        with mock.patch.object(server, "own_ipv6", return_value=(set(), [], "")), \
+                mock.patch.object(server, "neighbour_table", return_value={}), \
+                mock.patch.object(server, "ipv6_neighbour_table", return_value=None):
+            server.refresh_ipv6_view()
+        self.assertEqual(server.S.v6_unclear, frozenset())
 
     def test_an_address_built_from_a_hardware_address_proves_nothing(self):
         self.look({OLD_SPOT: fresh(TV)})

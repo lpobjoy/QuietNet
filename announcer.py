@@ -20,7 +20,11 @@ Safety rules this module keeps (docs/ARCHITECTURE.md lists them with the reasons
   - It sends nothing at all, and opens no socket, unless the owner has switched the trial on.
   - The message never offers this computer as a router: its router lifetime is 0, it hands out
     no address range, no route, and none of the "ask a DHCPv6 server" flags, and it leaves the
-    devices' other network settings alone. It carries nothing but the DNS part.
+    devices' other network settings alone. It carries nothing but the DNS part. One thing in it
+    is not "nothing to say": the two DHCPv6 flags have no such value, so leaving them clear
+    reads "DHCPv6 is not used here", which is the opposite of what a router that sets them
+    says. The trial therefore holds back while the home router hands out addresses by DHCPv6
+    (see server.announce_hold_reason, and known issue 101 for what is left open).
   - It can only ever name the computer that sends it (build_dns_announcement refuses anything
     else), and nothing but a checked hardware address and a checked address goes into it.
   - It is sent only while QuietNet really is answering lookups over IPv6 on the usual DNS port:
@@ -30,7 +34,8 @@ Safety rules this module keeps (docs/ARCHITECTURE.md lists them with the reasons
   - It holds back, with a plain reason for the dashboard, whenever the rest of QuietNet says
     announcing could harm a household device (the `hold_reason` it is given: see
     server.announce_hold_reason), and when the home network card has more than one home-only
-    address, since answers could then leave from the one that was not announced.
+    address: answering from the very address that was asked has not been tried on a real Pi
+    with two of them (see card_facts).
   - Devices are told to stop (the same message with a lifetime of 0, sent GOODBYES times) when
     the trial is switched off and when QuietNet is stopped cleanly. A goodbye that could not
     be sent is tried again at every look until one goes or the lifetime has run out, and the
@@ -149,7 +154,12 @@ def build_dns_announcement(our_mac, our_address, lifetime, withdrawn=()):
         checksum zero: no hop limit to adopt; no "get addresses from a DHCPv6 server" flag (M)
         and no "get other settings from one" flag (O); ordinary router preference (the standard
         requires that when the lifetime is 0); ROUTER LIFETIME 0, which means "do not send your
-        traffic through me"; and no timers to adopt.
+        traffic through me"; and no timers to adopt. For the hop limit and the timers zero means
+        "nothing to say". The M and O flags have no such value: clear, they read "DHCPv6 is not
+        used here", which differs from a router that sets them, and a device may go by whichever
+        announcer it heard last. They stay clear all the same (the design forbids them, and this
+        computer is no DHCPv6 server); the trial holds back instead while the home router sets
+        M (server.announce_hold_reason).
       - The DNS part(s): see dns_part. No address range (so no device makes itself an address
         from this), no route, no hardware address part: nothing else at all."""
     source_mac = own_hardware_address(our_mac)
@@ -224,11 +234,15 @@ def card_facts(card=None, inet6_path="/proc/net/if_inet6", folder="/sys/class/ne
     route uses), unless `card` names one (the tests do). Reads small files; runs no tools.
 
     A card with more than one working home-only address gives all three facts (the lowest
-    address) AND a reason not to announce. QuietNet's answers over IPv6 leave from whichever of
-    the card's addresses the system picks, which need not be the one a device asked; a device
-    throws away an answer from another address and waits. The announcer's own test question
-    can't notice, because an answer to this computer itself always leaves from the address
-    asked. The facts are still given so that devices already told can be sent a goodbye."""
+    address) AND a reason not to announce. On Linux both of QuietNet's UDP listeners answer
+    each lookup from the address it was sent to (server.ask_for_reply_address and send_answer),
+    and an answer over TCP always does. Only if the system refuses to send from that address
+    does the answer leave from whichever of the card's addresses the system picks, and a device
+    throws away an answer from an address it did not ask, and waits. That has never been tried
+    on a real Pi with two home-only addresses, and the announcer's own test question, asked
+    from this computer, could not notice it going wrong. So the trial holds back until manual
+    step 78 has been run; taking the hold out is the owner's decision. The facts are still
+    given so that devices already told can be sent a goodbye."""
     if card is None:
         card = enforcer.interface_and_gateway()[0]
     if not isinstance(card, str) or not CARD_NAME.fullmatch(card) or ".." in card:

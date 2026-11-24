@@ -192,10 +192,20 @@ class Sent:
         self.frames.append(frame)
 
 
-def steerer(saves=None):
+class Clock:
+    """A stand-in for the steady clock, moved on by hand so that no test waits."""
+    def __init__(self):
+        self.now = 1000.0
+
+    def __call__(self):
+        return self.now
+
+
+def steerer(saves=None, clock=None):
     """An IPv6Steerer wired to a stand-in socket, with the usual device turned on."""
     sent = Sent()
-    s = enforcer.IPv6Steerer("wlan0", PI_MAC, sent, log=lambda m: None, save=saves or (lambda: None))
+    s = enforcer.IPv6Steerer("wlan0", PI_MAC, sent, log=lambda m: None, save=saves or (lambda: None),
+                             **({"clock": clock} if clock else {}))
     s.set_target({"enabled": True, "hub": {"v6": HUB_LL, "mac": HUB_MAC}, "our_v6": "fd00::9",
                   "port": 53, "servers": [HUB_LL], "shared": [], "devices": {DEV_IP: {"mac": DEV_MAC, "ll": DEV_LL}}})
     return s, sent
@@ -631,7 +641,7 @@ class ListenerSockets(unittest.TestCase):
         frame = eth + bytes([0x60, 0, 0, 0, 0, 0, 59, 64]) + enforcer.v6_bytes("fe80::55") + enforcer.v6_bytes("ff02::fb")
         s, sent, pkt, join, stop = self.wired([frame])
         s.listen(stop)
-        self.assertEqual(s._heard.get(other), "fe80::55")
+        self.assertEqual(s.heard_addresses(other), ["fe80::55"])
 
     def test_both_sockets_are_closed_when_asked_to_stop(self):
         s, sent, pkt, join, stop = self.wired([])
@@ -817,6 +827,197 @@ class LearningLinkLocal(unittest.TestCase):
         s, sent = steerer()
         s.note_frame(self.frame_from("33:33:00:00:00:01", "fe80::9"))
         self.assertEqual(s._heard, {})
+
+
+OTHER_LL = "fe80::b"      # a second link-local address under the usual device's hardware address
+
+
+class SeveralLinkLocalAddresses(unittest.TestCase):
+    """Each device has one link-local address. A hardware address with more than one known (the one
+    the plan gives, those heard from it in the last hour, the one last claimed) may be several
+    devices behind a range extender not yet recognised, so it is never claimed, and a claim already
+    made is corrected."""
+
+    def setUp(self):
+        self.clock = Clock()
+        self.s, self.sent = steerer(clock=self.clock)
+
+    def hear(self, ll, mac=DEV_MAC):
+        """As if a frame from this hardware address and link-local address were heard on the wire."""
+        eth = enforcer.mac_to_bytes(PI_MAC) + enforcer.mac_to_bytes(mac) + struct.pack(">H", enforcer.ETH_IPV6)
+        self.s.note_frame(eth + bytes([0x60, 0, 0, 0, 0, 0, 59, 64]) + enforcer.v6_bytes(ll) + enforcer.v6_bytes("ff02::fb"))
+
+    def plan(self, ll):
+        """Have the plan give this link-local address for the usual device ('' for none)."""
+        self.s.devices = {DEV_IP: {"mac": DEV_MAC, "ll": ll}}
+
+    def sent_to(self):
+        """(the address each frame sent was for, the hardware address it says the router is at)."""
+        return [(str(enforcer.ipaddress.IPv6Address(f[38:54])), f[-6:].hex(":")) for f in self.sent.frames]
+
+    def test_a_second_link_local_address_heard_from_a_steered_hardware_address_hands_it_back_and_says_so(self):
+        self.s.steer()
+        self.sent.frames.clear()
+        self.hear(OTHER_LL)
+        problems = self.s.steer()
+        self.assertEqual(self.sent_to(), [(DEV_LL, HUB_MAC)])       # one correction, to the address that was claimed
+        self.assertIn("More than one device seems to share this device's hardware address", problems[DEV_IP])
+        self.assertFalse(self.s.active())
+
+    def test_the_other_address_is_never_sent_a_claim(self):
+        self.s.steer()
+        self.hear(OTHER_LL)
+        for _ in range(3):
+            self.s.steer()
+            self.hear(DEV_LL)                                       # the chosen device speaks again
+        self.assertNotIn(OTHER_LL, [to for to, _ in self.sent_to()])
+        self.assertEqual(self.sent_to()[1:], [(DEV_LL, HUB_MAC)])   # after the first claim, only the one correction
+
+    def test_two_link_local_addresses_heard_before_any_claim_send_nothing(self):
+        self.plan("")
+        self.hear(DEV_LL)
+        self.hear(OTHER_LL)
+        problems = self.s.steer()
+        self.assertEqual(self.sent.frames, [])
+        self.assertIn("share", problems[DEV_IP])
+
+    def test_a_heard_address_that_differs_from_the_plans_leaves_the_device_alone(self):
+        self.hear(OTHER_LL)
+        problems = self.s.steer()
+        self.assertEqual(self.sent.frames, [])
+        self.assertIn("share", problems[DEV_IP])
+        self.assertFalse(self.s.active())
+
+    def test_the_plans_address_is_used_when_the_same_one_was_heard(self):
+        self.hear(DEV_LL)
+        self.assertEqual(self.s.steer(), {})
+        self.assertEqual(self.sent.frames, [STEER_FRAME])
+
+    def test_a_heard_address_is_used_only_when_the_plan_gave_none(self):
+        self.plan("")
+        self.hear(DEV_LL)
+        self.s.steer()
+        self.assertEqual(self.sent.frames, [STEER_FRAME])
+
+    def test_the_same_address_written_two_ways_counts_as_one(self):
+        self.plan("FE80:0:0:0:0:0:0:23")
+        self.hear(DEV_LL)
+        self.assertEqual(self.s.steer(), {})
+        self.assertEqual(self.sent.frames, [STEER_FRAME])
+
+    def test_a_heard_address_is_forgotten_after_an_hour_and_the_device_is_steered_again(self):
+        self.hear(OTHER_LL)
+        self.s.steer()
+        self.clock.now += enforcer.IPv6Steerer.HEARD_KEPT - 1
+        self.s.steer()
+        self.assertEqual(self.sent.frames, [])
+        self.clock.now += 1
+        self.assertEqual(self.s.steer(), {})
+        self.assertEqual(self.sent.frames, [STEER_FRAME])
+
+    def test_an_address_heard_again_is_remembered_from_the_last_time_it_was_heard(self):
+        self.hear(OTHER_LL)
+        self.clock.now += enforcer.IPv6Steerer.HEARD_KEPT - 1
+        self.hear(OTHER_LL)
+        self.clock.now += enforcer.IPv6Steerer.HEARD_KEPT - 1
+        self.assertEqual(self.s.heard_addresses(DEV_MAC), [OTHER_LL])
+
+    def test_the_addresses_heard_are_given_most_recent_first(self):
+        self.hear(DEV_LL)
+        self.clock.now += 5
+        self.hear(OTHER_LL)
+        self.assertEqual(self.s.heard_addresses(DEV_MAC), [OTHER_LL, DEV_LL])
+
+    def test_a_device_whose_link_local_address_changes_is_sent_the_correction_at_the_old_one(self):
+        # A claim never moves straight to another address: the other may be another device.
+        self.s.steer()
+        self.sent.frames.clear()
+        self.plan(OTHER_LL)                                         # the neighbour table now lists another address
+        problems = self.s.steer()
+        self.assertEqual(self.sent_to(), [(DEV_LL, HUB_MAC)])       # the router's real hardware address, to the old one
+        self.assertIn("share", problems[DEV_IP])
+        self.assertEqual(self.s.state_dict(), {})
+
+    def test_the_new_address_is_claimed_once_the_old_one_has_not_been_known_for_an_hour(self):
+        self.s.steer()
+        self.plan(OTHER_LL)
+        self.s.steer()
+        self.sent.frames.clear()
+        self.clock.now += enforcer.IPv6Steerer.HEARD_KEPT
+        self.assertEqual(self.s.steer(), {})
+        self.assertEqual(self.sent_to(), [(OTHER_LL, PI_MAC)])
+
+    def test_the_address_last_claimed_still_counts_when_the_table_loses_it_and_another_is_heard(self):
+        self.s.steer()
+        self.clock.now += enforcer.IPv6Steerer.HEARD_KEPT * 2      # nothing heard from it for a long time
+        self.plan("")
+        self.hear(OTHER_LL)
+        self.sent.frames.clear()
+        problems = self.s.steer()
+        self.assertEqual(self.sent_to(), [(DEV_LL, HUB_MAC)])
+        self.assertIn("share", problems[DEV_IP])
+
+    def test_after_a_restart_a_saved_claim_at_another_address_is_corrected_before_the_new_one_is_claimed(self):
+        s, sent = steerer(clock=self.clock)
+        s.adopt({DEV_MAC: OTHER_LL}, {"v6": HUB_LL, "mac": HUB_MAC})
+        s.steer()
+        self.assertEqual([(f[38:54], f[-6:]) for f in sent.frames],
+                         [(enforcer.v6_bytes(OTHER_LL), enforcer.mac_to_bytes(HUB_MAC))])
+        s.steer()
+        self.assertEqual(sent.frames[1:], [STEER_FRAME])
+
+    def test_a_reachability_check_is_not_answered_once_the_device_is_left_alone(self):
+        self.s.steer()
+        self.hear(OTHER_LL)
+        self.s.steer()
+        self.sent.frames.clear()
+        self.s.handle_solicitation(solicitation(DEV_LL, DEV_MAC, HUB_LL))
+        self.assertEqual(self.sent.frames, [])
+
+    def test_no_redirect_is_kept_for_a_device_that_is_left_alone(self):
+        self.s.steer()
+        self.hear(OTHER_LL)
+        self.s.steer()
+        self.assertIsNone(self.s.redirect_info())
+
+    def test_no_more_than_four_addresses_are_kept_for_one_hardware_address(self):
+        for n in range(1, 8):
+            self.clock.now += 1
+            self.hear("fe80::%x" % n)
+        self.assertEqual(self.s.heard_addresses(DEV_MAC), ["fe80::7", "fe80::6", "fe80::5", "fe80::4"])
+
+    def test_no_more_than_512_hardware_addresses_are_remembered(self):
+        for n in range(600):
+            self.hear("fe80::1", mac="02:00:00:00:%02x:%02x" % (n >> 8, n & 255))
+        self.assertEqual(len(self.s._heard), 512)
+        self.assertEqual(self.s.heard_addresses("02:00:00:00:00:00"), [])          # the first heard made way
+        self.assertEqual(self.s.heard_addresses("02:00:00:00:02:57"), ["fe80::1"])  # the last is kept
+
+    def test_another_devices_link_local_address_does_not_make_this_one_unclear(self):
+        self.hear(OTHER_LL, mac="12:34:56:78:9a:bc")
+        self.assertEqual(self.s.steer(), {})
+        self.assertEqual(self.sent.frames, [STEER_FRAME])
+
+    def test_frames_can_be_heard_while_the_tick_is_steering(self):
+        # The listener thread notes addresses while the tick reads them.
+        stop = threading.Event()
+
+        def listener():
+            """Hear frames from many hardware addresses until told to stop."""
+            n = 0
+            while not stop.is_set():
+                n += 1
+                self.hear("fe80::%x" % (n % 7 + 1), mac="02:00:00:00:00:%02x" % (n % 50))
+        t = threading.Thread(target=listener, daemon=True)
+        t.start()
+        try:
+            for _ in range(200):
+                self.s.steer()
+                self.s.heard_addresses("02:00:00:00:00:07")
+        finally:
+            stop.set()
+            t.join(5)
+        self.assertEqual(self.s.steer(), {})
 
 
 class UnclearDevices(unittest.TestCase):
