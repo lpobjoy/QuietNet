@@ -236,6 +236,14 @@ class BlockingAddresses(Api):
         self.assertIn("may stop", out["error"])
         self.assertNotIn("will", out["error"])
 
+    def test_the_refusal_does_not_promise_that_reloading_the_page_is_enough(self):
+        # Through the relay the page is the relay's own copy, which stays old until the relay is
+        # updated, so the sentence also says what to do when a reload brings no question.
+        _, out = self.post("/api/block", {"domain": "samsungcloudsolution.net"})
+        self.assertTrue(out["error"].endswith("If you are still not asked and you are using QuietNet away from home, "
+                                              "remote access needs updating too: until then, block it from "
+                                              "QuietNet's own page at home."), out["error"])
+
     def test_blocking_a_needed_name_goes_ahead_once_the_person_has_said_yes(self):
         out = self.ok("/api/block", {"domain": "samsungcloudsolution.net", "sure": True})
         self.assertEqual(out, {"ok": True, "domain": "samsungcloudsolution.net"})
@@ -642,6 +650,31 @@ class Devices(Api):
         self.assertEqual(sorted((h["d"], h["v"], h["needed"]) for h in g["hosts"]),
                          [("lcprd1.samsungcloudsolution.net", "ok", ""),
                           ("log-config.samsungcloudsolution.net", "suspect", "")])
+
+    def test_a_needed_group_is_not_called_an_advert_because_only_advert_sub_names_were_seen(self):
+        # An idle Roku in "Last hour": nothing looked up but logs.roku.com, which is on the advert
+        # list. roku.com itself is not, so its row must not read "Advert / tracker".
+        self.log(KID, "logs.roku.com", blocked=1)
+        g = self.get("/api/activity?ip=%s" % KID)[1][0]
+        self.assertEqual((g["base"], g["v"], g["b"], g["needed"]), ("roku.com", "suspect", False, "Roku players and TVs"))
+
+    def test_an_advert_sub_name_beneath_a_needed_name_is_still_called_an_advert(self):
+        self.log(KID, "logs.roku.com", blocked=1)
+        h = self.get("/api/activity?ip=%s" % KID)[1][0]["hosts"][0]
+        self.assertEqual((h["d"], h["v"], h["b"], h["why"]), ("logs.roku.com", "junk", True, "list"))
+
+    def test_a_needed_name_that_is_itself_on_the_advert_list_is_still_called_an_advert(self):
+        self.addCleanup(setattr, server.S, "junk_builtin", server.S.junk_builtin)
+        server.S.junk_builtin = server.S.junk_builtin | {"roku.com"}
+        self.log(KID, "logs.roku.com", blocked=1)
+        g = self.get("/api/activity?ip=%s" % KID)[1][0]
+        self.assertEqual((g["v"], g["needed"]), ("junk", "Roku players and TVs"))
+
+    def test_an_ordinary_group_of_nothing_but_advert_sub_names_is_still_called_an_advert(self):
+        # As before for a name nobody needs: yahoo.com is not on the advert list, ads.yahoo.com is.
+        self.log(KID, "ads.yahoo.com", blocked=1)
+        g = self.get("/api/activity?ip=%s" % KID)[1][0]
+        self.assertEqual((g["base"], g["v"], g["needed"]), ("yahoo.com", "junk", ""))
 
     def test_a_needed_name_looked_up_by_itself_says_who_needs_it(self):
         self.log(KID, "samsungcloudsolution.net")

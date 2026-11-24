@@ -161,7 +161,7 @@ OWNERS = {
     "bbc.co.uk": "BBC", "bbci.co.uk": "BBC", "bbc.com": "BBC", "itv.com": "ITV", "channel4.com": "Channel 4",
     "sky.com": "Sky", "disneyplus.com": "Disney+", "disney-plus.net": "Disney+", "bamgrid.com": "Disney+",
     "roku.com": "Roku", "samsung.com": "Samsung", "samsungcloud.com": "Samsung", "samsungcloudsolution.com": "Samsung TV",
-    "samsungcloudsolution.net": "Samsung TV",
+    "samsungcloudsolution.net": "Samsung TV", "samsungqbe.com": "Samsung TV",
     "lgtvsdp.com": "LG TV", "lge.com": "LG", "sonos.com": "Sonos", "ring.com": "Ring", "nest.com": "Google Nest",
     "playstation.com": "PlayStation", "playstation.net": "PlayStation", "nintendo.net": "Nintendo",
     "nintendo.com": "Nintendo", "steampowered.com": "Steam", "epicgames.com": "Epic Games", "roblox.com": "Roblox",
@@ -191,11 +191,15 @@ OWNERS = {
 #  - not a name that is mainly adverts or tracking. Those belong on the advert list.
 # This table changes labels and adds a question. It never changes what decision() blocks.
 NEEDED = {
-    # Samsung TVs: the app system ("Smart Hub") and its clock; Samsung account sign-in.
+    # Samsung TVs: the app system ("Smart Hub") and its clock; the TV's online check, first set-up
+    # and app shop (several owners report each failing with samsungqbe.com blocked); Samsung
+    # account sign-in.
     "samsungcloudsolution.com": "Samsung TVs", "samsungcloudsolution.net": "Samsung TVs",
-    "samsungosp.com": "Samsung TVs and phones",
-    # LG TVs: the TV's service platform and clock; the app shop ("Content Store").
-    "lgtvsdp.com": "LG TVs", "lgappstv.com": "LG TVs",
+    "samsungqbe.com": "Samsung TVs", "samsungosp.com": "Samsung TVs and phones",
+    # LG TVs: the TV's service platform and clock; the app shop ("Content Store"); the TV's system
+    # updates and the app shop's downloads (blocking the whole of lge.com is reported to stop the
+    # Content Store; blocking one sub-name such as snu.lge.com, to hold back updates, does not ask).
+    "lgtvsdp.com": "LG TVs", "lgappstv.com": "LG TVs", "lge.com": "LG TVs",
     # Apple: sign-in, the online check, clock, activation and updates; iCloud sign-in;
     # the App Store's pages; update downloads.
     "apple.com": "Apple devices", "icloud.com": "Apple devices", "mzstatic.com": "Apple devices",
@@ -776,10 +780,15 @@ def needed_by(domain):
 def needed_refusal(who):
     """The sentence sent with the 409 when a needed name is blocked without the person's say-so.
     The dashboard asks its own question from the phrase alone; this is for anything else that
-    shows the 'error' text, such as a dashboard page loaded before this question existed."""
-    return ("%s need this address for their own system to work. Blocking it may stop apps opening, "
-            "signing in or updates on them. It has not been blocked. Reload this page and try again "
-            "to be asked first." % who)
+    shows the 'error' text, such as a dashboard page loaded before this question existed.
+    Reloading brings the new page from this computer, but not always through the relay: the relay
+    serves its own copy of the page, which stays old until the relay itself is updated. So the
+    sentence does not promise that a reload is enough, and says what to do when it is not."""
+    return ("%s need this address for their own system to work. Blocking it may stop them opening "
+            "apps, signing in or updating. It has not been blocked. Reload this page and try again "
+            "to be asked first. If you are still not asked and you are using QuietNet away from "
+            "home, remote access needs updating too: until then, block it from QuietNet's own page "
+            "at home." % who)
 
 
 def base_of(domain):
@@ -3013,7 +3022,12 @@ def activity_groups(ip, since):
     service (see OTHER_DNS_SERVICES) is shown as blocked with why 'other_dns' when this device is
     kept away from them (other_dns_blocked_for), since every lookup of it then is, and its group is
     marked "other_dns" too. Every name and group also carries "needed": who needs that whole name
-    for their own system (see needed_by), or '' for most."""
+    for their own system (see needed_by), or '' for most.
+
+    A group's "v" is 'junk' when every name in it is on the advert list. A needed group is the one
+    exception: it is 'junk' only when its own whole name is on the list, and 'suspect' otherwise,
+    so that a device which looked up nothing but advert sub-names (logs.roku.com, say) does not
+    make the whole of roku.com read "Advert / tracker". The sub-names keep their own 'junk'."""
     rows = read_sql("""SELECT domain, COUNT(*), MAX(ts), SUM(blocked) FROM queries
                   WHERE client=? AND ts>? GROUP BY domain""", (ip, since))
     guarded = other_dns_blocked_for(ip)
@@ -3036,15 +3050,19 @@ def activity_groups(ip, since):
         g["hosts"].sort(key=lambda h: -h["n"])
         vs = {h["v"] for h in g["hosts"]}
         g["v"] = "junk" if vs == {"junk"} else ("suspect" if vs & {"junk", "suspect"} else "ok")
+        # Who needs this whole name, if anyone (see NEEDED). The dashboard then shows "Needed by ..."
+        # where it would have shown "Possibly junk", whatever the sub-names beneath it look like.
+        g["needed"] = needed_by(g["base"])
+        # Every sub-name seen being an advert does not make a needed name one: only the advert
+        # list naming the whole name does. Still 'suspect', so the adverts filter lists the group.
+        if g["needed"] and g["v"] == "junk" and not is_junk(g["base"]):
+            g["v"] = "suspect"
         if kept_off(g["base"]):
             g["b"], g["why"], g["svc"] = True, "other_dns", ""
         else:
             g["b"], g["why"], g["svc"] = decision(g["base"], ip)
         g["some_blocked"] = any(h["b"] for h in g["hosts"])
         g["other_dns"] = any(h["why"] == "other_dns" for h in g["hosts"])
-        # Who needs this whole name, if anyone (see NEEDED). The dashboard then shows "Needed by ..."
-        # where it would have shown "Possibly junk", whatever the sub-names beneath it look like.
-        g["needed"] = needed_by(g["base"])
     return sorted(groups.values(), key=lambda g: -g["n"])
 
 

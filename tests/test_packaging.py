@@ -12,8 +12,15 @@ import json
 import os
 import re
 import sys
+import tempfile
 import unittest
 
+# Before server is imported, as in test_quietnet.py: server settles on its data folder when it is
+# first imported. Without this, naming a class from this file ahead of one built on
+# test_quietnet.Base would aim that class's clean-up at the checkout's own data folder (or at
+# whatever folder the person running the tests has in QUIETNET_DATA).
+if "server" not in sys.modules:
+    os.environ["QUIETNET_DATA"] = tempfile.mkdtemp(prefix="quietnet-test-")
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 import server  # noqa: E402
@@ -292,6 +299,41 @@ class NeededNames(unittest.TestCase):
     def test_samsungs_second_tv_name_has_an_owner_label(self):
         self.assertEqual(server.OWNERS["samsungcloudsolution.net"], "Samsung TV")
 
+    def test_the_name_behind_a_samsung_tvs_online_check_and_set_up_is_needed(self):
+        self.assertEqual(server.NEEDED["samsungqbe.com"], "Samsung TVs")
+
+    def test_the_name_behind_a_samsung_tvs_online_check_has_an_owner_label(self):
+        self.assertEqual(server.OWNERS["samsungqbe.com"], "Samsung TV")
+
+    def test_the_name_behind_an_lg_tvs_updates_is_needed(self):
+        self.assertEqual(server.NEEDED["lge.com"], "LG TVs")
+
+    def test_one_lg_update_sub_name_is_not_itself_needed(self):
+        # Blocking snu.lge.com alone is a common, deliberate way to hold back updates: it must not ask.
+        self.assertEqual(server.needed_by("snu.lge.com"), "")
+
+
+class TestDataFolder(unittest.TestCase):
+    """Tests never touch the real data folder. server.py settles on its folder when it is first
+    imported, so a test file that imports it must name a throwaway folder first; otherwise the
+    order in which test classes are named on the command line decides whose data gets cleared."""
+
+    def test_every_test_file_that_imports_server_names_a_throwaway_data_folder_first(self):
+        here = os.path.join(ROOT, "tests")
+        for name in sorted(os.listdir(here)):
+            if not name.endswith(".py"):
+                continue
+            lines = read("tests", name).splitlines()
+            imports = [i for i, line in enumerate(lines) if re.match(r"(import|from) server\b", line)]
+            if not imports:
+                continue
+            folder = [i for i, line in enumerate(lines)
+                      if line.strip().startswith('os.environ["QUIETNET_DATA"] = tempfile.mkdtemp(')]
+            self.assertTrue(folder and folder[0] < imports[0], name)
+
+    def test_the_data_folder_these_tests_use_is_not_the_checkouts_own(self):
+        self.assertNotEqual(os.path.realpath(server.DATA), os.path.realpath(os.path.join(ROOT, "data")))
+
 
 class DashboardNeededNames(unittest.TestCase):
     """The dashboard's parts for names a device's own system depends on: the "Needed by" note in
@@ -308,6 +350,7 @@ class DashboardNeededNames(unittest.TestCase):
         cls.activity = page[page.index("function activityList("):page.index("function viewDevice(")]
         cls.rules = page[page.index("function viewRules("):page.index("/* ---------- Set up a device")]
         cls.api = page[page.index("async function api("):page.index("function ago(")]
+        cls.ask = page[page.index("function ask("):page.index("const oops =")]
         cls.page = page
 
     def test_a_needed_name_shows_who_needs_it(self):
@@ -328,8 +371,8 @@ class DashboardNeededNames(unittest.TestCase):
         self.assertIn("x.v === 'ok' || x.needed ? '' : 'primary'", self.button)
 
     def test_the_question_says_who_needs_the_address_and_what_may_happen(self):
-        self.assertIn("${who} need this address for their own system to work. Blocking it may stop apps opening, "
-                      "signing in or updates on them. Block it anyway?", self.helpers)
+        self.assertIn("${who} need this address for their own system to work. Blocking it may stop them opening apps, "
+                      "signing in or updating. Block it anyway?", self.helpers)
 
     def test_the_question_promises_nothing(self):
         self.assertNotIn("will stop", self.helpers)
@@ -338,8 +381,34 @@ class DashboardNeededNames(unittest.TestCase):
         self.assertIn("if(e.status !== 409 || !a.needed) throw e;", self.block_address)
 
     def test_the_question_goes_through_the_pop_up_that_escapes_its_text(self):
-        self.assertIn("ask({title:`Block ${a.domain || domain}?`, ok:'Block it anyway', danger:true, text:neededQuestion(a.needed)})",
-                      self.block_address)
+        self.assertIn("ask({title:`Block ${a.domain || domain}?`, ok:'Block it anyway', danger:true, careful:true, "
+                      "text:neededQuestion(a.needed)})", self.block_address)
+
+    def test_a_needed_name_is_asked_one_question_not_two(self):
+        # The general "this doesn't look like an advert or tracker" question is skipped for a
+        # needed name, which gets the fuller one. The button carries who needs the name (checked
+        # in test_who_needs_a_name_is_escaped_wherever_it_is_shown), so d.needed is filled.
+        self.assertIn("if(d.v === 'ok' && !d.needed){", self.page)
+
+    # ----- a second Enter, or a held one, must not answer yes
+
+    def test_the_question_puts_the_keyboard_on_cancel(self):
+        self.assertIn("(input !== undefined ? $('mInput') : careful && cancel ? $('mNo') : $('mYes')).focus();", self.ask)
+
+    def test_enter_does_not_answer_yes_to_a_careful_question_from_anywhere_in_it(self):
+        # Enter then presses only the button the keyboard is on, which starts as Cancel.
+        self.assertIn("if(e.key === 'Enter' && !careful) $('mYes').click();", self.ask)
+
+    def test_a_question_is_careful_only_when_asked_to_be(self):
+        self.assertIn("cancel='Cancel', careful=false}){", self.ask)
+        self.assertEqual(self.page.count("careful:true"), 1)
+
+    def test_a_held_down_enter_never_answers_a_question(self):
+        held = self.ask.index("if(e.key === 'Enter' && e.repeat){ e.preventDefault(); return; }")
+        self.assertLess(held, self.ask.index("$('mYes').click()"))
+
+    def test_a_held_down_enter_sends_a_typed_name_only_once(self):
+        self.assertIn("if(e.key === 'Enter' && !e.repeat && e.target.id === 'addBox') actions.add();", self.page)
 
     def test_saying_no_blocks_nothing(self):
         self.assertIn("if(!yes) return false;", self.block_address)
@@ -361,6 +430,10 @@ class DashboardNeededNames(unittest.TestCase):
     def test_the_note_beside_an_existing_block_says_who_needs_it_and_what_to_do(self):
         self.assertIn("${esc(who)} need this address. If apps have stopped opening on one, or it can't sign in or "
                       "update, unblock it.", self.helpers)
+
+    def test_a_blocked_name_nobody_needs_carries_no_note(self):
+        self.assertIn("return who ? `<div class=\"meta\">${esc(who)} need this address.", self.helpers)
+        self.assertIn("unblock it.</div>` : '';", self.helpers)
 
     def test_the_blocked_list_page_carries_the_note(self):
         self.assertIn("${blocks ? neededBlockedNote(x.needed) : ''}", self.rules)
