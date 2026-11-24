@@ -1233,6 +1233,31 @@ class AMergedDeviceAtTwoAddressesAtOnce(TwoDevices):
         self.assertEqual(self.get("/api/schedules")[1][0]["scope"], "device:" + AT_WIFI)
 
 
+class NamesADevicesOwnSystemNeeds(TwoDevices):
+    """A name a device's own system needs says who needs it on the cards this part added: a
+    device with no address now, and a merged device. The page asks for a card's list with the
+    address the card is listed under (empty when it has none) and the device's number."""
+
+    def groups(self, device, address=""):
+        """(name, blocked?, why, who needs it) for each group in a card's activity list."""
+        _, out = self.get("/api/activity?ip=%s&hours=24&since=&device=%d" % (address, device))
+        return [(g["base"], g["b"], g["why"], g["needed"]) for g in out["groups"]]
+
+    def test_a_card_with_no_address_now_says_who_needs_a_name_the_person_blocked(self):
+        server.set_device_name(self.wifi, "Lounge TV")
+        self.file_lookup(AT_WIFI, "lcprd1.samsungcloudsolution.net", self.wifi)
+        self.ok("/api/block", {"domain": "samsungcloudsolution.net", "sure": True})
+        self.look({AT_CABLE: fresh(CABLE), AT_WIFI: fresh(PHONE)}, later=60)     # it has gone and its number was given away
+        card = next(d for d in self.get("/api/devices?all=1")[1] if d["id"] == self.wifi)
+        self.assertEqual(card["ip"], "")
+        self.assertEqual(self.groups(self.wifi), [("samsungcloudsolution.net", True, "you", "Samsung TVs")])
+
+    def test_a_merged_devices_one_list_says_who_needs_a_name_either_of_the_two_looked_up(self):
+        self.file_lookup(AT_WIFI, "lcprd1.samsungcloudsolution.net", self.wifi)
+        merged = self.merge(self.cable, self.wifi)
+        self.assertEqual(self.groups(merged, AT_CABLE), [("samsungcloudsolution.net", False, None, "Samsung TVs")])
+
+
 class WithoutALookStraightAfter(TwoDevices):
     """separate_by_hand without a neighbour table (not how the API calls it): the next look puts
     the addresses right."""
