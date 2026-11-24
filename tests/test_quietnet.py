@@ -52,7 +52,7 @@ class Base(unittest.TestCase):
             server.load_lists()
         for table in ("blocked", "allowed", "groups", "device_group", "service_blocks",
                       "internet_off", "schedules", "queries", "enforced", "device_mac", "known_macs", "events",
-                      "shared_macs"):
+                      "shared_macs", "device", "device_hw", "address_use", "moved_address"):
             server.sql("DELETE FROM %s" % table, commit=True)
         server.sql("DELETE FROM settings WHERE key IN ('other_dns_all', 'no_ipv6_all')", commit=True)
         server.init_db()
@@ -63,6 +63,7 @@ class Base(unittest.TestCase):
         # No IPv6 view of the real machine: nothing matched, no home range, no own addresses.
         server.S.v6_own, server.S.v6_prefixes, server.S.v6_devices = set(), [], {}
         server.S.v6_shared = frozenset()
+        server.S.v6_table = {}
         # Nothing heard from the router about IPv6, and no IPv6 address to give devices.
         server.S.v6_dns, server.S.router_v6_dns, server.S.ra_heard = "", {}, None
         server.S.router_prefixes = {}

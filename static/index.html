@@ -679,6 +679,9 @@ const S = {tab:'home', device:null, hours:24, filter:'all', search:'', sort:'n',
 const $ = id => document.getElementById(id);
 const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const num = n => Number(n || 0).toLocaleString();
+// The number the Pi knows a device by (d.id in the device list), for the card at this address; ''
+// when it has none: an address listed on its own, or an older Pi that lists by address.
+const deviceId = ip => { const d = S.devices.find(x => x.ip === ip); return d && Number.isInteger(d.id) ? String(d.id) : ''; };
 
 // The three looks. The choice is a display preference kept in a cookie for a year; it is checked
 // against this list wherever it is read, and anything else means calm. It never reaches the server's API.
@@ -882,6 +885,7 @@ function viewHome(){
   ${v6Warning(true)}
   ${v6NeighbourNotice()}
   ${firewallNotice()}
+  ${devicesNotice()}
   ${movedNotices(null)}
   ${deviceEvents()}
   <div class="card">
@@ -964,6 +968,13 @@ function v6NeighbourNotice(){
     this computer's list of IPv6 neighbours. While any device has rules of its own, is in a group or has "Cut live
     connections" on, lookups over IPv6 are refused, and devices fall back to their other DNS server. On a Raspberry Pi,
     running the install command again puts the missing tool back.</div>`;
+}
+// What the Pi has to say about bringing an older household's history up to date (st.devices.notice):
+// too little free space, or a move that failed. Nothing was changed in either case. An older Pi
+// sends no st.devices, and then nothing is shown.
+function devicesNotice(){
+  const note = ((S.status || {}).devices || {}).notice;
+  return note ? `<div class="notice warn">${esc(note)}</div>` : '';
 }
 // The optional household setting "Give no device IPv6 addresses". st.no_ipv6_all is true or false;
 // off unless the owner turns it on, because it changes what every device is told. Through the relay
@@ -1497,7 +1508,10 @@ async function refresh(hard, tick){
       jobs.push(api('/api/schedules').then(x => S.schedules = x));
     if(S.tab === 'setup') jobs.push(api('/api/cloud').then(x => S.cloud = x).catch(() => {}));
     if(S.tab === 'home' || S.tab === 'groups' || S.tab === 'schedules')
-      jobs.push(api('/api/devices').then(x => S.devices = x), api('/api/groups').then(x => S.groups = x));
+      // The Pi lists by device now. Every card here is still known by its address (d.ip), so a
+      // device with no address of its own (it has left, and its address went to another device)
+      // is not shown yet; its history is kept on the Pi under its number (d.id).
+      jobs.push(api('/api/devices').then(x => S.devices = x.filter(d => d.ip)), api('/api/groups').then(x => S.groups = x));
     if(S.tab === 'home' && S.device) jobs.push(ctl('device:' + S.device));
     if(S.tab === 'groups' && S.group) jobs.push(ctl('group:' + S.group));
     if(S.tab === 'rules') jobs.push(ctl('all'));
@@ -1505,9 +1519,11 @@ async function refresh(hard, tick){
       // The server gives a marker with each list. Sending it back gets {"unchanged": true} when
       // nothing has changed since, so the list is not sent again. A marker only counts for the
       // device and time period it came with, so any other pair asks with an empty one.
-      const dev = S.device, hours = S.hours, key = dev + '|' + hours;
+      // With the device's number (d.id, from a Pi that lists by device) the list is the device's
+      // own history at every address it has had; without it, what was recorded under the address.
+      const dev = S.device, hours = S.hours, id = deviceId(dev), key = dev + '|' + hours + '|' + id;
       const since = S.activityKey === key ? S.activityMark : '';
-      jobs.push(api(`/api/activity?ip=${encodeURIComponent(dev)}&hours=${hours}&since=${encodeURIComponent(since)}`).then(x => {
+      jobs.push(api(`/api/activity?ip=${encodeURIComponent(dev)}&hours=${hours}&since=${encodeURIComponent(since)}${id ? '&device=' + encodeURIComponent(id) : ''}`).then(x => {
         // Ignore a late answer for a device or time period the person has since moved away from.
         if(S.device !== dev || S.hours !== hours) return;
         if(Array.isArray(x)){ S.activity = x; S.activityKey = ''; }     // an older Pi sends the plain list
@@ -1645,7 +1661,8 @@ const actions = {
     const yes = await ask({title:'Forget this device\'s history?', ok:'Forget it', danger:true,
       text:'The list of what this device has contacted will be wiped. Your blocked list is not affected.'});
     if(!yes) return;
-    await api('/api/clear-history', {ip:S.device}).catch(oops); S.device = null; refresh(true);
+    const id = deviceId(S.device);
+    await api('/api/clear-history', id ? {ip:S.device, device:id} : {ip:S.device}).catch(oops); S.device = null; refresh(true);
   },
   async pause(){ await api('/api/pause', {minutes:10}).catch(oops); refresh(); },
   async resume(){ await api('/api/pause', {minutes:0}).catch(oops); refresh(); },

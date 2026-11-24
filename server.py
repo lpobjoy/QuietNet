@@ -19,6 +19,7 @@ import json
 import os
 import queue
 import re
+import shutil
 import signal
 import socket
 import socketserver
@@ -41,6 +42,9 @@ import names
 # MAP OF THIS FILE (each part starts with a "# ----- name" banner):
 #   settings and State   the values you might tune, and S, everything held in memory
 #   database             the SQLite connection, the tables, saved settings, the history writer
+#   devices              one device is one hardware address: the device tables, which device has which
+#                        address now (S.addr_device), the history filed against it, and the one-off
+#                        move of an older household's data into those tables
 #   rules                the lists, schedules and decision(): is this name blocked for this device, and why
 #   DNS                  reading questions, building answers, asking the real servers, the UDP/TCP listeners
 #   helpers              this computer's address, the neighbour table, device names (the work is in
@@ -138,6 +142,24 @@ IP_TOOL = next((p for p in ("/usr/sbin/ip", "/sbin/ip", "/usr/bin/ip", "/bin/ip"
 NDP = next((p for p in ("/usr/sbin/ndp", "/sbin/ndp") if os.path.exists(p)), "ndp")
 IFCONFIG = next((p for p in ("/sbin/ifconfig", "/usr/sbin/ifconfig") if os.path.exists(p)), "ifconfig")
 SCOPE = re.compile(r"all|device:[0-9a-f.:]{3,45}|group:\d+")
+# One device is one hardware address (see the "devices" part of this file). These say how the
+# record of which device has which address is kept, and how history is filed against the device.
+DEVICES_VERSION = 1            # the shape of the device tables, saved with the data when it is moved over
+BEFORE_DEVICES = "quietnet.db.before-devices"   # the copy of the database kept from just before that move
+NO_DEVICE = 0                  # filed against no device at all (no real device ever has this number)
+ADDRESS_LOOK = 5               # seconds between looks at the neighbour table that keep S.addr_device right
+ADDRESS_GRACE = 90             # seconds: a lookup made this long before a device was first confirmed at an
+                               # address still counts as that device's (it had to join before it was seen)
+ADDRESS_WAIT = 180             # seconds a lookup no device could be matched to waits for one, before it
+                               # is filed under the address itself
+TIDY_EVERY = 60                # seconds between passes that file waiting lookups against their device
+TIDY_BATCH = 500               # lookups filed per step of that pass
+FILL_BATCH = 2000              # rows of older history given their device per step, after the move
+FILL_PAUSE = 0.05              # seconds between those steps, so everything else gets a turn at the database
+ADDRESS_RECENT = 86400         # seconds: an address a device used this recently is listed with it
+MAX_DEVICES = 5000             # the most devices remembered; the longest unseen are forgotten first
+MAX_ADDRESS_USE = 20000        # the most "who used which address" rows kept
+MAX_LISTED_ADDRESSES = 32      # the most addresses listed with one device in GET /api/devices
 
 # Words that often appear in advert / tracking addresses. These are only
 # flagged as "possibly junk" for a human to decide on - never blocked on their own.
@@ -260,6 +282,27 @@ class State:
     other_dns_all = False   # block other DNS services for every device, not just those with rules?
     no_ipv6_all = False     # give no device IPv6 addresses in answers? (the optional whole-house switch)
     router_prefixes = {}    # IPv6 ranges announced by a real router -> when to forget each (time.time())
+    # One device is one hardware address: see the "devices" part of this file.
+    devices_ready = False   # are the device tables in use? False for an older database not moved over yet
+    devices_state = "old"   # "ready", "moving", "waiting" (too little free space), "failed", or "old" (not tried yet)
+    devices_notice = ""     # what to tell the owner about that move ('' = nothing)
+    devices_moved_at = 0.0  # when (time.time()) the device tables were made: older history gets its device from the move
+    history_fill = False    # is older history still being given its device (fill_old_history)?
+    history_filed = 0       # goes up whenever waiting or older history is filed against devices (see activity_marker)
+    addr_device = {}        # address, IPv4 or IPv6 -> device number, for addresses confirmed at the last look
+    map4 = {}               # the IPv4 half of addr_device, from the last look at the neighbour table
+    map6 = {}               # the IPv6 half, from the last look at the IPv6 neighbours
+    addr_use = {}           # address -> [device, first, last, row number, last as saved]: who used it most recently
+    hw_device = {}          # hardware address -> device number
+    addr_only = {}          # address -> the number of the device known only by that address
+    device_kind = {}        # device number -> "hw", "addr", "pi" (this computer) or "hub" (the home router)
+    pi_device = None        # the number of the fixed device that is this computer
+    hub_device = None       # the number of the fixed device that is the home router
+    hub_mac = ""            # the home router's hardware address, as last seen at its IPv4 address
+    hw_unsettled = frozenset()  # hardware addresses found at two live IPv4 addresses at the last look
+    v6_table = {}           # the IPv6 neighbour table as last read by refresh_ipv6_view
+    device_seen = {}        # device number -> when it was last seen, waiting to be saved (save_address_use)
+    hw_seen = {}            # hardware address -> the same
 
 
 S = State()
@@ -358,8 +401,15 @@ def init_db():
     # every batch of history - which matters on a Raspberry Pi's SD card. The worst a power cut can
     # lose is the last second or so of history.
     db.execute("PRAGMA synchronous=NORMAL")
+    # A database with no history table is a new household's: it gets the device tables straight away
+    # (see the "devices" part of this file). One that has a history table but no device tables is an
+    # older household's. Its device tables are NOT made here, because this runs before the filter
+    # is answering and they can take a while; move_to_devices moves it over afterwards, and until
+    # then (or if that fails) everything works on the old tables as before.
+    new_household = not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='queries'").fetchone()
     db.executescript("""
-        CREATE TABLE IF NOT EXISTS queries(id INTEGER PRIMARY KEY, ts REAL, client TEXT, domain TEXT, blocked INTEGER);
+        CREATE TABLE IF NOT EXISTS queries(id INTEGER PRIMARY KEY, ts REAL, client TEXT, domain TEXT, blocked INTEGER,
+            device INTEGER);
         -- Two indexes, one per question the dashboard asks of the history:
         --   q_client_ts: "what did THIS device look up recently?" (the device page) and "when was each device last active?"
         --   q_ts:        "what happened in the last 24 hours, across all devices?" (the status summary and device counts).
@@ -435,6 +485,12 @@ def init_db():
     load_schedules()
     S.junk_on = get_setting("junk_on", "1") == "1"
     S.paused_until = float(get_setting("paused_until", "0"))
+    if new_household:
+        make_device_tables()
+        db.execute("INSERT OR REPLACE INTO settings(key, value) VALUES('devices_version', ?)", (str(DEVICES_VERSION),))
+        db.commit()
+    S.devices_state, S.devices_notice = "old", ""
+    load_devices()
     open_read_db()                  # after the tables exist, so it never sees a half-made database
     rules_changed()
 
@@ -455,8 +511,9 @@ def log_writer():
     """Background thread: move recorded lookups from the queue into the database.
 
     The DNS path only puts a tuple on log_q, so answering a lookup never waits for the disk.
-    This thread gathers a second's worth and saves them in one go. Every ten minutes it also trims
-    the history (see prune_history)."""
+    This thread gathers a second's worth and saves them in one go (save_history), each against the
+    device that made it where that is known. Every ten minutes it also trims the history (see
+    prune_history)."""
     last_prune = 0
     while True:
         batch = [log_q.get()]
@@ -465,13 +522,38 @@ def log_writer():
             batch.append(log_q.get_nowait())
         try:
             with db_lock:
-                db.executemany("INSERT INTO queries(ts,client,domain,blocked) VALUES(?,?,?,?)", batch)
-                db.commit()
+                save_history(batch)
             if time.time() - last_prune > 600:
                 prune_history()
                 last_prune = time.time()
         except sqlite3.Error as e:
             print("Could not save history:", e)
+
+
+def history_row(item):
+    """One recorded lookup from log_q, ready to save: (time, address it was judged under, name,
+    blocked, device number or None). The item carries the device if the map knew it when the lookup
+    was made (note_lookup); if it did not, the map is tried once more here, a second or so later,
+    by which time a look at the neighbours has often confirmed who has that address. A lookup still
+    without a device is saved without one, and tidy_history files it within a few minutes."""
+    ts, client, name, blocked = item[:4]
+    device = item[4] if len(item) > 4 else None
+    if device is None:
+        device = device_of_lookup(item[5] if len(item) > 5 else None, client)
+    return ts, client, name, blocked, device
+
+
+def save_history(batch):
+    """Save a batch of recorded lookups. With the device tables in use each row carries its device;
+    on an older database not moved over yet (S.devices_ready is False) rows are saved as they
+    always were. Call holding db_lock; this commits."""
+    if S.devices_ready:
+        db.executemany("INSERT INTO queries(ts,client,domain,blocked,device) VALUES(?,?,?,?,?)",
+                       [history_row(item) for item in batch])
+    else:
+        db.executemany("INSERT INTO queries(ts,client,domain,blocked) VALUES(?,?,?,?)",
+                       [tuple(item[:4]) for item in batch])
+    db.commit()
 
 
 PRUNE_BATCH = 5000      # rows deleted per step when trimming history
@@ -510,25 +592,43 @@ CLEAR_DEVICE_SQL = ("DELETE FROM queries WHERE id IN "
                     "(SELECT id FROM queries WHERE client=? AND id<=? LIMIT ?)")
 
 
-def clear_history(ip=None):
-    """Delete one device's history, or everyone's when `ip` is empty.
+# The same for a device's history by its number, found through q_device_ts, and for lookups from
+# one address that are still waiting to be filed against a device.
+CLEAR_BY_NUMBER_SQL = ("DELETE FROM queries WHERE id IN "
+                       "(SELECT id FROM queries WHERE device=? AND id<=? LIMIT ?)")
+CLEAR_UNFILED_SQL = ("DELETE FROM queries WHERE id IN "
+                     "(SELECT id FROM queries INDEXED BY q_client_ts WHERE client=? AND device IS NULL AND id<=? LIMIT ?)")
+
+
+def clear_history(ip=None, device=None):
+    """Delete one device's history, or everyone's when neither `ip` nor `device` is given.
+
+    `device` is a device number: everything filed against that device goes, at whatever address it
+    was made, and so do the lookups from the addresses it has now that are still waiting to be
+    filed (the dashboard shows those as its own). `ip` alone deletes what was recorded under that
+    address, as it always did.
 
     Everyone's is one statement, which the database does quickly by emptying the table. One
     device's is deleted PRUNE_BATCH rows at a time, letting go of db_lock between steps as
     prune_history does, so clearing a busy device's month of history does not hold up the history
     writer or other dashboard calls. Only rows already there when the clear began are deleted.
     Call it without holding db_lock."""
-    if not ip:
+    if device is not None:
+        steps = [(CLEAR_BY_NUMBER_SQL, device)] + [(CLEAR_UNFILED_SQL, addr) for addr in device_addresses(device)]
+    elif ip:
+        steps = [(CLEAR_DEVICE_SQL, str(ip))]
+    else:
         sql("DELETE FROM queries", commit=True)
         return
     top = sql("SELECT MAX(id) FROM queries")[0][0] or 0
-    while True:
-        with db_lock:
-            n = db.execute(CLEAR_DEVICE_SQL, (str(ip), top, PRUNE_BATCH)).rowcount
-            db.commit()
-        if n < PRUNE_BATCH:
-            break
-        time.sleep(0.05)                     # give the history writer and the dashboard a turn at the lock
+    for statement, whose in steps:
+        while True:
+            with db_lock:
+                n = db.execute(statement, (whose, top, PRUNE_BATCH)).rowcount
+                db.commit()
+            if n < PRUNE_BATCH:
+                break
+            time.sleep(0.05)                 # give the history writer and the dashboard a turn at the lock
 
 
 def oldest_to_drop():
@@ -537,6 +637,793 @@ def oldest_to_drop():
     MAX_HISTORY_ROWS rows are the ones above it."""
     top = sql("SELECT MAX(id) FROM queries")[0][0] or 0
     return top - MAX_HISTORY_ROWS
+
+
+# ------------------------------------------------------------------ devices
+
+# One device is one hardware address, where one is known and it isn't shared. An IPv4 or IPv6
+# address is something a device uses for a while, not who it is: a TV can move from .65 to .67, a
+# phone holds several IPv6 addresses and makes a new one about daily, and an address a device
+# gave up can be handed to another.
+#
+#   device        one row per device. kind: "hw" (known by its hardware address), "addr" (known
+#                 only by a network address: no hardware address is known for it, or it sits behind a
+#                 Wi-Fi range extender that shows several devices under one hardware address), "pi"
+#                 (this computer) or "hub" (the home router). Numbers are never used twice.
+#   device_hw     which hardware address belongs to which device.
+#   address_use   a dated record of which device used which address. When an address turns up with
+#                 another device a new row is opened, and the old one is no longer added to. It is
+#                 for the history and for showing the owner. It never decides whose rules apply.
+#   moved_address for a household moved over from an older version: which device each address in
+#                 its old history was given to, and whether that rests on certain evidence.
+#   queries.device  the device each lookup belonged to WHEN IT WAS MADE, so a device keeps its
+#                 history across every address it has had, and an address handed to another device
+#                 does not hand over the history with it.
+#
+# In memory, S.addr_device says which device has each address now. It is kept by looking at the
+# neighbour tables (note_ipv4_addresses every ADDRESS_LOOK seconds, note_ipv6_addresses after each
+# look at the IPv6 neighbours), so a lookup finds its device with one dictionary lookup and never
+# touches the database. The safeguards that keep the wrong device out of it are in those two.
+#
+# Rules, names and groups are still kept under IPv4 addresses (see refresh_devices); only the
+# history is filed against the device so far.
+DEVICE_TABLES_SQL = (
+    "CREATE TABLE IF NOT EXISTS device(id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT, key TEXT UNIQUE, "
+    "name TEXT, first REAL, last REAL)",
+    "CREATE TABLE IF NOT EXISTS device_hw(mac TEXT PRIMARY KEY, device INTEGER, first REAL, last REAL)",
+    "CREATE TABLE IF NOT EXISTS address_use(addr TEXT, device INTEGER, first REAL, last REAL)",
+    "CREATE INDEX IF NOT EXISTS address_use_device ON address_use(device, last)",
+    "CREATE INDEX IF NOT EXISTS address_use_addr ON address_use(addr, first)",
+    "CREATE TABLE IF NOT EXISTS moved_address(addr TEXT PRIMARY KEY, device INTEGER, certain INTEGER)",
+    # "What did THIS device look up?", whatever address it had. It carries `blocked` too, so each
+    # device's count for today is answered from the index alone.
+    "CREATE INDEX IF NOT EXISTS q_device_ts ON queries(device, ts, blocked)",
+)
+
+
+def devices_made():
+    """Does this database have the device tables? They are made in one step with everything else
+    the move does (move_to_devices), so if the table is there, the whole move was done."""
+    return bool(db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='device'").fetchone())
+
+
+def make_device_tables():
+    """Make the device tables, and give the history its `device` column and index if it lacks them.
+    Quick on an empty database; on a big history the index takes a while to build, which is why an
+    older household's database gets this from move_to_devices, after the filter is answering, and
+    not from init_db. Call holding db_lock; the caller commits (or rolls back)."""
+    if "device" not in {row[1] for row in db.execute("PRAGMA table_info(queries)")}:
+        db.execute("ALTER TABLE queries ADD COLUMN device INTEGER")
+    for statement in DEVICE_TABLES_SQL:
+        db.execute(statement)
+
+
+def load_devices():
+    """Load the device tables into S, and make sure the two fixed devices exist: this computer
+    ("pi") and the home router ("hub"). On an older database that has no device tables yet,
+    S.devices_ready is left False and everything carries on as it did before them. Called at
+    start-up and when the move finishes."""
+    with db_lock:
+        S.addr_device, S.map4, S.map6, S.addr_use = {}, {}, {}, {}
+        S.hw_device, S.addr_only, S.device_kind = {}, {}, {}
+        S.hw_unsettled, S.device_seen, S.hw_seen = frozenset(), {}, {}
+        S.pi_device, S.hub_device, S.hub_mac = None, None, ""
+        S.history_fill = False
+        S.devices_ready = devices_made()
+        if not S.devices_ready:
+            return
+        load_device_rows()
+        if db.in_transaction:
+            db.commit()
+        S.devices_moved_at = float(get_setting("devices_moved_at", "0") or 0)
+        S.history_fill = get_setting("devices_fill", "") == "pending"
+        S.devices_state, S.devices_notice = "ready", ""
+        rebuild_address_map()
+
+
+def load_device_rows():
+    """Read the device tables into S.device_kind, S.addr_only, S.hw_device, S.hub_mac and
+    S.addr_use (the newest row for each address), making the two fixed devices if they are
+    missing. Call holding db_lock; the caller commits."""
+    now = time.time()
+    kinds, only, hw, use = {}, {}, {}, {}
+    for number, kind, key in db.execute("SELECT id, kind, key FROM device"):
+        kinds[number] = kind
+        if kind == "addr":
+            only[key[5:]] = number
+    S.device_kind, S.addr_only = kinds, only
+    S.pi_device = new_device("pi", "pi", now)
+    S.hub_device = new_device("hub", "hub", now)
+    hub_mac = ""
+    for mac, number in db.execute("SELECT mac, device FROM device_hw"):
+        hw[mac] = number
+        if number == S.hub_device:
+            hub_mac = mac
+    for row, addr, number, first, last in db.execute(
+            "SELECT rowid, addr, device, first, last FROM address_use ORDER BY first, rowid"):
+        use[addr] = [number, first, last, row, last]
+    S.hw_device, S.hub_mac, S.addr_use = hw, hub_mac, use
+
+
+def new_device(kind, key, now):
+    """The number of the device with this key ('hw:<hardware address>', 'addr:<address>', 'pi' or
+    'hub'), making it if it is not there. None when a new one can't be made because twice
+    MAX_DEVICES are remembered already (forget_old_devices trims them each hour), so a device
+    making up hardware addresses can't fill the SD card. Call holding db_lock; the caller commits."""
+    row = db.execute("SELECT id FROM device WHERE key=?", (key,)).fetchone()
+    if row:
+        return row[0]
+    if kind in ("hw", "addr") and len(S.device_kind) >= 2 * MAX_DEVICES:
+        return None
+    number = db.execute("INSERT INTO device(kind, key, name, first, last) VALUES(?,?,?,?,?)",
+                        (kind, key, "", now, now)).lastrowid
+    S.device_kind[number] = kind
+    return number
+
+
+def device_of_hw(mac, now):
+    """The number of the device with this hardware address, making it the first time the address
+    is seen (None if no more can be made: see new_device). A new hardware address is always a new
+    device: nothing is ever merged automatically, however alike two devices look. Call holding
+    db_lock; the caller commits."""
+    number = S.hw_device.get(mac)
+    if number is None:
+        number = new_device("hw", "hw:" + mac, now)
+        if number is not None:
+            db.execute("INSERT OR REPLACE INTO device_hw(mac, device, first, last) VALUES(?,?,?,?)",
+                       (mac, number, now, now))
+            S.hw_device[mac] = number
+    return number
+
+
+def device_of_address(addr, now):
+    """The number of the device known only by this network address, making it if need be (None if
+    no more can be made). Used where no hardware address tells devices apart: an address behind a
+    Wi-Fi range extender, or one no hardware address was ever seen for. Call holding db_lock; the
+    caller commits."""
+    number = S.addr_only.get(addr)
+    if number is None:
+        number = new_device("addr", "addr:" + addr, now)
+        if number is not None:
+            S.addr_only[addr] = number
+    return number
+
+
+def set_hub_mac(mac, now):
+    """Note the home router's hardware address: the one seen at the router's own IPv4 address. It
+    belongs to the fixed "hub" device and to no other, so if it was listed as an ordinary device
+    before (the router was not known then) it is taken from that one, and a hardware address the
+    router had before is let go. Call holding db_lock; the caller commits."""
+    db.execute("DELETE FROM device_hw WHERE device=? OR mac=?", (S.hub_device, mac))
+    for old in [m for m, number in S.hw_device.items() if number == S.hub_device]:
+        del S.hw_device[old]
+    db.execute("INSERT INTO device_hw(mac, device, first, last) VALUES(?,?,?,?)", (mac, S.hub_device, now, now))
+    S.hw_device[mac] = S.hub_device
+    S.hub_mac = mac
+
+
+def use_address(addr, device, now, confirmed=True):
+    """Record that this device has this address now. If it is the device that had it most recently
+    its row just runs on (`last` moves forward when the device was confirmed there just now; the
+    database is caught up each minute by save_address_use). If another device had it, that row is
+    finished with and a new one opens: who used an address, and when, is kept, never overwritten.
+    At most MAX_ADDRESS_USE addresses are followed. Call holding db_lock; the caller commits."""
+    use = S.addr_use.get(addr)
+    if use and use[0] == device:
+        if confirmed and now > use[2]:
+            use[2] = now
+        return
+    if use is None and len(S.addr_use) >= MAX_ADDRESS_USE:
+        return
+    if use and use[2] > use[4]:
+        db.execute("UPDATE address_use SET last=? WHERE rowid=?", (use[2], use[3]))
+    row = db.execute("INSERT INTO address_use(addr, device, first, last) VALUES(?,?,?,?)",
+                     (addr, device, now, now)).lastrowid
+    S.addr_use[addr] = [device, now, now, row, now]
+
+
+def rebuild_address_map():
+    """Put S.addr_device together from its two halves (S.map4, S.map6) and this computer's own
+    addresses, which always belong to the fixed "pi" device. The finished dictionary replaces the
+    old one in a single step, so a lookup reading it never sees it half made."""
+    known = dict(S.map6)
+    known.update(S.map4)
+    for addr in ["127.0.0.1", "::1", S.local_ip] + list(S.v6_own):
+        if addr:
+            known[addr] = S.pi_device
+    S.addr_device = known
+
+
+def note_ipv4_addresses(table=None, now=None):
+    """Work out which device has which IPv4 address now, from the neighbour table, and keep
+    S.addr_device and the address record up to date. Run every ADDRESS_LOOK seconds by
+    device_keeper and each minute by refresh_devices, never on a lookup. `table` is {ip: (hardware
+    address, freshness)} or {ip: hardware address} (the neighbour table when not given).
+
+    The safeguards, so that one device's lookups are never filed as another's:
+      - Only an address confirmed just now counts (its neighbour entry is fresh, or its freshness
+        can't be known on this system). Linux keeps an entry for a device that left for a long
+        time, and that address may since have gone to another device. A lookup from an address
+        that is not confirmed is saved without a device, and filed once a later look has confirmed
+        who was there (tidy_history).
+      - An address that turns up with a different hardware address belongs to that device from
+        then on: the old device's record of it stops, and its history stays its own.
+      - One hardware address at two confirmed addresses at once may be a Wi-Fi range extender
+        standing in for several devices. The address the device already had stays its own; the
+        other gets no device until the first is no longer confirmed, so a second device behind an
+        extender is never taken for the first. While that lasts the hardware address is unsettled
+        (S.hw_unsettled) and its IPv6 addresses are not matched either. If no address was its own
+        before, neither is given to it.
+      - A hardware address known to be a range extender's (S.shared_macs) gives each of its
+        addresses a device of its own, known by that address.
+      - A new hardware address is a new device. A phone that makes itself a new private Wi-Fi
+        address shows as a new device; nothing is merged automatically.
+    This computer and the home router are the two fixed devices and are never mixed with others."""
+    if not S.devices_ready:
+        return
+    now = time.time() if now is None else now
+    if table is None:
+        table = neighbour_table()
+    router = home_router() or S.router
+    seen_at = {}
+    for ip, entry in (table or {}).items():
+        mac, fresh = entry if isinstance(entry, tuple) and len(entry) == 2 else (entry, "")
+        try:
+            ip = str(ipaddress.IPv4Address(str(ip)))
+        except ValueError:
+            continue
+        mac = clean_mac(mac)
+        if mac and ip != S.local_ip:
+            seen_at[ip] = (mac, fresh)
+    with db_lock:
+        if not S.devices_ready:
+            return
+        if router and router in seen_at and seen_at[router][0] != S.hub_mac:
+            set_hub_mac(seen_at[router][0], now)
+        mapped, by_mac = {}, {}                 # mapped: address -> (device, confirmed just now?)
+        for ip, (mac, fresh) in seen_at.items():
+            if ip == router or mac == S.hub_mac:
+                mapped[ip] = (S.hub_device, fresh != "stale")
+            else:
+                by_mac.setdefault(mac, []).append((ip, fresh))
+        unsettled = set()
+        for mac, spots in by_mac.items():
+            live = [ip for ip, fresh in spots if fresh == "fresh"] or [ip for ip, fresh in spots if fresh == ""]
+            if mac in S.shared_macs:
+                for ip in live:
+                    mapped[ip] = (device_of_address(ip, now), True)
+                continue
+            if len(live) > 1:
+                unsettled.add(mac)
+                number = S.hw_device.get(mac)
+                own = [ip for ip in live if number is not None and ip in S.addr_use and S.addr_use[ip][0] == number]
+                newest = max([S.addr_use[ip][2] for ip in own], default=None)
+                own = [ip for ip in own if S.addr_use[ip][2] == newest]
+                live = own if len(own) == 1 else []
+            for ip in live:
+                mapped[ip] = (device_of_hw(mac, now), True)
+                S.hw_seen[mac] = now
+        known = {}
+        for ip, (number, confirmed) in mapped.items():
+            if number is None:
+                continue
+            known[ip] = number
+            use_address(ip, number, now, confirmed)
+            if confirmed:
+                S.device_seen[number] = now
+        S.hw_unsettled = frozenset(unsettled)
+        S.map4 = known
+        rebuild_address_map()
+        if db.in_transaction:
+            db.commit()
+
+
+def note_ipv6_addresses(table=None, now=None):
+    """Work out which device has which IPv6 address now, from the IPv6 neighbour table as last
+    read (S.v6_table; `table` in its place for the tests), and keep S.addr_device and the address
+    record up to date. Run after each look at the IPv6 neighbours (ipv6_look), never on a lookup.
+
+    An IPv6 address belongs to the device with the hardware address the neighbour table gives it,
+    so a phone's four or more addresses, and the new one it makes about daily, all come to one
+    device. A stale entry still counts: a device's own IPv6 address is not handed on to another.
+    Never matched: an address whose hardware address is a range extender's (S.shared_macs), or is
+    unsettled because it is at two live IPv4 addresses at once (S.hw_unsettled). Those lookups are
+    filed under whatever address they were judged under. An address built from a hardware address
+    (eui64_mac) proves nothing and is not looked at here."""
+    if not S.devices_ready:
+        return
+    now = time.time() if now is None else now
+    table = S.v6_table if table is None else table
+    with db_lock:
+        if not S.devices_ready:
+            return
+        known = {}
+        for addr, entry in (table or {}).items():
+            mac, fresh = entry if isinstance(entry, tuple) and len(entry) == 2 else (entry, "")
+            mac = clean_mac(mac)
+            if not mac or addr in S.v6_own:
+                continue
+            if mac == S.hub_mac:
+                number = S.hub_device
+            elif mac in S.shared_macs or mac in S.hw_unsettled:
+                continue
+            else:
+                number = device_of_hw(mac, now)
+                if fresh != "stale":
+                    S.hw_seen[mac] = now
+            if number is None:
+                continue
+            known[addr] = number
+            use_address(addr, number, now, fresh != "stale")
+            if fresh != "stale":
+                S.device_seen[number] = now
+        S.map6 = known
+        rebuild_address_map()
+        if db.in_transaction:
+            db.commit()
+
+
+def device_of_lookup(source, client):
+    """The number of the device a lookup belongs to, or None if the map can't say yet. `source` is
+    the address the lookup really came from; `client` the address it was judged under (a device
+    asking over IPv6 is judged under its IPv4 address: see answer_query). This computer is always
+    the fixed "pi" device. Otherwise the address it came from decides, and failing that the address
+    it was judged under. One or two dictionary lookups, no database: cheap enough for every lookup."""
+    if is_this_computer(client):
+        return S.pi_device
+    known = S.addr_device
+    number = known.get(source) if source else None
+    return number if number is not None else known.get(client)
+
+
+def note_lookup(client, name, blocked, source=None):
+    """Hand one lookup to the history writer (log_q), with the device it belongs to if the map
+    knows (device_of_lookup) and the address it really came from, so the writer can ask the map
+    again. Only dictionary lookups and a queue: answering never waits for the database."""
+    device = device_of_lookup(source, client) if S.devices_ready else None
+    log_q.put((time.time(), client, name, blocked, device, source))
+
+
+def save_address_use():
+    """Catch the database up with what the looks have seen since the last time: how recently each
+    address was confirmed with its device, and when each device and hardware address was last
+    seen. Done each minute (tidy_history), not on every look, to spare the SD card."""
+    with db_lock:
+        for use in list(S.addr_use.values()):
+            if use[2] > use[4]:
+                db.execute("UPDATE address_use SET last=? WHERE rowid=?", (use[2], use[3]))
+                use[4] = use[2]
+        seen, S.device_seen = S.device_seen, {}
+        for number, last in seen.items():
+            db.execute("UPDATE device SET last=? WHERE id=? AND last<?", (last, number, last))
+        seen, S.hw_seen = S.hw_seen, {}
+        for mac, last in seen.items():
+            db.execute("UPDATE device_hw SET last=? WHERE mac=? AND last<?", (last, mac, last))
+        if db.in_transaction:
+            db.commit()
+
+
+# Lookups saved without a device since the device tables were made, oldest first, found through
+# q_device_ts: the first step of a pass, and each step after it.
+UNFILED_SQL = "SELECT id, ts, client FROM queries WHERE device IS NULL AND ts>=? ORDER BY ts LIMIT ?"
+UNFILED_NEXT_SQL = "SELECT id, ts, client FROM queries WHERE device IS NULL AND ts>? ORDER BY ts LIMIT ?"
+
+
+def holder_at(client, ts, now, spans):
+    """Which device had the address `client` at the time `ts`, going by the address record: its
+    number, or None if that can't be said yet. `spans` remembers each address's rows for the
+    length of one pass.
+
+    The lookup is given to the device whose record covers that moment: it was confirmed at the
+    address before the lookup and again after. A lookup made up to ADDRESS_GRACE seconds before a
+    device was first confirmed there is that device's too, since a device must join the network
+    and ask for something before it can be seen. Otherwise the answer waits for a later look. A
+    lookup still unplaced after ADDRESS_WAIT seconds is filed under the address itself (an "addr"
+    device), which keeps it apart from every device that has had that address. This computer's
+    own lookups are always its own."""
+    if not client:
+        return NO_DEVICE
+    if is_this_computer(client):
+        return S.pi_device
+    if client not in spans:
+        spans[client] = db.execute("SELECT device, first, last FROM address_use WHERE addr=? ORDER BY first, rowid",
+                                   (client,)).fetchall()
+    for number, first, last in spans[client]:
+        if last >= ts:
+            if first - ts <= ADDRESS_GRACE:
+                return number
+            break
+    if now - ts > ADDRESS_WAIT:
+        number = device_of_address(client, now)
+        if number is None:
+            return NO_DEVICE
+        S.device_seen[number] = max(S.device_seen.get(number, 0), ts)
+        return number
+    return None
+
+
+def tidy_history(now=None):
+    """The clean-up pass, run each minute by device_keeper: file the lookups that were saved
+    without a device against the device that had their address at the time (holder_at). Returns
+    how many it filed.
+
+    Most lookups get their device as they are made. The rest came from an address not confirmed at
+    that moment: a device whose neighbour entry had gone stale, an address new to the network, or
+    one whose hardware address was unsettled. Works TIDY_BATCH rows at a time and lets go of
+    db_lock between steps, because the history writer needs that lock and its queue has no limit.
+    Call it without holding db_lock."""
+    if not S.devices_ready:
+        return 0
+    now = time.time() if now is None else now
+    save_address_use()
+    filed, spans = 0, {}
+    statement, after = UNFILED_SQL, S.devices_moved_at
+    while True:
+        with db_lock:
+            rows = db.execute(statement, (after, TIDY_BATCH)).fetchall()
+            placed = []
+            for row, ts, client in rows:
+                number = holder_at(client, ts, now, spans)
+                if number is not None:
+                    placed.append((number, row))
+            if placed:
+                db.executemany("UPDATE queries SET device=? WHERE id=? AND device IS NULL", placed)
+                S.history_filed += 1
+            if db.in_transaction:
+                db.commit()
+        filed += len(placed)
+        if len(rows) < TIDY_BATCH:
+            return filed
+        statement, after = UNFILED_NEXT_SQL, rows[-1][1]
+        time.sleep(0.05)                     # give the history writer and the dashboard a turn at the lock
+
+
+def forget_old_devices(now=None):
+    """Keep the device tables small, each hour: forget address records and devices not seen for
+    KEEP_DAYS (as long as history is kept, so a forgotten device has no history left), and beyond
+    MAX_ADDRESS_USE and MAX_DEVICES the longest unseen. The two fixed devices are never forgotten.
+    A forgotten device that comes back is a new device with a new number. (Rules are not kept
+    against devices yet. When they are, a device with a name or rules must be spared here.)"""
+    if not S.devices_ready:
+        return
+    now = time.time() if now is None else now
+    cutoff = now - KEEP_DAYS * 86400
+    save_address_use()
+    with db_lock:
+        db.execute("DELETE FROM address_use WHERE last<?", (cutoff,))
+        db.execute("DELETE FROM address_use WHERE rowid IN "
+                   "(SELECT rowid FROM address_use ORDER BY last DESC LIMIT -1 OFFSET ?)", (MAX_ADDRESS_USE,))
+        db.execute("DELETE FROM device WHERE kind IN ('hw', 'addr') AND name='' AND last<?", (cutoff,))
+        db.execute("DELETE FROM device WHERE id IN (SELECT id FROM device WHERE kind IN ('hw', 'addr') "
+                   "ORDER BY last DESC LIMIT -1 OFFSET ?)", (MAX_DEVICES,))
+        for table in ("device_hw", "address_use", "moved_address"):
+            db.execute("DELETE FROM %s WHERE device NOT IN (SELECT id FROM device)" % table)
+        load_device_rows()
+        db.commit()
+        S.map4 = {addr: number for addr, number in S.map4.items() if number in S.device_kind}
+        S.map6 = {addr: number for addr, number in S.map6.items() if number in S.device_kind}
+        rebuild_address_map()
+
+
+def device_addresses(number):
+    """The addresses a device has now, or was the last device seen at: IPv4 first, the most
+    recently confirmed first, MAX_LISTED_ADDRESSES at most. This computer's are its own, and a
+    device known only by an address has that address unless another device has been seen there
+    since. Reads S only, without a lock."""
+    kind = S.device_kind.get(number)
+    if kind == "pi":
+        return [S.local_ip] + sorted(S.v6_own)[:MAX_LISTED_ADDRESSES - 1]
+    uses = dict(S.addr_use)
+    mine = [(":" in addr, -use[2], addr) for addr, use in uses.items() if use[0] == number]
+    if kind == "addr":
+        mine += [(":" in addr, 0, addr) for addr, n in list(S.addr_only.items())
+                 if n == number and addr not in uses and S.addr_device.get(addr, number) == number]
+    return [addr for _, _, addr in sorted(mine)[:MAX_LISTED_ADDRESSES]]
+
+
+def device_number(value):
+    """The device number in a request, or None if it isn't the number of a device QuietNet knows
+    (or the device tables are not in use). Text of digits and whole numbers both count."""
+    if isinstance(value, bool) or not S.devices_ready:
+        return None
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number in S.device_kind else None
+
+
+# ----- moving an older household's data into the device tables
+
+MOVE_RETRY = 3600              # seconds before the move is tried again after too little free space
+# Every address in the old history, found by hopping through the q_client_ts index from one address
+# to the next (as LAST_SEEN_SQL does), not by reading every row.
+OLD_CLIENTS_SQL = """
+    WITH RECURSIVE c(x) AS (
+        SELECT MIN(client) FROM queries
+        UNION ALL
+        SELECT (SELECT MIN(client) FROM queries WHERE client>x) FROM c WHERE x IS NOT NULL)
+    SELECT x FROM c WHERE x IS NOT NULL"""
+# One step of giving older history its device: the newest rows still without one, found through
+# q_device_ts. Newest first, so the dashboard's last day is right within moments.
+FILL_SQL = "SELECT id, client FROM queries WHERE device IS NULL AND ts<? ORDER BY ts DESC LIMIT ?"
+
+
+def space_for_move():
+    """Is there room to move the household's data? Returns (enough?, megabytes wanted, megabytes
+    free). Wanted is twice the size of the database: once for the copy kept from before the move,
+    and as much again for the new index and the work of making it."""
+    path = os.path.join(DATA, "quietnet.db")
+    size = sum(os.path.getsize(p) for p in (path, path + "-wal") if os.path.exists(p))
+    free = shutil.disk_usage(DATA).free
+    return free >= 2 * size, (2 * size) // 1000000 + 1, free // 1000000
+
+
+def copy_database(dest):
+    """Copy the whole database to the file `dest`, as it stands at this moment, while QuietNet
+    carries on using it. Done by the database's own copying tool on a connection of its own, in a
+    single step, so the copy is complete and consistent and nothing waits for it. It is written
+    under another name first and forced onto the disk before it takes its real name, so a power
+    cut can't leave a half-written file that looks like a good copy."""
+    part = dest + ".part"
+    for leftover in (part, part + "-wal", part + "-shm", part + "-journal"):
+        if os.path.exists(leftover):
+            os.remove(leftover)
+    source = sqlite3.connect(os.path.join(DATA, "quietnet.db"))
+    try:
+        copy = sqlite3.connect(part)
+        try:
+            source.backup(copy)
+        finally:
+            copy.close()
+    finally:
+        source.close()
+    with open(part, "rb") as f:
+        os.fsync(f.fileno())
+    os.replace(part, dest)
+    try:
+        folder = os.open(DATA, os.O_RDONLY)
+        try:
+            os.fsync(folder)
+        finally:
+            os.close(folder)
+    except OSError:
+        pass                                # some systems can't do this for a folder; the copy is still there
+
+
+def build_devices(now):
+    """The data part of the move, inside move_to_devices' one transaction: make a device for every
+    hardware address the old tables know, and decide which device each address in the old history
+    is given to. Returns {"devices", "addresses", "uncertain"}: how many of each. Rules, names and
+    groups are not touched: they stay under their addresses.
+
+      1. A "hw" device for every hardware address in known_macs, device_mac and seen, leaving out
+         range extenders' (shared_macs) and the router's own, which goes to the fixed "hub" device.
+      2. Each address is given to a device: the device its rules were recorded as belonging to
+         (device_mac), unless they are paused because a different device has that address now;
+         then the hardware address most recently seen there (known_macs); then the one the last
+         scan found there (seen). Only the first is certain evidence and is marked so
+         (moved_address.certain); the others are the best guess.
+      5. An address with no hardware address to go by, among them IPv6 addresses in the old
+         history, becomes a device known only by that address (kind "addr"): MAX_DEVICES of them
+         at most. A history holding more such addresses than that was filled by something making
+         addresses up, and the rest are filed against no device (NO_DEVICE).
+      7. The version of the tables and the time of the move are saved with the settings.
+    Old history rows are given their device afterwards, in small steps (fill_old_history): the old
+    tables do not say when an address changed hands, so every row goes to the address's device as
+    decided here, and a few rows from before a change will sit with the wrong device until they
+    are 30 days old."""
+    shared = {mac for (mac,) in db.execute("SELECT mac FROM shared_macs WHERE hits>=?", (SHARED_AFTER,))}
+    router = home_router() or S.router
+    this_computer = {"127.0.0.1", "::1", S.local_ip}
+    numbers = {}
+
+    def make(kind, key, first):
+        """The number of the device with this key, made on first use."""
+        if key not in numbers:
+            numbers[key] = db.execute("INSERT INTO device(kind, key, name, first, last) VALUES(?,?,?,?,?)",
+                                      (kind, key, "", first, now)).lastrowid
+        return numbers[key]
+
+    pi, hub = make("pi", "pi", now), make("hub", "hub", now)
+    known = {}                                  # hardware address -> (first seen, last seen, the address it was last at)
+    for mac, ip, first, last in db.execute("SELECT mac, ip, first, last FROM known_macs ORDER BY last"):
+        if clean_mac(mac):
+            known[clean_mac(mac)] = (first or now, last or now, ip)
+    owner, paused = {}, set()                   # address -> the hardware address its rules belong to
+    for ip, mac, is_paused in db.execute("SELECT ip, mac, paused FROM device_mac"):
+        if clean_mac(mac):
+            owner[ip] = clean_mac(mac)
+            if is_paused:
+                paused.add(ip)
+    scanned = {}                                # address -> (hardware address, when the scan saw it)
+    for ip, mac, ts in db.execute("SELECT ip, mac, ts FROM seen"):
+        scanned[ip] = (clean_mac(mac), ts or now)
+    hub_mac = scanned.get(router, ("", 0))[0] if router else ""
+    latest = {}                                 # address -> the hardware address most recently seen there
+    for mac, (_, _, ip) in sorted(known.items(), key=lambda item: item[1][1]):
+        latest[ip] = mac
+    macs = set(known) | set(owner.values()) | {mac for mac, _ in scanned.values() if mac}
+    for mac in sorted(macs):
+        if mac in shared:
+            continue
+        first, last = known.get(mac, (now, now, ""))[:2]
+        if mac == hub_mac:
+            db.execute("INSERT OR REPLACE INTO device_hw(mac, device, first, last) VALUES(?,?,?,?)", (mac, hub, first, last))
+            continue
+        db.execute("INSERT OR REPLACE INTO device_hw(mac, device, first, last) VALUES(?,?,?,?)",
+                   (mac, make("hw", "hw:" + mac, first), first, last))
+    addresses = set(owner) | set(latest) | set(scanned)
+    addresses.update(x for (x,) in db.execute(OLD_CLIENTS_SQL))
+    for table in ("devices", "device_group", "enforced"):
+        addresses.update(ip for (ip,) in db.execute("SELECT ip FROM %s" % table))
+    uncertain = by_address = 0
+    for addr in sorted(a for a in addresses if a and isinstance(a, str)):
+        mac, certain = "", 1
+        if addr in this_computer:
+            number = pi
+        elif router and addr == router:
+            number = hub
+        else:
+            choices = ((owner.get(addr) if addr not in paused else "", 1), (latest.get(addr), 0),
+                       (scanned.get(addr, ("", 0))[0], 0))
+            mac, certain = next(((m, sure) for m, sure in choices if m and m not in shared), ("", 1))
+            if mac == hub_mac and mac:
+                number = hub
+            elif mac:
+                number = numbers["hw:" + mac]
+            elif by_address < MAX_DEVICES:
+                number, by_address = make("addr", "addr:" + addr, now), by_address + 1
+            else:
+                number = NO_DEVICE
+        uncertain += not certain
+        db.execute("INSERT OR REPLACE INTO moved_address(addr, device, certain) VALUES(?,?,?)", (addr, number, certain))
+        if mac:
+            # When the device was at this address, as far as the old tables say: the times it was
+            # seen on the network if this is where it was last seen, else when a scan found it here.
+            first, last, at = known.get(mac, (now, now, ""))
+            if at != addr:
+                seen_here = scanned[addr][1] if scanned.get(addr, ("", 0))[0] == mac else first
+                first, last = min(first, seen_here), seen_here
+            db.execute("INSERT INTO address_use(addr, device, first, last) VALUES(?,?,?,?)", (addr, number, first, last))
+    for key, value in (("devices_version", DEVICES_VERSION), ("devices_moved_at", repr(now)), ("devices_fill", "pending")):
+        db.execute("INSERT OR REPLACE INTO settings(key, value) VALUES(?,?)", (key, str(value)))
+    add_event("", "QuietNet now keeps each device's history with the device itself, whatever address it has. "
+                  "A copy of your data from just before this change is kept beside it as %s." % BEFORE_DEVICES, now)
+    return {"devices": sum(1 for key in numbers if key.startswith("hw:")), "addresses": len(addresses),
+            "uncertain": uncertain}
+
+
+def move_to_devices():
+    """Move an older household's data into the device tables. Run by device_keeper AFTER the filter
+    and the enforcer have started, never from init_db: on a big history it takes a while, and a
+    slow or failing start would leave the house without DNS. Returns S.devices_state afterwards.
+
+      - Too little free space (space_for_move): nothing is touched, the owner is told, and it is
+        tried again later ("waiting").
+      - A copy of the database is kept first, as BEFORE_DEVICES in the data folder (copy_database).
+      - Everything else is ONE transaction: the new tables, the history's new column and index,
+        the devices (build_devices). Any error rolls all of it back, so the database is exactly as
+        it was, QuietNet carries on with the old tables as before, and the owner is told
+        ("failed"). It is tried again at the next start.
+      - db_lock is held for that transaction, so the dashboard and the history writer wait while
+        the index is built (some seconds on a big history). Lookups are still answered: they never
+        take that lock.
+    Going back to an older QuietNet afterwards means putting the kept copy back in place of
+    quietnet.db, which loses what was recorded after the move (see docs/ARCHITECTURE.md)."""
+    if S.devices_ready:
+        return S.devices_state
+    try:
+        enough, wanted, free = space_for_move()
+        if not enough:
+            S.devices_state = "waiting"
+            S.devices_notice = ("QuietNet needs about %d MB of free space to bring your household's history up to "
+                                "date, and there is only %d MB. Nothing has been changed and everything works as "
+                                "before. Free some space on this computer and QuietNet will try again within the "
+                                "hour." % (wanted, free))
+            return S.devices_state
+        S.devices_state, S.devices_notice = "moving", ""
+        started = time.monotonic()
+        copy_database(os.path.join(DATA, BEFORE_DEVICES))
+        with db_lock:
+            if db.in_transaction:
+                db.commit()
+            db.execute("BEGIN IMMEDIATE")
+            try:
+                make_device_tables()
+                report = build_devices(time.time())
+                db.commit()
+            except BaseException:
+                db.rollback()
+                raise
+            load_devices()
+        print("Moved the household's data to the device tables in %.1f seconds: %d devices, %d addresses "
+              "(%d matched on a best guess)." % (time.monotonic() - started, report["devices"], report["addresses"],
+                                                 report["uncertain"]), flush=True)
+    except Exception as e:
+        S.devices_ready = False
+        S.devices_state = "failed"
+        S.devices_notice = ("QuietNet could not bring your household's history up to date (%s). Nothing has been "
+                            "changed and everything works as before. It will try again the next time it starts."
+                            % (str(e) or type(e).__name__))
+        print("Could not move the household's data to the device tables:", e, flush=True)
+    return S.devices_state
+
+
+def fill_step(moved, now=None):
+    """Give one batch of older history rows (from before the move) their device: each row goes to
+    the device its address was given to in the move (`moved`, from moved_address). An address the
+    move did not see gets a device of its own, known by that address. Returns how many rows it
+    did; 0 means the fill is finished, which is then saved so it is not started again."""
+    now = time.time() if now is None else now
+    with db_lock:
+        rows = db.execute(FILL_SQL, (S.devices_moved_at, FILL_BATCH)).fetchall()
+        if not rows:
+            S.history_fill = False
+            db.execute("INSERT OR REPLACE INTO settings(key, value) VALUES('devices_fill', 'done')")
+            db.commit()
+            return 0
+        placed = []
+        for row, client in rows:
+            number = moved.get(client) if client else NO_DEVICE
+            if number is None:
+                number = device_of_address(client, now)
+                number = NO_DEVICE if number is None else number
+                moved[client] = number
+                db.execute("INSERT OR REPLACE INTO moved_address(addr, device, certain) VALUES(?,?,1)", (client, number))
+            placed.append((number, row))
+        db.executemany("UPDATE queries SET device=? WHERE id=?", placed)
+        db.commit()
+        S.history_filed += 1
+    return len(rows)
+
+
+def fill_old_history():
+    """Background thread, started by device_keeper after the move (and again after a restart, until
+    it has finished): give every older history row its device, FILL_BATCH rows at a time, newest
+    first, letting go of db_lock and pausing between steps so lookups, the history writer and the
+    dashboard are not held up. Until a row is done the dashboard shows it under the device that
+    has its address now."""
+    moved = dict(sql("SELECT addr, device FROM moved_address"))
+    while S.devices_ready and S.history_fill:
+        if not fill_step(moved):
+            print("Every older history row now has its device.", flush=True)
+            return
+        time.sleep(FILL_PAUSE)
+
+
+def device_keeper():
+    """Background thread, started once the filter and the enforcer are running. First it moves an
+    older household's data into the device tables if that is still to do (move_to_devices; after
+    too little free space it tries again every MOVE_RETRY seconds, after a failure not until the
+    next start). Then, every ADDRESS_LOOK seconds, it looks at the neighbour table to keep
+    S.addr_device right (note_ipv4_addresses); each minute it files waiting lookups against their
+    device (tidy_history); each hour it forgets devices long gone (forget_old_devices). The first
+    look comes ADDRESS_LOOK seconds after starting."""
+    retry_at, filling = 0.0, None
+    tidied = forgot = time.monotonic()
+    while True:
+        try:
+            if not S.devices_ready and S.devices_state != "failed" and time.monotonic() >= retry_at:
+                move_to_devices()
+                retry_at = time.monotonic() + MOVE_RETRY
+            if S.devices_ready and S.history_fill and (filling is None or not filling.is_alive()):
+                filling = threading.Thread(target=fill_old_history, daemon=True)
+                filling.start()
+        except Exception as e:
+            print("Could not move the household's data to the device tables:", e, flush=True)
+        time.sleep(ADDRESS_LOOK)
+        try:
+            if S.devices_ready:
+                note_ipv4_addresses()
+                if time.monotonic() - tidied >= TIDY_EVERY:
+                    tidied = time.monotonic()
+                    tidy_history()
+                if time.monotonic() - forgot >= 3600:
+                    forgot = time.monotonic()
+                    forget_old_devices()
+        except Exception as e:
+            print("Could not keep the record of which device has which address:", e, flush=True)
 
 
 # ------------------------------------------------------------------ rules
@@ -1521,6 +2408,7 @@ def answer_query(data, client, forwarder, over_tcp=False):
     name, qtype, qend = q
     loggable = bool(VALID_NAME.fullmatch(name)) and not name.endswith(IGNORED_ENDINGS)
     client = device_address(client)
+    source = client                 # the address it really came from, for the history (note_lookup)
     if client in ("127.0.0.1", "::1") or client in S.v6_own:
         client = S.local_ip
     elif client and ":" in client:
@@ -1540,7 +2428,7 @@ def answer_query(data, client, forwarder, over_tcp=False):
         # The 'use the network's DNS' signals (see NO_SUCH_NAME_SIGNALS): the same answer for every
         # device, paused or not, whatever the rules say. They are written to the history as blocked,
         # because they were, so the owner can see which devices tried to bypass QuietNet.
-        log_q.put((time.time(), client, name, 1))
+        note_lookup(client, name, 1, source)
         if name in NO_SUCH_NAME_SIGNALS:
             return reply(data, qend, 3)
         return blocked_reply(data, qtype, qend)
@@ -1548,7 +2436,7 @@ def answer_query(data, client, forwarder, over_tcp=False):
         # Another DNS service (see OTHER_DNS_SERVICES), for a device the owner controls (or every
         # device, if the owner chose that): blocked, paused or not, whatever else the rules say,
         # and noted so the device's page can say it tried.
-        log_q.put((time.time(), client, name, 1))
+        note_lookup(client, name, 1, source)
         if client in S.other_dns or len(S.other_dns) < MAX_OTHER_DNS_DEVICES:
             S.other_dns[client] = time.time()
         return blocked_reply(data, qtype, qend)
@@ -1563,7 +2451,7 @@ def answer_query(data, client, forwarder, over_tcp=False):
         resp = forwarder(data)
         return cap_ttls(resp) if resp else reply(data, qend, 2)
     blocked = decision(name, client, time.time() < S.paused_until)[0]
-    log_q.put((time.time(), client, name, 1 if blocked else 0))
+    note_lookup(client, name, 1 if blocked else 0, source)
     if blocked:
         return blocked_reply(data, qtype, qend)
     if qtype in NO_IPV6_TYPES and (live_cut_on(client) or no_ipv6_for_everyone(name, qtype, client)):
@@ -2377,7 +3265,11 @@ def refresh_devices(table=None, now=None):
         (kept for X) until X comes back, and a device never seen before gets the new-device group.
     Also records every hardware address seen, puts devices seen for the first time into the
     new-device group if one is chosen, and works out the "may be the same device" notices.
-    This computer and the router never move and are never moved onto."""
+    This computer and the router never move and are never moved onto.
+
+    Last, the same table is used to keep S.addr_device right (note_ipv4_addresses): which device
+    each address belongs to, for filing the history. That is separate from the rules, which are
+    still kept under addresses and moved as described above."""
     now = time.time() if now is None else now
     if table is None:
         table = neighbour_table()
@@ -2470,6 +3362,7 @@ def refresh_devices(table=None, now=None):
         S.device_warnings = warnings
         S.device_notices = device_notices_now(present, given, now, same_number)
         db.commit()
+    note_ipv4_addresses(table, now)         # which device has which address, for the history
 
 
 def known_mac_at(ip):
@@ -2806,6 +3699,7 @@ def refresh_ipv6_view():
     shared = frozenset(addr for addr, (mac, _) in (table6 or {}).items() if mac in extenders)
     S.v6_own, S.v6_prefixes, S.v6_devices, S.v6_dns = own, ranges, matched, for_devices
     S.v6_shared = shared
+    S.v6_table = table6 or {}               # kept for note_ipv6_addresses, which ipv6_look runs next
     S.v6_neighbours_ok = table6 is not None
     if can_hear is not True:
         S.v6_hear_since = None
@@ -2817,7 +3711,9 @@ def refresh_ipv6_view():
 
 def ipv6_look():
     """One look by ipv6_watcher: work the IPv6 view out again, then tell any lookup waiting for
-    it (matched_ipv6_device) that it is done, whether or not it worked."""
+    it (matched_ipv6_device) that it is done, whether or not it worked. Only after that is the
+    record of which device has which IPv6 address brought up to date (note_ipv6_addresses): it
+    may wait a moment for the database, and a waiting lookup must not wait with it."""
     S.v6_looking = True
     try:
         refresh_ipv6_view()
@@ -2829,6 +3725,10 @@ def ipv6_look():
             S.v6_looked_at = time.monotonic()
             S.v6_looking = False
             v6_looked.notify_all()
+    try:
+        note_ipv6_addresses()
+    except Exception as e:
+        print("Could not note which device has which IPv6 address:", e, flush=True)
 
 
 def ipv6_watcher():
@@ -3271,6 +4171,10 @@ def api_status():
         "new_device_group": S.new_device_group,
         "device_notices": list(S.device_notices),
         "device_events": recent_device_events(),
+        # The device tables: "ready", or where the one-off move of an older household's data has
+        # got to (see move_to_devices), with anything the owner should be told, and whether older
+        # history is still being given its device.
+        "devices": {"state": S.devices_state, "notice": S.devices_notice, "filling": S.history_fill},
     }
 
 
@@ -3286,11 +4190,220 @@ LAST_SEEN_SQL = """
     SELECT x, (SELECT MAX(ts) FROM queries WHERE client=x) FROM c WHERE x IS NOT NULL"""
 
 
+# Each device's history in one question: when it last looked something up, and its counts since a
+# time. It hops from one device to the next in the q_device_ts index (as LAST_SEEN_SQL does with
+# addresses) and reads each device's figures from that index alone, so the work grows with the
+# number of devices and the size of the last day, not with the size of the history.
+DEVICE_HISTORY_SQL = """
+    WITH RECURSIVE c(x) AS (
+        SELECT MIN(device) FROM queries
+        UNION ALL
+        SELECT (SELECT MIN(device) FROM queries WHERE device>x) FROM c WHERE x IS NOT NULL)
+    SELECT x, (SELECT MAX(ts) FROM queries WHERE device=x),
+           (SELECT COUNT(*) FROM queries WHERE device=x AND ts>?1),
+           (SELECT COALESCE(SUM(blocked), 0) FROM queries WHERE device=x AND ts>?1)
+    FROM c WHERE x IS NOT NULL"""
+# Lookups since a time that are still waiting to be filed against a device, counted by the address
+# they were recorded under. There are few of them (tidy_history files them within minutes), except
+# just after an older household's data is moved over, when the newest rows are done first.
+UNFILED_COUNTS_SQL = """SELECT client, COUNT(*), COALESCE(SUM(blocked), 0) FROM queries INDEXED BY q_device_ts
+                        WHERE device IS NULL AND ts>? GROUP BY client"""
+# Each address's newest lookup, and the device it is filed against (empty while it is waiting).
+# Hops through q_client_ts from one address to the next, as LAST_SEEN_SQL does.
+NEWEST_BY_ADDRESS_SQL = """
+    WITH RECURSIVE c(x) AS (
+        SELECT MIN(client) FROM queries
+        UNION ALL
+        SELECT (SELECT MIN(client) FROM queries WHERE client>x) FROM c WHERE x IS NOT NULL)
+    SELECT x, q.ts, q.device FROM c JOIN queries q
+        ON q.id = (SELECT id FROM queries WHERE client=x ORDER BY ts DESC, id DESC LIMIT 1)
+    WHERE x IS NOT NULL"""
+
+
 def api_devices():
-    """GET /api/devices: every device that has used QuietNet, been found by a scan or has rules
-    that follow it (S.dev_mac),
+    """GET /api/devices: one entry for each device, with its name, group, switches and today's
+    counts, and when (if in the last 24 hours) it last tried to use another DNS service.
+
+    A device is one hardware address (see the "devices" part of this file), so a TV that moved from
+    .65 to .67 is one entry with the history of both, and an address handed from one device to
+    another shows each device's own history. Each entry carries:
+      "id"         the device's number (null for an address listed on its own: see below);
+      "kind"       "hw", "addr", "pi" (this computer) or "hub" (the home router);
+      "macs"       its hardware addresses ("mac" is the first, as before);
+      "addresses"  the addresses it has now or had in the last day, each as {"address", "first",
+                   "last", "now"}: when it was first and last confirmed there, and whether it is
+                   there now;
+      "ip"         the one address it is listed and controlled under: the IPv4 address it has now,
+                   else the last it had that no other device has since been seen at, else an IPv6
+                   address. Empty for a device that has left and whose address has gone to
+                   another device: its history is kept under its number all the same.
+    Names, groups and rules are still kept under addresses, so those fields are read from "ip". An
+    address that carries a name or rules of its own, but is not the address its device is listed
+    under, keeps an entry of its own ("id" null, "kind" "addr"), or its rules could not be seen or
+    removed. So does an address no device is known for.
+
+    Listed are the devices with any history, those found by a scan, and those with rules that
+    follow them (S.dev_mac) or a notice. Lookups still waiting to be filed against a device count
+    towards the device that has their address now. On an older database not moved to the device
+    tables yet, the list is by address, as it was (api_devices_by_address).
+
+    "v6_bypass" and "same_as" are as described in api_devices_by_address; "same_as" is only ever
+    set on an address listed on its own."""
+    if not S.devices_ready:
+        return api_devices_by_address()
+    now = time.time()
+    since = now - 86400
+    given = dict(sql("SELECT ip, name FROM devices"))
+    scanned = sql("SELECT ip, mac, host, ts FROM seen")
+    hints = S.hints
+    v6 = ipv6_dns_view()
+    v6_on = v6["in_use"] or bool(v6["router_dns_not_ours"])
+    # Copies, taken without a lock: the looks that keep these replace or add to them as we read.
+    kinds, current, uses, hw = dict(S.device_kind), S.addr_device, dict(S.addr_use), dict(S.hw_device)
+    shared, notices = S.shared_macs, list(S.device_notices)
+    macs_of, held, scan_owner, scanned_at = {}, {}, {}, {}
+    for mac, number in sorted(hw.items()):
+        macs_of.setdefault(number, []).append(mac)
+    for addr, use in uses.items():
+        held.setdefault(use[0], []).append((addr, use[1], use[2]))
+    only_at = dict(S.addr_only)
+    key_of = {number: addr for addr, number in only_at.items()}
+    for ip, mac, _, ts in scanned:
+        mac = clean_mac(mac)
+        if mac and mac not in shared and hw.get(mac) in kinds:
+            scan_owner[ip] = hw[mac]
+            scanned_at.setdefault(hw[mac], []).append((ts or 0, ip))
+
+    def holder(addr):
+        """The device an address belongs to: the one confirmed there now, else the last one seen
+        there, else the one the last scan found there, else the device known only by that
+        address. None if no device is known for it."""
+        number = current.get(addr)
+        if number is None:
+            number = uses[addr][0] if addr in uses else scan_owner.get(addr, only_at.get(addr))
+        return number if number in kinds else None
+
+    homes = {}
+
+    def home(number):
+        """The one address a device is listed and controlled under ("ip"), or '' if it has none
+        of its own now. See the docstring above for the order."""
+        if number not in homes:
+            mine = held.get(number, [])
+            v4 = [(last, addr) for addr, _, last in mine if ":" not in addr]
+            pools = ([x for x in v4 if current.get(x[1]) == number], v4,
+                     [x for x in scanned_at.get(number, []) if ":" not in x[1] and holder(x[1]) == number],
+                     [(last, addr) for addr, _, last in mine])
+            only = key_of.get(number)
+            if kinds[number] == "pi":
+                homes[number] = S.local_ip
+            elif any(pools):
+                homes[number] = max(next(pool for pool in pools if pool))[1]
+            else:
+                homes[number] = only if only and holder(only) == number else ""
+        return homes[number]
+
+    out = {}
+
+    def card(ip, number=None):
+        """The entry for a device (by its number), or for the address `ip` listed on its own,
+        made with empty figures the first time it is asked for."""
+        key = "address " + ip if number is None else number
+        if key not in out:
+            kind = kinds.get(number, "addr")
+            mine = macs_of.get(number, [])
+            tip = hints.get(ip, {})
+            this_computer = kind == "pi" or (number is None and ip == S.local_ip)
+            out[key] = {
+                "ip": ip, "id": number, "kind": kind, "name": given.get(ip) or "", "hint": tip.get("name", ""),
+                "hint_source": tip.get("source", ""), "hint_detail": tip.get("detail", ""),
+                "mac": mine[0] if mine else "", "macs": list(mine), "addresses": [], "same_as": "",
+                "this_computer": this_computer, "last": 0, "n": 0, "nb": 0, "on_network": 0,
+                "v6_bypass": v6_on and not this_computer,
+                "group": S.dev_group.get(ip), "off": internet_off_for(ip),
+                "enforced": ip in S.enforced, "other_dns": other_dns_since(ip, since),
+                "paused": ip in S.paused_ips, "warning": S.device_warnings.get(ip, "")}
+        return out[key]
+
+    def card_at(addr, number=None):
+        """The entry that something known about an address belongs to: its device's (`number`
+        when a hardware address already says which device, else whichever device has the address).
+        But an address with a name or rules of its own that is not the one its device is listed
+        under keeps an entry of its own, and so does an address no device is known for."""
+        if number is None:
+            number = holder(addr)
+        if number is None or (home(number) != addr and (own_rules(addr, given) or addr in S.dev_mac
+                                                        or addr in S.device_warnings)):
+            return card(addr)
+        return card(home(number), number)
+
+    # Three small questions about the history, each answered from an index.
+    for number, last, n, nb in read_sql(DEVICE_HISTORY_SQL, (since,)):
+        if number in kinds:
+            card(home(number), number).update(last=last or 0, n=n, nb=nb)
+    for client, n, nb in read_sql(UNFILED_COUNTS_SQL, (since,)):
+        if client:
+            d = card_at(client)
+            d.update(n=d["n"] + n, nb=d["nb"] + nb)
+    for client, ts, filed in read_sql(NEWEST_BY_ADDRESS_SQL):
+        if client and filed is None:
+            d = card_at(client)
+            d["last"] = max(d["last"], ts or 0)
+    for ip, mac, host, ts in scanned:
+        tidy = clean_mac(mac)
+        number = hw.get(tidy) if tidy and tidy not in shared else None
+        d = card_at(ip, number if number in kinds else None)
+        if d["id"] is not None and tidy and tidy not in d["macs"]:
+            continue                            # the scan saw a different device here than has the address now
+        d["on_network"] = max(d["on_network"], ts or 0)
+        d["mac"] = d["mac"] or mac or ""
+        if host and not d["hint"] and names.tidy_name(host):
+            d.update(hint=names.tidy_name(host), hint_source=names.LABELS["dns"])
+    # Every address whose rules follow a device by hardware address, and every address a "may be
+    # the same device" notice points at, is listed even before it has used QuietNet or been scanned.
+    for ip, mac in list(S.dev_mac.items()) + [(n["to"], n["mac"]) for n in notices]:
+        d = card_at(ip)
+        if d["id"] is None:
+            d["mac"] = d["mac"] or mac
+    at = {}
+    for d in out.values():
+        number = d["id"]
+        if number is None:
+            d["macs"] = [clean_mac(d["mac"])] if clean_mac(d["mac"]) else []
+            d["addresses"] = [{"address": d["ip"], "first": None, "last": None, "now": False}]
+        elif d["kind"] == "pi":
+            d["addresses"] = [{"address": a, "first": None, "last": None, "now": True}
+                              for a in [S.local_ip] + sorted(S.v6_own)[:MAX_LISTED_ADDRESSES - 1]]
+        else:
+            mine = [(":" in addr, -last, addr, first) for addr, first, last in held.get(number, [])
+                    if current.get(addr) == number or last >= now - ADDRESS_RECENT or addr == d["ip"]]
+            d["addresses"] = [{"address": addr, "first": first, "last": -last, "now": current.get(addr) == number}
+                              for _, last, addr, first in sorted(mine)[:MAX_LISTED_ADDRESSES]]
+            if d["ip"] and all(a["address"] != d["ip"] for a in d["addresses"]):
+                d["addresses"].insert(0, {"address": d["ip"], "first": None, "last": None, "now": False})
+            for a in d["addresses"]:
+                d["other_dns"] = max(d["other_dns"], other_dns_since(a["address"], since))
+                tip = hints.get(a["address"])
+                if tip and tip.get("name") and not d["hint"]:
+                    d.update(hint=tip["name"], hint_source=tip.get("source", ""), hint_detail=tip.get("detail", ""))
+        if d["ip"] and ":" not in d["ip"]:
+            at.update((mac, d["ip"]) for mac in d["macs"])
+    for d in out.values():
+        if not d["hint"] and not d["hint_detail"] and names.is_private_mac(d["mac"]):
+            d["hint_detail"] = names.PRIVATE_NOTE
+        if d["id"] is None and ":" in d["ip"]:
+            d["same_as"] = at.get(eui64_mac(d["ip"]), "")
+    # Devices using QuietNet first (most recent at the top), then the rest in address order.
+    return sorted(out.values(), key=lambda d: (-d["last"], [int(x) if x.isdigit() else 0 for x in d["ip"].split(".")]))
+
+
+def api_devices_by_address():
+    """The device list as it was before the device tables, one entry per address: every address
+    that has used QuietNet, been found by a scan or has rules that follow it (S.dev_mac),
     with its name, group, switches and today's counts, and when (if in the last 24 hours) it last
-    tried to use another DNS service.
+    tried to use another DNS service. Used by api_devices while an older database has not been
+    moved to the device tables (S.devices_ready is False); each entry then has "id" null and
+    "kind" "addr", so the answer has the same shape either way.
 
     "v6_bypass" is the honest label "can bypass QuietNet over IPv6": true for every device but this
     computer while the home network has IPv6 (ipv6_dns_view's "in_use"), or while something on the
@@ -3346,6 +4459,8 @@ def api_devices():
             d["hint_detail"] = names.PRIVATE_NOTE
         if ":" in d["ip"]:
             d["same_as"] = at.get(eui64_mac(d["ip"]), "")
+        d.update(id=None, kind="addr", macs=[clean_mac(d["mac"])] if clean_mac(d["mac"]) else [],
+                 addresses=[{"address": d["ip"], "first": None, "last": None, "now": False}])
     # Devices using QuietNet first (most recent at the top), then the rest in address order.
     return sorted(out.values(), key=lambda d: (-d["last"], [int(x) if x.isdigit() else 0 for x in d["ip"].split(".")]))
 
@@ -3354,37 +4469,79 @@ def api_devices():
 # one step into the q_client_ts index: the device's newest entry, and its oldest inside the window.
 NEWEST_FOR_DEVICE_SQL = "SELECT id, ts FROM queries WHERE client=? ORDER BY ts DESC, id DESC LIMIT 1"
 OLDEST_IN_WINDOW_SQL = "SELECT MIN(ts) FROM queries WHERE client=? AND ts>?"
+# The same two for a device by its number, each one step into the q_device_ts index.
+NEWEST_FOR_NUMBER_SQL = "SELECT id, ts FROM queries WHERE device=? ORDER BY ts DESC LIMIT 1"
+OLDEST_FOR_NUMBER_SQL = "SELECT MIN(ts) FROM queries WHERE device=? AND ts>?"
+# What a device looked up since a time: the lookups filed against it (through q_device_ts), and
+# those from one address that are still waiting to be filed (through q_client_ts).
+DEVICE_ACTIVITY_SQL = ("SELECT domain, COUNT(*), MAX(ts), SUM(blocked) FROM queries "
+                       "WHERE device=? AND ts>? GROUP BY domain")
+UNFILED_ACTIVITY_SQL = ("SELECT domain, COUNT(*), MAX(ts), SUM(blocked) FROM queries INDEXED BY q_client_ts "
+                        "WHERE client=? AND ts>? AND device IS NULL GROUP BY domain")
 
 
-def activity_marker(ip, hours, since):
+def activity_marker(ip, hours, since, device=None):
     """A short code that changes whenever one device's activity list could have changed: a new
     lookup (its newest entry), an old one leaving the window or being cleared (its oldest entry
     inside the window), or anything that changes a block decision or label (the rules version,
     the pause, the advert switch, the schedules in force, the advert lists). The page sends it back
-    and is told "unchanged" without the list being built again. It reveals nothing on its own."""
-    newest = read_sql(NEWEST_FOR_DEVICE_SQL, (ip,))
-    oldest = read_sql(OLDEST_IN_WINDOW_SQL, (ip, since))[0][0]
-    parts = (ip, float(hours), newest[0] if newest else None, oldest, S.rules_version,
+    and is told "unchanged" without the list being built again. It reveals nothing on its own.
+
+    With a device number the entries are the device's own, plus the newest entry under each
+    address it has now (a lookup still waiting to be filed shows there first), and the code also
+    changes whenever waiting lookups are filed against devices (S.history_filed), since that can
+    move a lookup onto or off this device's list."""
+    if device is None:
+        newest = read_sql(NEWEST_FOR_DEVICE_SQL, (ip,))
+        oldest = read_sql(OLDEST_IN_WINDOW_SQL, (ip, since))[0][0]
+    else:
+        newest = read_sql(NEWEST_FOR_NUMBER_SQL, (device,))
+        for addr in device_addresses(device):
+            newest += read_sql(NEWEST_FOR_DEVICE_SQL, (addr,))
+        oldest = read_sql(OLDEST_FOR_NUMBER_SQL, (device, since))[0][0]
+    parts = (ip, device, None if device is None else S.history_filed, float(hours), newest, oldest, S.rules_version,
              time.time() < S.paused_until, S.junk_on, tuple(sorted(x["id"] for x in active_schedules())),
              S.junk_count, len(S.junk_community))
     return hashlib.sha256(repr(parts).encode()).hexdigest()[:24]
 
 
-def api_activity(ip, hours, seen=None):
+def api_activity(ip, hours, seen=None, device=None):
     """GET /api/activity: what one device looked up in the last `hours`, grouped by owner
     (see base_of), with the label and the current block decision for every name and group.
+
+    `device` is a device number from GET /api/devices: the list is then everything filed against
+    that device, at whatever address it was made, plus what is still waiting to be filed from the
+    addresses it has now. Without it the list is what was recorded under the address `ip`, as it
+    always was. Either way the block decisions shown are those for the address `ip`, since rules
+    are still kept under addresses (with a device number and no `ip`, the device's own address).
 
     Without `seen` the answer is the list itself, as it always was. With `seen` (the request's
     'since' parameter: the marker from the last answer, or empty the first time) the answer is
     {"unchanged": false, "marker": ..., "groups": the list}, or just
     {"unchanged": true, "marker": ...} when the marker still matches and the list is not built."""
     since = time.time() - hours * 3600
+    if device is not None and not ip:
+        ip = (device_addresses(device) + [""])[0]
     if seen is not None:
-        marker = activity_marker(ip, hours, since)
+        marker = activity_marker(ip, hours, since, device)
         if seen == marker:
             return {"unchanged": True, "marker": marker}
-        return {"unchanged": False, "marker": marker, "groups": activity_groups(ip, since)}
-    return activity_groups(ip, since)
+        return {"unchanged": False, "marker": marker, "groups": activity_groups(ip, since, device)}
+    return activity_groups(ip, since, device)
+
+
+def device_history(device, since):
+    """What one device looked up since a time, as (name, how many times, most recent, how many
+    blocked) rows: everything filed against the device, and what is still waiting to be filed
+    from the addresses it has now. Asked on the read-only connection."""
+    found = {}
+    parts = [read_sql(DEVICE_ACTIVITY_SQL, (device, since))]
+    parts += [read_sql(UNFILED_ACTIVITY_SQL, (addr, since)) for addr in device_addresses(device)]
+    for rows in parts:
+        for domain, n, last, nb in rows:
+            had = found.get(domain, (0, 0, 0))
+            found[domain] = (had[0] + n, max(had[1], last), had[2] + (nb or 0))
+    return [(domain,) + figures for domain, figures in found.items()]
 
 
 def other_dns_since(ip, since):
@@ -3395,13 +4552,16 @@ def other_dns_since(ip, since):
     return last if last > since else 0
 
 
-def activity_groups(ip, since):
+def activity_groups(ip, since, device=None):
     """The activity list for one device since a time: see api_activity. A name of another DNS
     service (see OTHER_DNS_SERVICES) is shown as blocked with why 'other_dns' when this device is
     kept away from them (other_dns_blocked_for), since every lookup of it then is, and its group is
     marked "other_dns" too."""
-    rows = read_sql("""SELECT domain, COUNT(*), MAX(ts), SUM(blocked) FROM queries
-                  WHERE client=? AND ts>? GROUP BY domain""", (ip, since))
+    if device is None:
+        rows = read_sql("""SELECT domain, COUNT(*), MAX(ts), SUM(blocked) FROM queries
+                      WHERE client=? AND ts>? GROUP BY domain""", (ip, since))
+    else:
+        rows = device_history(device, since)
     guarded = other_dns_blocked_for(ip)
 
     def kept_off(domain):
@@ -3658,7 +4818,10 @@ class Web(BaseHTTPRequestHandler):
                 hours = 24
             # 'since' may be sent empty (the first ask), and parse_qs drops empty values unless told not to.
             seen = parse_qs(url.query, keep_blank_values=True).get("since", [None])[0]
-            self.send_json(api_activity(qs.get("ip", [""])[0], hours, seen))
+            # 'device' is a device number from GET /api/devices; without one (or with one QuietNet
+            # doesn't know) the list is the one recorded under the address 'ip', as it always was.
+            device = device_number(qs.get("device", [""])[0])
+            self.send_json(api_activity(qs.get("ip", [""])[0], hours, seen, device))
         elif url.path == "/api/rules":
             self.send_json(api_rules())
         elif url.path == "/api/services":
@@ -3895,11 +5058,17 @@ class Web(BaseHTTPRequestHandler):
             return self.send_json({"ok": True})
         if path == "/api/clear-history":
             ip = body.get("ip")
-            if ip:
+            device = device_number(body.get("device"))
+            if "device" in body and device is None and not ip:
+                # A device number QuietNet doesn't know, and no address to fall back on. Refuse:
+                # carrying on would clear everyone's history, which is not what was asked for.
+                return self.send_json({"error": "QuietNet doesn't know that device."}, 400)
+            if ip or device is not None:
                 # One device's history goes in steps, which can take a while for a busy device; long
                 # enough, through the relay, to run past its 30-second wait. So answer at once.
                 global last_clear
-                last_clear = threading.Thread(target=clear_history, args=(ip,), daemon=True)
+                last_clear = threading.Thread(target=clear_history, args=(ip,) if device is None else (ip, device),
+                                              daemon=True)
                 last_clear.start()
             else:
                 clear_history()                   # everyone's is one quick statement
@@ -3939,6 +5108,9 @@ def main():
                             dns_port=None if S.dns_error else S.dns_port)
     ENF.start()
     threading.Thread(target=address_watcher, daemon=True).start()
+    # Only now, with the filter answering and the enforcer started: bring an older household's
+    # data into the device tables if that is still to do, then keep track of devices' addresses.
+    threading.Thread(target=device_keeper, daemon=True).start()
     global CA
     CA = cloud_agent.CloudAgent(args.web_port, DATA)
     CA.start()
