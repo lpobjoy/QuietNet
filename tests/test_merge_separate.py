@@ -468,6 +468,66 @@ class TheSameDeviceQuestion(Api, Setup):
         self.assertEqual(server.S.hw_device[PRIVATE], self.phone)
 
 
+class AThirdDeviceStillBeingAskedAbout(Api, Setup):
+    """A newcomer is being held to a phone's rules, not answered yet, when the owner merges that
+    phone into another device. The rules must not slip off the newcomer, and what the owner has
+    already said about the phone goes on being true of the merged device."""
+
+    def setUp(self):
+        super().setUp()
+        self.start_clean()
+        self.look({OLD: PHONE, OTHER: LAPTOP})
+        self.phone, self.laptop = self.give_rules(PHONE), self.number(LAPTOP)
+        self.look({OLD: PRIVATE, OTHER: LAPTOP}, later=60)
+        self.newcomer = self.number(PRIVATE)
+        self.assertEqual(server.S.provisional, {self.newcomer: self.phone})
+
+    def merge(self, device, other):
+        marker = self.ok("/api/merge", {"device": device, "with": other})["preview"]["marker"]
+        return self.ok("/api/merge", {"device": device, "with": other, "seen": marker})["device"]
+
+    def test_the_newcomer_is_held_to_the_merged_devices_rules(self):
+        self.merge(self.laptop, self.phone)
+        self.assertEqual(server.S.provisional, {self.newcomer: self.laptop})
+        self.assertTrue(blocked_for(OLD))
+        self.assertEqual(server.sql("SELECT device, follows, state FROM device_follow"),
+                         [(self.newcomer, self.laptop, "asked")])
+
+    def test_the_question_stays_open_while_the_merged_device_is_away(self):
+        self.merge(self.laptop, self.phone)
+        self.look({OLD: PRIVATE}, later=120)                       # neither of its hardware addresses is here
+        self.assertEqual(server.S.provisional, {self.newcomer: self.laptop})
+        self.assertTrue(blocked_for(OLD))
+
+    def test_the_question_ends_when_the_merged_device_is_seen_beside_the_newcomer(self):
+        # As for any device seen on the network beside the newcomer (known issue 99: with a merged
+        # device this is the laptop's other network card, which proves less than it used to).
+        self.merge(self.laptop, self.phone)
+        self.look({OLD: PRIVATE, OTHER: LAPTOP}, later=120)
+        self.assertEqual(server.S.provisional, {})
+        self.assertFalse(blocked_for(OLD))
+        self.assertTrue(blocked_for(OTHER))
+
+    def test_the_question_about_the_newcomer_is_still_asked_after_a_restart(self):
+        self.merge(self.laptop, self.phone)
+        server.init_db()
+        self.assertEqual(server.S.provisional, {self.newcomer: self.laptop})
+
+    def test_the_preview_says_the_newcomer_will_get_the_merged_devices_rules_too(self):
+        notes = self.ok("/api/merge", {"device": self.laptop, "with": self.phone})["preview"]["notes"]
+        self.assertIn("%s may be the same device as Wilf's iPad, and you have not answered that yet. Until you do, the "
+                      "merged device's rules apply to it too." % OLD, notes)
+
+    def test_a_no_already_given_about_the_device_that_goes_holds_for_the_merged_device(self):
+        self.ok("/api/different-device", {"device": self.newcomer})
+        self.assertIn((self.newcomer, self.phone), server.S.not_same)
+        self.merge(self.laptop, self.phone)
+        self.assertIn((self.newcomer, self.laptop), server.S.not_same)
+        self.assertEqual(server.S.provisional, {})
+        server.init_db()
+        self.assertIn((self.newcomer, self.laptop), server.S.not_same)
+
+
 class RulesKeptUnderANumber(Api, Setup):
     """Rules set for an address before QuietNet could tell which device has it. The device then
     seen there is given them for now, and "yes, they are this device's" goes through the preview."""
@@ -907,7 +967,8 @@ class TheDashboardPage(unittest.TestCase):
     def test_merge_with_offers_the_other_devices_but_never_this_computer_or_the_router(self):
         choices = self.part("mergeChoices")
         self.assertIn("const ok = x => Number.isInteger(x.id) && (x.kind === 'hw' || x.kind === 'addr');", choices)
-        self.assertIn("ok(d) ? byName(S.devices.filter(x => ok(x) && x.id !== d.id)) : []", choices)
+        self.assertIn("ok(d) ? byName(S.devices.filter(x => ok(x) && x.id !== d.id && "
+                      "!(d.kind === 'addr' && x.kind === 'addr'))) : []", choices)
 
     def test_merge_asks_for_the_preview_before_anything_else(self):
         flow = self.page[self.page.index("async function mergeFlow("):self.page.index("const actions = {")]
@@ -972,6 +1033,14 @@ class TheDashboardPage(unittest.TestCase):
         self.assertIn("if(r.status !== 404){ await oops(r); return refresh(true); }", answer)
         self.assertIn("api('/api/move-rules', body)", answer)
 
+    def test_a_card_the_question_is_about_carries_a_same_device_badge(self):
+        self.assertIn("${askedAbout(d) ? '<span class=\"badge warn\">Same device?</span>' : ''}", self.part("viewHome"))
+        self.assertIn("((S.status || {}).device_notices || []).some(n => aboutCard(n, keyOf(d)))", self.part("askedAbout"))
+
+    def test_a_device_known_only_by_its_number_says_why_on_its_page(self):
+        self.assertIn("${byNumberOnly(d) ? '<p class=\"meta\">QuietNet recognises this device by its number alone",
+                      self.part("deviceDetails"))
+
     def test_the_gone_quiet_notice_asks_same_device(self):
         self.assertIn("It may be the same one with a new private Wi-Fi address. Same device?", self.part("movedNotices"))
 
@@ -1018,7 +1087,7 @@ class TheDashboardPage(unittest.TestCase):
             self.assertNotIn("style=", self.part(name))
 
     def test_the_page_still_has_no_emoji(self):
-        self.assertNotRegex(self.page, "[\U0001F000-\U0001FAFF☀-➿️]")
+        self.assertNotRegex(self.page, "[\U0001F000-\U0001FAFF\u2600-\u27BF\uFE0F]")
 
 
 if __name__ == "__main__":

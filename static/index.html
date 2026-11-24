@@ -978,7 +978,7 @@ function viewHome(){
       <span class="tile-figs">${d.last
         ? `${num(d.n)} requests today · <b>${num(d.nb)} blocked</b> · active ${esc(ago(d.last))}`
         : '<span class="muted">Not using QuietNet yet</span>'}</span>
-      <span class="tile-badges">${d.off ? '<span class="badge danger">Internet off</span>' : ''}${d.enforced ? '<span class="badge accent">Live-enforced</span>' : ''}${d.paused ? '<span class="badge warn">Rules paused</span>' : ''}${d.other_dns ? '<span class="badge warn">Tried another DNS service</span>' : ''}${v6Bypass(d) ? '<span class="badge warn">Can bypass over IPv6</span>' : ''}${byNumberOnly(d) ? '<span class="badge">Recognised by its number</span>' : ''}${d.group ? `<span class="badge">${esc(groupName(d.group))}</span>` : ''}</span>
+      <span class="tile-badges">${d.off ? '<span class="badge danger">Internet off</span>' : ''}${d.enforced ? '<span class="badge accent">Live-enforced</span>' : ''}${d.paused ? '<span class="badge warn">Rules paused</span>' : ''}${d.other_dns ? '<span class="badge warn">Tried another DNS service</span>' : ''}${v6Bypass(d) ? '<span class="badge warn">Can bypass over IPv6</span>' : ''}${byNumberOnly(d) ? '<span class="badge">Recognised by its number</span>' : ''}${askedAbout(d) ? '<span class="badge warn">Same device?</span>' : ''}${d.group ? `<span class="badge">${esc(groupName(d.group))}</span>` : ''}</span>
       ${ICON.go}
     </button>`).join('');
   const scanning = st.scan && st.scan.state === 'scanning';
@@ -1188,8 +1188,12 @@ function firewallNotice(){
 // or joined to another; the only answer is "no".
 // Otherwise it is only a suggestion: a device with rules went quiet just as a new one appeared.
 const noticeKey = n => n.to_device == null ? 'a' + n.to : 'd' + n.to_device;
+// Is one of those questions about the device on this card (as the newcomer, or as the device the
+// rules belong to)? Its card then carries a "Same device?" badge, and its page the question.
+const aboutCard = (n, key) => noticeKey(n) === key || (n.from_device != null && 'd' + n.from_device === key);
+function askedAbout(d){ return ((S.status || {}).device_notices || []).some(n => aboutCard(n, keyOf(d))); }
 function movedNotices(key){
-  const list = ((S.status || {}).device_notices || []).filter(n => !key || noticeKey(n) === key || (n.from_device != null && 'd' + n.from_device === key));
+  const list = ((S.status || {}).device_notices || []).filter(n => !key || aboutCard(n, key));
   const ids = n => n.to_device == null ? '' : ` data-todev="${esc(n.to_device)}" data-fromdev="${esc(n.from_device)}"`;
   const open = n => key ? '' : `<button class="btn link" data-act="open" data-device="${esc(noticeKey(n))}">Open it</button>`;
   return list.map(n => n.same && n.extender
@@ -1318,8 +1322,10 @@ function activityList(){
 // changed (see mergeFlow and the separate action). An older Pi sends no addresses and no numbers:
 // then the list is left out and nothing is offered. Every address, time and name is escaped.
 function mergeChoices(d){
+  // Never this computer or the router, and never two that are both known only by a number: the
+  // Pi refuses those, since neither has a hardware address to keep the merged device together.
   const ok = x => Number.isInteger(x.id) && (x.kind === 'hw' || x.kind === 'addr');
-  return ok(d) ? byName(S.devices.filter(x => ok(x) && x.id !== d.id)) : [];
+  return ok(d) ? byName(S.devices.filter(x => ok(x) && x.id !== d.id && !(d.kind === 'addr' && x.kind === 'addr'))) : [];
 }
 function deviceDetails(d){
   const macs = macsOf(d), others = mergeChoices(d);
@@ -1344,6 +1350,7 @@ function deviceDetails(d){
     ${rows ? `<h3>Network addresses, now and in the last day</h3><ul class="list">${rows}</ul>` : ''}
     ${hw ? `<h3>Hardware address${macs.length === 1 ? '' : 'es'}</h3><ul class="list">${hw}</ul>` : ''}
     ${canSeparate ? '<p class="meta">This is one device with more than one hardware address, because you merged them. Separate takes one out again as a device of its own, and asks whether the rules go with it.</p>' : ''}
+    ${byNumberOnly(d) ? '<p class="meta">QuietNet recognises this device by its number alone: it is behind a Wi-Fi range extender, or no hardware address has been seen for it. Its name and rules stay with that number.</p>' : ''}
     ${merge}</section>`;
 }
 function viewDevice(){

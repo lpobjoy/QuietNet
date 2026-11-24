@@ -669,9 +669,10 @@ class DashboardDeviceMoves(unittest.TestCase):
     def test_the_notices_come_from_the_status_and_a_device_page_shows_only_its_own(self):
         # A device's page shows the questions it is part of, as the newcomer or as the device the
         # rules belong to. A card is known by its key (the device's number, else its address).
-        self.assertIn("((S.status || {}).device_notices || []).filter(n => !key || noticeKey(n) === key || "
-                      "(n.from_device != null && 'd' + n.from_device === key))", self.notices)
+        self.assertIn("((S.status || {}).device_notices || []).filter(n => !key || aboutCard(n, key))", self.notices)
         self.assertIn("const noticeKey = n => n.to_device == null ? 'a' + n.to : 'd' + n.to_device;", self.page)
+        self.assertIn("const aboutCard = (n, key) => noticeKey(n) === key || "
+                      "(n.from_device != null && 'd' + n.from_device === key);", self.page)
 
     def test_a_notice_opens_the_newcomers_card_by_its_key(self):
         self.assertIn('data-act="open" data-device="${esc(noticeKey(n))}"', self.notices)

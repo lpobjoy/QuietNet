@@ -4818,6 +4818,22 @@ def merge_devices(keep, gone, note="", prefer=None, prefer_name=None):
         for use in list(S.addr_use.values()):
             if use[0] == gone:
                 use[0] = keep
+        # A third device that is being held to the rules of the one that goes ("may be the same
+        # device", not answered yet) is held to the kept device's from now on: the question is
+        # still open, and the rules must not slip off it meanwhile. And what the owner said about
+        # the one that goes ("not the same device as ...") is true of the kept device too.
+        moved_on = time.time()
+        for n, d in list(S.provisional.items()):
+            if d == gone and n not in (keep, gone):
+                S.provisional[n] = keep
+                db.execute("INSERT OR REPLACE INTO device_follow(device, follows, state, since) VALUES(?,?,?,?)",
+                           (n, keep, "asked", moved_on))
+        for a, b in list(S.not_same):
+            pair = (keep if a == gone else a, keep if b == gone else b)
+            if gone in (a, b) and pair[0] != pair[1] and S.provisional.get(pair[0]) != pair[1]:
+                S.not_same.add(pair)
+                db.execute("INSERT OR REPLACE INTO device_follow(device, follows, state, since) VALUES(?,?,?,?)",
+                           (pair[0], pair[1], "no", moved_on))
         db.execute("DELETE FROM device_follow WHERE device=? OR follows=?", (gone, gone))
         db.execute("DELETE FROM device_follow WHERE device=? AND follows=?", (keep, gone))
         S.provisional = {n: d for n, d in S.provisional.items() if gone not in (n, d)}
@@ -5113,6 +5129,10 @@ def merge_preview(device, other):
     for g in lost:
         notes.append("It will no longer be in the %s group, so what is blocked or scheduled for that group stops "
                      "applying to it." % S.group_names.get(g, "other"))
+    for held, to in sorted(S.provisional.items()):
+        if to in (device, other) and held not in (device, other):
+            notes.append("%s may be the same device as %s, and you have not answered that yet. Until you do, the "
+                         "merged device's rules apply to it too." % (device_label(held), device_label(to)))
     for number in (device, other):
         if S.device_kind[number] == "addr":
             notes.append("QuietNet knows %s only by its number. Its rules and history go to the merged device; "
