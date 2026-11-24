@@ -591,7 +591,7 @@ class DashboardIPv6Honesty(unittest.TestCase):
         self.assertIn("Probably the same device as ${esc(sameAsName(d))}", self.part("sameAsLine"))
         notice = self.part("sameAsNotice")
         self.assertIn("<b>${esc(sameAsName(d))}</b>", notice)
-        self.assertIn('data-ip="${esc(d.same_as)}"', notice)
+        self.assertIn('data-act="open" data-device="${esc(keyOf(sameAsCard(d)))}"', notice)
         self.assertIn("so that device's rules are not applied here", notice)
         self.assertIn("${sameAsNotice(d)}", self.device)
 
@@ -664,10 +664,17 @@ class DashboardDeviceMoves(unittest.TestCase):
 
     def test_the_notices_are_on_the_home_page_and_the_device_page(self):
         self.assertIn("${movedNotices(null)}", self.home)
-        self.assertIn("${movedNotices(d.ip)}", self.device)
+        self.assertIn("${movedNotices(S.device)}", self.device)
 
     def test_the_notices_come_from_the_status_and_a_device_page_shows_only_its_own(self):
-        self.assertIn("((S.status || {}).device_notices || []).filter(n => !ip || n.to === ip)", self.notices)
+        # A device's page shows the questions it is part of, as the newcomer or as the device the
+        # rules belong to. A card is known by its key (the device's number, else its address).
+        self.assertIn("((S.status || {}).device_notices || []).filter(n => !key || noticeKey(n) === key || "
+                      "(n.from_device != null && 'd' + n.from_device === key))", self.notices)
+        self.assertIn("const noticeKey = n => n.to_device == null ? 'a' + n.to : 'd' + n.to_device;", self.page)
+
+    def test_a_notice_opens_the_newcomers_card_by_its_key(self):
+        self.assertIn('data-act="open" data-device="${esc(noticeKey(n))}"', self.notices)
 
     def test_the_notices_escape_the_name_and_both_addresses(self):
         self.assertIn("${esc(n.name)}", self.notices)

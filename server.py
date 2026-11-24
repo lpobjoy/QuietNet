@@ -49,9 +49,10 @@ import names
 #                        move of an older household's data into those tables
 #   rules                the lists, schedules and decision(): is this name blocked for this device, and why
 #   DNS                  reading questions, building answers, asking the real servers, the UDP/TCP listeners
-#   helpers              this computer's address, the neighbour table, device names (the work is in
-#                        names.py), the network scan, and the api_...() functions that build each
-#                        dashboard answer
+#   helpers              this computer's address, the neighbour table, the owner's answers about
+#                        devices (same device, different device, Merge and Separate, each shown
+#                        before it is done), device names (the work is in names.py), the network
+#                        scan, and the api_...() functions that build each dashboard answer
 #   dashboard web server the Web class (every HTTP call) and main()
 #
 # HOW A CHANGE TO A RULE WORKS: the rule sets live in S for speed and in the database so they
@@ -4752,25 +4753,26 @@ def clear_device_rules(number):
         db.execute("DELETE FROM %s WHERE scope=?" % table, (scope,))
 
 
-def merge_devices(keep, gone, note="", prefer=None):
+def merge_devices(keep, gone, note="", prefer=None, prefer_name=None):
     """The owner says two entries are one device: join `gone` into `keep`. Everything `gone` has
     goes to `keep`: its hardware addresses, its addresses and the record of them, and its history.
     `keep` ends with every internet switch, blocked service, schedule and "cut live connections"
     that either had. A device has one name and is in one group, so where both had one, one gives
-    way, and the owner is told which in the recent changes, every time: the name kept is `keep`'s
-    own (else `gone`'s); the group kept is that of `prefer` (one of the two; `keep` when not
-    given), else the other's. A group that gives way takes its blocks and schedules off the
-    device, which is why it is never dropped without a word. `gone` is then no more, and its
-    number is never used again. `note` is kept for the owner. Never for this computer or the
-    router.
+    way, and the owner is told which in the recent changes, every time: the name kept is that of
+    `prefer_name` (one of the two; `keep` when not given), else the other's; the group kept is
+    that of `prefer` (one of the two; `keep` when not given), else the other's. A group that
+    gives way takes its blocks and schedules off the device, which is why it is never dropped
+    without a word. `gone` is then no more, and its number is never used again. `note` is kept
+    for the owner. Never for this computer or the router.
 
     Changes S and the database in one step, holding db_lock; the history is then given its new
     device in small steps, letting go of the lock between them, as clear_history does."""
     with db_lock:
         save_address_use()                  # first, and by itself: it saves (commits) what the looks have seen
         ks, gs = "dev:%d" % keep, "dev:%d" % gone
-        name = S.given.get(keep) or S.given.get(gone) or ""
-        name_lost = S.given.get(gone) if S.given.get(keep) and S.given.get(gone) not in (None, name) else None
+        named, other = (gone, keep) if prefer_name == gone else (keep, gone)
+        name = S.given.get(named) or S.given.get(other) or ""
+        name_lost = S.given.get(other) if S.given.get(named) and S.given.get(other) not in (None, name) else None
         first = min([t for t in (S.dev_first.get(keep), S.dev_first.get(gone)) if t] or [0])
         last = max(S.dev_last.get(keep, 0), S.dev_last.get(gone, 0))
         db.execute("UPDATE device SET name=?, first=?, last=? WHERE id=?", (name, first, last, keep))
@@ -4876,7 +4878,9 @@ def same_device_by_hand(to_device, from_device=None):
     joins the phone it always was, and rules that were kept under a number alone go to the device
     that has it. Refused for this computer and the router, and, unless QuietNet was already
     giving it those rules, for a device that has rules of its own: joining then needs the owner
-    to see what would apply afterwards, which the device page's "Merge" will show. Refused too
+    to see what would apply afterwards, which the device page's "Merge with" shows first
+    (merge_preview, merge_by_hand; the dashboard now asks its "same device?" questions that way
+    too, and this call is kept for pages written before it). Refused too
     for rules the move set aside for the owner to choose: that choice is made on the home page
     (settle_conflict)."""
     if not S.devices_ready:
@@ -4897,8 +4901,8 @@ def same_device_by_hand(to_device, from_device=None):
     if from_device in S.set_aside or to_device in S.set_aside:
         return "Those rules are waiting for your decision under \"Rules that need your decision\" on the home page."
     if asked != from_device and holds_rules(to_device):
-        return ("That device already has rules of its own. Remove them first if you want to move "
-                "the other device's rules to it.")
+        return ("That device already has rules of its own. Use \"Merge with\" on its page instead: it shows "
+                "what would apply to each of them before anything is changed.")
     keep, gone = (from_device, to_device) if kinds[1] == "hw" else (to_device, from_device)
     if kinds[1] == "hw" and to_device in S.dev_group and S.dev_group[to_device] == new_device_group():
         # The newcomer was only in the new-device group because QuietNet took it for a new device.
@@ -4930,6 +4934,345 @@ def different_device_by_hand(number):
         S.device_notices = [n for n in S.device_notices if n.get("to_device") != number]
         db.commit()
     return None
+
+
+# ----- Merge and Separate, each shown to the owner before it is done
+#
+# Nothing is ever merged automatically, and nothing here happens on the first ask either. A request
+# to merge two devices, or to separate a hardware address from a device, is answered with a
+# preview: what would apply to each hardware address afterwards, in plain words. Only a second
+# request that sends the preview's marker back ("seen") is carried out, and only while the preview
+# would still read the same: if a rule, a name, a group or a hardware address has changed since,
+# nothing is done and the owner is shown the new preview. So what is applied is what was shown.
+
+PREVIEW_CHANGED = ("Something changed since this was shown, so nothing was done. Look at what would apply "
+                   "now and confirm again.")
+MAX_HARDWARE_ADDRESSES = 16    # hardware addresses one device may hold; no more can be merged into it
+
+
+def schedule_words(x):
+    """One schedule in plain words for a preview: 'the "Bedtime" schedule (all internet off, 21:00
+    to 07:00)', with 'not in use' added for one that is switched off. `x` is an entry of S.schedules."""
+    what = "all internet off" if x["off"] else "blocks " + ", ".join(
+        sorted(S.svc_names.get(s, s) for s in x["services"])[:6])
+    return 'The "%s" schedule (%s, %s to %s%s)' % (x["name"], what, x["start"], x["end"],
+                                                  "" if x["enabled"] else ", not in use")
+
+
+def rule_items(own, groups, cut):
+    """What a device's rules come to, as an ordered {key: plain words}: the groups it is in, the
+    internet switches, the blocked services, the schedules and "cut live connections". `own` is the
+    device scopes whose rules count as the device's own ("dev:12"; several when two devices are
+    about to become one), `groups` the ids of the groups whose rules reach it, `cut` whether "cut
+    live connections" is on. What is set for the whole house is left out: it applies to every
+    device whatever is merged or separated. The keys are the same for the same rule however it
+    reaches the device, so two of these can be compared to say what is new and what stops. Reads
+    S only."""
+    items = {}
+    groups = [gid for gid in dict.fromkeys(groups) if gid in S.group_names]
+    for gid in groups:
+        items[("group", gid)] = "In the %s group" % S.group_names[gid]
+    scopes = [(scope, "", "own") for scope in own]
+    scopes += [("group:%d" % gid, " for the %s group" % S.group_names[gid], gid) for gid in groups]
+    for scope, tail, key in scopes:
+        if scope in S.off:
+            items[("off", key)] = "Internet switched off" + tail
+    for scope, tail, key in scopes:
+        for service in sorted(S.svc_blocks.get(scope, ()), key=lambda s: S.svc_names.get(s, s).lower()):
+            items[("service", service, key)] = "%s blocked%s" % (S.svc_names.get(service, service), tail)
+    for scope, tail, key in scopes:
+        for x in list(S.schedules):
+            if x["scope"] == scope:
+                items[("schedule", x["id"])] = schedule_words(x) + tail
+    if cut:
+        items[("cut",)] = "Cut live connections"
+    return items
+
+
+def rules_now(number):
+    """The rules that reach a device now, as rule_items gives them: its own, its group's, and
+    those of a device it may be while the owner has not answered (S.provisional). Reads S only."""
+    own, groups = ["dev:%d" % number], [S.dev_group.get(number)]
+    other = S.provisional.get(number)
+    if other is not None:
+        own.append("dev:%d" % other)
+        groups.append(S.dev_group.get(other))
+    return rule_items(own, groups, number in S.enforced or other in S.enforced)
+
+
+def hardware_of(number):
+    """The hardware addresses that belong to a device, in order. Reads S only."""
+    return sorted(mac for mac, n in list(S.hw_device.items()) if n == number)
+
+
+def own_membership(number):
+    """Is this device in its group because QuietNet put it there by itself (the group chosen for
+    new devices), and not because the owner chose it? Asks the database, so not for a lookup."""
+    row = sql("SELECT auto FROM group_member WHERE device=?", (number,))
+    return bool(row and row[0][0])
+
+
+def preview_marker(preview):
+    """A short code for one preview, which changes whenever anything in the preview would read
+    differently. The page sends it back to have the change carried out (see the notes above)."""
+    return hashlib.sha256(json.dumps(preview, sort_keys=True).encode()).hexdigest()[:24]
+
+
+def merge_problem(device, other):
+    """Why these two devices can't be merged, in words for the owner, or None if they can.
+    Never this computer or the router, never rules waiting for the owner's decision, never two
+    devices both known only by a number, and never a number behind a Wi-Fi range extender (one
+    hardware address answers for several devices there, so QuietNet could not keep the merged
+    device together)."""
+    if not S.devices_ready:
+        return not_ready_message()
+    if device not in S.device_kind or other not in S.device_kind or device == other:
+        return "Choose two different devices to merge."
+    kinds = (S.device_kind[device], S.device_kind[other])
+    if "pi" in kinds or "hub" in kinds:
+        return "This computer and the router can't be merged with another device."
+    if device in S.set_aside or other in S.set_aside:
+        return "Those rules are waiting for your decision under \"Rules that need your decision\" on the home page."
+    if kinds == ("addr", "addr"):
+        return ("QuietNet knows both of those only by their numbers, with no hardware address for either, so it "
+                "can't keep them together as one device.")
+    for number in (device, other):
+        if S.device_kind[number] == "addr" and (S.device_warnings.get(number) == EXTENDER_OWNER
+                                                or S.provisional.get(number) is not None):
+            return ("QuietNet knows that device only by its number (it is behind a Wi-Fi range extender), so it can't "
+                    "be joined to another device. The rules keep applying to that number.")
+    if len(hardware_of(device)) + len(hardware_of(other)) > MAX_HARDWARE_ADDRESSES:
+        return "That would give one device more hardware addresses than QuietNet keeps for a device."
+    return None
+
+
+def merge_plan(device, other):
+    """How two devices would be merged: (the one kept, the one that goes, the group the merged
+    device ends in or None, the groups that give way, the devices whose own-accord membership
+    must be dropped first). `device` is the one the owner is merging INTO, whose name and group
+    win where both have one; `other` is the one being merged into it.
+
+    The device known by a hardware address is the one kept, whichever way round they were given:
+    a device known only by a number has no hardware address to be recognised by. A group that
+    QuietNet itself put a device in as a new device gives way to the other device's group, or to
+    none: the device is not new, so the new-device group must not stick to it (or a visitors'
+    group would follow the family's tablet home). That is so whichever of the two it is; when
+    both were put in theirs that way, only `other`'s gives way. Otherwise the group kept is
+    `device`'s, else `other`'s."""
+    keep, gone = (other, device) if (S.device_kind[device], S.device_kind[other]) == ("addr", "hw") else (device, other)
+    mine, theirs = S.dev_group.get(device), S.dev_group.get(other)
+    kept = {device: mine, other: theirs}
+    drop = []
+    if theirs is not None and own_membership(other):
+        drop.append(other)
+    elif mine is not None and own_membership(device):
+        drop.append(device)
+    for number in drop:
+        kept[number] = None
+    gid = kept[device] if kept[device] is not None else kept[other]
+    lost = [g for g in dict.fromkeys((mine, theirs)) if g is not None and g != gid]
+    return keep, gone, gid, lost, drop
+
+
+def merge_preview(device, other):
+    """What merging `other` into `device` would do, for the owner to read before anything is
+    done: (None, the preview) or (an error message, None). Changes nothing.
+
+    The preview is {"device", "with", "keep" (the number the merged device will have), "label",
+    "other_label", "name" (what it will be called), "group" and "group_name" (the group it will
+    be in, null and '' for none), "notes" (plain-English lines), "hardware" (one entry for each
+    hardware address of either device: {"mac", "label" (the device it belongs to now), "applies"
+    (every rule that will apply to it afterwards, each {"text", "new"}: "new" true if it does not
+    apply to that hardware address today), "stops" (the rules that apply to it today and will
+    not afterwards)}), "marker"}. Rules set for the whole house are left out: they apply either
+    way."""
+    problem = merge_problem(device, other)
+    if problem:
+        return problem, None
+    keep, gone, gid, lost, _ = merge_plan(device, other)
+    names_now = (S.given.get(device), S.given.get(other))
+    name = names_now[0] or names_now[1] or ""
+    follow = S.provisional.get(keep)
+    own, groups, cut = ["dev:%d" % keep, "dev:%d" % gone], [gid], keep in S.enforced or gone in S.enforced
+    if follow is not None and follow != gone:
+        own.append("dev:%d" % follow)
+        groups.append(S.dev_group.get(follow))
+        cut = cut or follow in S.enforced
+    after = rule_items(own, groups, cut)
+    hardware = []
+    for number in (device, other):
+        before = rules_now(number)
+        for mac in hardware_of(number):
+            hardware.append({"mac": mac, "label": device_label(number),
+                             "applies": [{"text": text, "new": key not in before} for key, text in after.items()],
+                             "stops": [text for key, text in before.items() if key not in after]})
+    notes = []
+    if name:
+        notes.append('The merged device will be called "%s".' % name
+                     + (' The name "%s" is not kept.' % names_now[1] if all(names_now) and names_now[1] != name else ""))
+    for g in lost:
+        notes.append("It will no longer be in the %s group, so what is blocked or scheduled for that group stops "
+                     "applying to it." % S.group_names.get(g, "other"))
+    for number in (device, other):
+        if S.device_kind[number] == "addr":
+            notes.append("QuietNet knows %s only by its number. Its rules and history go to the merged device; "
+                         "anything that still looks things up from that number afterwards will show as a separate "
+                         "entry again." % device_label(number))
+    notes.append("The history of both becomes one history. Every internet switch, blocked service and schedule "
+                 "either has is kept.")
+    notes.append("You can undo this with Separate on the device's page. The history then stays with this device.")
+    preview = {"device": device, "with": other, "keep": keep, "label": device_label(device),
+               "other_label": device_label(other), "name": name, "group": gid,
+               "group_name": S.group_names.get(gid, "") if gid is not None else "", "notes": notes,
+               "hardware": hardware}
+    preview["marker"] = preview_marker(preview)
+    return None, preview
+
+
+def merge_by_hand(device, other, seen):
+    """The owner's "Merge", after reading the preview: `other` is the same device as `device`, so
+    the two become one (merge_devices). `seen` is the marker of the preview the owner was shown;
+    if the preview would read differently now, nothing is done. Returns (an error message, None),
+    or (None, the number the merged device has)."""
+    with db_lock:
+        problem, preview = merge_preview(device, other)
+        if problem:
+            return problem, None
+        if not isinstance(seen, str) or seen != preview["marker"]:
+            return PREVIEW_CHANGED, None
+        keep, gone, _, _, drop = merge_plan(device, other)
+    for number in drop:
+        set_device_group(number, None)
+    merge_devices(keep, gone, "You merged %s into %s, so they are now one device with one set of rules."
+                  % (preview["other_label"], preview["label"]), prefer=device, prefer_name=device)
+    return None, keep
+
+
+def separate_problem(number, mac):
+    """Why this hardware address can't be separated from this device, in words for the owner, or
+    None if it can: the device must be one known by its hardware addresses, hold this one, and
+    hold at least one other (a device is never left with none)."""
+    if not S.devices_ready:
+        return not_ready_message()
+    if number not in S.device_kind:
+        return UNKNOWN_DEVICE
+    held = hardware_of(number)
+    if S.device_kind[number] != "hw" or len(held) < 2:
+        return "This device has only one hardware address, so there is nothing to separate."
+    if mac not in held:
+        return "That hardware address does not belong to this device."
+    if len(S.device_kind) >= 2 * MAX_DEVICES:
+        return "QuietNet is remembering as many devices as it can, so it can't make another one just now."
+    return None
+
+
+def separate_preview(number, mac):
+    """What separating the hardware address `mac` from the device `number` would do, for the owner
+    to read before anything is done: (None, the preview) or (an error message, None). Changes
+    nothing.
+
+    The preview is {"device", "mac", "label", "stays" (the hardware addresses that stay with the
+    device), "rules" (what the device carries now, in plain words: its group, its own internet
+    switch, blocked services, schedules and "cut live connections"; with "rules": "copy" the
+    separated device is given the same, with "none" it gets none of them), "notes", "marker"}."""
+    problem = separate_problem(number, mac)
+    if problem:
+        return problem, None
+    label = device_label(number)
+    rules = list(rule_items(["dev:%d" % number], [S.dev_group.get(number)], number in S.enforced).values())
+    notes = ["The hardware address %s becomes a device of its own again, with no name." % mac,
+             "Its history so far stays with %s. From now on what it looks up is kept under the new device." % label,
+             "%s keeps its name, its group, its rules and its other hardware address%s."
+             % (label, "" if len(hardware_of(number)) == 2 else "es"),
+             "QuietNet will not ask whether the two are the same device again. You can merge them again from "
+             "either one's page."]
+    preview = {"device": number, "mac": mac, "label": label, "stays": [m for m in hardware_of(number) if m != mac],
+               "rules": rules, "notes": notes}
+    preview["marker"] = preview_marker(preview)
+    return None, preview
+
+
+def separate_by_hand(number, mac, rules, seen, table=None):
+    """The owner's "Separate", after reading the preview: the hardware address `mac` is not the
+    device `number` after all, and becomes a device of its own. `rules` is the owner's answer to
+    "do the rules go with it?": "copy" gives the new device the same group, internet switch,
+    blocked services, schedules and "cut live connections" (each a copy of its own from then on),
+    "none" gives it nothing but what is set for the whole house. There is no default: the owner
+    must say. `seen` is the marker of the preview the owner was shown; if the preview would read
+    differently now, nothing is done. Returns (an error message, None), or (None, the new
+    device's number).
+
+    The history stays with the device it was merged into, and so does the record of addresses:
+    the new device starts a record of its own at the next look. The two are remembered as
+    different devices (S.not_same), so the new one is never held to the other's rules as "maybe
+    the same device". `table` is the IPv4 neighbour table as just read, for a look straight
+    afterwards, so that lookups from the separated device stop getting the other's rules at once
+    and not at the next look; without it the next look (seconds away) does that."""
+    if rules not in ("copy", "none"):
+        return "Please choose whether the rules go with it.", None
+    with db_lock:
+        problem, preview = separate_preview(number, mac)
+        if problem:
+            return problem, None
+        if not isinstance(seen, str) or seen != preview["marker"]:
+            return PREVIEW_CHANGED, None
+        save_address_use()                  # first, and by itself: it saves (commits) what the looks have seen
+        now = time.time()
+        # A device's key names the hardware address it was first known by. If that is the one
+        # leaving, the device is re-keyed to one that stays, so the key is free for the new device.
+        if db.execute("SELECT 1 FROM device WHERE id=? AND key=?", (number, "hw:" + mac)).fetchone():
+            db.execute("UPDATE device SET key=? WHERE id=?", ("hw:" + preview["stays"][0], number))
+        if db.execute("SELECT 1 FROM device WHERE key=?", ("hw:" + mac,)).fetchone():
+            db.rollback()
+            return "QuietNet could not separate that hardware address. Nothing was changed.", None
+        seen_row = db.execute("SELECT first, last FROM device_hw WHERE mac=?", (mac,)).fetchone() or (now, now)
+        first, last = seen_row[0] or now, seen_row[1] or now
+        new = db.execute("INSERT INTO device(kind, key, name, first, last) VALUES('hw',?,?,?,?)",
+                         ("hw:" + mac, "", first, last)).lastrowid
+        S.device_kind[new] = "hw"
+        S.dev_first[new], S.dev_last[new] = first, last
+        db.execute("UPDATE device_hw SET device=? WHERE mac=?", (new, mac))
+        S.hw_device[mac] = new
+        for pair in ((new, number), (number, new)):
+            S.not_same.add(pair)
+            db.execute("INSERT OR REPLACE INTO device_follow(device, follows, state, since) VALUES(?,?,?,?)",
+                       (pair[0], pair[1], "no", now))
+        if rules == "copy":
+            copy_device_rules(number, new)
+        add_event((device_addresses(number) + [""])[0],
+                  "You separated the hardware address %s from %s. It is a device of its own again, %s. Its history "
+                  "so far stays with %s." % (mac, preview["label"], "with the same rules" if rules == "copy"
+                                             else "with no rules of its own", preview["label"]), now)
+        db.commit()
+        load_schedules()                    # also tells the enforcer and the answer cache that rules changed
+    if table is not None:
+        note_ipv4_addresses(table)
+        note_ipv6_addresses()
+    return None, new
+
+
+def copy_device_rules(number, new):
+    """Give the device `new` a copy of everything the device `number` carries but its name: its
+    group (as the owner's own choice), its internet switch, its blocked services, its schedules
+    and "cut live connections". Changes S and the database; call holding db_lock (the caller
+    commits and reloads the schedules)."""
+    old_scope, scope = "dev:%d" % number, "dev:%d" % new
+    if number in S.dev_group:
+        S.dev_group[new] = S.dev_group[number]
+        db.execute("INSERT OR REPLACE INTO group_member(device, gid, auto) VALUES(?,?,0)", (new, S.dev_group[number]))
+    if old_scope in S.off:
+        S.off.add(scope)
+        db.execute("INSERT OR IGNORE INTO internet_off VALUES(?)", (scope,))
+    for service in sorted(S.svc_blocks.get(old_scope, ())):
+        S.svc_blocks.setdefault(scope, set()).add(service)
+        db.execute("INSERT OR IGNORE INTO service_blocks VALUES(?,?)", (scope, service))
+    db.execute("INSERT INTO schedules(name, scope, days, t_from, t_to, off, services, enabled) "
+               "SELECT name, ?, days, t_from, t_to, off, services, enabled FROM schedules WHERE scope=? ORDER BY id",
+               (scope, old_scope))
+    if number in S.enforced:
+        S.enforced.add(new)
+        S.enforced_mac[new] = ""
+        db.execute("INSERT OR REPLACE INTO live_cut(device, mac) VALUES(?,?)", (new, ""))
 
 
 def set_new_device_group(gid):
@@ -5759,7 +6102,8 @@ def api_devices(everything=False):
     entries share an "ip".
 
     Listed are the devices with any history, those found by a scan, those with a name, a group or
-    rules, and those a "same device?" question is about. Lookups still waiting to be filed against
+    rules, those a "same device?" question is about, and those the owner has merged, separated or
+    said are different devices. Lookups still waiting to be filed against
     a device count towards the device that has their address now. On an older database not moved
     to the device tables yet, the list is by address, as it was (api_devices_by_address).
 
@@ -5879,6 +6223,11 @@ def api_devices(everything=False):
     # a rule must never be in force, or waiting for its device, with no entry to see it on.
     carrying = devices_with_rules() | set(S.provisional) | set(S.provisional.values()) | set(warnings)
     carrying.update(n.get("to_device") for n in notices)
+    # And so is every device the owner has merged (it holds more than one hardware address) or
+    # said is a different device from another (a separated hardware address among them): what the
+    # owner has just done must show, even before the device next looks anything up.
+    carrying.update(number for number, mine in macs_of.items() if len(mine) > 1)
+    carrying.update(number for pair in list(S.not_same) for number in pair)
     for number in sorted(n for n in carrying if n in kinds):
         card(home(number), number)
     at = {}
@@ -6616,6 +6965,40 @@ class Web(BaseHTTPRequestHandler):
                 number = device_for_address(body["ip"]) if S.devices_ready else None
             error = different_device_by_hand(number)
             return self.send_json({"error": error}, 400) if error else self.send_json({"ok": True})
+        if path == "/api/merge":              # "Merge with...": what would apply first, then (with "seen") the merge
+            # "device" is the device merged into, "with" the one merged into it, both by number.
+            # Without "seen" nothing is changed: the answer is the preview. With "seen" (the
+            # preview's marker) the merge is done, if the preview would still read the same.
+            device, other = device_number(body.get("device")), device_number(body.get("with"))
+            if device is None or other is None:
+                return self.send_json({"error": UNKNOWN_DEVICE if S.devices_ready else not_ready_message()}, 400)
+            if "seen" not in body:
+                error, preview = merge_preview(device, other)
+                return self.send_json({"error": error}, 400) if error else self.send_json({"ok": True, "preview": preview})
+            error, kept = merge_by_hand(device, other, body["seen"])
+            if error:
+                return self.send_json({"error": error}, 409 if error == PREVIEW_CHANGED else 400)
+            return self.send_json({"ok": True, "device": kept})
+        if path == "/api/separate":           # "Separate": what would happen first, then (with "seen") the separation
+            # "device" is the device's number, "mac" the hardware address to take out of it.
+            # Without "seen" nothing is changed: the answer is the preview. With "seen" and the
+            # owner's answer to "do the rules go with it?" ("rules": "copy" or "none") it is done.
+            device, mac = device_number(body.get("device")), clean_mac(body.get("mac"))
+            if device is None:
+                return self.send_json({"error": UNKNOWN_DEVICE if S.devices_ready else not_ready_message()}, 400)
+            if not mac:
+                return self.send_json({"error": "That is not a hardware address."}, 400)
+            if "seen" not in body:
+                error, preview = separate_preview(device, mac)
+                return self.send_json({"error": error}, 400) if error else self.send_json({"ok": True, "preview": preview})
+            if body.get("rules") not in ("copy", "none"):
+                return self.send_json({"error": "Please choose whether the rules go with it."}, 400)
+            # The neighbour table is read before the lock is taken (it runs a system tool), for a
+            # look straight after the separation: see separate_by_hand.
+            error, new = separate_by_hand(device, mac, body["rules"], body["seen"], neighbour_table())
+            if error:
+                return self.send_json({"error": error}, 409 if error == PREVIEW_CHANGED else 400)
+            return self.send_json({"ok": True, "device": new})
         if path == "/api/rule-conflict":      # the owner's choice for rules the move set aside
             cid = body.get("id")
             if not isinstance(cid, int) or isinstance(cid, bool) or not isinstance(body.get("choice"), str):
