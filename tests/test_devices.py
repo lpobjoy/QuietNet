@@ -2208,7 +2208,8 @@ class StartUp(unittest.TestCase):
                 order.append(self.target.__name__)
 
         class Part:
-            """Stands in for the enforcer, the cloud link and the dashboard's web server."""
+            """Stands in for the enforcer, the cloud link, the trial announcer and the dashboard's
+            web server."""
             reason = "this is a test"
 
             def __init__(self, name):
@@ -2229,6 +2230,9 @@ class StartUp(unittest.TestCase):
             def stop(self):
                 """Nothing to stop."""
 
+            def ask_to_stop(self):
+                """Nothing to stop."""
+
         threads = mock.Mock(wraps=threading)
         threads.Thread = Thread
         swaps = [
@@ -2241,8 +2245,11 @@ class StartUp(unittest.TestCase):
             mock.patch.object(server.enforcer, "Enforcer", lambda *a, **k: Part("enforcer")),
             mock.patch.object(server.cloud_agent, "CloudAgent", lambda *a, **k: Part("cloud link")),
             mock.patch.object(server, "ThreadingHTTPServer", lambda *a, **k: Part("dashboard")),
+            # The real announcer would read its setting from the database and start a thread of its own.
+            mock.patch.object(server, "make_announcer", lambda: Part("announcer")),
             mock.patch.object(server.signal, "signal", lambda *a: None),
             mock.patch.object(server, "ENF", None), mock.patch.object(server, "CA", None),
+            mock.patch.object(server, "AN", None),
             mock.patch.object(server.S, "local_ip", PI),
             mock.patch("builtins.print"),
         ]
@@ -2262,6 +2269,12 @@ class StartUp(unittest.TestCase):
     def test_start_up_leaves_the_move_to_the_device_keeper(self):
         _, move = self.start_up()
         move.assert_not_called()
+
+    def test_the_trial_announcer_is_started_after_the_device_keeper_and_last_before_the_dashboard(self):
+        order, _ = self.start_up()
+        self.assertEqual(order.count("announcer"), 1)
+        self.assertGreater(order.index("announcer"), order.index("device_keeper"))
+        self.assertEqual(order[-2:], ["announcer", "dashboard"])
 
     def test_the_history_writer_is_started_at_start_up(self):
         order, _ = self.start_up()

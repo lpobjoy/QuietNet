@@ -1523,12 +1523,29 @@ class InTheServer(Api):
         self.assertEqual(server.announce_hold_reason(ADDR), "")
 
     def test_a_known_range_extender_holds_the_trial_back(self):
-        # Over IPv6 every device behind one is judged under a single device's rules (issue 95).
+        # Over IPv6 the devices behind one can't be told apart (issues 95 and 101).
         self.router_heard()
         self.assertEqual(server.announce_hold_reason(ADDR), "")
         with mock.patch.object(server.S, "shared_macs", {"aa:bb:cc:00:00:01"}):
             reason = server.announce_hold_reason(ADDR)
         self.assertIn("Wi-Fi range extender", reason)
+        self.assertIn("QuietNet is not announcing itself.", reason)
+
+    def test_with_the_device_tables_the_reason_says_lookups_behind_an_extender_get_no_devices_rules(self):
+        # Their IPv6 addresses are matched to no device, so nobody gets another device's rules.
+        self.router_heard()
+        with mock.patch.object(server.S, "shared_macs", {"aa:bb:cc:00:00:01"}), \
+                mock.patch.object(server.S, "devices_ready", True):
+            reason = server.announce_hold_reason(ADDR)
+        self.assertIn("would refuse their lookups or give them only the whole house's rules", reason)
+        self.assertNotIn("another's rules", reason)
+
+    def test_on_an_older_database_the_reason_says_one_device_could_get_anothers_rules(self):
+        # Not yet moved to the device tables: every device behind one is judged under one number's rules.
+        self.router_heard()
+        with mock.patch.object(server.S, "shared_macs", {"aa:bb:cc:00:00:01"}), \
+                mock.patch.object(server.S, "devices_ready", False):
+            reason = server.announce_hold_reason(ADDR)
         self.assertIn("could give one device another's rules", reason)
 
     def test_the_reason_to_hold_back_is_worked_out_without_the_database(self):
@@ -1636,6 +1653,9 @@ class StartingUp(Base):
             ("AN", None), ("ENF", None), ("CA", None),             # main() sets these; put back afterwards
             ("make_announcer", lambda: self.an), ("start_dns", nothing), ("find_local_ip", lambda: "192.168.1.2"),
             ("log_writer", nothing), ("router_advert_listener", nothing), ("address_watcher", nothing),
+            # The device keeper never ends, and every 5 seconds reads this computer's real neighbour
+            # table and writes to the database: left running it would disturb every later test.
+            ("device_keeper", nothing),
             ("ThreadingHTTPServer", mock.Mock(return_value=self.web)))]
         stand_ins += [mock.patch.object(server.enforcer, "Enforcer", mock.Mock()),
                       mock.patch.object(server.cloud_agent, "CloudAgent", mock.Mock()),

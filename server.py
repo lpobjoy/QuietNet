@@ -6169,11 +6169,16 @@ def announce_hold_reason(address=""):
     database, no tools. Two things hold it back, each because announcing could cut off or
     disturb a device by accident:
 
-    1. A Wi-Fi range extender is known (S.shared_macs). Over IPv6 every device behind one is
-       still matched to a single device's rules (refresh_ipv6_view). Left alone that only touches
-       a device given this computer's IPv6 address by hand; the announcement would invite every
-       device behind the extender to ask over IPv6, and one could then be blocked by another's
-       "internet off" or bedtime.
+    1. A Wi-Fi range extender is known (S.shared_macs). Over IPv6 the devices behind one can't
+       be told apart. On an older database not yet moved to the device tables, every one of them
+       is still matched to a single device's rules (refresh_ipv6_view), and one could be blocked
+       by another's "internet off" or bedtime. With the device tables in use their IPv6 addresses
+       are matched to no device (note_ipv6_addresses): a lookup from one is refused while any
+       device is treated differently from the whole house, and otherwise gets the whole house's
+       rules alone. Left alone, either only touches a device given this computer's IPv6 address
+       by hand; the announcement would invite every device behind the extender to ask over IPv6.
+       The hold was written for the first case. It is kept for the second until that has been
+       tried on a real network (known issue 101), and the reason given says which applies.
 
     2. This computer could be the ONLY IPv6 DNS server devices are told of while they have IPv6
        from a router. An Android phone counts its IPv6 as set up once it has an address, a route
@@ -6193,6 +6198,10 @@ def announce_hold_reason(address=""):
     This is for the announcer alone. It must never feed ipv6_dns_view(), `hub_off` or the "Can
     bypass over IPv6" labels, and it changes nothing they read."""
     if S.shared_macs:
+        if S.devices_ready:
+            return ("Some devices here connect through a Wi-Fi range extender, and over IPv6 QuietNet can't tell "
+                    "them apart, so it would refuse their lookups or give them only the whole house's rules. "
+                    "QuietNet is not announcing itself.")
         return ("Some devices here connect through a Wi-Fi range extender, and over IPv6 QuietNet can't yet tell "
                 "them apart, so announcing could give one device another's rules. QuietNet is not announcing itself.")
     now, mono = time.time(), time.monotonic()
