@@ -18,7 +18,7 @@ A home network filter. Devices point their DNS at it; it records what they look 
 | `server.py` | DNS filter, rules engine, dashboard web server, start-up. A map of its sections is near the top |
 | `enforcer.py` | Cuts live connections: ARP steering and firewall rules. Linux only |
 | `cloud_agent.py` | The Pi's outbound link to the relay |
-| `cloud/relay.py` | The relay: accounts, pairing, the browser-to-Pi bridge. Deployed on its own; must not import the other programs |
+| `cloud/relay.py` | The relay: accounts, pairing, licences (and the owner's `licence` command line), the browser-to-Pi bridge. Deployed on its own; must not import the other programs |
 | `static/index.html` | The dashboard. One file, served by both the Pi and the relay. Its script opens with notes for editors |
 | `services.json`, `junk_domains.txt` | Data: blockable services and the built-in advert list |
 | `install.sh` | The one-line installer for a Pi. Plain POSIX `sh` (dash, busybox ash, bash); everything in functions, only the last line runs; every value checked before use. Notes for editors at the top |
@@ -66,6 +66,7 @@ Each of these is the only thing standing between a hostile web page, or a strang
 - **The three looks (themes) must each stay complete.** The dashboard's style sheet and the relay's `RELAY_CSS` set every colour and size name for each look under `[data-theme="..."]`, with Calm as the root default (the font stacks `--font-body` and `--font-mono` are shared from the root on purpose). A new colour or size name goes into all three looks (and Calm's and Household's dark sets), the markup stays free of fixed colours and inline styles, and nothing is loaded from other websites: no font files, `@import` or outside addresses. Theme names are checked against `calm`, `household` and `control` wherever the `qn_theme` cookie is read.
 - **History queries must use an index.** `queries` can hold a month of a household's lookups. A test checks the query plans.
 - **`cloud/relay.py` is deployed without the other programs.** It cannot import them.
+- **Licence code stays on the relay and never answers 401.** It must never reach the Pi's blocking (`decision()`, the enforcer, the internet switches). A licence refusal is `402` or `403`, never `401`, which today's Pis take to mean "unpaired" and delete their token. Every licence check goes through `licence_state()` and `licence_gate()`, and the two rescue calls must keep working in every licence state.
 - **Python 3.9 must still work** for the programs: the macOS launcher prefers the Python that Apple supplies. Avoid newer syntax such as `match` or `X | Y` type hints at run time.
 
 ## Working method

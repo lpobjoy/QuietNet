@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+Licences on the relay, first phase (relay only; nothing changes on the Pi):
+- **New: one licence per account**, in new `licences` and `licence_log` tables. `licence_state()` works out the state (none, trial, active, cancelling, past due with 14 days' grace, expired, revoked; active counts as expired 3 days after its end date) and what it allows: remote access, updates, adding and pairing Pis.
+- **New: `QUIETNET_LICENCE_GATE`, off by default.** While off, nothing is refused; what would have been refused is logged (a log line and a `licence_log` row, at most once an hour per account and kind of refusal). With it on: the Pi's page becomes a "Remote access is paused" page and dashboard calls get `402`; adding a Pi needs a licence that allows it and a free seat; `POST /agent/pair` answers `403` with the reason and the licence state. Never `401` for a licence reason.
+- **New: every account that exists when licences arrive gets a `legacy` licence**, active for 90 days, with seats for its Pis (at least 2), once only.
+- **New: the paused page keeps two rescue buttons** (`POST /pi/<id>/rescue`): "Turn the internet back on for every device" and "Pause blocking for an hour", in every licence state and with the gate on or off. The relay sends only fixed calls (`/api/rescue` for a 0.6 Pi, `/api/kill {"on": false}` for an older one, `/api/pause {"minutes": 60}`), and logs each.
+- **New: seats and install ids.** A licence covers 2 Pis unless the owner changes it. A Pi may send its install id when pairing; pairing again with the same id replaces its old, offline entry, and is refused while that entry is online (a copied SD card).
+- **New: poll answers carry a `licence` object** (and `latest` when `QUIETNET_LATEST` is set). Polling is otherwise unchanged; older Pis ignore the extra keys. The Pi's `X-QuietNet-Agent` header is recorded.
+- **New: a Licence card on the home page** with one sentence per state and "Pis: N of M"; paused Pis say "Remote access paused".
+- **New: the owner's command line**, `python relay.py licence show|grant|revoke|restore|seats`, which gives up root before opening the database. Documented in `cloud/README.md` with the go-live steps; manual checks in `docs/TESTING.md`; gaps in known issue 94.
+
 Second check of the robustness review's fixes (23 November). Each is in `docs/KNOWN_ISSUES.md`, "Faults in the robustness review's fixes":
 - Two devices that swap addresses each keep their own rules (they used to swap rules). A device whose rules can't be moved to its new address has them applied there, live cut included, until the owner sorts it out.
 - Rules move onto an address left with only a name or a departed visitor's group; a moved device no longer inherits the visitors' group.

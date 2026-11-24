@@ -101,6 +101,17 @@ When Docker is missing (and the person agrees), the installer downloads `https:/
 - The pairing code is never written to a file, but Docker keeps it in the container's settings (`docker inspect quietnet` shows `QUIETNET_PAIR`) until the next run without `--code`. It has already been used or has expired by then, so it is of no use to anyone, but it is visible.
 - Uninstalling says how to remove the systemd-resolved settings file, but does not point `/etc/resolv.conf` back at `stub-resolv.conf`. Lookups keep working either way.
 
+### 94. Licences on the relay: what the first phase leaves out
+
+The relay now keeps a licence per account and can enforce it (`QUIETNET_LICENCE_GATE`, off by default). Gaps left on purpose, or found while building it:
+
+- **No way to pay or renew yet.** The paused page has no Renew button and the Licence card no billing buttons; licences come only from the owner's command line until payments are added. The wording still says "Renew at q3n.net", as the design asks.
+- **"Blocking is paused for an hour", not "until 14:35".** The relay doesn't know the Pi's time zone, so the result page after the second rescue button gives no clock time.
+- **Downloads don't take seats yet.** Seats in use are only the account's paired Pis. Installs that downloaded but never paired, and the 60-day expiry of seats, come with downloads.
+- **The gate's "once an hour" is kept in memory.** After a restart the same would-be refusal can be logged again straight away. `licence_log` is never trimmed; it grows by at most one row an hour for each account and kind of refusal, plus one row per rescue and per owner command.
+- **The legacy licences end 90 days after the first start.** Grant the owner's own account `--plan owner` (no end) before switching the gate on, or its Pis will pause when the legacy licence ends.
+- **The Pi's side isn't built yet.** Pis before 0.6 ignore the licence in poll answers and send no install id or agent header, so they get the older rescue call (kill switch off only) and every copy of them pairs as a separate Pi.
+
 ## Open: design decisions for the owner
 
 ### 5. IPv6: the enforcer, and devices known by two addresses
