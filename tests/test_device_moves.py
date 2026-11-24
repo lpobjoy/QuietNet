@@ -10,7 +10,9 @@ Standard library only. The neighbour table is always a stand-in passed to the lo
 for the API and the enforcer's plan), so nothing reads the real network.
 """
 import os
+import sqlite3
 import sys
+import threading
 import time
 import unittest
 from unittest import mock
@@ -355,7 +357,6 @@ class WhoseRulesALookupGets(Base, Setup):
     def test_a_lookup_does_not_wait_for_the_lock_that_guards_the_map(self):
         with server.rule_map_lock, server.db_lock:
             done = []
-            import threading
             t = threading.Thread(target=lambda: done.append(answered_blocked(OLD)))
             t.start()
             t.join(5)
@@ -435,6 +436,18 @@ class RangeExtenders(Base, Setup):
         error = server.same_device_by_hand(server.S.addr_only[OLD], phone)
         self.assertIn("only by its number", error)
         self.assertTrue(blocked_for(OLD))
+
+    def test_a_number_behind_an_extender_is_steered_only_on_its_own_switch(self):
+        self.look({OLD: fresh(PHONE)})
+        phone = self.give_rules(PHONE)
+        server.set_live_cut(phone, True)
+        self.become_an_extender({OLD: fresh(PHONE), OTHER: fresh(EXTENDER), NEW: fresh(EXTENDER)})
+        table = {OLD: fresh(EXTENDER), NEW: fresh(EXTENDER)}
+        self.look(table, later=600)                                 # the phone now connects through the extender
+        self.assertTrue(server.live_cut_on(OLD))                    # its lookups still get no IPv6 addresses
+        self.assertEqual(self.plan(table), {})                      # but QuietNet can't tell who is there: no steering
+        server.set_live_cut(server.S.addr_only[NEW], True)
+        self.assertEqual({ip: rule["mac"] for ip, rule in self.plan(table).items()}, {NEW: EXTENDER})
 
     def test_a_device_newly_shown_behind_an_extender_is_not_put_in_the_new_device_group(self):
         visitors = self.make_group("Visitors", "tiktok")
@@ -519,6 +532,11 @@ class MayBeTheSameDevice(Api, Setup):
         self.look({OLD: PRIVATE}, later=120)
         self.assertEqual(server.S.device_notices, [])
         self.assertTrue(blocked_for(OLD))
+
+    def test_joining_is_noted_in_plain_english(self):
+        self.ok("/api/move-rules", {"from": OLD, "to": OLD})
+        self.assertIn("You said the device at %s is the same device as Wilf's iPad, so they are now one device with "
+                      "one set of rules." % OLD, self.events())
 
     def test_saying_it_is_the_same_device_by_the_two_numbers_joins_them(self):
         self.ok("/api/move-rules", {"from_device": self.phone, "to_device": self.newcomer})
@@ -816,6 +834,24 @@ class GoneQuietNotice(Api, Setup):
         self.assertEqual((devices[NEW]["name"], devices[NEW]["id"], devices[NEW]["macs"]),
                          ("Wilf's iPad", phone, [PHONE, PRIVATE]))
 
+    def test_the_new_device_group_given_to_the_newcomer_does_not_stick_to_the_device_it_turns_out_to_be(self):
+        self.look({OLD: PHONE})
+        phone = self.give_rules(PHONE)
+        visitors = self.ok("/api/group", {"name": "Visitors"})["id"]
+        self.ok("/api/new-device-group", {"group": visitors})
+        self.look({NEW: PRIVATE}, later=server.QUIET_AFTER + 120)
+        self.assertEqual(server.S.dev_group, {self.number(PRIVATE): visitors})
+        self.ok("/api/move-rules", {"from_device": phone, "to_device": self.number(PRIVATE)})
+        self.assertEqual(server.S.dev_group, {})
+        self.assertEqual(server.sql("SELECT * FROM group_member"), [])
+
+    def test_a_group_the_owner_gave_the_newcomer_is_kept_when_the_two_are_joined(self):
+        kids = self.ok("/api/group", {"name": "Kids"})["id"]
+        phone = self.quiet_then_new()
+        self.ok("/api/device-group", {"device": self.number(PRIVATE), "group": kids})
+        self.ok("/api/move-rules", {"from_device": phone, "to_device": self.number(PRIVATE)})
+        self.assertEqual(server.S.dev_group, {phone: kids})
+
     def test_joining_is_refused_when_the_new_device_has_rules_of_its_own(self):
         self.quiet_then_new()
         server.set_internet_off("dev:%d" % self.number(PRIVATE), True)
@@ -955,6 +991,16 @@ class DevicesWithRulesAreKept(Base, Setup):
         server.refresh_devices({PI: PI_MAC, ROUTER: ROUTER_MAC, OTHER: PHONE}, now=self.long_after + 60)
         self.assertTrue(blocked_for(OTHER))
 
+    def test_a_question_about_a_forgotten_device_is_forgotten_with_it(self):
+        with server.db_lock:
+            server.db.execute("INSERT INTO device_follow(device, follows, state, since) VALUES(?,?,?,?)",
+                              (self.number(LAPTOP), self.phone, "no", self.now))
+            server.db.commit()
+        server.init_db()
+        self.assertEqual(server.S.not_same, {(self.number(LAPTOP), self.phone)})
+        server.forget_old_devices(now=self.long_after)
+        self.assertEqual((server.S.not_same, server.sql("SELECT * FROM device_follow")), (set(), []))
+
     def test_devices_with_rules_do_not_count_towards_the_limit_on_remembered_devices(self):
         server.set_device_name(self.phone, "Wilf's iPad")
         with mock.patch.object(server, "MAX_DEVICES", 0):
@@ -1085,6 +1131,11 @@ class DhcpSightings(Base, Setup):
             self.assertFalse(server.note_dhcp(PHONE, OTHER))
         self.assertEqual(server.S.dhcp_claims, {})
 
+    def test_the_device_name_listener_passes_what_it_hears_to_the_rules(self):
+        server.NAMER.on_address(PHONE, OTHER)
+        self.assertEqual(server.S.dhcp_claims[OTHER][0], PHONE)
+        self.assertTrue(blocked_for(OTHER))
+
     def test_a_dhcp_request_is_handled_without_the_database(self):
         with mock.patch.object(server, "sql", side_effect=AssertionError("database used")), \
                 mock.patch.object(server, "db", None):
@@ -1184,6 +1235,13 @@ class WhereTheEnforcerSteers(Base, Setup):
         self.look({OLD: fresh(PRIVATE)}, later=60)                  # a new private address at the phone's number
         self.assertEqual({ip: rule["mac"] for ip, rule in self.plan({OLD: fresh(PRIVATE)}).items()}, {OLD: PRIVATE})
 
+    def test_a_device_with_two_hardware_addresses_is_steered_at_each(self):
+        self.look({OLD: fresh(PHONE), NEW: fresh(LAPTOP)}, later=60)        # its Wi-Fi and its cable, joined by the owner
+        server.merge_devices(self.phone, self.number(LAPTOP))
+        table = {OLD: fresh(PHONE), NEW: fresh(LAPTOP)}
+        self.look(table, later=120)
+        self.assertEqual({ip: rule["mac"] for ip, rule in self.plan(table).items()}, {OLD: PHONE, NEW: LAPTOP})
+
     def test_the_plan_works_out_the_blocks_by_the_device_not_the_address(self):
         server.record_resolved("www.youtube.com", fake_answer(query("www.youtube.com")))
         self.look({NEW: fresh(PHONE)}, later=60)
@@ -1223,7 +1281,6 @@ class DecisionStaysFast(Base, Setup):
 
     def test_decision_takes_no_lock(self):
         with server.rule_map_lock, server.db_lock:
-            import threading
             done = []
             t = threading.Thread(target=lambda: done.append(server.decision("youtube.com", OLD)[0]))
             t.start()
@@ -1239,6 +1296,33 @@ class TheApiByDevice(Api, Setup):
         self.start_clean()
         self.look({OLD: PHONE})
         self.phone = self.number(PHONE)
+
+    def test_a_change_to_a_card_a_scan_found_goes_to_the_hardware_address_that_card_shows(self):
+        server.sql("INSERT INTO seen(ip, mac, host, ts) VALUES(?,?,?,?)", (NEW, TV, "tv", self.now), commit=True)
+        self.assertEqual([(d["ip"], d["id"], d["mac"]) for d in self.get("/api/devices")[1] if d["ip"] == NEW],
+                         [(NEW, None, TV)])                          # found by a scan; no look has confirmed it yet
+        self.ok("/api/device-name", {"ip": NEW, "name": "Lounge TV"})
+        tv = self.number(TV)
+        self.assertEqual((server.S.device_kind[tv], server.S.given[tv]), ("hw", "Lounge TV"))
+        self.look({OLD: PHONE, NEW: TV}, later=60)                  # when it is seen there, no question is asked
+        self.assertEqual((server.S.provisional, server.S.device_notices), ({}, []))
+        self.assertEqual([(d["id"], d["name"]) for d in self.get("/api/devices")[1] if d["ip"] == NEW], [(tv, "Lounge TV")])
+
+    def test_the_live_neighbour_table_wins_over_an_old_scan_when_a_card_is_first_changed(self):
+        server.sql("INSERT INTO seen(ip, mac, host, ts) VALUES(?,?,?,?)", (NEW, TV, "tv", self.now - 9000), commit=True)
+        self.neighbours_now = {NEW: LAPTOP}                         # the scan is out of date: the laptop is there now
+        self.ok("/api/internet", {"scope": "device:" + NEW, "off": True})
+        self.assertEqual(server.S.off, {"dev:%d" % self.number(LAPTOP)})
+        self.assertNotIn(TV, server.S.hw_device)
+        card = [d for d in self.get("/api/devices")[1] if d["ip"] == NEW][0]
+        self.assertEqual((card["id"], card["off"]), (self.number(LAPTOP), True))
+
+    def test_a_change_to_a_scanned_card_behind_a_range_extender_is_held_against_the_number(self):
+        server.sql("INSERT INTO seen(ip, mac, host, ts) VALUES(?,?,?,?)", (NEW, EXTENDER, "", self.now), commit=True)
+        with mock.patch.object(server.S, "shared_macs", {EXTENDER}):
+            self.ok("/api/device-name", {"ip": NEW, "name": "Garden tablet"})
+        self.assertEqual(server.S.given, {server.S.addr_only[NEW]: "Garden tablet"})
+        self.assertNotIn(EXTENDER, server.S.hw_device)
 
     def test_a_rule_given_by_address_is_kept_against_the_device_listed_there(self):
         self.ok("/api/internet", {"scope": "device:" + OLD, "off": True})
@@ -1318,6 +1402,54 @@ class TheApiByDevice(Api, Setup):
         self.look({NEW: PHONE}, later=60)
         d = self.get("/api/devices")[1][0]
         self.assertEqual((d["ip"], d["id"], d["off"], d["group"], d["paused"]), (NEW, self.phone, True, gid, False))
+
+    def test_the_number_wins_when_a_request_names_a_device_both_ways(self):
+        self.look({OLD: PHONE, NEW: LAPTOP})
+        self.ok("/api/device-name", {"ip": NEW, "device": self.phone, "name": "Wilf's iPad"})
+        self.assertEqual(server.S.given, {self.phone: "Wilf's iPad"})
+
+    def test_the_routers_own_address_always_means_the_router(self):
+        self.assertEqual(server.address_holder(ROUTER), server.S.hub_device)
+        self.assertEqual(server.address_holder(PI), server.S.pi_device)
+        self.assertEqual(server.stored_scope("device:" + ROUTER), "dev:%d" % server.S.hub_device)
+
+    def test_cut_live_connections_is_refused_for_the_router_and_this_computer_by_number(self):
+        for fixed in (server.S.hub_device, server.S.pi_device):
+            status, out = self.post("/api/enforce", {"device": fixed, "on": True})
+            self.assertEqual((status, out["error"]), (400, "QuietNet can't steer the router or itself."))
+        self.assertEqual(server.S.enforced, set())
+
+    def test_a_group_lists_a_member_that_has_no_address_now(self):
+        gid = self.ok("/api/group", {"name": "Kids"})["id"]
+        self.ok("/api/device-group", {"device": self.phone, "group": gid})
+        self.look({OLD: LAPTOP}, later=60)                          # the phone has gone and its number was given away
+        group = self.get("/api/groups")[1][0]
+        self.assertEqual((group["members"], group["devices"]), ([""], [self.phone]))
+
+    def test_a_try_at_another_dns_service_is_remembered_against_the_device_not_the_address(self):
+        server.set_internet_off("dev:%d" % self.phone, True)       # a device the owner controls
+        server.answer_query(query("dns.google"), OLD, fake_answer)
+        drain()
+        self.look({OLD: LAPTOP, NEW: PHONE}, later=60)
+        server.set_device_name(self.number(LAPTOP), "Dad laptop")
+        cards = {d["id"]: d for d in self.get("/api/devices?all=1")[1]}
+        self.assertGreater(cards[self.phone]["other_dns"], 0)
+        self.assertEqual((cards[self.number(LAPTOP)]["ip"], cards[self.number(LAPTOP)]["other_dns"]), (OLD, 0))
+
+    def test_a_suggested_name_is_filed_under_the_device_as_well_as_the_address(self):
+        hint = {"name": "Sams iPad", "source": "Bonjour", "detail": ""}
+        hints = server.hints_by_device({OLD: hint}, {OLD: PHONE})
+        self.assertEqual(hints, {OLD: hint, self.phone: hint})
+        server.set_internet_off("dev:%d" % self.phone, True)       # so it is listed without any history
+        with mock.patch.object(server.S, "hints", hints):
+            self.look({NEW: PHONE}, later=60)                       # at another address the suggestion is still its own
+            card = self.get("/api/devices")[1][0]
+            self.assertEqual((card["ip"], card["hint"]), (NEW, "Sams iPad"))
+
+    def test_a_suggested_name_for_the_router_or_an_unknown_hardware_address_is_filed_by_address_only(self):
+        hint = {"name": "hub", "source": "router", "detail": ""}
+        self.assertEqual(server.hints_by_device({ROUTER: hint, NEW: hint}, {ROUTER: ROUTER_MAC, NEW: TV}),
+                         {ROUTER: hint, NEW: hint})
 
     def test_the_new_calls_refuse_values_of_the_wrong_kind(self):
         for path, body in (("/api/rule-conflict", {}), ("/api/rule-conflict", {"id": "1", "choice": "give"}),
@@ -1561,6 +1693,16 @@ class MovingTheRules(OlderHousehold):
         self.assertIn("dev:%d" % held, server.S.off)
         self.assertEqual(server.S.rule_conflicts, [])
 
+    def test_the_choice_can_be_made_through_the_dashboard(self):
+        cid = server.S.rule_conflicts[0]["id"]
+        Api.setUpClass()
+        try:
+            api = Api("call")
+            self.assertEqual(api.call("POST", "/api/rule-conflict", {"id": cid, "choice": "remove"}), (200, {"ok": True}))
+            self.assertEqual(api.call("GET", "/api/status")[1]["devices"]["conflicts"], [])
+        finally:
+            Api.tearDownClass()
+
     def test_an_unknown_choice_changes_nothing(self):
         cid = server.S.rule_conflicts[0]["id"]
         for wrong in ((cid, "merge"), (cid + 99, "give")):
@@ -1593,7 +1735,6 @@ class MovingTheRules(OlderHousehold):
         self.assertEqual(server.S.old_rules, 0)
 
     def test_the_copy_kept_before_the_move_still_has_the_rules_as_they_were(self):
-        import sqlite3
         copy = sqlite3.connect(self.copy())
         try:
             self.assertEqual(copy.execute("SELECT COUNT(*) FROM devices").fetchone()[0], 4)
@@ -1610,6 +1751,12 @@ class MovingTheRules(OlderHousehold):
         self.assertTrue(any("The same device had rules under two numbers" in line for line in report))
         server.init_db()
         self.assertEqual(server.S.move_report, report)
+
+    def test_a_report_that_cannot_be_read_is_shown_as_empty(self):
+        for broken in ("not json", "{}", ""):
+            server.set_setting("rules_move_report", broken)
+            server.init_db()
+            self.assertEqual(server.S.move_report, [], broken)
 
     def test_the_report_says_what_each_set_of_rules_was(self):
         line = [l for l in server.S.move_report if "kept under %s (" % self.A in l][0]
@@ -1824,6 +1971,15 @@ class RulesAnOlderVersionLeftBehind(OlderHousehold):
         self.assertEqual(server.S.given[laptop], "Games console")
         self.assertIn("dev:%d" % laptop, server.S.off)
         self.assertEqual(server.api_status()["devices"]["old_rules"], 0)
+
+    def test_bringing_them_in_can_be_asked_for_through_the_dashboard(self):
+        Api.setUpClass()
+        try:
+            api = Api("call")
+            self.assertEqual(api.call("POST", "/api/move-old-rules", {}), (200, {"ok": True}))
+            self.assertEqual(api.call("GET", "/api/status")[1]["devices"]["old_rules"], 0)
+        finally:
+            Api.tearDownClass()
 
     def test_bringing_them_in_keeps_the_rules_already_held_against_devices(self):
         phone = server.S.hw_device[older.PHONE]

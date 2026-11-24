@@ -43,7 +43,9 @@ import names
 #   settings and State   the values you might tune, and S, everything held in memory
 #   database             the SQLite connection, the tables, saved settings, the history writer
 #   devices              one device is one hardware address: the device tables, which device has which
-#                        address now (S.addr_device), the history filed against it, and the one-off
+#                        address now (S.addr_device) and whose rules a lookup from each address gets
+#                        (S.addr_rules), the history, names, groups and rules held against the device,
+#                        a device that may be another with a new hardware address, and the one-off
 #                        move of an older household's data into those tables
 #   rules                the lists, schedules and decision(): is this name blocked for this device, and why
 #   DNS                  reading questions, building answers, asking the real servers, the UDP/TCP listeners
@@ -2959,8 +2961,8 @@ def live_cut_devices(table=None):
       - the device the last look put at that address (S.addr_device, itself only confirmed
         addresses) must be one the cut is on for, and the hardware address in the entry must be
         that device's own. For a device known only by its address (behind a Wi-Fi range extender)
-        it must be the hardware address noted when the cut was switched on, which is noted now if
-        it was not known then;
+        the switch must be that number's own, and the entry must hold the hardware address noted
+        when the cut was switched on, which is noted now if it was not known then;
       - every address reaches the firewall through ipaddress.IPv4Address.
     No fresh match, no steering. This computer and the router are never steered.
 
@@ -2990,10 +2992,13 @@ def live_cut_devices(table=None):
             if S.hw_device.get(mac) != number:
                 continue
         elif kind == "addr":
+            # Known only by its number: steered only on its own switch (never because a device it
+            # stands in for has the cut on: QuietNet can't tell which device is there), and only
+            # while the hardware address noted for it still answers there.
             noted = S.enforced_mac.get(number, "")
-            if noted and noted != mac:
-                continue                    # a different device (or extender) answers at this number now
-            if not noted and number in S.enforced:
+            if number not in S.enforced or (noted and noted != mac):
+                continue
+            if not noted:
                 S.enforced_mac[number] = mac
                 db.execute("UPDATE live_cut SET mac=? WHERE device=?", (mac, number))
                 db.commit()
@@ -4009,8 +4014,9 @@ def refresh_local_ip():
 
 
 def address_watcher():
-    """Background thread: keep S.local_ip up to date, and keep each device's rules with the device
-    when it changes address (refresh_devices). At start-up the network may not be ready
+    """Background thread: keep S.local_ip up to date, and take the minute's look at the neighbour
+    table (refresh_devices: spotting Wi-Fi range extenders, and on an older database keeping the
+    pause on an address a different device has). At start-up the network may not be ready
     yet (a Raspberry Pi can start QuietNet before Wi-Fi is connected), and the router may later
     hand this computer a different address. Checks every 10 seconds while there is no address,
     and every minute after that."""
@@ -4362,11 +4368,14 @@ def device_ip(text):
 def address_holder(addr):
     """The number of the device listed under this address in GET /api/devices: the device
     confirmed there now, else the last one seen there, else the one the last scan found there,
-    else the device known only by that address. None if no device is known for it. This is the
-    same order api_devices uses, so that a request that names a device by its card's address
+    else the device known only by that address. This computer's and the router's own addresses
+    are always those two fixed devices. None if no device is known for it. This is the same order
+    api_devices uses, so that a request that names a device by its card's address
     reaches the device that card shows."""
     if is_this_computer(addr) or addr in S.v6_own:
         return S.pi_device
+    if addr and addr == (home_router() or S.router):
+        return S.hub_device                 # the router's own address is always the router
     number = S.addr_device.get(addr)
     if number is None:
         use = S.addr_use.get(addr)
@@ -4384,18 +4393,30 @@ def address_holder(addr):
 
 def device_for_address(text, make=False):
     """The number of the device a request means when it names one by address: the device listed
-    under that address now (address_holder). With `make`, an address no device is known for gets
-    a device known only by that address, so a name or a rule can be held against it. None if the
-    text is not an IPv4 or IPv6 address, or no device is known (or can be made). Not for the
-    lookup path: it may read and write the database."""
+    under that address now (address_holder). With `make`, an address no device is known for yet
+    gets one, so a name or a rule can be held against it: the device with the hardware address
+    the neighbour table lists there now (the live table first: a scan's record may be out of
+    date), else the one the last scan found there, and failing both, or behind a Wi-Fi range
+    extender, a device known only by that address. The address is then recorded as that device's,
+    so its card shows what was just set. None if the text is not an IPv4 or IPv6 address, or no
+    device is known (or can be made). Not for the lookup path: it may run a tool and it reads and
+    writes the database."""
     try:
         addr = str(ipaddress.ip_address(str(text).split("%", 1)[0]))
     except ValueError:
         return None
     number = address_holder(addr)
     if number is None and make:
+        row = sql("SELECT mac FROM seen WHERE ip=?", (addr,))
+        mac = clean_mac(neighbours().get(addr, "")) or (clean_mac(row[0][0]) if row else "")
         with db_lock:
-            number = device_of_address(addr, time.time())
+            now = time.time()
+            if mac and mac not in S.shared_macs and mac != S.hub_mac:
+                number = device_of_hw(mac, now)
+                if number is not None:
+                    use_address(addr, number, now, confirmed=False)
+            if number is None:
+                number = device_of_address(addr, now)
             if db.in_transaction:
                 db.commit()
     return number
@@ -4636,8 +4657,14 @@ def same_device_by_hand(to_device, from_device=None):
         return ("That device already has rules of its own. Remove them first if you want to move "
                 "the other device's rules to it.")
     keep, gone = (from_device, to_device) if kinds[1] == "hw" else (to_device, from_device)
+    if kinds[1] == "hw" and to_device in S.dev_group and S.dev_group[to_device] == new_device_group():
+        # The newcomer was only in the new-device group because QuietNet took it for a new device.
+        # It is not one, so that group gives way: a visitors' group must not stick to the family's
+        # tablet because it came back with a new hardware address.
+        set_device_group(to_device, None)
+    newcomer = S.given.get(to_device) or "the device at %s" % (device_addresses(to_device) + ["a new number"])[0]
     merge_devices(keep, gone, "You said %s is the same device as %s, so they are now one device with one set of "
-                              "rules." % (device_label(to_device), device_label(from_device)))
+                              "rules." % (newcomer, device_label(from_device)))
     return None
 
 
@@ -4872,8 +4899,12 @@ def can_hear_router():
 
 def refresh_ipv6_view():
     """Look again at this computer's IPv6 addresses and ranges (for v6_source_allowed and 'this
-    computer'), and match each IPv6 neighbour to an IPv4 device with the same hardware address,
-    so a device's IPv6 lookups come under its IPv4 rules (see answer_query). IPv4 devices come from
+    computer'), and match each IPv6 neighbour to an IPv4 device with the same hardware address
+    (S.v6_devices): that is the address a device's IPv6 lookups are recorded under in the history,
+    what its share of the listeners is counted by, and, on an older database not yet moved to the
+    device tables, the address whose rules they get (see answer_query). With the device tables in
+    use, whose rules each IPv6 address gets is published here too, straight from the IPv6
+    neighbours' hardware addresses (ipv6_rules, into S.addr_rules). IPv4 devices come from
     the last network scan (the 'seen' table, oldest first) and then the current neighbour table,
     which is the live view and so wins; see ipv4_by_hardware_address for how a stale entry is kept
     from beating a fresh one. If the IPv6 neighbour table can't be read, nothing is matched and
@@ -5267,7 +5298,8 @@ def reverse_name(ip):
 
 # Finds device names (names.py). Reverse lookups go through reverse_name, looked up afresh on each
 # call so a stand-in put in its place is used. NAMES_WANTED asks hint_refresher to look again now.
-NAMER = names.Namer(reverse=lambda ip: reverse_name(ip))
+# Its DHCP listener also passes on which address each device says it is taking (see note_dhcp).
+NAMER = names.Namer(reverse=lambda ip: reverse_name(ip), on_address=lambda mac, address: note_dhcp(mac, address))
 NAMES_WANTED = threading.Event()
 
 
@@ -6436,7 +6468,6 @@ def main():
     S.local_ip = find_local_ip()
     threading.Thread(target=log_writer, daemon=True).start()
     if not args.no_device_names:
-        NAMER.on_address = note_dhcp        # a device saying which address it is taking (see note_dhcp)
         NAMER.start_listeners()
         threading.Thread(target=hint_refresher, daemon=True).start()
     start_dns(args.dns_port)

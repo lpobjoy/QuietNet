@@ -1276,16 +1276,17 @@ class TheDashboardPage(unittest.TestCase):
         self.assertIn("if(!lines.length) return '';", self.notice)
 
     def test_the_page_names_a_device_by_its_number_as_well_as_its_address_when_it_changes_it(self):
-        self.assertIn("const who = ip => { const id = deviceId(ip); return id ? {ip, device:id} : {ip}; };", self.page)
-        for call in ("api('/api/device-name', Object.assign(who(ip), {name}))",
-                     "api('/api/device-group', Object.assign(who(S.device), {group:",
-                     "api('/api/enforce', Object.assign(who(S.device), {on:e.target.checked}))"):
+        self.assertIn("const byDevice = ip => { const id = deviceId(ip); return id ? {ip, device:id} : {ip}; };", self.page)
+        for call in ("api('/api/device-name', Object.assign(byDevice(ip), {name}))",
+                     "api('/api/device-group', Object.assign(byDevice(S.device), {group:",
+                     "api('/api/enforce', Object.assign(byDevice(S.device), {on:e.target.checked}))"):
             self.assertIn(call, self.page)
 
     def test_the_page_keeps_a_devices_rules_under_its_number_when_it_has_one(self):
         self.assertIn("return id ? 'dev:' + id : 'device:' + ip;", self.page)
         self.assertIn("${controls(scopeOf(S.device), 'this device')}", self.page)
-        self.assertIn("jobs.push(ctl(scopeOf(S.device)))", self.page)
+        # The controls are asked for only once the device list has arrived, so the number is the right one.
+        self.assertIn("jobs.push(devices.then(() => ctl(scopeOf(S.device))))", self.page)
 
     def test_the_page_matches_a_schedule_to_a_device_by_its_number(self):
         self.assertIn("x.scope === scope || (x.device != null && scope === 'dev:' + x.device)", self.page)

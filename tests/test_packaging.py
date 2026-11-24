@@ -685,6 +685,12 @@ class DashboardDeviceMoves(unittest.TestCase):
                       self.notices)
         self.assertIn("if(d.todev){ body.to_device = d.todev; body.from_device = d.fromdev; }", self.page)
 
+    def test_a_number_now_behind_a_range_extender_offers_only_the_answer_no(self):
+        part = self.notices[self.notices.index("n.same && n.extender"):self.notices.index(": n.same && n.held")]
+        self.assertIn("now connects through a Wi-Fi range extender", part)
+        self.assertIn('data-act="notsame"', part)
+        self.assertNotIn('data-act="moverules"', part)
+
     def test_rules_kept_under_a_number_alone_get_a_notice_of_their_own(self):
         self.assertIn("n.same && n.held", self.notices)
         self.assertIn("Are they for this device?", self.notices)

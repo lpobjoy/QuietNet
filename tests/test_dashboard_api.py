@@ -1008,13 +1008,15 @@ class EnforceAndCloud(Api):
         self.assertEqual(server.S.enforced, set())
 
     def test_enforcing_remembers_which_device_it_is_from_the_live_table_first(self):
-        server.sql("INSERT INTO seen(ip,mac,host,ts) VALUES(?,?,?,?)", (KID, "aa:aa:aa:aa:aa:01", "", 0), commit=True)
-        self.neighbours_now = {KID: "bb:bb:bb:bb:bb:02"}                 # the old scan is out of date
+        server.sql("INSERT INTO seen(ip,mac,host,ts) VALUES(?,?,?,?)", (KID, "a4:aa:aa:aa:aa:01", "", 0), commit=True)
+        self.neighbours_now = {KID: "b8:27:eb:00:00:02"}                 # the old scan is out of date
         self.ok("/api/enforce", {"ip": KID, "on": True})
-        kid = self.device(KID)                                           # known only by its address so far
-        self.assertEqual(server.S.enforced_mac[kid], "bb:bb:bb:bb:bb:02")
+        there_now = server.S.hw_device["b8:27:eb:00:00:02"]
+        self.assertEqual(server.S.enforced, {there_now})                 # the device there now, not the scan's
+        self.assertNotIn("a4:aa:aa:aa:aa:01", server.S.hw_device)
         server.init_db()
-        self.assertEqual(server.S.enforced_mac[kid], "bb:bb:bb:bb:bb:02")    # kept across a restart
+        self.assertEqual(server.S.enforced, {there_now})                 # kept across a restart
+        self.assertEqual(self.device(KID), there_now)                    # and its card is that device's
 
     def test_an_unknown_hardware_address_is_filled_in_when_first_seen(self):
         self.ok("/api/enforce", {"ip": KID, "on": True})

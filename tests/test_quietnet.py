@@ -80,6 +80,11 @@ class Base(unittest.TestCase):
         hearing = mock.patch.object(server, "can_hear_router", return_value=None)
         hearing.start()
         self.addCleanup(hearing.stop)
+        # Nor is this computer's real neighbour table ever read: giving a rule to an address no
+        # device is known for looks there for a hardware address (device_for_address).
+        nobody = mock.patch.object(server, "neighbours", return_value={})
+        nobody.start()
+        self.addCleanup(nobody.stop)
         server.v6_askers.clear()
         server.v6_wanted.clear()
         server.S.other_dns = {}
