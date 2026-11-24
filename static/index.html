@@ -1118,6 +1118,20 @@ function noIpv6Switch(st){
       affected. Turn it off again at any time; devices pick that up within a couple of minutes.</p></div>
     <label class="switch"><input type="checkbox" id="noIpv6Switch" ${st.no_ipv6_all ? 'checked' : ''} aria-label="Give no device IPv6 addresses"><span></span></label></div>`;
 }
+// The setting "Take IPv6 away from devices you cut live connections for" (design option c2).
+// st.ipv6_steer is true or false; off unless the owner turns it on, because it changes those
+// devices' network. Through the relay the Pi may be an older QuietNet without it (no st.ipv6_steer):
+// then it is not offered.
+function ipv6SteerSwitch(st){
+  if(st.ipv6_steer == null) return '';
+  return `<div class="row"><div class="grow"><h2>Take IPv6 away from steered devices</h2>
+    <p class="meta">Off unless you turn it on, and only for devices you have "Cut live connections" on for. QuietNet
+      tells each of those devices that it, not the hub, is the way out for IPv6, and answers their lookups with no IPv6
+      addresses, so they use IPv4, where your blocks and cuts work. It leaves every other device alone, changes nothing
+      lasting on the Pi, and never touches a device behind a range extender. Turn it off to stop at once and hand the
+      devices straight back to the hub; without the Pi they also right themselves within a minute or two.</p></div>
+    <label class="switch"><input type="checkbox" id="ipv6SteerSwitch" ${st.ipv6_steer ? 'checked' : ''} aria-label="Take IPv6 away from steered devices"><span></span></label></div>`;
+}
 // What QuietNet knows about IPv6 on the home network, for "Set up a device". v6.hub_off is true only
 // after the Pi has listened for a full hour while able to hear the router, heard no router announce
 // IPv6, holds no public IPv6 address itself, and nothing in the home names an IPv6 DNS server other
@@ -1647,7 +1661,8 @@ function viewSetup(){
       'Set that number as the IPv6 DNS server on each device, using the steps below.',
       'This narrows the gap but does not close it: the hub still gives devices its own IPv6 DNS server, and devices marked "Can bypass over IPv6" still can. The switch below helps a little more.',
       'To undo it, turn <b>ULA Enabled</b> off again.'])}
-    ${noIpv6Switch(S.status || {})}</div>`;
+    ${noIpv6Switch(S.status || {})}
+    ${ipv6SteerSwitch(S.status || {})}</div>`;
   return `
   ${v6Warning(false)}
   ${cloudCard()}
@@ -2017,6 +2032,7 @@ document.addEventListener('change', async e => {
   if(e.target.id === 'junkSwitch'){ await api('/api/junk-switch', {on:e.target.checked}).catch(oops); refresh(); }
   if(e.target.id === 'otherDnsSwitch'){ await api('/api/other-dns-switch', {on:e.target.checked}).catch(oops); refresh(); }
   if(e.target.id === 'noIpv6Switch'){ await api('/api/no-ipv6-switch', {on:e.target.checked}).catch(oops); refresh(); }
+  if(e.target.id === 'ipv6SteerSwitch'){ await api('/api/ipv6-steer-switch', {on:e.target.checked}).catch(oops); refresh(); }
   if(e.target.id === 'enforceSwitch'){ await api('/api/enforce', Object.assign(byDevice(S.device), {on:e.target.checked})).catch(oops); refresh(true); }
   if(e.target.id === 'netSwitch'){ await api('/api/internet', {scope:e.target.dataset.scope, off:!e.target.checked}).catch(oops); refresh(true); }
   if(e.target.id === 'newGroupSel'){ await api('/api/new-device-group', {group:e.target.value ? +e.target.value : null}).catch(oops); e.target.blur(); refresh(true); }

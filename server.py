@@ -281,6 +281,7 @@ class State:
     v6_own = set()          # this computer's own IPv6 addresses (see refresh_ipv6_view)
     v6_prefixes = []        # the home network's public IPv6 ranges, from this computer's own addresses
     v6_devices = {}         # a device's IPv6 address -> its IPv4 address, matched by hardware address
+    v6_by_mac = {}          # hardware address -> {"ll": its link-local IPv6 address, "addrs": [all its IPv6 addresses]}
     v6_shared = frozenset()  # IPv6 addresses behind a range extender (S.shared_macs): each keeps its own share of lookups
     v6_dns = ""             # the IPv6 address to give devices as their DNS server ('' = none suitable)
     v6_neighbours_ok = None  # could the IPv6 neighbour table be read at the last look? (None = not looked yet)
@@ -306,6 +307,7 @@ class State:
     shared_macs = set()     # hardware addresses seen at several addresses at once: range extenders, not devices
     other_dns_all = False   # block other DNS services for every device, not just those with rules?
     no_ipv6_all = False     # give no device IPv6 addresses in answers? (the optional whole-house switch)
+    ipv6_steer = False      # take IPv6 away from steered devices (option c2)? Off unless the owner turns it on
     router_prefixes = {}    # IPv6 ranges announced by a real router -> when to forget each (time.time())
     # One device is one hardware address: see the "devices" part of this file.
     devices_ready = False   # are the device tables in use? False for an older database not moved over yet
@@ -521,6 +523,7 @@ def init_db():
     S.shared_macs = {mac for (mac,) in sql("SELECT mac FROM shared_macs WHERE hits>=?", (SHARED_AFTER,))}
     S.other_dns_all = get_setting("other_dns_all", "0") == "1"
     S.no_ipv6_all = get_setting("no_ipv6_all", "0") == "1"
+    S.ipv6_steer = get_setting("ipv6_steer", "0") == "1"
     if not sql("SELECT 1 FROM known_macs LIMIT 1"):
         # First start with this table: every device a scan has already found counts as known, so
         # none of them is mistaken for a new device and put in the new-device group.
@@ -3353,6 +3356,76 @@ def enforcement_plan():
     return plan
 
 
+# How old (seconds) the neighbour table enforcement_plan last read may be for plan6 to go by it.
+# The enforcer asks for both every two seconds, plan6 first, so the table plan6 finds is the one the
+# tick before read; a tick that ran late still finds it.
+PLAN_TABLE_KEPT = 5
+
+
+def steered_now():
+    """{IPv4 address: (hardware address, device key)} for the devices "Cut live connections" is on for
+    and that can be steered right now, for plan6: live_cut_devices' answer, so with the device tables
+    in use only a device the live neighbour table lists, at the address its rules are held at and with
+    its own hardware address. Goes by the neighbour table enforcement_plan read for the tick before
+    (S.plan_table) while that is no more than PLAN_TABLE_KEPT seconds old, so `ip neigh` is not run
+    twice every two seconds; otherwise the table is read here, before the lock is taken, because
+    reading it runs a system tool."""
+    table = None
+    if S.devices_ready and S.enforced:
+        read_at, table = S.plan_table
+        if table is None or time.monotonic() - read_at > PLAN_TABLE_KEPT:
+            table = neighbour_table()
+    with db_lock:
+        return live_cut_devices(table)
+
+
+def plan6():
+    """What IPv6 steering should do now, for the enforcer's IPv6Steerer (option c2). Reads memory
+    only (no database beyond a quick locked copy; the neighbour table only when the IPv4 plan has not
+    just read it: see steered_now), so it is cheap enough to run every two seconds on the enforcer's
+    tick. While the setting is off no device is named and nothing is read.
+
+    Returns {"enabled", "hub", "our_v6", "port", "servers", "shared", "devices"}:
+      - "enabled" is the household's setting (off unless turned on);
+      - "hub" is the real router heard announcing IPv6 most recently, by its link-local and hardware
+        addresses ({} until one is heard, which keeps the steerer from doing anything);
+      - "devices" are the devices "Cut live connections" is on for and that the live neighbour table
+        lists now (steered_now: no matching entry there, no steering, over IPv6 as over IPv4), keyed by
+        the IPv4 address each is at, each with its hardware address and its own link-local IPv6
+        address, where both are known. A merged device with two hardware addresses is named once for
+        each, at the address each is at. Never named: a device known only by its number or behind a
+        range extender, and one whose hardware address is at two live addresses at once
+        (S.hw_unsettled), whose IPv6 addresses are matched to no device either;
+      - "our_v6" is a lasting IPv6 address of this computer to answer redirected lookups from (the one
+        also offered to devices as a DNS server; '' when there is none, so no redirect is added);
+      - "port" is the port QuietNet answers on while it is listening over IPv6 (None otherwise, so no
+        redirect is added); "servers" the router's IPv6 DNS addresses to catch; "shared" the range
+        extenders, never steered."""
+    hub = {}
+    now = time.time()
+    with router_dns_lock:
+        heard = [(a, r) for a, r in S.routers_v6.items() if r.get("mac")]
+        if heard:
+            addr, rec = max(heard, key=lambda ar: ar[1].get("heard", 0))
+            hub = {"v6": addr, "mac": rec["mac"]}
+        named = [a for a, until in S.router_v6_dns.items() if until > now]
+    ours = S.v6_own if S.dns_ipv6 else set()
+    servers = ([hub["v6"]] if hub.get("v6") else []) + [a for a in named if a not in ours]
+    by_mac = S.v6_by_mac
+    devices = {}
+    for ip, (mac, number) in (steered_now() if S.ipv6_steer else {}).items():
+        if not mac or mac in S.shared_macs:
+            continue
+        if S.devices_ready and (S.device_kind.get(number) != "hw" or mac in S.hw_unsettled):
+            continue
+        info = by_mac.get(mac)
+        if info and info.get("ll"):
+            devices[ip] = {"mac": mac, "ll": info["ll"]}
+    return {"enabled": S.ipv6_steer, "hub": hub, "our_v6": S.v6_dns if S.dns_ipv6 else "",
+            "port": S.dns_port if S.dns_ipv6 else None, "servers": servers,
+            "shared": list(S.shared_macs), "devices": devices}
+
+
 def ttl_positions(resp):
     """Where each record's lifetime ("how long it may be remembered", four bytes) sits in a DNS
     answer, leaving out the settings record (type 41), which has no real lifetime. Returns a list
@@ -3867,38 +3940,52 @@ def answer_query(data, client, forwarder, over_tcp=False):
 # Linux's "tell me which of my addresses this packet was sent to" option (IP_PKTINFO). Python only
 # names it from 3.13 on Linux; its number there has always been 8. Other systems go without it.
 IP_PKTINFO = getattr(socket, "IP_PKTINFO", 8) if sys.platform.startswith("linux") else None
+# The same for IPv6 (IPV6_RECVPKTINFO asks for it; IPV6_PKTINFO carries it). Their numbers on Linux
+# have always been 49 and 50. Needed so an IPv6 lookup the enforcer redirected from the router's
+# address is answered from the address it was redirected to (option c2).
+IPV6_RECVPKTINFO = getattr(socket, "IPV6_RECVPKTINFO", 49) if sys.platform.startswith("linux") else None
+IPV6_PKTINFO = getattr(socket, "IPV6_PKTINFO", 50) if sys.platform.startswith("linux") else None
 
 
 def ask_for_reply_address(sock):
-    """On Linux, ask an IPv4 UDP socket to report, with each lookup, which of this computer's
-    addresses it was sent to. True if that worked.
+    """On Linux, ask a UDP socket to report, with each lookup, which of this computer's addresses it
+    was sent to. True if that worked.
 
-    Why: the socket listens on every address at once, so without this the system picks the
-    address an answer is sent from. When the enforcer redirects a steered device's lookup meant for
-    8.8.8.8 to this computer (see enforcer.nft_ruleset), the answer must leave from exactly the
-    address the lookup was redirected to; only then can the firewall put 8.8.8.8 back as the
-    sender. An answer from any other address of this computer would be thrown away by the device."""
-    if IP_PKTINFO is None or sock.family != socket.AF_INET or not hasattr(sock, "recvmsg"):
+    Why: the socket listens on every address at once, so without this the system picks the address an
+    answer is sent from. When the enforcer redirects a steered device's lookup meant for 8.8.8.8 (or,
+    over IPv6, the router) to this computer (see enforcer.nft_ruleset), the answer must leave from
+    exactly the address the lookup was redirected to; only then can the firewall put the original
+    server back as the sender. An answer from any other address of this computer would be thrown away
+    by the device. Both the IPv4 and the IPv6 listener ask for it, each in its own way."""
+    if not hasattr(sock, "recvmsg"):
         return False
     try:
-        sock.setsockopt(socket.IPPROTO_IP, IP_PKTINFO, 1)
-        return True
+        if sock.family == socket.AF_INET and IP_PKTINFO is not None:
+            sock.setsockopt(socket.IPPROTO_IP, IP_PKTINFO, 1)
+            return True
+        if sock.family == socket.AF_INET6 and IPV6_RECVPKTINFO is not None:
+            sock.setsockopt(socket.IPPROTO_IPV6, IPV6_RECVPKTINFO, 1)
+            return True
     except OSError:
         return False
+    return False
 
 
 def receive_lookup(sock, with_address):
-    """Wait for one lookup. Returns (packet, sender, the address it was sent to or None). The last
-    is only known when ask_for_reply_address worked (with_address)."""
+    """Wait for one lookup. Returns (packet, sender, where it was sent). The last is None unless
+    ask_for_reply_address worked (with_address): over IPv4 it is then the address text, over IPv6 a
+    ('v6', address text, network card number) tuple, both ready to pass to send_answer."""
     if not with_address:
         data, addr = sock.recvfrom(4096)
         return data, addr, None
-    data, ancillary, _flags, addr = sock.recvmsg(4096, socket.CMSG_SPACE(12))
-    return data, addr, reply_address(ancillary)
+    space = socket.CMSG_SPACE(20 if sock.family == socket.AF_INET6 else 12)
+    data, ancillary, _flags, addr = sock.recvmsg(4096, space)
+    source = reply_address6(ancillary) if sock.family == socket.AF_INET6 else reply_address(ancillary)
+    return data, addr, source
 
 
 def reply_address(ancillary):
-    """The address a lookup was sent to, from the extra details Linux gives with it (a 12-byte
+    """The address an IPv4 lookup was sent to, from the extra details Linux gives with it (a 12-byte
     record: the network card's number, then two addresses, the second being the one the packet
     was addressed to). None if it isn't there or isn't a plain address of one device."""
     for level, kind, value in ancillary:
@@ -3910,11 +3997,33 @@ def reply_address(ancillary):
     return None
 
 
+def reply_address6(ancillary):
+    """Where an IPv6 lookup was sent, from the extra details Linux gives with it (a 20-byte record:
+    the address it was addressed to, then the network card's number). Returns a ('v6', address text,
+    card number) tuple, or None if it isn't there or isn't a plain address of one device. The card
+    number is kept because replying from an IPv6 address - a link-local one especially - needs it."""
+    for level, kind, value in ancillary:
+        if level == socket.IPPROTO_IPV6 and kind == IPV6_PKTINFO and len(value) >= 20:
+            addr = ipaddress.IPv6Address(value[:16])
+            if addr.is_multicast or addr.is_unspecified:
+                return None
+            return ("v6", str(addr), struct.unpack("=I", value[16:20])[0])
+    return None
+
+
 def send_answer(sock, resp, addr, source):
-    """Send an answer back to the device that asked, from `source` (the address the lookup was sent
-    to) when that is known, so the answer leaves from the address the device or the firewall
-    expects. If the system won't send from it, fall back to letting the system choose."""
-    if source:
+    """Send an answer back to the device that asked, from `source` (where the lookup was sent) when
+    that is known, so the answer leaves from the address the device or the firewall expects. `source`
+    is an IPv4 address text, an IPv6 ('v6', address text, card number) tuple, or None (let the system
+    choose). If the system won't send from the address, fall back to letting it choose."""
+    if isinstance(source, tuple) and len(source) == 3 and source[0] == "v6":
+        try:
+            info = ipaddress.IPv6Address(source[1]).packed + struct.pack("=I", source[2])
+            sock.sendmsg([resp], [(socket.IPPROTO_IPV6, IPV6_PKTINFO, info)], 0, addr)
+            return
+        except OSError:
+            pass
+    elif source:
         try:
             info = struct.pack("=i4s4s", 0, socket.inet_aton(source), bytes(4))
             sock.sendmsg([resp], [(socket.IPPROTO_IP, IP_PKTINFO, info)], 0, addr)
@@ -5671,7 +5780,22 @@ def refresh_ipv6_view():
     matched = {addr: by_mac[mac] for addr, (mac, _) in (table6 or {}).items() if mac in by_mac}
     extenders = S.shared_macs
     shared = frozenset(addr for addr, (mac, _) in (table6 or {}).items() if mac in extenders)
+    # Each hardware address's IPv6 addresses, and its link-local one, so IPv6 steering can address a
+    # device by its own link-local without running a tool on the lookup path (plan6). Range extenders
+    # are left out: their addresses are never steered.
+    by_mac = {}
+    for addr, (mac, _) in (table6 or {}).items():
+        if mac in extenders:
+            continue
+        info = by_mac.setdefault(mac, {"ll": "", "addrs": []})
+        info["addrs"].append(addr)
+        try:
+            if ipaddress.IPv6Address(addr).is_link_local and not info["ll"]:
+                info["ll"] = addr
+        except ValueError:
+            pass
     S.v6_own, S.v6_prefixes, S.v6_devices, S.v6_dns = own, ranges, matched, for_devices
+    S.v6_by_mac = by_mac
     S.v6_shared = shared
     S.v6_table = table6 or {}               # kept for note_ipv6_addresses, which ipv6_look runs next
     if S.devices_ready:
@@ -5924,6 +6048,10 @@ def router_advert_listener(sock=None):
             if found is not None:
                 note_router_dns(found["servers"], time.time(), found["lifetime"], found["prefixes"],
                                 sender=str(sender), mac=found["mac"])
+                # A real router announcing resets a steered device's idea of where the router is, so
+                # wake the enforcer to send the claim again at once (option c2).
+                if found["lifetime"] > 0 and ENF is not None:
+                    ENF.poke()
     finally:
         S.ra_listening = False
         S.ra_since = None
@@ -6153,7 +6281,7 @@ def api_status():
     return {
         "ip": S.local_ip, "dns_ok": S.dns_error is None, "dns_error": S.dns_error, "dns_port": S.dns_port,
         "paused_for": max(0, int(S.paused_until - now)), "junk_on": S.junk_on,
-        "other_dns_all": S.other_dns_all, "no_ipv6_all": S.no_ipv6_all,
+        "other_dns_all": S.other_dns_all, "no_ipv6_all": S.no_ipv6_all, "ipv6_steer": S.ipv6_steer,
         "kill": "all" in S.off, "clock": time.strftime("%H:%M"),
         "junk_count": S.junk_count,
         "community": {"installed": bool(S.junk_community), "count": len(S.junk_community),
@@ -7185,6 +7313,15 @@ class Web(BaseHTTPRequestHandler):
                 db.commit()
             rules_changed()
             return self.send_json({"ok": True})
+        if path == "/api/ipv6-steer-switch":     # take IPv6 away from steered devices (off by default)
+            # Turning it off is also "Stop IPv6 steering now": the next enforcer tick hands every
+            # steered device back to the router (IPv6Steerer.release_all), and poke() runs it at once.
+            with db_lock:
+                S.ipv6_steer = bool(body.get("on"))
+                db.execute("INSERT OR REPLACE INTO settings(key, value) VALUES('ipv6_steer', ?)",
+                           ("1" if S.ipv6_steer else "0",))
+                db.commit()
+            return self.send_json({"ok": True})
         if path == "/api/junk-switch":
             S.junk_on = bool(body.get("on"))
             set_setting("junk_on", "1" if S.junk_on else "0")
@@ -7265,7 +7402,8 @@ def main():
 
     global ENF
     ENF = enforcer.Enforcer(S.local_ip, enforcement_plan, plan_neighbours, data_dir=DATA,
-                            learn_mac=learn_enforced_mac, dns_port=None if S.dns_error else S.dns_port)
+                            learn_mac=learn_enforced_mac, dns_port=None if S.dns_error else S.dns_port,
+                            plan6=plan6)
     ENF.start()
     threading.Thread(target=address_watcher, daemon=True).start()
     # Only now, with the filter answering and the enforcer started: bring an older household's

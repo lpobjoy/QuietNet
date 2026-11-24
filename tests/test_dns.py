@@ -6,6 +6,7 @@ Run with:  python3 -m unittest discover tests
 
 Standard library only. The "real internet" is a pretend upstream on this computer.
 """
+import ipaddress
 import os
 import queue
 import socket
@@ -595,10 +596,41 @@ class ReplyAddress(unittest.TestCase):
             self.assertFalse(server.ask_for_reply_address(sock))
         sock.setsockopt.assert_not_called()
 
-    def test_the_option_is_not_asked_for_on_the_ipv6_listener(self):
+    def test_the_v6_option_is_asked_for_on_the_ipv6_listener(self):
+        # The IPv6 listener needs it too: an IPv6 lookup the enforcer redirected from the router must
+        # be answered from the address it was redirected to (option c2).
         sock = mock.Mock(family=socket.AF_INET6)
-        with mock.patch.object(server, "IP_PKTINFO", 8):
+        with mock.patch.object(server, "IPV6_RECVPKTINFO", 49):
+            self.assertTrue(server.ask_for_reply_address(sock))
+        sock.setsockopt.assert_called_once_with(socket.IPPROTO_IPV6, 49, 1)
+
+    def test_the_v6_option_is_not_asked_for_away_from_linux(self):
+        sock = mock.Mock(family=socket.AF_INET6)
+        with mock.patch.object(server, "IPV6_RECVPKTINFO", None):
             self.assertFalse(server.ask_for_reply_address(sock))
+        sock.setsockopt.assert_not_called()
+
+    def test_the_v6_address_a_lookup_was_sent_to_is_read(self):
+        info = ipaddress.IPv6Address("fe80::1").packed + struct.pack("=I", 3)
+        with mock.patch.object(server, "IPV6_PKTINFO", 50):
+            got = server.reply_address6([(socket.IPPROTO_IPV6, 50, info)])
+        self.assertEqual(got, ("v6", "fe80::1", 3))
+
+    def test_a_v6_lookup_sent_to_a_group_gives_no_reply_address(self):
+        info = ipaddress.IPv6Address("ff02::1").packed + struct.pack("=I", 3)
+        with mock.patch.object(server, "IPV6_PKTINFO", 50):
+            self.assertIsNone(server.reply_address6([(socket.IPPROTO_IPV6, 50, info)]))
+
+    def test_an_answer_is_sent_from_the_v6_address_the_lookup_was_sent_to(self):
+        sock = mock.Mock()
+        with mock.patch.object(server, "IPV6_PKTINFO", 50):
+            server.send_answer(sock, b"answer", ("fe80::9", 5000, 0, 3), ("v6", "fe80::1", 3))
+        sock.sendmsg.assert_called_once()
+        (parts, ancillary, flags, addr), _ = sock.sendmsg.call_args
+        level, kind, info = ancillary[0]
+        self.assertEqual((parts, level, kind), ([b"answer"], socket.IPPROTO_IPV6, 50))
+        self.assertEqual(info, ipaddress.IPv6Address("fe80::1").packed + struct.pack("=I", 3))
+        sock.sendto.assert_not_called()
 
     def test_the_listener_answers_from_the_address_each_lookup_was_sent_to(self):
         sock = mock.Mock(family=socket.AF_INET)
