@@ -489,6 +489,64 @@ class Devices(Api):
         self.ok("/api/other-dns-switch", {"on": False})
         self.assertFalse(server.S.other_dns_all)
 
+    def test_the_no_ipv6_switch_is_off_until_the_owner_turns_it_on(self):
+        self.assertIs(self.get("/api/status")[1]["no_ipv6_all"], False)
+
+    def test_the_no_ipv6_switch_is_saved_and_shown_in_the_status(self):
+        self.ok("/api/no-ipv6-switch", {"on": True})
+        self.assertTrue(self.get("/api/status")[1]["no_ipv6_all"])
+        server.init_db()
+        self.assertTrue(server.S.no_ipv6_all)
+        self.ok("/api/no-ipv6-switch", {"on": False})
+        self.assertFalse(server.S.no_ipv6_all)
+        server.init_db()
+        self.assertFalse(server.S.no_ipv6_all)
+
+    def test_the_no_ipv6_switch_bites_on_the_very_next_lookup_and_lets_go_as_fast(self):
+        v6 = bytes.fromhex("2a001450400908000000000000000200")
+        internet = lambda d: d[:2] + b"\x81\x80\x00\x01\x00\x01\x00\x00\x00\x00" + d[12:] \
+            + b"\xc0\x0c\x00\x1c\x00\x01\x00\x00\x01\x2c\x00\x10" + v6
+        self.assertIn(v6, server.answer_query(query("www.bbc.co.uk", 28), KID, internet))
+        self.ok("/api/no-ipv6-switch", {"on": True})
+        self.assertNotIn(v6, server.answer_query(query("www.bbc.co.uk", 28), KID, internet))
+        self.ok("/api/no-ipv6-switch", {"on": False})
+        self.assertIn(v6, server.answer_query(query("www.bbc.co.uk", 28), KID, internet))
+
+    def test_every_device_is_marked_as_able_to_bypass_over_ipv6_while_the_network_has_ipv6(self):
+        self.log(KID, "www.bbc.co.uk")
+        self.log(ADULT, "www.bbc.co.uk")
+        server.S.ra_heard = time.time()
+        self.assertEqual([d["v6_bypass"] for d in self.get("/api/devices")[1]], [True, True])
+
+    def test_a_device_with_cut_live_connections_is_still_marked_as_able_to_bypass_over_ipv6(self):
+        self.log(KID, "www.bbc.co.uk")
+        server.S.enforced = {KID}
+        server.S.v6_prefixes = [server.ipaddress.IPv6Network("2001:db8:1:2::/64")]
+        d = self.get("/api/devices")[1][0]
+        self.assertEqual((d["enforced"], d["v6_bypass"]), (True, True))
+
+    def test_no_device_is_marked_as_able_to_bypass_over_ipv6_on_an_ipv4_only_network(self):
+        self.log(KID, "www.bbc.co.uk")
+        self.assertIs(self.get("/api/devices")[1][0]["v6_bypass"], False)
+
+    def test_quietnets_own_machine_is_never_marked_as_able_to_bypass_over_ipv6(self):
+        self.addCleanup(setattr, server.S, "local_ip", server.S.local_ip)
+        server.S.local_ip = ADULT
+        self.log(ADULT, "www.bbc.co.uk")
+        server.S.ra_heard = time.time()
+        self.assertIs(self.get("/api/devices")[1][0]["v6_bypass"], False)
+
+    def test_the_status_says_whether_the_filter_is_taking_lookups_over_ipv6(self):
+        with mock.patch.object(server.S, "dns_ipv6", True):
+            self.assertIs(self.get("/api/status")[1]["ipv6"]["taking_lookups"], True)
+        with mock.patch.object(server.S, "dns_ipv6", False):
+            self.assertIs(self.get("/api/status")[1]["ipv6"]["taking_lookups"], False)
+
+    def test_the_status_carries_the_ipv6_confirmation_and_what_it_rests_on(self):
+        ipv6 = self.get("/api/status")[1]["ipv6"]
+        self.assertEqual((ipv6["hub_off"], ipv6["listening_for"], ipv6["routers"], ipv6["neighbours_ok"]),
+                         (False, 0, [], None))
+
     def test_ordinary_activity_is_not_flagged_as_another_dns_service(self):
         self.log(KID, "www.bbc.co.uk")
         g = self.get("/api/activity?ip=%s&hours=24" % KID)[1][0]

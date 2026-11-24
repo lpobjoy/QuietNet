@@ -12,6 +12,7 @@ No extra software is needed - just Python 3.
 """
 import argparse
 import collections
+import functools
 import hashlib
 import ipaddress
 import json
@@ -108,6 +109,13 @@ OTHER_DNS_SERVICES = frozenset((
 MAX_OTHER_DNS_DEVICES = 1024   # devices remembered as having tried another DNS service (see S.other_dns)
 ROUTER_RECHECK = 300           # seconds between looks at which router this computer uses
 IPV6_RECHECK = 60              # seconds between looks at this computer's IPv6 addresses and its IPv6 neighbours
+# A lookup from an IPv6 address no device is matched to yet (a phone makes itself a new one about
+# daily) asks for a look straight away, so the gap is seconds, not a minute (see matched_ipv6_device).
+V6_QUICK_GAP = 2               # seconds: the least time between two such looks, however many lookups ask
+V6_ANSWER_WAIT = 0.4           # seconds: the most one lookup waits for a look that is about to happen
+V6_MAX_WAITING = 8             # lookups that may wait like that at once; any more are not held up at all
+V6_ASKS_PER_ADDRESS = 3        # looks one unmatched address may set off in each IPV6_RECHECK seconds
+V6_MAX_ASKERS = 512            # unmatched addresses whose asks are counted at once
 # Listening for the router's IPv6 announcements, to spot it naming its own DNS server (see router_advert_listener).
 RA_READ_BYTES = 2048           # the most of one announcement read; real ones are well under 1500
 RA_MAX_PER_SECOND = 20         # announcements looked at each second; any more are read and ignored
@@ -225,8 +233,17 @@ class State:
     v6_prefixes = []        # the home network's public IPv6 ranges, from this computer's own addresses
     v6_devices = {}         # a device's IPv6 address -> its IPv4 address, matched by hardware address
     v6_dns = ""             # the IPv6 address to give devices as their DNS server ('' = none suitable)
+    v6_neighbours_ok = None  # could the IPv6 neighbour table be read at the last look? (None = not looked yet)
+    v6_checked = None       # when (time.monotonic()) the IPv6 view was last worked out without a fault
+    v6_looked_at = None     # when (time.monotonic()) ipv6_watcher last finished a look, good or bad
+    v6_round = 0            # how many looks ipv6_watcher has finished (a waiting lookup watches this change)
+    v6_watching = False     # is ipv6_watcher running?
+    v6_looking = False      # is ipv6_watcher in the middle of a look right now?
     ra_listening = False    # is router_advert_listener hearing the router's IPv6 announcements?
     ra_heard = None         # when (time.time()) the router last announced IPv6 on the home network
+    ra_heard_at = None      # the same moment by time.monotonic(), which a change of the clock can't move
+    ra_since = None         # when (time.monotonic()) router_advert_listener began listening (None = it isn't)
+    routers_v6 = {}         # real routers heard announcing: link-local address -> {"mac", "heard" (time.time())}
     router_v6_dns = {}      # IPv6 DNS servers the router names -> when to forget each (time.time())
     other_dns = {}          # device address -> when (time.time()) it last looked up another DNS service
     dev_mac = {}            # device ip with rules or a name -> the hardware address those belong to (see refresh_devices)
@@ -238,6 +255,7 @@ class State:
     follow = {}             # device ip -> the ip its own rules are kept under, while they can't be moved there
     shared_macs = set()     # hardware addresses seen at several addresses at once: range extenders, not devices
     other_dns_all = False   # block other DNS services for every device, not just those with rules?
+    no_ipv6_all = False     # give no device IPv6 addresses in answers? (the optional whole-house switch)
     router_prefixes = {}    # IPv6 ranges announced by a real router -> when to forget each (time.time())
 
 
@@ -266,8 +284,18 @@ answer_cache_lock = threading.Lock()
 # spot a router that sends lookups back here, so the two can't ask each other for ever.
 router_waiting = {}
 router_waiting_lock = threading.Lock()
-# Guards S.router_v6_dns and S.ra_heard, written by router_advert_listener and read by the dashboard.
+# Guards S.router_v6_dns, S.ra_heard, S.ra_heard_at, S.router_prefixes and S.routers_v6, written by
+# router_advert_listener and read by the dashboard.
 router_dns_lock = threading.Lock()
+# The quick look at the IPv6 neighbours (see matched_ipv6_device and ipv6_watcher). v6_wanted is set
+# by a lookup from an unmatched IPv6 address to wake the watcher; v6_looked is told each time a look
+# finishes; v6_waiting caps how many lookups wait for one; v6_askers counts each address's asks as
+# address -> [asks, when the count began (time.monotonic())].
+v6_wanted = threading.Event()
+v6_looked = threading.Condition()
+v6_waiting = threading.BoundedSemaphore(V6_MAX_WAITING)
+v6_askers = {}
+v6_askers_lock = threading.Lock()
 # The thread clearing one device's history, started by the last POST /api/clear-history that named
 # a device (None before any). Kept so the tests can wait for it to finish.
 last_clear = None
@@ -387,6 +415,7 @@ def init_db():
                 S.guest_group[ip] = (guest_mac, guest_gid)
     S.shared_macs = {mac for (mac,) in sql("SELECT mac FROM shared_macs WHERE hits>=?", (SHARED_AFTER,))}
     S.other_dns_all = get_setting("other_dns_all", "0") == "1"
+    S.no_ipv6_all = get_setting("no_ipv6_all", "0") == "1"
     if not sql("SELECT 1 FROM known_macs LIMIT 1"):
         # First start with this table: every device a scan has already found counts as known, so
         # none of them is mistaken for a new device and put in the new-device group.
@@ -1408,6 +1437,74 @@ def device_address(host):
     return host
 
 
+def no_ipv6_for_everyone(name, qtype, client):
+    """Does the optional "Give no device IPv6 addresses" switch (S.no_ipv6_all, off unless the
+    owner turns it on) apply to this lookup? Never to a name only the home network can answer
+    (is_home_name: printers, the router and other home devices may be reachable over IPv6 alone),
+    and never to QuietNet's own machine. Reads S only."""
+    return S.no_ipv6_all and not is_home_name(name, qtype) and not is_this_computer(client)
+
+
+def ask_for_ipv6_look(client):
+    """A lookup came from an IPv6 address no device is matched to: ask ipv6_watcher to look at the
+    IPv6 neighbours again now, not at the next minute. Returns True if a look is on its way. Only
+    sets a flag, so it costs a lookup nothing.
+
+    If a look has been asked for already, nothing more is needed. Otherwise this address sets one
+    off, which it may do V6_ASKS_PER_ADDRESS times in IPV6_RECHECK seconds: enough for a second
+    look when the first came a moment too early, without letting a device that can never be
+    matched (one QuietNet has not seen over IPv4) keep the watcher busy for ever. The watcher
+    itself never looks more often than every V6_QUICK_GAP seconds. Does nothing while the watcher
+    isn't running."""
+    if not S.v6_watching:
+        return False
+    if v6_wanted.is_set():
+        return True
+    now = time.monotonic()
+    with v6_askers_lock:
+        entry = v6_askers.get(client)
+        if entry is None or now - entry[1] >= IPV6_RECHECK:
+            if len(v6_askers) >= V6_MAX_ASKERS:
+                v6_askers.clear()
+            entry = v6_askers[client] = [0, now]
+        if entry[0] >= V6_ASKS_PER_ADDRESS:
+            return False
+        entry[0] += 1
+    v6_wanted.set()
+    return True
+
+
+def matched_ipv6_device(client):
+    """The IPv4 address of the device asking from this IPv6 address (S.v6_devices), or None if it
+    can't be matched. Called for a lookup, before decision(), never inside it.
+
+    A phone makes itself a new IPv6 address about daily, and ipv6_watcher looks only every minute.
+    So an unknown address asks for a look straight away (ask_for_ipv6_look) and, when a look is
+    under way or can start at once, this lookup waits for it, for V6_ANSWER_WAIT seconds at most,
+    and then looks the address up again. It does not wait when the watcher finished a look less
+    than V6_QUICK_GAP seconds ago (the next one is not due yet) or when V6_MAX_WAITING lookups are
+    waiting already, so a flood from made-up addresses can't tie up the threads that answer
+    everyone else. The wait runs on one of the answering threads; the thread that receives lookups
+    never waits."""
+    seen_round = S.v6_round
+    mapped = S.v6_devices.get(client)
+    if mapped:
+        return mapped
+    asked = ask_for_ipv6_look(client)
+    if not S.v6_looking:
+        looked = S.v6_looked_at
+        if not asked or (looked is not None and time.monotonic() - looked < V6_QUICK_GAP):
+            return None
+    if not v6_waiting.acquire(blocking=False):
+        return None
+    try:
+        with v6_looked:
+            v6_looked.wait_for(lambda: S.v6_round != seen_round, V6_ANSWER_WAIT)
+    finally:
+        v6_waiting.release()
+    return S.v6_devices.get(client)
+
+
 def answer_query(data, client, forwarder, over_tcp=False):
     """The whole life of one lookup: read it, decide, record it, answer it.
 
@@ -1425,10 +1522,13 @@ def answer_query(data, client, forwarder, over_tcp=False):
         client = S.local_ip
     elif client and ":" in client:
         # A device asking from its own IPv6 address. Rules are set on IPv4 addresses, so file it
-        # under its IPv4 address if it can be matched. If not, and any rule applies to particular
-        # devices or groups, refuse: the device then asks QuietNet's IPv4 address instead, where
-        # its own rules are known, rather than slip past them over IPv6.
-        mapped = S.v6_devices.get(client)
+        # under its IPv4 address if it can be matched (a new address is looked for at once: see
+        # matched_ipv6_device). If not, and any device is treated differently from the whole
+        # house (device_rules_exist), refuse, rather than answer it as if it were not one. A refused
+        # device tries its next DNS server. That may be QuietNet's IPv4 address, where its rules
+        # are known, or the router's own IPv6 DNS server, which is a way round QuietNet, not an
+        # outage (docs/KNOWN_ISSUES.md, issue 5).
+        mapped = matched_ipv6_device(client)
         if mapped:
             client = mapped
         elif device_rules_exist():
@@ -1463,12 +1563,13 @@ def answer_query(data, client, forwarder, over_tcp=False):
     log_q.put((time.time(), client, name, 1 if blocked else 0))
     if blocked:
         return blocked_reply(data, qtype, qend)
-    if qtype in NO_IPV6_TYPES and live_cut_on(client):
+    if qtype in NO_IPV6_TYPES and (live_cut_on(client) or no_ipv6_for_everyone(name, qtype, client)):
         # "Cut live connections" steers and cuts IPv4 only. So a device it is on gets no IPv6
         # addresses ('no error, no records', like blocked_reply for other questions), and its apps
         # connect over IPv4, through the Pi, where they can be cut. Made fresh each time and never
         # remembered, so the answer cache can't hand this empty answer to other devices, or their
-        # real IPv6 answers to this one.
+        # real IPv6 answers to this one. The optional whole-house switch does the same for every
+        # device (see no_ipv6_for_everyone).
         return reply(data, qend, 0)
     # Only now, with the device's own rules already checked, may a remembered answer stand in for
     # the trip to the internet.
@@ -1546,25 +1647,76 @@ def send_answer(sock, resp, addr, source):
     sock.sendto(resp, addr)
 
 
-def udp_server(sock):
+class Shares:
+    """How many lookups (or TCP connections) each device has in hand right now, so that no one
+    device can take them all. Counted per device, not per address: see share_key. One of these is
+    shared by the IPv4 and the IPv6 listener (UDP_SHARES, TCP_SHARES), so a device asking over both,
+    or from several IPv6 addresses, still gets one share. Safe to use from several threads."""
+
+    def __init__(self):
+        """Nothing in hand for anyone."""
+        self.lock = threading.Lock()
+        self.count = {}                 # share_key -> how many it has in hand now
+
+    def take(self, who, limit):
+        """Count one more for this device, or return False if it already has `limit` in hand."""
+        with self.lock:
+            mine = self.count.get(who, 0)
+            if mine >= limit:
+                return False
+            self.count[who] = mine + 1
+            return True
+
+    def give_back(self, who):
+        """Count one fewer for this device, once a lookup or connection is finished with."""
+        with self.lock:
+            left = self.count.get(who, 1) - 1
+            if left > 0:
+                self.count[who] = left
+            else:
+                self.count.pop(who, None)
+
+
+UDP_SHARES = Shares()       # lookups over UDP, across the IPv4 and IPv6 listeners
+TCP_SHARES = Shares()       # connections over TCP, across the IPv4 and IPv6 listeners
+
+
+def share_key(host):
+    """Whose share a lookup from this address counts against (see Shares): the device's, not the
+    address's. An IPv4 device reaching the IPv6 listener counts as its IPv4 address
+    (device_address); this computer counts as one, whichever of its addresses it asks from; and an
+    IPv6 address matched to a device (S.v6_devices) counts as that device's IPv4 address, so a
+    phone with four IPv6 addresses has one share, not five. An IPv6 address that can't be matched
+    counts by itself. One or two dictionary lookups, no database."""
+    who = device_address(host)
+    if who in ("127.0.0.1", "::1") or who in S.v6_own:
+        return S.local_ip
+    if who and ":" in who:
+        return S.v6_devices.get(who, who)
+    return who
+
+
+def udp_server(sock, shares=None):
     """Receive lookups on the UDP socket for ever, handing each to a pool of 64 worker
     threads so that one slow upstream answer does not hold up the rest. At most
     MAX_DNS_WAITING are in hand at once, and at most MAX_DNS_PER_DEVICE from any one device;
     beyond that, new lookups are dropped rather than queued without limit (a flood from one
     device, or the internet being down). The per-device share means one busy or broken device
     can't use up every slot and stop everyone else's lookups. Devices simply ask again.
+    `shares` counts each device's lookups in hand; start_dns gives the IPv4 and IPv6 listeners
+    the same one (UDP_SHARES), so a device's share is one across both and across all its
+    addresses (see share_key). Left out, this listener counts by itself.
     On the IPv6 socket, lookups from outside the home network are dropped unanswered.
     On Linux, each answer leaves from the address its lookup was sent to (see ask_for_reply_address)."""
     pool = ThreadPoolExecutor(max_workers=64)
     with_address = ask_for_reply_address(sock)
     slots = threading.BoundedSemaphore(MAX_DNS_WAITING)
     on_ipv6 = sock.family == socket.AF_INET6
-    in_hand = {}                    # device address -> lookups of its being answered now
-    in_hand_lock = threading.Lock()
+    shares = shares or Shares()
 
-    def work(data, addr, source):
-        """Answer one lookup and send the reply back to the device that asked, from `source`."""
-        who = device_address(addr[0])
+    def work(who, data, addr, source):
+        """Answer one lookup and send the reply back to the device that asked, from `source`.
+        `who` is the share it was counted against, handed back when done."""
         try:
             resp = answer_query(data, addr[0], forward_udp)
             if resp:
@@ -1572,12 +1724,7 @@ def udp_server(sock):
         except Exception as e:
             print("Lookup problem:", e)
         finally:
-            with in_hand_lock:
-                left = in_hand.get(who, 1) - 1
-                if left > 0:
-                    in_hand[who] = left
-                else:
-                    in_hand.pop(who, None)
+            shares.give_back(who)
             slots.release()
 
     while True:
@@ -1587,13 +1734,13 @@ def udp_server(sock):
             continue
         if on_ipv6 and not v6_source_allowed(addr[0]):
             continue                        # from outside the home: no answer at all (see v6_source_allowed)
-        who = device_address(addr[0])
-        with in_hand_lock:
-            mine = in_hand.get(who, 0)
-            if mine >= MAX_DNS_PER_DEVICE or not slots.acquire(blocking=False):
-                continue
-            in_hand[who] = mine + 1
-        pool.submit(work, data, addr, source)
+        who = share_key(addr[0])
+        if not shares.take(who, MAX_DNS_PER_DEVICE):
+            continue
+        if not slots.acquire(blocking=False):
+            shares.give_back(who)
+            continue
+        pool.submit(functools.partial(work, who), data, addr, source)
 
 
 class TCPHandler(socketserver.BaseRequestHandler):
@@ -1621,32 +1768,34 @@ class TCPServer(socketserver.ThreadingTCPServer):
     daemon_threads = True
 
     def __init__(self, *args, **kw):
-        """As usual, plus the count of connections in hand, in all and for each device."""
+        """As usual, plus the count of connections in hand, in all and for each device. `shares`
+        counts each device's; start_dns swaps in the one shared by the IPv4 and IPv6 listeners
+        (TCP_SHARES), so a device's share is one across both and across all its addresses."""
         self.slots = threading.BoundedSemaphore(MAX_TCP_CLIENTS)
-        self.in_hand = {}                   # device address -> its connections open now
-        self.in_hand_lock = threading.Lock()
+        self.shares = Shares()
+        self.holders = {}                   # an open connection's (address, port, ...) -> the share it took
+        self.holders_lock = threading.Lock()
         super().__init__(*args, **kw)
 
     def take_slot(self, client_address):
         """Take one of this device's connections and one of the house's, or return False if
-        either has none left."""
-        who = device_address(client_address[0])
-        with self.in_hand_lock:
-            mine = self.in_hand.get(who, 0)
-            if mine >= MAX_TCP_PER_DEVICE or not self.slots.acquire(blocking=False):
-                return False
-            self.in_hand[who] = mine + 1
+        either has none left. Which device's share was taken is remembered for give_slot_back,
+        because the match between an IPv6 address and a device can change while it is open."""
+        who = share_key(client_address[0])
+        if not self.shares.take(who, MAX_TCP_PER_DEVICE):
+            return False
+        if not self.slots.acquire(blocking=False):
+            self.shares.give_back(who)
+            return False
+        with self.holders_lock:
+            self.holders[client_address] = who
         return True
 
     def give_slot_back(self, client_address):
         """Hand back what take_slot took, once a connection is finished with."""
-        who = device_address(client_address[0])
-        with self.in_hand_lock:
-            left = self.in_hand.get(who, 1) - 1
-            if left > 0:
-                self.in_hand[who] = left
-            else:
-                self.in_hand.pop(who, None)
+        with self.holders_lock:
+            who = self.holders.pop(client_address, None)
+        self.shares.give_back(share_key(client_address[0]) if who is None else who)
         self.slots.release()
 
     def process_request(self, request, client_address):
@@ -1687,29 +1836,39 @@ def start_dns(port):
     """Open the DNS port for UDP and TCP and start serving, on IPv4 and, where this computer has
     it, IPv6 (start_dns6). If the IPv4 port cannot be opened (usually because something else is
     using it) the reason is kept in S.dns_error for the dashboard to show, and the rest of
-    QuietNet carries on."""
+    QuietNet carries on. IPv6 is tried either way: one failing must not take the other with it,
+    and the IPv6 watcher that start_dns6 starts is needed whether or not the filter is listening."""
     S.dns_port = port
+    sock = None
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         sock.bind(("0.0.0.0", port))
         tcp = TCPServer(("0.0.0.0", port), TCPHandler)
+        tcp.shares = TCP_SHARES
     except OSError as e:
+        if sock is not None:
+            sock.close()
         S.dns_error = str(e)
         print("Could not start the filter on port %d: %s" % (port, e))
-        return
-    threading.Thread(target=udp_server, args=(sock,), daemon=True).start()
-    threading.Thread(target=tcp.serve_forever, daemon=True).start()
+    else:
+        threading.Thread(target=udp_server, args=(sock, UDP_SHARES), daemon=True).start()
+        threading.Thread(target=tcp.serve_forever, daemon=True).start()
     start_dns6(port)
 
 
 def start_dns6(port):
     """Also listen for lookups over IPv6, on the same port, for devices the router has told to use
     an IPv6 address for DNS. Optional: if this computer has no IPv6, or the port can't be opened on
-    it, the reason is printed and QuietNet carries on with IPv4 alone. Returns True if listening."""
+    it, the reason is printed and QuietNet carries on with IPv4 alone. Returns True if listening.
+
+    The IPv6 watcher (ipv6_watcher) is started here whenever this computer has IPv6 at all, even
+    if the port can't be opened: the dashboard's "IPv6 is off on your hub" check needs to know
+    whether this computer holds a public IPv6 address, listening or not."""
     if not socket.has_ipv6 or not hasattr(socket, "IPV6_V6ONLY"):
         print("This computer has no IPv6, so the filter listens on IPv4 only.")
         return False
+    threading.Thread(target=ipv6_watcher, daemon=True).start()
     sock = None
     try:
         sock = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
@@ -1717,13 +1876,14 @@ def start_dns6(port):
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         sock.bind(("::", port))
         tcp = TCPServer6(("::", port), TCPHandler)
+        tcp.shares = TCP_SHARES
     except OSError as e:
         if sock is not None:
             sock.close()
-        print("Could not listen for lookups over IPv6 on port %d (%s). IPv4 lookups still work." % (port, e))
+        print("Could not listen for lookups over IPv6 on port %d (%s). %s" % (
+            port, e, "IPv4 lookups still work." if S.dns_error is None else "The filter is not listening at all."))
         return False
-    threading.Thread(target=ipv6_watcher, daemon=True).start()
-    threading.Thread(target=udp_server, args=(sock,), daemon=True).start()
+    threading.Thread(target=udp_server, args=(sock, UDP_SHARES), daemon=True).start()
     threading.Thread(target=tcp.serve_forever, daemon=True).start()
     S.dns_ipv6 = True
     return True
@@ -1750,12 +1910,19 @@ def v6_source_allowed(host):
 
 
 def device_rules_exist():
-    """Are there any rules that apply to particular devices or groups rather than the whole house:
-    an internet switch, a blocked service or an enabled schedule? Used to decide whether an IPv6
-    lookup that can't be matched to a device must be refused (see answer_query)."""
-    return (any(sc != "all" for sc in S.off)
-            or any(sc != "all" and ids for sc, ids in S.svc_blocks.items())
-            or any(x["scope"] != "all" for x in S.schedules if x["enabled"]))
+    """Is any device treated differently from the whole house: an internet switch, a blocked
+    service or an enabled schedule for a device or a group, "Cut live connections" on for a device
+    (S.enforced), or a device in a group, even a group with no rules yet? Used to decide whether an
+    IPv6 lookup that can't be matched to a device must be refused (see answer_query).
+
+    The last two matter because such a device is treated differently even with no rule to its
+    name: one with "Cut live connections" gets no IPv6 addresses (answering it unmatched would hand
+    them back, undoing the cut), and one in a group is kept away from other DNS services
+    (other_dns_blocked_for). Reads S only, so it is cheap enough for a lookup."""
+    return bool(S.enforced or S.dev_group or S.guest_group
+                or any(sc != "all" for sc in S.off)
+                or any(sc != "all" and ids for sc, ids in S.svc_blocks.items())
+                or any(x["scope"] != "all" for x in S.schedules if x["enabled"]))
 
 
 # ------------------------------------------------------------------ helpers
@@ -1812,11 +1979,31 @@ def address_watcher():
 # a while; on a home network Linux keeps such entries for good, so a device that has moved on can
 # still be listed at its old address. Failed and unfinished entries are left out altogether.
 FRESH_STATES = ("REACHABLE", "DELAY", "PROBE", "PERMANENT", "NOARP")
+# Which freshness to believe when two entries disagree: confirmed just now, then not known, then stale.
+FRESHNESS_RANK = {"fresh": 2, "": 1, "stale": 0}
+
+
+def freshness_of(states):
+    """How fresh a neighbour-table entry is, from the words `ip neigh` ends its line with: "fresh",
+    "stale" or "" (not known), or None for an entry to leave out (failed, or never finished)."""
+    if any(x in states for x in ("FAILED", "INCOMPLETE")):
+        return None
+    return "fresh" if any(x in states for x in FRESH_STATES) else ("stale" if "STALE" in states else "")
+
+
+def keep_fresher(out, address, mac, fresh):
+    """Put one neighbour-table entry into `out` ({address: (mac, freshness)}), unless the address
+    is there already with an entry at least as fresh. The same address can be listed twice (once
+    per network card, say); a stale entry must never replace one confirmed just now."""
+    old = out.get(address)
+    if old is None or FRESHNESS_RANK[fresh] > FRESHNESS_RANK[old[1]]:
+        out[address] = (mac, fresh)
 
 
 def neighbour_table():
     """Which devices this computer currently knows about: {ip: (mac, freshness)}, where freshness
-    is "fresh", "stale" or "" (not known). See FRESH_STATES.
+    is "fresh", "stale" or "" (not known). See FRESH_STATES. An address listed twice keeps its
+    fresher entry (keep_fresher).
 
     On Linux (e.g. a Raspberry Pi) it runs `ip -4 neigh show`, which says how fresh each entry is,
     and falls back to /proc/net/arp (no tools needed, but no freshness) if that can't be run. On
@@ -1830,11 +2017,9 @@ def neighbour_table():
                     m = re.match(r"^(\d+\.\d+\.\d+\.\d+)\s.*\blladdr ([0-9a-fA-F:]{11,17})\b(.*)$", line.strip())
                     if not m:
                         continue
-                    states = m.group(3).split()
-                    if any(x in states for x in ("FAILED", "INCOMPLETE")):
-                        continue
-                    fresh = "fresh" if any(x in states for x in FRESH_STATES) else ("stale" if "STALE" in states else "")
-                    out[m.group(1)] = (tidy_mac(m.group(2)), fresh)
+                    fresh = freshness_of(m.group(3).split())
+                    if fresh is not None:
+                        keep_fresher(out, m.group(1), tidy_mac(m.group(2)), fresh)
                 return out
         except (OSError, ValueError, subprocess.SubprocessError):
             pass
@@ -2446,27 +2631,103 @@ def own_ipv6(announced=None):
     return own, ranges, (sorted(local) + sorted(public) + [""])[0]
 
 
-def ipv6_neighbours():
-    """The devices this computer has recently talked to over IPv6: {IPv6 address: hardware address}.
-    From `ip -6 neigh` on Linux and `ndp -an` on a Mac. Empty if neither tool can be run."""
-    out = {}
-    if os.path.exists("/proc/net/if_inet6"):
-        command, pattern = [IP_TOOL, "-6", "neigh", "show"], r"^([0-9a-fA-F:]+)\s.*\blladdr ([0-9a-fA-F:]{11,17})\b"
+# What `ndp -an` on a Mac prints in its "St" column, as the freshness words used here.
+NDP_FRESHNESS = {"R": "fresh", "D": "fresh", "P": "fresh", "S": "stale"}
+
+
+def ipv6_neighbour_table():
+    """The devices this computer has recently talked to over IPv6: {IPv6 address: (hardware
+    address, freshness)}, with freshness as in neighbour_table. From `ip -6 neigh` on Linux and
+    `ndp -an` on a Mac. None if neither tool can be run or it reports a fault, which is not the
+    same as "no neighbours": the dashboard says so, since nothing can then be matched.
+
+    Entries the system has confirmed, is checking, or simply hasn't heard from for a while (stale)
+    are all kept: a device's private IPv6 address is not handed on to another device, so a stale
+    entry is still right about whose it is. Failed and unfinished entries are left out. An address
+    listed twice keeps its fresher entry."""
+    on_linux = os.path.exists("/proc/net/if_inet6")
+    if on_linux:
+        command, pattern = [IP_TOOL, "-6", "neigh", "show"], r"^([0-9a-fA-F:]+)\s.*\blladdr ([0-9a-fA-F:]{11,17})\b(.*)$"
     else:
-        command, pattern = [NDP, "-an"], r"^([0-9a-fA-F:]+)(?:%\S+)?\s+([0-9a-fA-F]{1,2}(?::[0-9a-fA-F]{1,2}){5})\s"
+        command = [NDP, "-an"]
+        pattern = r"^([0-9a-fA-F:]+)(?:%\S+)?\s+([0-9a-fA-F]{1,2}(?::[0-9a-fA-F]{1,2}){5})\s(.*)$"
     try:
-        text = subprocess.run(command, capture_output=True, text=True, timeout=10).stdout
+        done = subprocess.run(command, capture_output=True, text=True, timeout=10)
     except (OSError, ValueError, subprocess.SubprocessError):
-        return out
-    for line in text.splitlines():
+        return None
+    if done.returncode != 0:
+        return None
+    out = {}
+    for line in done.stdout.splitlines():
         m = re.match(pattern, line.strip())
         if not m:
             continue
+        rest = m.group(3).split()
+        if on_linux:
+            fresh = freshness_of(rest)
+        else:                                   # after the hardware address: network card, expiry, state
+            fresh = NDP_FRESHNESS.get(rest[2] if len(rest) > 2 else "", "")
+        if fresh is None:
+            continue
         try:
-            out[str(ipaddress.IPv6Address(m.group(1)))] = tidy_mac(m.group(2))
+            keep_fresher(out, str(ipaddress.IPv6Address(m.group(1))), tidy_mac(m.group(2)), fresh)
         except ValueError:
             continue
     return out
+
+
+def ipv6_neighbours():
+    """The devices this computer has recently talked to over IPv6: {IPv6 address: hardware address}.
+    Empty if the neighbour table can't be read. See ipv6_neighbour_table."""
+    return {addr: mac for addr, (mac, _) in (ipv6_neighbour_table() or {}).items()}
+
+
+def eui64_mac(address):
+    """The hardware address an IPv6 address was built from, or '' if it wasn't built that way.
+
+    Some devices make the second half of an IPv6 address from their hardware address (the "EUI-64"
+    form): the first three bytes, then ff:fe, then the last three, with one bit of the first byte
+    flipped. So 2001:db8::0211:22ff:fe33:4455 was built from 00:11:22:33:44:55.
+
+    This is a hint only, and must never decide which device's rules a lookup gets. Any device can
+    put someone else's hardware address into its own IPv6 address, and an address chosen at
+    random can have ff:fe in the middle by chance. Which device an IPv6 address belongs to is
+    decided by the neighbour table alone (refresh_ipv6_view); the hint is only shown to the owner
+    (api_devices), and only when the neighbour table has seen that hardware address."""
+    try:
+        packed = ipaddress.IPv6Address(str(address).split("%", 1)[0]).packed
+    except ValueError:
+        return ""
+    if packed[11:13] != b"\xff\xfe":
+        return ""
+    raw = bytes([packed[8] ^ 0x02]) + packed[9:11] + packed[13:16]
+    return clean_mac(":".join("%02x" % b for b in raw))
+
+
+def ipv4_by_hardware_address(table, scanned):
+    """{hardware address: the IPv4 address its device is at}, for matching IPv6 addresses to
+    devices. `table` is neighbour_table()'s answer; `scanned` is (ip, mac) rows from the last
+    network scan, oldest first.
+
+    The neighbour table is the live view, so any entry in it beats the scan. When it lists one
+    hardware address at two addresses (a TV that moved from .65 to .67 keeps a stale entry at
+    .65 for a long time), the one confirmed just now wins, then one of unknown freshness, then a
+    stale one; never simply whichever line was printed last. Between two equally fresh, the one
+    the device's rules are kept under (S.dev_mac) wins, then the lower address, so the answer is
+    the same every time. Hardware addresses that can't belong to one device are left out."""
+    best = {}                                   # mac -> (how good, ip)
+    for ip, mac in scanned:
+        if clean_mac(mac):
+            best[clean_mac(mac)] = ((-1, False), ip)
+    for ip in sorted(table):
+        mac, fresh = table[ip]
+        mac = clean_mac(mac)
+        if not mac:
+            continue
+        how_good = (FRESHNESS_RANK.get(fresh, 1), S.dev_mac.get(ip) == mac)
+        if mac not in best or how_good > best[mac][0]:
+            best[mac] = (how_good, ip)
+    return {mac: ip for mac, (_, ip) in best.items()}
 
 
 def refresh_ipv6_view():
@@ -2474,28 +2735,51 @@ def refresh_ipv6_view():
     computer'), and match each IPv6 neighbour to an IPv4 device with the same hardware address,
     so a device's IPv6 lookups come under its IPv4 rules (see answer_query). IPv4 devices come from
     the last network scan (the 'seen' table, oldest first) and then the current neighbour table,
-    which is fresher and so wins."""
+    which is the live view and so wins; see ipv4_by_hardware_address for how a stale entry is kept
+    from beating a fresh one. If the IPv6 neighbour table can't be read, nothing is matched and
+    S.v6_neighbours_ok says so for the dashboard."""
     with router_dns_lock:
         announced = list(S.router_prefixes) if S.ra_listening else None
     own, ranges, for_devices = own_ipv6(announced)
-    by_mac = {}
-    if db is not None:
-        for ip, mac in sql("SELECT ip, mac FROM seen WHERE mac != '' ORDER BY ts"):
-            by_mac[mac] = ip
-    by_mac.update({mac: ip for ip, mac in neighbours().items()})
-    matched = {addr: by_mac[mac] for addr, mac in ipv6_neighbours().items() if mac in by_mac}
+    scanned = sql("SELECT ip, mac FROM seen WHERE mac != '' ORDER BY ts") if db is not None else []
+    by_mac = ipv4_by_hardware_address(neighbour_table(), scanned)
+    table6 = ipv6_neighbour_table()
+    matched = {addr: by_mac[mac] for addr, (mac, _) in (table6 or {}).items() if mac in by_mac}
     S.v6_own, S.v6_prefixes, S.v6_devices, S.v6_dns = own, ranges, matched, for_devices
+    S.v6_neighbours_ok = table6 is not None
+    S.v6_checked = time.monotonic()
+
+
+def ipv6_look():
+    """One look by ipv6_watcher: work the IPv6 view out again, then tell any lookup waiting for
+    it (matched_ipv6_device) that it is done, whether or not it worked."""
+    S.v6_looking = True
+    try:
+        refresh_ipv6_view()
+    except Exception as e:
+        print("Could not check this computer's IPv6 addresses:", e, flush=True)
+    finally:
+        with v6_looked:
+            S.v6_round += 1
+            S.v6_looked_at = time.monotonic()
+            S.v6_looking = False
+            v6_looked.notify_all()
 
 
 def ipv6_watcher():
-    """Background thread, started when the filter listens on IPv6: keep the IPv6 view up to date,
-    looking again every IPV6_RECHECK seconds. Done here, never on a lookup, because it runs tools."""
-    while True:
-        try:
-            refresh_ipv6_view()
-        except Exception as e:
-            print("Could not check this computer's IPv6 addresses:", e, flush=True)
-        time.sleep(IPV6_RECHECK)
+    """Background thread, started when this computer has IPv6: keep the IPv6 view up to date,
+    looking again every IPV6_RECHECK seconds, or sooner when a lookup arrives from an IPv6 address
+    no device is matched to (ask_for_ipv6_look), but never less than V6_QUICK_GAP seconds after
+    the last look. Done here, never on a lookup, because it runs tools."""
+    S.v6_watching = True
+    try:
+        while True:
+            v6_wanted.clear()               # before the look: an ask that arrives during it earns another
+            ipv6_look()
+            if v6_wanted.wait(IPV6_RECHECK):
+                time.sleep(max(0.0, V6_QUICK_GAP - (time.monotonic() - S.v6_looked_at)))
+    finally:
+        S.v6_watching = False
 
 
 def read_router_advert(data):
@@ -2503,8 +2787,10 @@ def read_router_advert(data):
     {"lifetime": how long, in seconds, devices may send through the sender (0 = it is not a
     router for them), "servers": the DNS servers it names (its RDNSS parts, option 25) as
     (address text, seconds to keep using it), "prefixes": the address ranges it hands out (option
-    3) as (network, seconds valid)}, or None if the message is not a router announcement or is
-    badly formed.
+    3) as (network, seconds valid), "mac": the sender's hardware address as the message itself
+    gives it (its source link-layer address, option 1; '' if it gives none, or one that could not
+    belong to a single device)}, or None if the message is not a router announcement or is badly
+    formed.
 
     The message comes from anyone on the home network, so every length is checked before it is
     used: the fixed 16-byte start, then each option's length byte (in 8-byte units; 0 is not
@@ -2515,7 +2801,7 @@ def read_router_advert(data):
     loopback and IPv4-style addresses are skipped, as no device would use them for DNS."""
     if not isinstance(data, (bytes, bytearray)) or len(data) < 16 or data[0] != 134 or data[1] != 0:
         return None
-    out = {"lifetime": int.from_bytes(data[6:8], "big"), "servers": [], "prefixes": []}
+    out = {"lifetime": int.from_bytes(data[6:8], "big"), "servers": [], "prefixes": [], "mac": ""}
     at = 16
     while at < len(data):
         if len(data) - at < 2:
@@ -2533,6 +2819,11 @@ def read_router_advert(data):
                 if addr.is_multicast or addr.is_unspecified or addr.is_loopback or addr.ipv4_mapped:
                     continue
                 out["servers"].append((str(addr), lifetime))
+        elif kind == 1:
+            # The sender's hardware address: 8 bytes on Ethernet and Wi-Fi (type, length, six bytes).
+            # Another size belongs to another kind of network and is passed over; the first one counts.
+            if units == 1 and not out["mac"]:
+                out["mac"] = clean_mac(":".join("%02x" % b for b in data[at + 2:at + 8]))
         elif kind == 3:
             if units != 4:
                 return None
@@ -2551,7 +2842,7 @@ def parse_router_advert(data):
     return None if found is None else found["servers"]
 
 
-def note_router_dns(servers, now, router_lifetime=1, prefixes=()):
+def note_router_dns(servers, now, router_lifetime=1, prefixes=(), sender="", mac=""):
     """Remember the IPv6 DNS servers named in one router announcement (from read_router_advert),
     each until its stated lifetime runs out, but never more than RA_HOLD_MAX seconds without being
     named again, so a router that stops naming one (IPv6 switched off, say) is forgotten within the
@@ -2563,10 +2854,25 @@ def note_router_dns(servers, now, router_lifetime=1, prefixes=()):
     network having IPv6 (S.ra_heard), and only its address ranges (`prefixes`) are remembered in
     S.router_prefixes, the same way. A Thread border router, such as an Apple TV or a HomePod mini,
     announces a range of its own with a lifetime of 0, and does so precisely when the home router's
-    IPv6 is switched off; it must not make the network look as if it has IPv6."""
+    IPv6 is switched off; it must not make the network look as if it has IPv6.
+
+    For a real router, the address the announcement came from (`sender`, its link-local address)
+    and the hardware address it gave (`mac`) are kept too, in S.routers_v6, for RA_HOLD_MAX seconds
+    after it was last heard and for RA_MAX_SERVERS routers at most. Nothing acts on them yet: they
+    are what anyone on the home network claimed, shown in the status for the owner and kept for
+    the work on steering IPv6. An announcement that gives no hardware address keeps the last one
+    that sender gave."""
     with router_dns_lock:
         if router_lifetime > 0:
             S.ra_heard = now
+            S.ra_heard_at = time.monotonic()
+            if sender:
+                S.routers_v6[sender] = {"mac": mac or S.routers_v6.get(sender, {}).get("mac", ""), "heard": now}
+        for addr in [a for a, r in S.routers_v6.items() if now - r["heard"] >= RA_HOLD_MAX]:
+            del S.routers_v6[addr]
+        while len(S.routers_v6) > RA_MAX_SERVERS:
+            del S.routers_v6[min(S.routers_v6, key=lambda a: S.routers_v6[a]["heard"])]
+        if router_lifetime > 0:
             for net, valid in prefixes:
                 if valid == 0:
                     S.router_prefixes.pop(net, None)
@@ -2636,10 +2942,16 @@ def router_advert_listener(sock=None):
     hop limit of 255, as real ones always do (one that has passed through a router arrives with
     less, so it can't have come from the home network); when the system gives no hop limit, the
     address check alone applies. At most RA_MAX_PER_SECOND are looked at each second, so a flood of
-    them costs little. Never sends anything."""
+    them costs little. Never sends anything.
+
+    The address each announcement came from is passed on with it, so a real router's link-local
+    address and hardware address are kept (note_router_dns). When listening began is kept too
+    (S.ra_since), so the dashboard only says "IPv6 is off on your hub" after a full hour of
+    listening; it is cleared when listening stops."""
     sock = sock or open_ra_socket()
     if sock is None:
         return
+    S.ra_since = time.monotonic()
     S.ra_listening = True
     window, looked = time.monotonic(), 0
     try:
@@ -2656,7 +2968,8 @@ def router_advert_listener(sock=None):
                 continue
             looked += 1
             try:
-                if not ipaddress.IPv6Address(str(addr[0]).split("%")[0]).is_link_local:
+                sender = ipaddress.IPv6Address(str(addr[0]).split("%")[0])
+                if not sender.is_link_local:
                     continue
             except (ValueError, IndexError, TypeError):
                 continue
@@ -2664,27 +2977,62 @@ def router_advert_listener(sock=None):
                 continue
             found = read_router_advert(data)
             if found is not None:
-                note_router_dns(found["servers"], time.time(), found["lifetime"], found["prefixes"])
+                note_router_dns(found["servers"], time.time(), found["lifetime"], found["prefixes"],
+                                sender=str(sender), mac=found["mac"])
     finally:
         S.ra_listening = False
+        S.ra_since = None
 
 
-def ipv6_dns_view(now=None):
+# How recently the IPv6 view must have been worked out for "this computer holds no public IPv6
+# address" to count as something seen, not something assumed (see ipv6_dns_view).
+V6_VIEW_FRESH = 3 * IPV6_RECHECK
+
+
+def ipv6_dns_view(now=None, mono=None):
     """What the dashboard shows about IPv6 and DNS (the "ipv6" part of GET /api/status): the
     address to give devices for IPv6 DNS ('' if QuietNet isn't taking lookups over IPv6 or has no
     lasting address), whether the router's announcements are being listened for and when it last
     announced IPv6, the IPv6 DNS servers it names, and which of those are not this computer.
     "in_use" says the home network has IPv6: this computer has a public IPv6 range, or the router
-    announced IPv6 within the last hour (the live-cut card then says IPv6 can't be cut). A
-    server only counts as this computer if QuietNet is taking lookups over IPv6 on that address."""
+    announced IPv6 within the last hour (devices are then marked "can bypass QuietNet over IPv6").
+    A server only counts as this computer if QuietNet is taking lookups over IPv6 on that address.
+
+    "hub_off" is the confirmation "IPv6 is off on your hub". It is true only when every one of
+    these holds, so that not knowing never looks like being protected:
+      - the announcement listener is running and has run for a full hour (RA_HOLD_MAX) without a
+        break ("listening_for" is how long, in seconds; 0 when it isn't running). A listener that
+        never started, or a restart, starts the hour again;
+      - no real router was heard announcing IPv6 in that hour;
+      - this computer holds no public IPv6 address, and that was looked at in the last few minutes
+        (V6_VIEW_FRESH), not assumed because the IPv6 watcher isn't running.
+    The hour is measured with time.monotonic() (`mono`), not the clock: a Pi has no clock of its
+    own, and the jump when it gets the right time after starting must not count as an hour.
+
+    "routers" lists the real routers heard in the last hour (link-local address, the hardware
+    address each gave, when last heard), most recent first. "neighbours_ok" is whether the IPv6
+    neighbour table could be read at the last look (null before the first), and "taking_lookups"
+    whether the filter is listening on IPv6 at all; the home page warns when lookups arrive over
+    IPv6 but can't be matched to devices."""
     now = time.time() if now is None else now
+    mono = time.monotonic() if mono is None else mono
     with router_dns_lock:
         named = sorted(a for a, until in S.router_v6_dns.items() if until > now)
-        heard = S.ra_heard
+        heard, heard_at = S.ra_heard, S.ra_heard_at
+        routers = sorted(({"address": a, "mac": r["mac"], "heard": r["heard"]}
+                          for a, r in S.routers_v6.items() if now - r["heard"] < RA_HOLD_MAX),
+                         key=lambda r: (-r["heard"], r["address"]))
     ours = S.v6_own if S.dns_ipv6 else set()
     in_use = bool(S.v6_prefixes) or bool(heard and now - heard < RA_HOLD_MAX)
+    since = S.ra_since
+    listening_for = max(0, int(mono - since)) if S.ra_listening and since is not None else 0
+    quiet = heard_at is None or mono - heard_at >= RA_HOLD_MAX
+    looked = S.v6_checked is not None and mono - S.v6_checked < V6_VIEW_FRESH
     return {"dns_address": S.v6_dns if S.dns_ipv6 else "", "listening": S.ra_listening,
+            "listening_for": listening_for,
             "router_heard": heard, "router_dns": named, "in_use": in_use,
+            "hub_off": listening_for >= RA_HOLD_MAX and quiet and looked and not in_use,
+            "routers": routers, "neighbours_ok": S.v6_neighbours_ok, "taking_lookups": S.dns_ipv6,
             "router_dns_not_ours": [a for a in named if a not in ours]}
 
 
@@ -2828,7 +3176,7 @@ def api_status():
     return {
         "ip": S.local_ip, "dns_ok": S.dns_error is None, "dns_error": S.dns_error, "dns_port": S.dns_port,
         "paused_for": max(0, int(S.paused_until - now)), "junk_on": S.junk_on,
-        "other_dns_all": S.other_dns_all,
+        "other_dns_all": S.other_dns_all, "no_ipv6_all": S.no_ipv6_all,
         "kill": "all" in S.off, "clock": time.strftime("%H:%M"),
         "junk_count": S.junk_count,
         "community": {"installed": bool(S.junk_community), "count": len(S.junk_community),
@@ -2861,10 +3209,21 @@ def api_devices():
     """GET /api/devices: every device that has used QuietNet, been found by a scan or has rules
     that follow it (S.dev_mac),
     with its name, group, switches and today's counts, and when (if in the last 24 hours) it last
-    tried to use another DNS service."""
+    tried to use another DNS service.
+
+    "v6_bypass" is the honest label "can bypass QuietNet over IPv6": true for every device but this
+    computer while the home network has IPv6 (ipv6_dns_view's "in_use"). That includes a device
+    with "Cut live connections" on, because steering covers IPv4 only: its lookups to the router's
+    own IPv6 DNS server, and anything it reaches over IPv6, never pass through QuietNet.
+
+    "same_as" is a hint for a card filed under an IPv6 address that could not be matched to a
+    device: the IPv4 address of the device whose hardware address that IPv6 address was built from
+    (eui64_mac), when a scan or the neighbour table has seen that hardware address. It is only
+    shown; no rule is ever applied from it."""
     since = time.time() - 86400
     given = dict(sql("SELECT ip, name FROM devices"))
     hints = S.hints
+    v6_on = ipv6_dns_view()["in_use"]
     out = {}
 
     def entry(ip):
@@ -2872,8 +3231,9 @@ def api_devices():
         return out.setdefault(ip, {
             "ip": ip, "name": given.get(ip) or "", "hint": hints.get(ip, {}).get("name", ""),
             "hint_source": hints.get(ip, {}).get("source", ""), "hint_detail": hints.get(ip, {}).get("detail", ""),
-            "mac": "",
+            "mac": "", "same_as": "",
             "this_computer": ip == S.local_ip, "last": 0, "n": 0, "nb": 0, "on_network": 0,
+            "v6_bypass": v6_on and ip != S.local_ip,
             "group": S.dev_group.get(ip), "off": internet_off_for(ip),
             "enforced": ip in S.enforced, "other_dns": other_dns_since(ip, since),
             "paused": ip in S.paused_ips, "warning": S.device_warnings.get(ip, "")})
@@ -2895,9 +3255,12 @@ def api_devices():
     for ip, mac in list(S.dev_mac.items()) + [(n["to"], n["mac"]) for n in S.device_notices]:
         d = entry(ip)
         d["mac"] = d["mac"] or mac
+    at = {clean_mac(d["mac"]): d["ip"] for d in out.values() if ":" not in d["ip"] and clean_mac(d["mac"])}
     for d in out.values():
         if not d["hint"] and not d["hint_detail"] and names.is_private_mac(d["mac"]):
             d["hint_detail"] = names.PRIVATE_NOTE
+        if ":" in d["ip"]:
+            d["same_as"] = at.get(eui64_mac(d["ip"]), "")
     # Devices using QuietNet first (most recent at the top), then the rest in address order.
     return sorted(out.values(), key=lambda d: (-d["last"], [int(x) if x.isdigit() else 0 for x in d["ip"].split(".")]))
 
@@ -3407,6 +3770,14 @@ class Web(BaseHTTPRequestHandler):
                 S.other_dns_all = bool(body.get("on"))
                 db.execute("INSERT OR REPLACE INTO settings(key, value) VALUES('other_dns_all', ?)",
                            ("1" if S.other_dns_all else "0",))
+                db.commit()
+            rules_changed()
+            return self.send_json({"ok": True})
+        if path == "/api/no-ipv6-switch":       # give no device IPv6 addresses (optional, off by default)
+            with db_lock:
+                S.no_ipv6_all = bool(body.get("on"))
+                db.execute("INSERT OR REPLACE INTO settings(key, value) VALUES('no_ipv6_all', ?)",
+                           ("1" if S.no_ipv6_all else "0",))
                 db.commit()
             rules_changed()
             return self.send_json({"ok": True})
