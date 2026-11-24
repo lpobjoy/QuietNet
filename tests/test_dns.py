@@ -19,6 +19,11 @@ from unittest import mock
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from test_quietnet import ADULT, KID, Base, fake_answer, query, server
 
+# The real check of whether this computer could hear the router over IPv6. Base swaps it for a
+# stand-in in every test, so that no test reads the real machine's network cards; the tests of the
+# check itself put this back, with stand-ins underneath it.
+REAL_CAN_HEAR_ROUTER = server.can_hear_router
+
 
 def drain_log():
     out = []
@@ -1002,6 +1007,56 @@ class LookupsOverIPv6(Base):
             self.view({ip: (self.TV_MAC, "fresh") for ip in order}, {self.TV_V6: (self.TV_MAC, "fresh")})
             self.assertEqual(server.S.v6_devices, {self.TV_V6: self.TV_OLD}, order)
 
+    # A range extender shows the three devices behind it under its own hardware address.
+    EXTENDER = "aa:bb:cc:dd:ee:70"
+    BEHIND_V4 = ("192.168.1.70", "192.168.1.71", "192.168.1.72")
+    BEHIND_V6 = ("fe80::a", "fe80::b", "fe80::c")
+
+    def behind_an_extender(self):
+        """Work out the IPv6 view of a home where three devices sit behind a known range extender
+        and the child's phone (one IPv6 address, fd00::23) does not."""
+        self.addCleanup(setattr, server.S, "shared_macs", server.S.shared_macs)
+        server.S.shared_macs = {self.EXTENDER}
+        v4 = {ip: (self.EXTENDER, "fresh") for ip in self.BEHIND_V4}
+        v4[KID] = ("aa:bb:cc:dd:ee:01", "fresh")
+        v6 = {addr: (self.EXTENDER, "fresh") for addr in self.BEHIND_V6}
+        v6["fd00::23"] = ("aa:bb:cc:dd:ee:01", "fresh")
+        self.view(v4, v6)
+
+    def test_ipv6_addresses_behind_a_range_extender_each_count_against_a_share_of_their_own(self):
+        self.behind_an_extender()
+        self.assertEqual([server.share_key(addr) for addr in self.BEHIND_V6], list(self.BEHIND_V6))
+
+    def test_one_busy_device_behind_a_range_extender_does_not_use_up_the_others_lookups(self):
+        self.behind_an_extender()
+        shares = server.Shares()
+        for _ in range(server.MAX_DNS_PER_DEVICE):
+            self.assertTrue(shares.take(server.share_key(self.BEHIND_V6[0]), server.MAX_DNS_PER_DEVICE))
+        self.assertFalse(shares.take(server.share_key(self.BEHIND_V6[0]), server.MAX_DNS_PER_DEVICE))
+        for other in self.BEHIND_V6[1:] + self.BEHIND_V4:
+            self.assertTrue(shares.take(server.share_key(other), server.MAX_DNS_PER_DEVICE), other)
+
+    def test_an_ordinary_devices_ipv6_address_still_counts_against_that_devices_share(self):
+        self.behind_an_extender()
+        self.assertEqual(server.share_key("fd00::23"), KID)
+
+    def test_a_hardware_address_not_yet_known_as_a_range_extender_is_still_counted_as_one_device(self):
+        self.behind_an_extender()
+        server.S.shared_macs = set()                 # seen at several numbers, but not often enough yet
+        self.view({ip: (self.EXTENDER, "fresh") for ip in self.BEHIND_V4},
+                  {addr: (self.EXTENDER, "fresh") for addr in self.BEHIND_V6})
+        self.assertEqual({server.share_key(addr) for addr in self.BEHIND_V6}, {self.BEHIND_V4[0]})
+
+    def test_an_ipv6_address_behind_a_range_extender_keeps_the_rules_it_had_before(self):
+        # Only whose share is counted changes here: which rules apply is the next part of the work.
+        self.behind_an_extender()
+        self.assertEqual({server.S.v6_devices[addr] for addr in self.BEHIND_V6}, {self.BEHIND_V4[0]})
+
+    def test_the_addresses_behind_a_range_extender_are_forgotten_when_they_leave(self):
+        self.behind_an_extender()
+        self.view({}, {})
+        self.assertEqual(server.S.v6_shared, frozenset())
+
     def test_an_ipv4_address_listed_twice_keeps_its_reachable_entry_not_its_stale_one(self):
         text = ("192.168.1.67 dev wlan0 lladdr aa:bb:cc:dd:ee:67 REACHABLE\n"
                 "192.168.1.67 dev eth0 lladdr aa:bb:cc:dd:ee:99 STALE\n")
@@ -1246,6 +1301,40 @@ class QuickLookForNewIPv6Addresses(Base):
                 server.ipv6_watcher()
         self.assertEqual([c[0][0] for c in clock.sleep.call_args_list], [0.0, 0.0])
 
+    def watch_the_real_flag(self, ask_during_first_look):
+        """Run the watcher for two looks against the real "look now" flag, which a lookup set
+        before the first; returns (whether the ask was still standing as each look began, how
+        many sleeps it took). A lookup asks again during the first look if `ask_during_first_look`."""
+        standing = []
+
+        def look():
+            """Note whether the ask is still standing, ask again if told to, stop at the second look."""
+            standing.append(server.v6_wanted.is_set())
+            if len(standing) == 2:
+                raise KeyboardInterrupt()
+            if ask_during_first_look:
+                server.v6_wanted.set()
+        clock = mock.Mock(wraps=time)
+        clock.sleep = mock.Mock()
+        server.v6_wanted.set()
+        self.addCleanup(server.v6_wanted.clear)
+        with mock.patch.object(server, "refresh_ipv6_view", side_effect=look), \
+                mock.patch.object(server, "time", clock), mock.patch.object(server, "IPV6_RECHECK", 0.01):
+            with self.assertRaises(KeyboardInterrupt):
+                server.ipv6_watcher()
+        return standing, clock.sleep.call_count
+
+    def test_the_watcher_takes_up_an_ask_when_it_looks_so_one_ask_sets_off_one_look(self):
+        standing, sleeps = self.watch_the_real_flag(ask_during_first_look=False)
+        self.assertEqual(standing, [False, False])
+        self.assertEqual(sleeps, 0)                  # the next look waited the full time, not the quick gap
+        self.assertFalse(server.v6_wanted.is_set())
+
+    def test_an_ask_that_arrives_during_a_look_earns_another_look(self):
+        standing, sleeps = self.watch_the_real_flag(ask_during_first_look=True)
+        self.assertEqual(standing, [False, False])
+        self.assertEqual(sleeps, 1)                  # woken by the ask, so only the quick gap was waited
+
     def test_the_watcher_says_it_is_running_only_while_it_is(self):
         server.S.v6_watching = False
         seen = []
@@ -1258,6 +1347,12 @@ class QuickLookForNewIPv6Addresses(Base):
             with self.assertRaises(KeyboardInterrupt):
                 server.ipv6_watcher()
         self.assertEqual((seen, server.S.v6_watching), ([True], False))
+
+    def test_a_look_says_it_is_under_way_only_while_it_is(self):
+        seen = []
+        with mock.patch.object(server, "refresh_ipv6_view", side_effect=lambda: seen.append(server.S.v6_looking)):
+            server.ipv6_look()
+        self.assertEqual((seen, server.S.v6_looking), ([True], False))
 
     def test_waiting_lookups_are_told_when_a_look_finishes_even_if_it_failed(self):
         before = server.S.v6_round
@@ -1534,9 +1629,17 @@ class RouterAnnouncements(Base):
         self.assertEqual(server.read_router_advert(router_advert(rdnss(600, self.HUB)))["mac"], "")
 
     def test_a_hardware_address_option_of_another_size_is_passed_over_not_misread(self):
-        long_one = bytes([1, 2]) + bytes(range(1, 15))               # 16 bytes: not an Ethernet or Wi-Fi address
+        # 16 bytes: not an Ethernet or Wi-Fi address. Its first six bytes, 02:03:04:05:06:07, would
+        # be kept as a hardware address if they were misread as one.
+        long_one = bytes([1, 2]) + bytes(range(2, 16))
+        self.assertEqual(server.clean_mac("02:03:04:05:06:07"), "02:03:04:05:06:07")
         found = server.read_router_advert(router_advert(long_one, rdnss(600, self.HUB)))
         self.assertEqual((found["mac"], found["servers"]), ("", [(self.HUB, 600)]))
+
+    def test_the_first_hardware_address_in_an_announcement_is_the_one_kept(self):
+        second = bytes([1, 1, 0x02, 0x11, 0x22, 0x33, 0x44, 0x55])
+        found = server.read_router_advert(router_advert(self.LINK_ADDR, second))
+        self.assertEqual(found["mac"], self.HUB_MAC)
 
     def test_a_group_or_empty_hardware_address_in_an_announcement_is_not_kept(self):
         for raw in (bytes(6), b"\xff" * 6, bytes([0x01, 0, 0x5e, 0, 0, 1])):
@@ -1736,9 +1839,11 @@ class IPv6IsOffOnTheHub(Base):
 
     def setUp(self):
         super().setUp()
-        # Everything the confirmation needs: listening for just over the hour, nothing heard,
-        # no public range, and the IPv6 view worked out a moment ago.
+        # Everything the confirmation needs: listening for just over the hour, this computer able
+        # to hear the router for as long, nothing heard, no public range, no IPv6 DNS server named,
+        # and the IPv6 view worked out a moment ago.
         server.S.ra_listening, server.S.ra_since = True, self.MONO - self.HOUR - 1
+        server.S.v6_can_hear, server.S.v6_hear_since = True, self.MONO - self.HOUR - 1
         server.S.v6_checked = self.MONO - 5
         self.addCleanup(setattr, server.S, "ra_listening", False)
 
@@ -1803,9 +1908,172 @@ class IPv6IsOffOnTheHub(Base):
     def test_a_real_announcement_arriving_switches_the_confirmation_off(self):
         # Real clocks here, since the announcement is noted with them.
         server.S.ra_since, server.S.v6_checked = time.monotonic() - self.HOUR - 1, time.monotonic()
+        server.S.v6_hear_since = server.S.ra_since
         self.assertTrue(server.ipv6_dns_view()["hub_off"])
         server.note_router_dns([], time.time(), router_lifetime=1800)
         self.assertFalse(server.ipv6_dns_view()["hub_off"])
+
+    def test_a_real_announcement_keeps_it_off_even_if_the_clock_then_jumps_forward(self):
+        # Real clocks here, since the announcement is noted with them. Five hours on by the clock
+        # the announcement looks old, but by the steady timer it was heard a moment ago.
+        server.S.ra_since, server.S.v6_checked = time.monotonic() - self.HOUR - 1, time.monotonic()
+        server.S.v6_hear_since = server.S.ra_since
+        heard = time.time()
+        self.assertTrue(server.ipv6_dns_view(heard + 5 * self.HOUR)["hub_off"])
+        server.note_router_dns([], heard, router_lifetime=1800)
+        self.assertFalse(server.ipv6_dns_view(heard + 5 * self.HOUR)["hub_off"])
+
+    # A router with no IPv6 internet but a private range: it announces with router lifetime 0,
+    # hands out fd.. addresses and names itself as IPv6 DNS server.
+    PRIVATE_RANGE = [(server.ipaddress.IPv6Network("fd12:3456:789a::/64"), 1800)]
+    PRIVATE_DNS = "fd12:3456:789a::1"
+
+    def test_it_stays_off_while_an_announcement_with_router_lifetime_0_names_another_ipv6_dns_server(self):
+        server.note_router_dns([(self.PRIVATE_DNS, 1800)], self.NOW - 10, router_lifetime=0,
+                               prefixes=self.PRIVATE_RANGE, sender="fe80::1", mac="aa:bb:cc:dd:ee:ff")
+        view = server.ipv6_dns_view(self.NOW, self.MONO)
+        self.assertEqual((view["hub_off"], view["in_use"], view["router_dns_not_ours"]),
+                         (False, False, [self.PRIVATE_DNS]))
+
+    def test_it_stays_off_while_a_link_local_ipv6_dns_server_is_named(self):
+        server.note_router_dns([("fe80::1", 1800)], self.NOW - 10, router_lifetime=0)
+        self.assertFalse(self.off())
+
+    def test_it_is_shown_when_the_only_ipv6_dns_server_named_is_this_computer(self):
+        self.addCleanup(setattr, server.S, "dns_ipv6", server.S.dns_ipv6)
+        server.S.dns_ipv6, server.S.v6_own = True, {"fd12:3456:789a::60"}
+        server.note_router_dns([("fd12:3456:789a::60", 1800)], self.NOW - 10, router_lifetime=0)
+        self.assertTrue(self.off())
+
+    def test_this_computer_being_named_does_not_count_while_it_takes_no_lookups_over_ipv6(self):
+        self.addCleanup(setattr, server.S, "dns_ipv6", server.S.dns_ipv6)
+        server.S.dns_ipv6, server.S.v6_own = False, {"fd12:3456:789a::60"}
+        server.note_router_dns([("fd12:3456:789a::60", 1800)], self.NOW - 10, router_lifetime=0)
+        self.assertFalse(self.off())
+
+    def test_it_is_shown_again_once_that_servers_time_has_run_out(self):
+        server.note_router_dns([(self.PRIVATE_DNS, 600)], self.NOW - 601, router_lifetime=0)
+        self.assertTrue(self.off())
+
+    def test_it_is_shown_again_once_the_router_says_to_stop_using_that_server(self):
+        server.note_router_dns([(self.PRIVATE_DNS, 1800)], self.NOW - 20, router_lifetime=0)
+        self.assertFalse(self.off())
+        server.note_router_dns([(self.PRIVATE_DNS, 0)], self.NOW - 10, router_lifetime=0)
+        self.assertTrue(self.off())
+
+    def test_ipv6_is_not_called_off_when_this_computer_has_no_link_local_address_on_its_home_network_card(self):
+        server.S.v6_can_hear, server.S.v6_hear_since = False, None
+        view = server.ipv6_dns_view(self.NOW, self.MONO)
+        self.assertEqual((view["hub_off"], view["can_hear"], view["listening_for"]), (False, False, 0))
+
+    def test_it_stays_off_when_it_is_not_known_whether_this_computer_can_hear_ipv6(self):
+        server.S.v6_can_hear, server.S.v6_hear_since = None, None
+        view = server.ipv6_dns_view(self.NOW, self.MONO)
+        self.assertEqual((view["hub_off"], view["can_hear"], view["listening_for"]), (False, None, 0))
+
+    def test_it_stays_off_when_the_last_look_found_this_computer_could_not_hear_whatever_was_noted_before(self):
+        server.S.v6_can_hear = False                 # the time it first could is still there, by a slip
+        self.assertFalse(self.off())
+
+    def test_it_stays_off_until_this_computer_has_been_able_to_hear_for_the_full_hour(self):
+        server.S.ra_since = self.MONO - 5 * self.HOUR
+        server.S.v6_hear_since = self.MONO - self.HOUR + 1
+        view = server.ipv6_dns_view(self.NOW, self.MONO)
+        self.assertEqual((view["hub_off"], view["listening_for"]), (False, self.HOUR - 1))
+
+    def test_the_status_says_this_computer_can_hear_the_router_when_it_can(self):
+        self.assertIs(server.ipv6_dns_view(self.NOW, self.MONO)["can_hear"], True)
+
+    def look(self, can_hear):
+        """Work out the IPv6 view once, with a stand-in answer to "could this computer hear the
+        router over IPv6?" and nothing on the home network."""
+        with mock.patch.object(server, "own_ipv6", return_value=(set(), [], "")), \
+                mock.patch.object(server, "neighbour_table", return_value={}), \
+                mock.patch.object(server, "ipv6_neighbour_table", return_value={}), \
+                mock.patch.object(server, "can_hear_router", return_value=can_hear):
+            server.refresh_ipv6_view()
+
+    def test_a_look_notes_when_this_computer_could_first_hear_the_router_and_keeps_that_time(self):
+        server.S.v6_can_hear, server.S.v6_hear_since = None, None
+        self.look(True)
+        first = server.S.v6_hear_since
+        self.assertLess(time.monotonic() - first, 5)
+        self.look(True)
+        self.assertEqual((server.S.v6_can_hear, server.S.v6_hear_since), (True, first))
+
+    def test_a_look_that_finds_this_computer_cannot_hear_the_router_forgets_when_it_first_could(self):
+        for answer in (False, None):
+            server.S.v6_can_hear, server.S.v6_hear_since = True, self.MONO - self.HOUR - 1
+            self.look(answer)
+            self.assertEqual((server.S.v6_can_hear, server.S.v6_hear_since), (answer, None), answer)
+
+    def test_the_hour_starts_again_when_the_link_local_address_comes_back(self):
+        # Real clocks here, since a look notes the time itself. Listening for five hours, but IPv6
+        # on this computer's own card was off until a moment ago.
+        server.S.ra_since = time.monotonic() - 5 * self.HOUR
+        self.look(False)
+        self.look(True)
+        view = server.ipv6_dns_view()
+        self.assertEqual((view["hub_off"], view["can_hear"]), (False, True))
+        self.assertLess(view["listening_for"], 60)
+        self.assertTrue(server.ipv6_dns_view(mono=time.monotonic() + self.HOUR - 60)["listening_for"] < self.HOUR)
+
+    # /proc/net/if_inet6 as Linux writes it: address, card number, range size, scope, flags, card.
+    HOME_CARD_UP = ("00000000000000000000000000000001 01 80 10 80       lo\n"
+                    "fe80000000000000dea632fffe112233 03 40 20 80    wlan0\n"
+                    "fe80000000000000004242fffe000001 04 40 20 80  docker0\n")
+
+    def on_card(self, text, card="wlan0"):
+        """Ask whether `card` has working IPv6, with `text` standing in for the system's list of
+        this computer's IPv6 addresses."""
+        with mock.patch("builtins.open", mock.mock_open(read_data=text)) as opened:
+            answer = server.ipv6_on_card(card)
+        opened.assert_called_once_with("/proc/net/if_inet6")
+        return answer
+
+    def test_a_link_local_address_on_the_home_network_card_means_the_router_can_be_heard(self):
+        self.assertIs(self.on_card(self.HOME_CARD_UP), True)
+
+    def test_a_link_local_address_on_another_card_does_not_count_as_able_to_hear_the_router(self):
+        only_docker = "".join(line for line in self.HOME_CARD_UP.splitlines(True) if "wlan0" not in line)
+        self.assertIs(self.on_card(only_docker), False)
+        self.assertIs(self.on_card(self.HOME_CARD_UP.replace("wlan0", "wlan01")), False)
+
+    def test_a_link_local_address_still_being_checked_does_not_count(self):
+        self.assertIs(self.on_card("fe80000000000000dea632fffe112233 03 40 20 40    wlan0\n"), False)
+
+    def test_a_link_local_address_that_failed_its_check_does_not_count(self):
+        self.assertIs(self.on_card("fe80000000000000dea632fffe112233 03 40 20 08    wlan0\n"), False)
+
+    def test_a_private_or_public_address_alone_on_the_home_network_card_does_not_count(self):
+        self.assertIs(self.on_card("fd123456789a0000dea632fffe112233 03 40 00 00    wlan0\n"
+                                   "20010db800010002dea632fffe112233 03 40 00 00    wlan0\n"), False)
+
+    def test_a_computer_with_no_ipv6_addresses_at_all_cannot_hear_the_router(self):
+        self.assertIs(self.on_card(""), False)
+
+    def test_whether_the_router_can_be_heard_is_not_known_when_the_address_list_cannot_be_read(self):
+        with mock.patch("builtins.open", side_effect=OSError("no such file")):
+            self.assertIsNone(server.ipv6_on_card("wlan0"))
+        self.assertIsNone(self.on_card("fe80000000000000dea632fffe112233 03 40 20 zz    wlan0\n"))
+
+    def test_whether_the_router_can_be_heard_is_not_known_without_the_home_network_card(self):
+        with mock.patch("builtins.open", side_effect=AssertionError("looked anyway")):
+            self.assertIsNone(server.ipv6_on_card(None))
+            self.assertIsNone(server.ipv6_on_card(""))
+
+    def test_the_card_asked_about_is_the_one_this_computers_default_route_uses(self):
+        with mock.patch.object(server, "can_hear_router", REAL_CAN_HEAR_ROUTER), \
+                mock.patch.object(server.enforcer, "interface_and_gateway", return_value=("wlan0", "192.168.1.254")), \
+                mock.patch.object(server, "ipv6_on_card", return_value=True) as asked:
+            self.assertIs(server.can_hear_router(), True)
+        asked.assert_called_once_with("wlan0")
+
+    def test_a_computer_with_no_default_route_does_not_know_whether_it_can_hear_the_router(self):
+        with mock.patch.object(server, "can_hear_router", REAL_CAN_HEAR_ROUTER), \
+                mock.patch.object(server.enforcer, "interface_and_gateway", return_value=(None, None)), \
+                mock.patch("builtins.open", side_effect=AssertionError("looked anyway")):
+            self.assertIsNone(server.can_hear_router())
 
     def test_the_status_says_how_long_the_listener_has_been_listening(self):
         server.S.ra_since = self.MONO - 600

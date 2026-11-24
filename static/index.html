@@ -920,15 +920,21 @@ function otherDnsSwitch(st){
 }
 
 /* ---------- IPv6: saying honestly what QuietNet can't see ---------- */
-// d.v6_bypass comes from the Pi: true while the home network has IPv6, for every device but the Pi
-// itself, steered or not ("Cut live connections" covers IPv4 only). Shown only for a device that
-// uses QuietNet; one that doesn't is already marked "Not using QuietNet yet".
+// d.v6_bypass comes from the Pi: true while the home network has IPv6, or while something in the
+// home names an IPv6 DNS server that is not QuietNet, for every device but the Pi itself, steered
+// or not ("Cut live connections" covers IPv4 only). Shown only for a device that uses QuietNet;
+// one that doesn't is already marked "Not using QuietNet yet".
 function v6Bypass(d){ return !!(d.v6_bypass && d.last); }
+// The notice says "IPv6 is on in your home" only when the Pi says so (in_use). A router with no
+// IPv6 internet can still name its own IPv6 DNS server; then the notice says that instead.
 function v6BypassNotice(d){
   if(!v6Bypass(d)) return '';
-  return `<div class="notice warn"><b>This device can bypass QuietNet over IPv6.</b> IPv6 is on in your home, and
-    your router gives every device its own IPv6 DNS server. So this device can look names up, and connect, without QuietNet
-    seeing or blocking it.${d.enforced ? ' "Cut live connections" covers IPv4 only, so it does not close this.' : ''}
+  const why = ((S.status || {}).ipv6 || {}).in_use
+    ? `IPv6 is on in your home, and your router gives every device its own IPv6 DNS server. So this device can look
+    names up, and connect, without QuietNet seeing or blocking it.`
+    : `Something in your home, most likely your router, tells every device to use an IPv6 DNS server that is not
+    QuietNet. So this device can look names up without QuietNet seeing or blocking them.`;
+  return `<div class="notice warn"><b>This device can bypass QuietNet over IPv6.</b> ${why}${d.enforced ? ' "Cut live connections" covers IPv4 only, so it does not close this.' : ''}
     The sure fix is to switch IPv6 off on your router.
     <button class="btn link" data-act="tab" data-tab="setup">Show me how</button></div>`;
 }
@@ -972,9 +978,15 @@ function noIpv6Switch(st){
     <label class="switch"><input type="checkbox" id="noIpv6Switch" ${st.no_ipv6_all ? 'checked' : ''} aria-label="Give no device IPv6 addresses"><span></span></label></div>`;
 }
 // What QuietNet knows about IPv6 on the home network, for "Set up a device". v6.hub_off is true only
-// after the Pi has listened for a full hour, heard no router announce IPv6 and holds no public IPv6
-// address itself; a Pi that is not listening, or was restarted, never shows it. Through the relay
-// the Pi may be an older QuietNet that sends no listening_for: that counts as "can't tell" too.
+// after the Pi has listened for a full hour while able to hear the router, heard no router announce
+// IPv6, holds no public IPv6 address itself, and nothing in the home names an IPv6 DNS server other
+// than QuietNet; a Pi that is not listening, or was restarted, never shows it. The order matters:
+// "off" only on the Pi's word; then "on"; then a DNS server still being named (v6.router_dns_not_ours),
+// which means devices can bypass even with no IPv6 internet; then the "can't tell" cases; and only
+// then "Still checking". v6.can_hear is false when IPv6 is switched off on the Pi's own network
+// card (it then hears nothing, which is not the same as nothing being said) and null when the Pi
+// could not find out. Through the relay the Pi may be an older QuietNet that sends no listening_for
+// (that counts as "can't tell" too) or no can_hear (then the page says what it always did).
 function hubIpv6State(v6){
   if(v6.hub_off) return `<div class="notice info"><b>IPv6 is off on your hub.</b> QuietNet has listened for over an hour,
     heard no IPv6 announcement from your router, and has no public IPv6 address itself. Devices can't use IPv6 to get
@@ -982,8 +994,22 @@ function hubIpv6State(v6){
   if(v6.in_use) return `<div class="notice warn"><b>IPv6 is on in your home.</b> Your router gives devices IPv6
     addresses and, on a BT Smart Hub, its own IPv6 DNS server, which can't be changed. Devices that use it bypass
     QuietNet, whatever DNS you set on them. They are marked "Can bypass over IPv6" on the Devices page.</div>`;
+  if((v6.router_dns_not_ours || []).length) return `<div class="notice warn"><b>Something in your home still names an IPv6
+    DNS server that is not QuietNet</b> (${v6.router_dns_not_ours.map(a => '<b>' + esc(a) + '</b>').join(', ')}). Devices
+    that use it send their lookups past QuietNet, so QuietNet can't say IPv6 is off. They are marked "Can bypass over IPv6"
+    on the Devices page. This is most likely your router: it can go on naming its own DNS server after it stops giving
+    out IPv6 internet addresses. On a BT Smart Hub that can happen while <b>ULA Enabled</b> is on, so if you have set
+    Allocation Mode to Off, turn ULA Enabled off as well. The notice goes within an hour of the server no longer being named.</div>`;
   if(!v6.listening || v6.listening_for == null) return `<p class="meta">QuietNet can't tell from here whether IPv6 is on.
     It can only listen for the router's IPv6 announcements when it runs on a Raspberry Pi.</p>`;
+  if(v6.can_hear === false) return `<div class="notice warn"><b>QuietNet can't tell whether IPv6 is on in your home.</b>
+    IPv6 is switched off on this computer's own network connection, so it can't hear your router's IPv6 announcements.
+    That is not the same as your router being silent: devices may still be using IPv6 to get round QuietNet, and
+    QuietNet can't mark them "Can bypass over IPv6" while it can't hear. To let it check, switch IPv6 back on for the
+    Raspberry Pi itself; it then needs a full hour of listening. Or look at the IPv6 page in your router's own settings.</div>`;
+  if(v6.can_hear === null) return `<p class="meta"><b>QuietNet can't tell yet whether IPv6 is on.</b> It has not been able to
+    check that this computer's own network connection can hear your router's IPv6 announcements. That check is made
+    every minute or so; the hour of listening starts once it passes.</p>`;
   const left = Math.ceil((3600 - (v6.listening_for || 0)) / 60);
   return `<p class="meta"><b>Still checking.</b> QuietNet has not heard your router announce IPv6. It only says "IPv6 is
     off on your hub" after listening for a full hour without a break${left > 0 ? ': about ' + num(left) + ' min to go' : ''}.

@@ -525,6 +525,20 @@ class Devices(Api):
         d = self.get("/api/devices")[1][0]
         self.assertEqual((d["enforced"], d["v6_bypass"]), (True, True))
 
+    def test_a_device_stays_marked_while_an_announcement_with_router_lifetime_0_names_another_ipv6_dns_server(self):
+        # A router with no IPv6 internet but a private range still names itself as IPv6 DNS server.
+        self.log(KID, "www.bbc.co.uk")
+        server.note_router_dns([("fd12:3456:789a::1", 1800)], time.time(), router_lifetime=0)
+        self.assertIs(self.get("/api/status")[1]["ipv6"]["in_use"], False)
+        self.assertIs(self.get("/api/devices")[1][0]["v6_bypass"], True)
+
+    def test_a_device_is_not_marked_when_the_only_ipv6_dns_server_named_is_quietnet(self):
+        self.log(KID, "www.bbc.co.uk")
+        server.S.v6_own = {"fd12:3456:789a::60"}
+        server.note_router_dns([("fd12:3456:789a::60", 1800)], time.time(), router_lifetime=0)
+        with mock.patch.object(server.S, "dns_ipv6", True):
+            self.assertIs(self.get("/api/devices")[1][0]["v6_bypass"], False)
+
     def test_no_device_is_marked_as_able_to_bypass_over_ipv6_on_an_ipv4_only_network(self):
         self.log(KID, "www.bbc.co.uk")
         self.assertIs(self.get("/api/devices")[1][0]["v6_bypass"], False)
@@ -546,6 +560,12 @@ class Devices(Api):
         ipv6 = self.get("/api/status")[1]["ipv6"]
         self.assertEqual((ipv6["hub_off"], ipv6["listening_for"], ipv6["routers"], ipv6["neighbours_ok"]),
                          (False, 0, [], None))
+
+    def test_the_status_says_whether_this_computer_could_hear_the_router_over_ipv6(self):
+        self.assertIsNone(self.get("/api/status")[1]["ipv6"]["can_hear"])
+        for known in (False, True):
+            server.S.v6_can_hear = known
+            self.assertIs(self.get("/api/status")[1]["ipv6"]["can_hear"], known)
 
     def test_ordinary_activity_is_not_flagged_as_another_dns_service(self):
         self.log(KID, "www.bbc.co.uk")

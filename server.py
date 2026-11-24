@@ -232,9 +232,12 @@ class State:
     v6_own = set()          # this computer's own IPv6 addresses (see refresh_ipv6_view)
     v6_prefixes = []        # the home network's public IPv6 ranges, from this computer's own addresses
     v6_devices = {}         # a device's IPv6 address -> its IPv4 address, matched by hardware address
+    v6_shared = frozenset()  # IPv6 addresses behind a range extender (S.shared_macs): each keeps its own share of lookups
     v6_dns = ""             # the IPv6 address to give devices as their DNS server ('' = none suitable)
     v6_neighbours_ok = None  # could the IPv6 neighbour table be read at the last look? (None = not looked yet)
     v6_checked = None       # when (time.monotonic()) the IPv6 view was last worked out without a fault
+    v6_can_hear = None      # does this computer's home network card have working IPv6 (can_hear_router)? None = not known
+    v6_hear_since = None    # when (time.monotonic()) a look first found that it does; None while it doesn't
     v6_looked_at = None     # when (time.monotonic()) ipv6_watcher last finished a look, good or bad
     v6_round = 0            # how many looks ipv6_watcher has finished (a waiting lookup watches this change)
     v6_watching = False     # is ipv6_watcher running?
@@ -1651,7 +1654,9 @@ class Shares:
     """How many lookups (or TCP connections) each device has in hand right now, so that no one
     device can take them all. Counted per device, not per address: see share_key. One of these is
     shared by the IPv4 and the IPv6 listener (UDP_SHARES, TCP_SHARES), so a device asking over both,
-    or from several IPv6 addresses, still gets one share. Safe to use from several threads."""
+    or from several IPv6 addresses, still gets one share. An IPv6 address that can't be matched to
+    one device, or that sits behind a range extender, keeps a share of its own. Safe to use from
+    several threads."""
 
     def __init__(self):
         """Nothing in hand for anyone."""
@@ -1687,12 +1692,15 @@ def share_key(host):
     (device_address); this computer counts as one, whichever of its addresses it asks from; and an
     IPv6 address matched to a device (S.v6_devices) counts as that device's IPv4 address, so a
     phone with four IPv6 addresses has one share, not five. An IPv6 address that can't be matched
-    counts by itself. One or two dictionary lookups, no database."""
+    counts by itself. So does one behind a range extender (S.v6_shared): an extender shows several
+    devices under one hardware address, so they all match one IPv4 address, and counting them as
+    one would let a single busy device use up the share of every device behind that extender. A
+    few set and dictionary lookups, no database."""
     who = device_address(host)
     if who in ("127.0.0.1", "::1") or who in S.v6_own:
         return S.local_ip
     if who and ":" in who:
-        return S.v6_devices.get(who, who)
+        return who if who in S.v6_shared else S.v6_devices.get(who, who)
     return who
 
 
@@ -2714,7 +2722,10 @@ def ipv4_by_hardware_address(table, scanned):
     .65 for a long time), the one confirmed just now wins, then one of unknown freshness, then a
     stale one; never simply whichever line was printed last. Between two equally fresh, the one
     the device's rules are kept under (S.dev_mac) wins, then the lower address, so the answer is
-    the same every time. Hardware addresses that can't belong to one device are left out."""
+    the same every time. Hardware addresses that can't be a device's own (all zeros, or a group
+    address) are left out. A range extender's hardware address (S.shared_macs) is not: it still
+    gets one address here, as it always has, and refresh_ipv6_view notes the IPv6 addresses behind
+    it (S.v6_shared) so that each keeps its own share of lookups."""
     best = {}                                   # mac -> (how good, ip)
     for ip, mac in scanned:
         if clean_mac(mac):
@@ -2730,6 +2741,43 @@ def ipv4_by_hardware_address(table, scanned):
     return {mac: ip for mac, (_, ip) in best.items()}
 
 
+def ipv6_on_card(card, path="/proc/net/if_inet6"):
+    """Does this network card have a working IPv6 address of its own (a link-local one, starting
+    fe80)? True or False, or None when that can't be known: no card name, or the list of this
+    computer's IPv6 addresses (`path`, Linux only) is missing or can't be read.
+
+    This is how QuietNet knows it could have heard the router's IPv6 announcements. When IPv6 is
+    switched off on a card (a system setting some guides recommend), Linux takes the card's IPv6
+    addresses away and throws away every IPv6 message arriving on it before any program sees it.
+    The announcement listener's socket still opens, and then hears nothing for ever, which must
+    not be taken for "the router is not announcing IPv6".
+
+    Only an address on this very card counts: Docker's own cards and the loopback keep theirs
+    whatever the home network card is set to. One that failed its check (0x08) or is still being
+    checked (0x40) doesn't count, as the card isn't receiving on it yet. The card's name is only
+    ever compared with the file's own last column; it is never put into a command or a path."""
+    if not card:
+        return None
+    try:
+        with open(path) as f:
+            for line in f:
+                cols = line.split()
+                if len(cols) < 6 or len(cols[0]) != 32 or cols[5] != card:
+                    continue
+                if (int(cols[0][:4], 16) & 0xffc0) == 0xfe80 and not int(cols[4], 16) & 0x48:
+                    return True
+    except (OSError, ValueError):
+        return None
+    return False
+
+
+def can_hear_router():
+    """Could this computer hear the home router's IPv6 announcements? True if the network card
+    its home network is on (the one its default route uses) has working IPv6, False if it has
+    not, None if that can't be known. See ipv6_on_card. Reads two small files; runs no tools."""
+    return ipv6_on_card(enforcer.interface_and_gateway()[0])
+
+
 def refresh_ipv6_view():
     """Look again at this computer's IPv6 addresses and ranges (for v6_source_allowed and 'this
     computer'), and match each IPv6 neighbour to an IPv4 device with the same hardware address,
@@ -2737,16 +2785,33 @@ def refresh_ipv6_view():
     the last network scan (the 'seen' table, oldest first) and then the current neighbour table,
     which is the live view and so wins; see ipv4_by_hardware_address for how a stale entry is kept
     from beating a fresh one. If the IPv6 neighbour table can't be read, nothing is matched and
-    S.v6_neighbours_ok says so for the dashboard."""
+    S.v6_neighbours_ok says so for the dashboard.
+
+    IPv6 addresses whose hardware address is a range extender's (S.shared_macs) are noted in
+    S.v6_shared, so each keeps its own share of lookups (share_key).
+
+    Whether this computer's home network card has working IPv6 is noted too (S.v6_can_hear), with
+    when a look first found that it has (S.v6_hear_since): the hour of listening behind "IPv6 is
+    off on your hub" only counts while this computer could have heard the router (ipv6_dns_view).
+    Losing it, or not knowing, starts that hour again."""
     with router_dns_lock:
         announced = list(S.router_prefixes) if S.ra_listening else None
     own, ranges, for_devices = own_ipv6(announced)
+    can_hear = can_hear_router()
     scanned = sql("SELECT ip, mac FROM seen WHERE mac != '' ORDER BY ts") if db is not None else []
     by_mac = ipv4_by_hardware_address(neighbour_table(), scanned)
     table6 = ipv6_neighbour_table()
     matched = {addr: by_mac[mac] for addr, (mac, _) in (table6 or {}).items() if mac in by_mac}
+    extenders = S.shared_macs
+    shared = frozenset(addr for addr, (mac, _) in (table6 or {}).items() if mac in extenders)
     S.v6_own, S.v6_prefixes, S.v6_devices, S.v6_dns = own, ranges, matched, for_devices
+    S.v6_shared = shared
     S.v6_neighbours_ok = table6 is not None
+    if can_hear is not True:
+        S.v6_hear_since = None
+    elif S.v6_hear_since is None:
+        S.v6_hear_since = time.monotonic()
+    S.v6_can_hear = can_hear
     S.v6_checked = time.monotonic()
 
 
@@ -2995,17 +3060,29 @@ def ipv6_dns_view(now=None, mono=None):
     lasting address), whether the router's announcements are being listened for and when it last
     announced IPv6, the IPv6 DNS servers it names, and which of those are not this computer.
     "in_use" says the home network has IPv6: this computer has a public IPv6 range, or the router
-    announced IPv6 within the last hour (devices are then marked "can bypass QuietNet over IPv6").
+    announced IPv6 within the last hour (devices are then marked "can bypass QuietNet over IPv6";
+    api_devices marks them as well while "router_dns_not_ours" is not empty).
     A server only counts as this computer if QuietNet is taking lookups over IPv6 on that address.
 
     "hub_off" is the confirmation "IPv6 is off on your hub". It is true only when every one of
     these holds, so that not knowing never looks like being protected:
-      - the announcement listener is running and has run for a full hour (RA_HOLD_MAX) without a
-        break ("listening_for" is how long, in seconds; 0 when it isn't running). A listener that
-        never started, or a restart, starts the hour again;
+      - the announcement listener is running, this computer could hear the router, and both have
+        been so for a full hour (RA_HOLD_MAX) without a break ("listening_for" is how long, in
+        seconds; 0 when either isn't so). A listener that never started, or a restart, starts
+        the hour again;
+      - this computer's home network card has working IPv6 of its own ("can_hear": true, false, or
+        null for not known; see ipv6_on_card). With IPv6 switched off on that card the listener
+        runs but hears nothing, so the hour only counts from when a look first found it working
+        (S.v6_hear_since), and starts again if it is lost;
       - no real router was heard announcing IPv6 in that hour;
       - this computer holds no public IPv6 address, and that was looked at in the last few minutes
-        (V6_VIEW_FRESH), not assumed because the IPv6 watcher isn't running.
+        (V6_VIEW_FRESH), not assumed because the IPv6 watcher isn't running;
+      - nothing on the home network is currently naming an IPv6 DNS server other than this
+        computer ("router_dns_not_ours" is empty), whoever announced it and whatever its router
+        lifetime. A router with no IPv6 internet but a private range still announces, with a
+        router lifetime of 0, and can name itself as DNS server; devices use that server, so their
+        lookups still skip QuietNet. Named servers are forgotten within the hour once nothing
+        names them, so this cannot hold the confirmation back for good.
     The hour is measured with time.monotonic() (`mono`), not the clock: a Pi has no clock of its
     own, and the jump when it gets the right time after starting must not count as an hour.
 
@@ -3023,17 +3100,21 @@ def ipv6_dns_view(now=None, mono=None):
                           for a, r in S.routers_v6.items() if now - r["heard"] < RA_HOLD_MAX),
                          key=lambda r: (-r["heard"], r["address"]))
     ours = S.v6_own if S.dns_ipv6 else set()
+    not_ours = [a for a in named if a not in ours]
     in_use = bool(S.v6_prefixes) or bool(heard and now - heard < RA_HOLD_MAX)
-    since = S.ra_since
-    listening_for = max(0, int(mono - since)) if S.ra_listening and since is not None else 0
+    since, hear_since, can_hear = S.ra_since, S.v6_hear_since, S.v6_can_hear
+    if S.ra_listening and since is not None and hear_since is not None and can_hear is True:
+        listening_for = max(0, int(mono - max(since, hear_since)))
+    else:
+        listening_for = 0
     quiet = heard_at is None or mono - heard_at >= RA_HOLD_MAX
     looked = S.v6_checked is not None and mono - S.v6_checked < V6_VIEW_FRESH
     return {"dns_address": S.v6_dns if S.dns_ipv6 else "", "listening": S.ra_listening,
-            "listening_for": listening_for,
+            "listening_for": listening_for, "can_hear": can_hear,
             "router_heard": heard, "router_dns": named, "in_use": in_use,
-            "hub_off": listening_for >= RA_HOLD_MAX and quiet and looked and not in_use,
+            "hub_off": listening_for >= RA_HOLD_MAX and quiet and looked and not in_use and not not_ours,
             "routers": routers, "neighbours_ok": S.v6_neighbours_ok, "taking_lookups": S.dns_ipv6,
-            "router_dns_not_ours": [a for a in named if a not in ours]}
+            "router_dns_not_ours": not_ours}
 
 
 def hint_refresher():
@@ -3212,9 +3293,12 @@ def api_devices():
     tried to use another DNS service.
 
     "v6_bypass" is the honest label "can bypass QuietNet over IPv6": true for every device but this
-    computer while the home network has IPv6 (ipv6_dns_view's "in_use"). That includes a device
-    with "Cut live connections" on, because steering covers IPv4 only: its lookups to the router's
-    own IPv6 DNS server, and anything it reaches over IPv6, never pass through QuietNet.
+    computer while the home network has IPv6 (ipv6_dns_view's "in_use"), or while something on the
+    home network names an IPv6 DNS server that is not this computer ("router_dns_not_ours"), since
+    a device that uses that server sends its lookups past QuietNet whether or not the home has
+    IPv6 internet. That includes a device with "Cut live connections" on, because steering covers
+    IPv4 only: its lookups to the router's own IPv6 DNS server, and anything it reaches over IPv6,
+    never pass through QuietNet.
 
     "same_as" is a hint for a card filed under an IPv6 address that could not be matched to a
     device: the IPv4 address of the device whose hardware address that IPv6 address was built from
@@ -3223,7 +3307,8 @@ def api_devices():
     since = time.time() - 86400
     given = dict(sql("SELECT ip, name FROM devices"))
     hints = S.hints
-    v6_on = ipv6_dns_view()["in_use"]
+    v6 = ipv6_dns_view()
+    v6_on = v6["in_use"] or bool(v6["router_dns_not_ours"])
     out = {}
 
     def entry(ip):

@@ -62,6 +62,7 @@ class Base(unittest.TestCase):
         server.S.router, server.S.router_checked = "", float("inf")
         # No IPv6 view of the real machine: nothing matched, no home range, no own addresses.
         server.S.v6_own, server.S.v6_prefixes, server.S.v6_devices = set(), [], {}
+        server.S.v6_shared = frozenset()
         # Nothing heard from the router about IPv6, and no IPv6 address to give devices.
         server.S.v6_dns, server.S.router_v6_dns, server.S.ra_heard = "", {}, None
         server.S.router_prefixes = {}
@@ -69,6 +70,12 @@ class Base(unittest.TestCase):
         server.S.ra_listening, server.S.ra_since, server.S.ra_heard_at, server.S.routers_v6 = False, None, None, {}
         server.S.v6_watching, server.S.v6_looking, server.S.v6_checked, server.S.v6_looked_at = False, False, None, None
         server.S.v6_neighbours_ok = None
+        # Nor is it known whether this computer could hear the router over IPv6, and a look at the
+        # IPv6 view never reads the real machine's network cards to find out.
+        server.S.v6_can_hear, server.S.v6_hear_since = None, None
+        hearing = mock.patch.object(server, "can_hear_router", return_value=None)
+        hearing.start()
+        self.addCleanup(hearing.stop)
         server.v6_askers.clear()
         server.v6_wanted.clear()
         server.S.other_dns = {}
