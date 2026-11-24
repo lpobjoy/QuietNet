@@ -1319,8 +1319,10 @@ function activityList(){
 // when it was first and last seen there, and its hardware address or addresses. One of two or more
 // hardware addresses (a laptop's cable and Wi-Fi, merged by the owner) can be separated again, and
 // "Merge with" lists the other devices by name. Both show what would apply before anything is
-// changed (see mergeFlow and the separate action). An older Pi sends no addresses and no numbers:
-// then the list is left out and nothing is offered. Every address, time and name is escaped.
+// changed (see mergeFlow and the separate action). A Pi from before the device tables sends no
+// addresses and no numbers: then the list is left out and nothing is offered. A Pi that has device
+// numbers but no Merge yet is offered both, and answers 404: the actions then say that it needs
+// updating. Every address, time and name is escaped.
 function mergeChoices(d){
   // Never this computer or the router, and never two that are both known only by a number: the
   // Pi refuses those, since neither has a hardware address to keep the merged device together.
@@ -1342,7 +1344,8 @@ function deviceDetails(d){
     <button class="btn" data-act="merge" aria-haspopup="dialog">Show what would change&hellip;</button></div>
     <p class="meta">For one device that shows as two: a laptop on both cable and Wi-Fi, or a phone that came back with a
       new private Wi-Fi address. You are shown which rules would apply to each hardware address before anything is
-      changed, and it can be undone with Separate. QuietNet never merges devices by itself.</p>`;
+      changed. Two devices that each have a hardware address can be taken apart again with Separate; one recognised
+      only by its number can't, and the box says so before you confirm. QuietNet never merges devices by itself.</p>`;
   if(!rows && !hw && !merge) return '';
   return `<section class="card details" aria-labelledby="detailsTitle"><h2 id="detailsTitle">This device's addresses</h2>
     <p class="meta">A device is recognised by its hardware address, the label of its network card. The numbers it uses
@@ -1466,15 +1469,23 @@ function daysText(days){
   for(const [label, set] of Object.entries(DAYSETS)) if([...set].sort().join('') === key) return label;
   return [...days].sort().map(d => DAYS[d]).join(', ');
 }
-function scopeText(scope){
+function scopeText(x){
+  const scope = x.scope;
   if(scope === 'all') return 'Whole house';
   if(scope.startsWith('group:')) return groupName(+scope.slice(6)) + ' group';
+  if(x.device != null){
+    // The Pi says which device the schedule is for. A merged device can be at two addresses at
+    // once, and its card is listed under only one of them: go by its number, not the address.
+    const mine = S.devices.find(d => d.id === x.device);
+    if(mine) return pickerLabel(mine);
+  }
   if(scope.startsWith('dev:')){
     // A device named by its number. One QuietNet has since forgotten has no card to name it by.
-    const known = S.devices.find(x => String(x.id) === scope.slice(4));
+    const known = S.devices.find(v => String(v.id) === scope.slice(4));
     return known ? pickerLabel(known) : 'A device QuietNet no longer lists';
   }
-  const d = S.devices.find(x => x.ip === scope.slice(7));
+  // An older Pi names the device by its address alone.
+  const d = S.devices.find(v => v.ip === scope.slice(7));
   return d ? pickerLabel(d) : scope.slice(7);
 }
 function whatText(x){
@@ -1487,7 +1498,7 @@ function viewSchedules(){
     <label class="switch"><input type="checkbox" class="schedOn" data-id="${esc(x.id)}" ${x.enabled ? 'checked' : ''} aria-label="Use the ${esc(x.name)} schedule"><span></span></label>
     <span class="avatar sm moon" aria-hidden="true">${ICON.moon}</span>
     <div class="info"><h2 class="title">${esc(x.name)}</h2>${x.active ? '<span class="badge danger">On right now</span>' : ''}${x.enabled ? '' : '<span class="badge">Not in use</span>'}
-      <div>${esc(scopeText(x.scope))} · ${esc(daysText(x.days))}, <span class="mono">${esc(x.start)}</span> to <span class="mono">${esc(x.end)}</span>${x.start > x.end ? ' next morning' : ''}</div>
+      <div>${esc(scopeText(x))} · ${esc(daysText(x.days))}, <span class="mono">${esc(x.start)}</span> to <span class="mono">${esc(x.end)}</span>${x.start > x.end ? ' next morning' : ''}</div>
       <div class="meta">${esc(whatText(x))}</div></div>
     <div class="item-actions"><button class="btn" data-act="schededit" data-id="${esc(x.id)}">Change</button>
     <button class="btn link danger-text" data-act="scheddelete" data-id="${esc(x.id)}">Delete</button></div></div></div>`).join('');
@@ -1774,6 +1785,14 @@ function mergeBlocks(p){
     lines: (h.applies || []).map(x => ({text:x.text, tag:x['new'] ? 'New for it' : ''}))
       .concat((h.stops || []).map(t => ({text:t, tag:'Stops applying', cls:'warn'})))}));
 }
+// The rules that reach a device only because QuietNet is still asking whether it is another one
+// ("Same device?", not answered yet), as a second block of the Separate box: they go on applying to
+// both hardware addresses whatever is chosen there. Nothing when there are none (p.held is empty,
+// or an older Pi sends none).
+function separateHeld(p){
+  return (p.held || []).length ? [{head:'Applies for now, until you answer "Same device?"', none:'',
+                                   lines:p.held.map(t => ({text:t, tag:'Stays for both', cls:'warn'}))}] : [];
+}
 async function mergeFlow(device, other){
   for(;;){
     let p;
@@ -1786,6 +1805,9 @@ async function mergeFlow(device, other){
     catch(e){ if(e.status !== 409) return e; await oops(e); }
   }
 }
+
+// What an older Pi, with no Merge or Separate, is answered with when either is pressed.
+const NEEDS_UPDATE = 'This QuietNet needs updating before devices can be ';
 
 const actions = {
   tab(d){ S.tab = d.tab; S.device = null; S.group = null; S.svcOpen = false; S.edit = null; refresh(true); },
@@ -1895,6 +1917,9 @@ const actions = {
     const sel = $('mergeSel'), id = deviceId(S.device), other = sel ? deviceId(sel.value) : '';
     if(!id || !other) return;
     const r = await mergeFlow(id, other);
+    // A Pi with device numbers but no Merge yet (an older QuietNet reached through the relay)
+    // answers 404, with nothing a person could read.
+    if(r instanceof Error && r.status === 404) r.message = NEEDS_UPDATE + 'merged. Nothing was changed.';
     if(r instanceof Error) await oops(r);
     else if(r) S.device = 'd' + r.device;
     refresh(true);
@@ -1907,12 +1932,18 @@ const actions = {
     if(!id || !d.mac) return;
     for(;;){
       let p;
-      try{ p = (await api('/api/separate', {device:id, mac:d.mac})).preview; }catch(e){ await oops(e); return refresh(true); }
+      try{ p = (await api('/api/separate', {device:id, mac:d.mac})).preview; }
+      catch(e){
+        if(e.status === 404) e.message = NEEDS_UPDATE + 'separated. Nothing was changed.';
+        await oops(e); return refresh(true);
+      }
       const rules = await askPreview({title:'Separate ' + p.mac + ' from ' + p.label + '?',
         intro:'It becomes a device of its own again. Do the rules go with it?',
         blocks:[{head:'What ' + p.label + ' carries now', none:'Nothing of its own: only what is set for the whole house.',
-                 lines:(p.rules || []).map(t => ({text:t}))}],
-        notes:(p.notes || []).concat(['With the same rules, the separated device gets a copy of everything listed above. With no rules, only what is set for the whole house applies to it.']),
+                 lines:(p.rules || []).map(t => ({text:t}))}].concat(separateHeld(p)),
+        notes:(p.notes || []).concat([(p.held || []).length
+          ? 'With the same rules, the separated device gets a copy of what ' + p.label + ' carries. With no rules, it gets none of that. Either way, what applies for now goes on applying to both until you answer "Same device?".'
+          : 'With the same rules, the separated device gets a copy of everything listed above. With no rules, only what is set for the whole house applies to it.']),
         buttons:[{label:'Separate, with the same rules', value:'copy'}, {label:'Separate, with no rules', value:'none'}]});
       if(!rules) return;
       try{ await api('/api/separate', {device:id, mac:d.mac, rules, seen:p.marker}); return refresh(true); }

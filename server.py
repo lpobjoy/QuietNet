@@ -323,6 +323,7 @@ class State:
     addr_use = {}           # address -> [device, first, last, row number, last as saved]: who used it most recently
     hw_device = {}          # hardware address -> device number
     addr_only = {}          # address -> the number of the device known only by that address
+    behind_extender = {}    # device known only by its address -> the range extender's hardware address seen answering for it
     device_kind = {}        # device number -> "hw", "addr", "pi" (this computer) or "hub" (the home router)
     pi_device = None        # the number of the fixed device that is this computer
     hub_device = None       # the number of the fixed device that is the home router
@@ -761,6 +762,8 @@ def oldest_to_drop():
 #                 two are the same ("asked"), and pairs the owner said are different ("no").
 #   rule_conflict rules the move from an older version set aside, for the owner to decide: they
 #                 apply to nobody until then.
+#   behind_extender  which devices known only by a number sit behind a Wi-Fi range extender, and
+#                 the extender's hardware address: such a number is never merged (merge_problem).
 #   A device's own internet switch, blocked services and schedules are kept in the same tables as
 #   a group's and the whole house's, under the scope "dev:<number>".
 #
@@ -773,6 +776,13 @@ def oldest_to_drop():
 #   S.addr_rules   whose rules a lookup from each address gets. Wider than S.addr_device, so that a
 #                 phone that has been idle for a minute (its entry gone stale) still gets its own
 #                 rules on its first lookup: see "whose rules a lookup gets" below.
+
+# Which devices known only by a number sit behind a Wi-Fi range extender, and which extender (its
+# hardware address) last answered for the number. Kept in the database, not worked out afresh at
+# each look: a merge of such a number must be refused whether or not the extender happens to be
+# listed at that moment (see merge_problem). A database whose device tables were made before this
+# table gets it when it is loaded (make_extender_table): it is small and empty, so that is instant.
+BEHIND_EXTENDER_SQL = "CREATE TABLE IF NOT EXISTS behind_extender(device INTEGER PRIMARY KEY, mac TEXT)"
 DEVICE_TABLES_SQL = (
     "CREATE TABLE IF NOT EXISTS device(id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT, key TEXT UNIQUE, "
     "name TEXT, first REAL, last REAL)",
@@ -792,6 +802,7 @@ DEVICE_TABLES_SQL = (
     "PRIMARY KEY(device, follows))",
     "CREATE TABLE IF NOT EXISTS rule_conflict(id INTEGER PRIMARY KEY, device INTEGER, held INTEGER, addr TEXT, "
     "text TEXT, ts REAL)",
+    BEHIND_EXTENDER_SQL,
 )
 
 
@@ -823,6 +834,13 @@ def mark_own_memberships():
         db.execute("ALTER TABLE group_member ADD COLUMN auto INTEGER DEFAULT 0")
 
 
+def make_extender_table():
+    """Make the table of numbers behind a Wi-Fi range extender if this database lacks it (its
+    device tables were made before the table was added). It starts empty and the looks fill it, so
+    this is instant. Call holding db_lock; the caller commits."""
+    db.execute(BEHIND_EXTENDER_SQL)
+
+
 def rules_on_devices():
     """Does this database hold names, groups and rules against the device (version 2 of the
     device tables)? The table of group members is made in one step with the move of the rules
@@ -843,7 +861,7 @@ def load_devices():
     before, until move_to_devices has done its work."""
     with db_lock:
         S.addr_device, S.map4, S.map6, S.addr_use = {}, {}, {}, {}
-        S.hw_device, S.addr_only, S.device_kind = {}, {}, {}
+        S.hw_device, S.addr_only, S.device_kind, S.behind_extender = {}, {}, {}, {}
         S.hw_unsettled, S.device_seen, S.hw_seen = frozenset(), {}, {}
         S.pi_device, S.hub_device, S.hub_mac = None, None, ""
         S.dev_first, S.dev_last, S.seeded = {}, {}, False
@@ -853,6 +871,7 @@ def load_devices():
         S.devices_ready = devices_made() and rules_on_devices()
         if S.devices_ready:
             mark_own_memberships()
+            make_extender_table()
             load_device_rows()
             if db.in_transaction:
                 db.commit()
@@ -872,8 +891,9 @@ def load_devices():
 
 def load_device_rows():
     """Read the device tables into S.device_kind, S.addr_only, S.hw_device, S.hub_mac, S.addr_use
-    (the newest row for each address) and when each device was first and last seen, making the two
-    fixed devices if they are missing. Call holding db_lock; the caller commits."""
+    (the newest row for each address), S.behind_extender and when each device was first and last
+    seen, making the two fixed devices if they are missing. Call holding db_lock; the caller
+    commits."""
     now = time.time()
     kinds, only, hw, use, first_seen, last_seen = {}, {}, {}, {}, {}, {}
     for number, kind, key, first, last in db.execute("SELECT id, kind, key, first, last FROM device"):
@@ -895,6 +915,8 @@ def load_device_rows():
             "SELECT rowid, addr, device, first, last FROM address_use ORDER BY first, rowid"):
         use[addr] = [number, first, last, row, last]
     S.hw_device, S.hub_mac, S.addr_use = hw, hub_mac, use
+    S.behind_extender = {number: mac for number, mac in db.execute("SELECT device, mac FROM behind_extender")
+                         if kinds.get(number) == "addr"}
 
 
 def new_device(kind, key, now):
@@ -1221,7 +1243,9 @@ def note_ipv4_addresses(table=None, now=None):
             live = [ip for ip, fresh in spots if fresh == "fresh"] or [ip for ip, fresh in spots if fresh == ""]
             if mac in S.shared_macs:
                 for ip in live:
-                    mapped[ip] = (device_of_address(ip, now), True)
+                    number = device_of_address(ip, now)
+                    mapped[ip] = (number, True)
+                    note_behind_extender(number, mac)
                 continue
             number = S.hw_device.get(mac)
             if not live:
@@ -1261,6 +1285,10 @@ def note_ipv4_addresses(table=None, now=None):
             if confirmed:
                 seen_now(number, now)
                 present.setdefault(number, (ip, seen_at[ip][0]))
+                if S.device_kind.get(number) == "hw" and S.addr_only.get(ip) in S.behind_extender:
+                    # A device known by its own hardware address is confirmed at this number: no
+                    # range extender is answering for it now.
+                    note_behind_extender(S.addr_only[ip], "")
         S.hw_unsettled = frozenset(unsettled)
         S.map4 = known
         # An address that has dropped out of the table altogether (Linux gives up on an entry
@@ -1315,6 +1343,26 @@ def note_ipv4_addresses(table=None, now=None):
         S.device_notices = device_notices_now(present, now)
         if db.in_transaction:
             db.commit()
+
+
+def note_behind_extender(number, mac):
+    """Remember that the device `number`, known only by its address, sits behind the Wi-Fi range
+    extender with the hardware address `mac`; with '' for `mac`, that it no longer does (a device
+    known by its own hardware address was confirmed at its number). Kept in S.behind_extender and
+    the database, so that it is still known when the extender is not listed (the device behind it
+    is asleep or away, or QuietNet has just restarted): merge_problem goes by it. Does nothing
+    when that is what is remembered already, which is every look but the first. Call holding
+    db_lock; the caller commits."""
+    if number is None or S.behind_extender.get(number, "") == mac:
+        return
+    kept = dict(S.behind_extender)
+    if mac:
+        kept[number] = mac
+        db.execute("INSERT OR REPLACE INTO behind_extender(device, mac) VALUES(?,?)", (number, mac))
+    else:
+        kept.pop(number, None)
+        db.execute("DELETE FROM behind_extender WHERE device=?", (number,))
+    S.behind_extender = kept
 
 
 def own_address(number, addresses):
@@ -1793,7 +1841,7 @@ def forget_old_devices(now=None):
                    % KEPT_DEVICES_SQL, (cutoff,))
         db.execute("DELETE FROM device WHERE id IN (SELECT id FROM device WHERE kind IN ('hw', 'addr') AND name='' "
                    "AND id NOT IN (%s) ORDER BY last DESC LIMIT -1 OFFSET ?)" % KEPT_DEVICES_SQL, (MAX_DEVICES,))
-        for table in ("device_hw", "address_use", "moved_address", "group_member"):
+        for table in ("device_hw", "address_use", "moved_address", "group_member", "behind_extender"):
             db.execute("DELETE FROM %s WHERE device NOT IN (SELECT id FROM device)" % table)
         db.execute("DELETE FROM device_follow WHERE device NOT IN (SELECT id FROM device) "
                    "OR follows NOT IN (SELECT id FROM device)")
@@ -4384,6 +4432,16 @@ def device_label(who):
     return who
 
 
+def steady_label(who):
+    """A name for a device that does not move from one look to the next: the name it was given,
+    else "device <number>". Never shown to anyone: a preview's marker is worked out with it
+    (preview_marker), because the address an unnamed device is shown by (device_label) changes as
+    its neighbour entries go fresh and stale, and that alone must not make a preview out of date."""
+    if who in S.given:
+        return S.given[who]
+    return "device %d" % who if isinstance(who, int) else who
+
+
 def add_event(ip, text, now=None):
     """Note something QuietNet did to a device's rules by itself, for the dashboard, keeping only
     the newest MAX_EVENTS. `ip` is the address it happened at ('' if none). Call holding db_lock;
@@ -4843,6 +4901,8 @@ def merge_devices(keep, gone, note="", prefer=None, prefer_name=None):
         db.execute("UPDATE rule_conflict SET device=? WHERE device=?", (keep, gone))
         db.execute("DELETE FROM rule_conflict WHERE held=? OR held=device", (gone,))
         db.execute("DELETE FROM device WHERE id=?", (gone,))
+        db.execute("DELETE FROM behind_extender WHERE device=?", (gone,))
+        S.behind_extender = {n: mac for n, mac in S.behind_extender.items() if n != gone}
         S.device_kind.pop(gone, None)
         S.dev_first.pop(gone, None)
         S.dev_last.pop(gone, None)
@@ -4960,6 +5020,9 @@ def different_device_by_hand(number):
 # request that sends the preview's marker back ("seen") is carried out, and only while the preview
 # would still read the same: if a rule, a name, a group or a hardware address has changed since,
 # nothing is done and the owner is shown the new preview. So what is applied is what was shown.
+# The one thing left out of that comparison is the address an unnamed device is shown by: it moves
+# from one look to the next (whichever of a merged laptop's two addresses was confirmed last), and
+# changes nothing that would be done. The marker is worked out with steady_label in its place.
 
 PREVIEW_CHANGED = ("Something changed since this was shown, so nothing was done. Look at what would apply "
                    "now and confirm again.")
@@ -5029,8 +5092,10 @@ def own_membership(number):
 
 
 def preview_marker(preview):
-    """A short code for one preview, which changes whenever anything in the preview would read
-    differently. The page sends it back to have the change carried out (see the notes above)."""
+    """A short code for one preview, which changes whenever a rule, a name, a group or a hardware
+    address in the preview would read differently. The page sends it back to have the change
+    carried out (see the notes above). It is given the preview as built with steady_label, so the
+    address an unnamed device happens to be shown by does not come into it."""
     return hashlib.sha256(json.dumps(preview, sort_keys=True).encode()).hexdigest()[:24]
 
 
@@ -5039,7 +5104,14 @@ def merge_problem(device, other):
     Never this computer or the router, never rules waiting for the owner's decision, never two
     devices both known only by a number, and never a number behind a Wi-Fi range extender (one
     hardware address answers for several devices there, so QuietNet could not keep the merged
-    device together)."""
+    device together).
+
+    Whether a number is behind a range extender is remembered (S.behind_extender, kept by the
+    looks and saved), not read from what the last look happened to list: the device behind the
+    extender may be asleep or away, or QuietNet may just have restarted, and the merge must be
+    refused all the same. It lifts by itself when the extender has not been seen sharing for
+    KNOWN_MACS_DAYS and is forgotten (S.shared_macs), or when a device known by its own hardware
+    address is confirmed at that number."""
     if not S.devices_ready:
         return not_ready_message()
     if device not in S.device_kind or other not in S.device_kind or device == other:
@@ -5053,7 +5125,7 @@ def merge_problem(device, other):
         return ("QuietNet knows both of those only by their numbers, with no hardware address for either, so it "
                 "can't keep them together as one device.")
     for number in (device, other):
-        if S.device_kind[number] == "addr" and (S.device_warnings.get(number) == EXTENDER_OWNER
+        if S.device_kind[number] == "addr" and (S.behind_extender.get(number) in S.shared_macs
                                                 or S.provisional.get(number) is not None):
             return ("QuietNet knows that device only by its number (it is behind a Wi-Fi range extender), so it can't "
                     "be joined to another device. The rules keep applying to that number.")
@@ -5096,12 +5168,13 @@ def merge_preview(device, other):
 
     The preview is {"device", "with", "keep" (the number the merged device will have), "label",
     "other_label", "name" (what it will be called), "group" and "group_name" (the group it will
-    be in, null and '' for none), "notes" (plain-English lines), "hardware" (one entry for each
-    hardware address of either device: {"mac", "label" (the device it belongs to now), "applies"
-    (every rule that will apply to it afterwards, each {"text", "new"}: "new" true if it does not
-    apply to that hardware address today), "stops" (the rules that apply to it today and will
-    not afterwards)}), "marker"}. Rules set for the whole house are left out: they apply either
-    way."""
+    be in, null and '' for none), "notes" (plain-English lines, the last of which says whether
+    Separate can undo the merge: it can only when both devices are known by a hardware address),
+    "hardware" (one entry for each hardware address of either device: {"mac", "label" (the device
+    it belongs to now), "applies" (every rule that will apply to it afterwards, each {"text",
+    "new"}: "new" true if it does not apply to that hardware address today), "stops" (the rules
+    that apply to it today and will not afterwards)}), "marker"}. Rules set for the whole house
+    are left out: they apply either way."""
     problem = merge_problem(device, other)
     if problem:
         return problem, None
@@ -5115,37 +5188,55 @@ def merge_preview(device, other):
         groups.append(S.dev_group.get(follow))
         cut = cut or follow in S.enforced
     after = rule_items(own, groups, cut)
-    hardware = []
-    for number in (device, other):
-        before = rules_now(number)
-        for mac in hardware_of(number):
-            hardware.append({"mac": mac, "label": device_label(number),
-                             "applies": [{"text": text, "new": key not in before} for key, text in after.items()],
-                             "stops": [text for key, text in before.items() if key not in after]})
-    notes = []
-    if name:
-        notes.append('The merged device will be called "%s".' % name
-                     + (' The name "%s" is not kept.' % names_now[1] if all(names_now) and names_now[1] != name else ""))
-    for g in lost:
-        notes.append("It will no longer be in the %s group, so what is blocked or scheduled for that group stops "
-                     "applying to it." % S.group_names.get(g, "other"))
-    for held, to in sorted(S.provisional.items()):
-        if to in (device, other) and held not in (device, other):
-            notes.append("%s may be the same device as %s, and you have not answered that yet. Until you do, the "
-                         "merged device's rules apply to it too." % (device_label(held), device_label(to)))
-    for number in (device, other):
-        if S.device_kind[number] == "addr":
+    before = {number: rules_now(number) for number in (device, other)}
+    by_number = [number for number in (device, other) if S.device_kind[number] == "addr"]
+
+    def build(label):
+        """The preview with each device named by `label`: device_label for the one the owner
+        reads, steady_label for the one the marker is worked out from."""
+        hardware = []
+        for number in (device, other):
+            for mac in hardware_of(number):
+                hardware.append({"mac": mac, "label": label(number),
+                                 "applies": [{"text": text, "new": key not in before[number]}
+                                             for key, text in after.items()],
+                                 "stops": [text for key, text in before[number].items() if key not in after]})
+        notes = []
+        if name:
+            notes.append('The merged device will be called "%s".' % name
+                         + (' The name "%s" is not kept.' % names_now[1]
+                            if all(names_now) and names_now[1] != name else ""))
+        for g in lost:
+            notes.append("It will no longer be in the %s group, so what is blocked or scheduled for that group "
+                         "stops applying to it." % S.group_names.get(g, "other"))
+        for held, to in sorted(S.provisional.items()):
+            if to in (device, other) and held not in (device, other):
+                notes.append("%s may be the same device as %s, and you have not answered that yet. Until you do, "
+                             "the merged device's rules apply to it too." % (label(held), label(to)))
+        for number in by_number:
             notes.append("QuietNet knows %s only by its number. Its rules and history go to the merged device; "
                          "anything that still looks things up from that number afterwards will show as a separate "
-                         "entry again." % device_label(number))
-    notes.append("The history of both becomes one history. Every internet switch, blocked service and schedule "
-                 "either has is kept.")
-    notes.append("You can undo this with Separate on the device's page. The history then stays with this device.")
-    preview = {"device": device, "with": other, "keep": keep, "label": device_label(device),
-               "other_label": device_label(other), "name": name, "group": gid,
-               "group_name": S.group_names.get(gid, "") if gid is not None else "", "notes": notes,
-               "hardware": hardware}
-    preview["marker"] = preview_marker(preview)
+                         "entry again." % label(number))
+        notes.append("The history of both becomes one history. Every internet switch, blocked service and schedule "
+                     "either has is kept.")
+        if by_number:
+            # Separate takes a hardware address out of a device, and a number has none: it can
+            # never give the number its name and rules back, however many hardware addresses the
+            # kept device holds. So the owner is told plainly, before confirming.
+            notes.append("This can't be undone with Separate: QuietNet knows %s only by its number, so there is no "
+                         "hardware address to take out again. Its rules become the merged device's own for good. To "
+                         "go back, you would take them off again on the merged device's page, one at a time."
+                         % label(by_number[0]))
+        else:
+            notes.append("You can undo this with Separate on the device's page. The history then stays with this "
+                         "device.")
+        return {"device": device, "with": other, "keep": keep, "label": label(device),
+                "other_label": label(other), "name": name, "group": gid,
+                "group_name": S.group_names.get(gid, "") if gid is not None else "", "notes": notes,
+                "hardware": hardware}
+
+    preview = build(device_label)
+    preview["marker"] = preview_marker(build(steady_label))
     return None, preview
 
 
@@ -5194,21 +5285,45 @@ def separate_preview(number, mac):
     The preview is {"device", "mac", "label", "stays" (the hardware addresses that stay with the
     device), "rules" (what the device carries now, in plain words: its group, its own internet
     switch, blocked services, schedules and "cut live connections"; with "rules": "copy" the
-    separated device is given the same, with "none" it gets none of them), "notes", "marker"}."""
+    separated device is given the same, with "none" it gets none of them), "follows" and "held",
+    "notes", "marker"}.
+
+    "follows" is the number of the device this one is being held to the rules of while the owner
+    has not answered "same device?" (S.provisional), or null; "held" is what reaches it that way,
+    in plain words, beyond what is in "rules". Those go on applying to both hardware addresses
+    whatever the owner chooses here (separate_by_hand carries the open question to the new
+    device), so they are shown, and a note says so: Separate must never be a way out from under
+    rules that are being held to a device. Both are part of the marker, so a question that is
+    answered, or starts, between the preview and the confirm makes the preview out of date."""
     problem = separate_problem(number, mac)
     if problem:
         return problem, None
-    label = device_label(number)
-    rules = list(rule_items(["dev:%d" % number], [S.dev_group.get(number)], number in S.enforced).values())
-    notes = ["The hardware address %s becomes a device of its own again, with no name." % mac,
-             "Its history so far stays with %s. From now on what it looks up is kept under the new device." % label,
-             "%s keeps its name, its group, its rules and its other hardware address%s."
-             % (label, "" if len(hardware_of(number)) == 2 else "es"),
-             "QuietNet will not ask whether the two are the same device again. You can merge them again from "
-             "either one's page."]
-    preview = {"device": number, "mac": mac, "label": label, "stays": [m for m in hardware_of(number) if m != mac],
-               "rules": rules, "notes": notes}
-    preview["marker"] = preview_marker(preview)
+    own = rule_items(["dev:%d" % number], [S.dev_group.get(number)], number in S.enforced)
+    followed = S.provisional.get(number)
+    held = [] if followed is None else [text for key, text in rules_now(number).items() if key not in own]
+    several = len(hardware_of(number)) != 2
+
+    def build(label):
+        """The preview with each device named by `label`: device_label for the one the owner
+        reads, steady_label for the one the marker is worked out from."""
+        me = label(number)
+        notes = ["The hardware address %s becomes a device of its own again, with no name." % mac,
+                 "Its history so far stays with %s. From now on what it looks up is kept under the new device." % me,
+                 "%s keeps its name, its group, its rules and its other hardware address%s."
+                 % (me, "es" if several else ""),
+                 "QuietNet will not ask whether the two are the same device again. You can merge them again from "
+                 "either one's page."]
+        if followed is not None:
+            whose = label(followed)
+            notes.append("%s may be the same device as %s, and you have not answered that yet. Until you do, the "
+                         "rules for %s go on applying to both: to %s and to the separated hardware address, "
+                         "whichever you choose here. QuietNet will ask about each of them."
+                         % (me, whose, whose, me))
+        return {"device": number, "mac": mac, "label": me, "stays": [m for m in hardware_of(number) if m != mac],
+                "rules": list(own.values()), "held": held, "follows": followed, "notes": notes}
+
+    preview = build(device_label)
+    preview["marker"] = preview_marker(build(steady_label))
     return None, preview
 
 
@@ -5225,7 +5340,15 @@ def separate_by_hand(number, mac, rules, seen, table=None):
     The history stays with the device it was merged into, and so does the record of addresses:
     the new device starts a record of its own at the next look. The two are remembered as
     different devices (S.not_same), so the new one is never held to the other's rules as "maybe
-    the same device". `table` is the IPv4 neighbour table as just read, for a look straight
+    the same device".
+
+    If the device is itself being held to a third device's rules, the question not answered yet
+    (S.provisional), the new device is held to them too, and the question is asked about each.
+    Both hardware addresses were under those rules before, so nothing is newly blocked, and
+    neither gets out from under them by being separated, whichever of the two the owner picks and
+    whatever the answer about the device's own rules. The preview says so (separate_preview).
+
+    `table` is the IPv4 neighbour table as just read, for a look straight
     afterwards, so that lookups from the separated device stop getting the other's rules at once
     and not at the next look; without it the next look (seconds away) does that."""
     if rules not in ("copy", "none"):
@@ -5257,12 +5380,21 @@ def separate_by_hand(number, mac, rules, seen, table=None):
             S.not_same.add(pair)
             db.execute("INSERT OR REPLACE INTO device_follow(device, follows, state, since) VALUES(?,?,?,?)",
                        (pair[0], pair[1], "no", now))
+        followed = S.provisional.get(number)
+        if followed is not None:
+            # An open "same device?" question goes with it: see the docstring.
+            S.provisional[new] = followed
+            db.execute("INSERT OR REPLACE INTO device_follow(device, follows, state, since) VALUES(?,?,?,?)",
+                       (new, followed, "asked", now))
         if rules == "copy":
             copy_device_rules(number, new)
         add_event((device_addresses(number) + [""])[0],
                   "You separated the hardware address %s from %s. It is a device of its own again, %s. Its history "
-                  "so far stays with %s." % (mac, preview["label"], "with the same rules" if rules == "copy"
-                                             else "with no rules of its own", preview["label"]), now)
+                  "so far stays with %s.%s"
+                  % (mac, preview["label"], "with the same rules" if rules == "copy" else "with no rules of its own",
+                     preview["label"],
+                     "" if followed is None else " It may still be the same device as %s, so the rules for %s apply "
+                     "to it until you say." % (device_label(followed), device_label(followed))), now)
         db.commit()
         load_schedules()                    # also tells the enforcer and the answer cache that rules changed
     if table is not None:
@@ -6104,7 +6236,10 @@ def api_devices(everything=False):
                    "last", "now"}: when it was first and last confirmed there, and whether it is
                    there now;
       "ip"         the one address it is listed under: the IPv4 address it has now, else the last
-                   it had that no other device has since been seen at, else an IPv6 address. Empty
+                   it had that no other device has since been seen at, else an IPv6 address. Of
+                   two, the one confirmed most recently, and of two confirmed at the same moment
+                   the lower, as device_addresses orders them, so that a schedule's scope
+                   (shown_scope) and device_label name the address the card is listed under. Empty
                    for a device that has left and whose address has gone to another device: its
                    history, name and rules are kept under its number all the same. Such a device is
                    only listed when `everything` is true (GET /api/devices?all=1), because a page
@@ -6178,7 +6313,10 @@ def api_devices(everything=False):
             if kinds[number] == "pi":
                 homes[number] = S.local_ip
             elif any(pools):
-                homes[number] = max(next(pool for pool in pools if pool))[1]
+                # The most recently confirmed; of two confirmed at the same moment (both cards
+                # of a merged laptop, at every look), the lower address, as device_addresses
+                # has it, so that the card and a schedule's scope name the same address.
+                homes[number] = min(next(pool for pool in pools if pool), key=lambda x: (-x[0], x[1]))[1]
             else:
                 homes[number] = only if only and holder(only) == number else ""
         return homes[number]

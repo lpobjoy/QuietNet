@@ -31,7 +31,7 @@ AT_CABLE, AT_WIFI = OLD, NEW           # where each is on the home network
 def tables():
     """Everything in the database a merge or a separation could touch, to show nothing changed."""
     names = ("device", "device_hw", "address_use", "group_member", "live_cut", "device_follow", "internet_off",
-             "service_blocks", "schedules", "events", "queries", "rule_conflict")
+             "service_blocks", "schedules", "events", "queries", "rule_conflict", "behind_extender")
     return {name: sorted(server.sql("SELECT * FROM %s" % name), key=repr) for name in names}
 
 
@@ -154,6 +154,9 @@ class MergeIsShownFirst(TwoDevices):
                       "either has is kept.", notes)
         self.assertIn("You can undo this with Separate on the device's page. The history then stays with this device.",
                       notes)
+
+    def test_the_preview_does_not_say_a_merge_of_two_hardware_addresses_cannot_be_undone(self):
+        self.assertFalse(any("can't be undone" in note for note in self.preview(self.cable, self.wifi)["notes"]))
 
     def test_a_schedule_that_is_switched_off_is_shown_as_not_in_use(self):
         schedule = self.schedule(scope="dev:%d" % self.wifi)
@@ -340,6 +343,36 @@ class WhatCannotBeMerged(TwoDevices):
         self.assertIn("behind a Wi-Fi range extender", self.refused(self.cable, behind))
         self.assertIn("behind a Wi-Fi range extender", self.refused(behind, self.cable))
 
+    def test_a_number_a_range_extender_now_answers_for_is_not_merged_with_the_device_whose_rules_it_is_given(self):
+        self.look(dict(self.table, **{OTHER: fresh(PHONE)}), later=30)
+        phone = self.give_rules(PHONE)
+        sharing = dict(self.table, **{OTHER: fresh(PHONE), "192.168.1.80": fresh(EXTENDER),
+                                      "192.168.1.81": fresh(EXTENDER)})
+        for minute in range(1, 1 + server.SHARED_AFTER):
+            self.look(sharing, later=60 * minute)
+        self.look(dict(self.table, **{OTHER: fresh(EXTENDER), "192.168.1.81": fresh(EXTENDER)}), later=600)
+        behind = server.S.addr_only[OTHER]                          # the phone's number, now answered by the extender
+        self.assertEqual(server.S.provisional, {behind: phone})
+        for device, other in ((phone, behind), (behind, phone), (self.cable, behind)):
+            self.assertIn("behind a Wi-Fi range extender", self.refused(device, other))
+        self.assertTrue(blocked_for(OTHER))                         # the rules keep applying to that number
+
+    def test_a_number_being_held_to_a_devices_rules_is_not_merged_even_when_the_extender_is_forgotten(self):
+        self.look(dict(self.table, **{OTHER: fresh(PHONE)}), later=30)
+        phone = self.give_rules(PHONE)
+        sharing = dict(self.table, **{OTHER: fresh(PHONE), "192.168.1.80": fresh(EXTENDER),
+                                      "192.168.1.81": fresh(EXTENDER)})
+        for minute in range(1, 1 + server.SHARED_AFTER):
+            self.look(sharing, later=60 * minute)
+        self.look(dict(self.table, **{OTHER: fresh(EXTENDER), "192.168.1.81": fresh(EXTENDER)}), later=600)
+        behind = server.S.addr_only[OTHER]
+        with server.db_lock:                                        # the extender no longer counts as one
+            server.note_shared_macs(set(), self.now + (server.KNOWN_MACS_DAYS + 1) * 86400)
+            server.db.commit()
+        self.assertEqual((server.S.shared_macs, server.S.provisional), (set(), {behind: phone}))
+        for device, other in ((phone, behind), (behind, phone), (self.cable, behind)):
+            self.assertIn("behind a Wi-Fi range extender", self.refused(device, other))
+
     def test_rules_waiting_for_the_owners_decision_are_not_merged(self):
         with server.rule_map_lock:
             server.S.set_aside = frozenset({self.wifi})
@@ -355,6 +388,90 @@ class WhatCannotBeMerged(TwoDevices):
         self.addCleanup(setattr, server.S, "devices_ready", True)
         status, out = self.post("/api/merge", {"device": self.cable, "with": self.wifi})
         self.assertEqual((status, out["error"]), (400, server.STILL_MOVING))
+
+
+class ANumberBehindARangeExtender(TwoDevices):
+    """A number a Wi-Fi range extender answers for is never merged, and that does not depend on
+    the extender being in the neighbour table at the moment the owner asks."""
+
+    def setUp(self):
+        super().setUp()
+        self.behind_extender = {AT_CABLE: fresh(CABLE), OTHER: fresh(EXTENDER), "192.168.1.81": fresh(EXTENDER)}
+        for minute in range(1, 1 + server.SHARED_AFTER):
+            self.look(self.behind_extender, later=60 * minute)
+        self.behind = server.S.addr_only[OTHER]
+        server.set_service_block("dev:%d" % self.behind, "youtube", True)
+
+    def refused(self, device, other):
+        before = tables()
+        status, out = self.post("/api/merge", {"device": device, "with": other})
+        self.assertEqual(status, 400, out)
+        self.assertEqual(tables(), before)
+        return out["error"]
+
+    def test_which_extender_answers_for_the_number_is_remembered(self):
+        self.assertEqual(server.S.behind_extender, {self.behind: EXTENDER, server.S.addr_only["192.168.1.81"]: EXTENDER})
+        self.assertIn((self.behind, EXTENDER), server.sql("SELECT device, mac FROM behind_extender"))
+
+    def test_a_number_behind_a_range_extender_is_not_merged_while_the_extender_is_not_listed(self):
+        # The device behind it is asleep: the extender's entries have dropped out of the table.
+        self.look({AT_CABLE: fresh(CABLE)}, later=600)
+        self.assertNotIn(self.behind, server.S.device_warnings)     # nothing in this look says "extender"
+        self.assertIn("behind a Wi-Fi range extender", self.refused(self.cable, self.behind))
+        self.assertIn("behind a Wi-Fi range extender", self.refused(self.behind, self.cable))
+        self.look(self.behind_extender, later=660)                  # and its rules are still there when it wakes
+        self.assertTrue(blocked_for(OTHER))
+
+    def test_a_number_behind_a_range_extender_is_still_not_merged_after_a_restart(self):
+        server.init_db()                                            # no look yet: the table is still filling
+        self.assertEqual(server.S.device_warnings, {})
+        self.assertIn("behind a Wi-Fi range extender", self.refused(self.cable, self.behind))
+        self.assertIn("behind a Wi-Fi range extender", self.refused(self.behind, self.cable))
+
+    def test_a_number_once_behind_an_extender_can_be_merged_after_the_extender_is_forgotten(self):
+        # Not seen sharing for KNOWN_MACS_DAYS: it no longer counts as a range extender.
+        self.look({AT_CABLE: fresh(CABLE)}, later=600)
+        with server.db_lock:
+            server.note_shared_macs(set(), self.now + (server.KNOWN_MACS_DAYS + 1) * 86400)
+            server.db.commit()
+        self.assertEqual(server.S.shared_macs, set())
+        self.assertEqual(self.preview(self.cable, self.behind)["keep"], self.cable)
+
+    def test_a_number_a_device_now_has_by_its_own_hardware_address_can_be_merged(self):
+        # The tablet now connects straight to the router at the same number, and is held to the
+        # rules kept under it: "yes, they are this device's" must be open to the owner.
+        self.look({AT_CABLE: fresh(CABLE), OTHER: fresh(PHONE)}, later=600)
+        tablet = self.number(PHONE)
+        self.assertEqual(server.S.provisional, {tablet: self.behind})
+        self.assertNotIn(self.behind, server.S.behind_extender)
+        self.assertEqual(server.sql("SELECT device FROM behind_extender WHERE device=?", (self.behind,)), [])
+        self.assertEqual(self.merge(self.behind, tablet), tablet)
+        self.assertTrue(blocked_for(OTHER))
+
+    def test_a_database_made_before_this_was_remembered_is_given_the_table_when_it_is_loaded(self):
+        server.sql("DROP TABLE behind_extender", commit=True)
+        server.init_db()
+        self.assertEqual(server.sql("SELECT device FROM behind_extender"), [])
+        self.assertEqual(server.S.behind_extender, {})
+        self.look(self.behind_extender, later=600)                  # the next look that sees the extender fills it
+        self.assertEqual(server.S.behind_extender[self.behind], EXTENDER)
+        self.assertIn("behind a Wi-Fi range extender", self.refused(self.cable, self.behind))
+
+    def test_what_is_remembered_about_the_extender_goes_when_the_number_is_merged_away(self):
+        self.look({AT_CABLE: fresh(CABLE)}, later=600)
+        with server.db_lock:
+            server.note_shared_macs(set(), self.now + (server.KNOWN_MACS_DAYS + 1) * 86400)
+            server.db.commit()
+        self.merge(self.cable, self.behind)
+        self.assertNotIn(self.behind, server.S.behind_extender)
+        self.assertEqual(server.sql("SELECT device FROM behind_extender WHERE device=?", (self.behind,)), [])
+
+    def test_what_is_remembered_about_the_extender_goes_when_the_number_is_forgotten(self):
+        server.set_service_block("dev:%d" % self.behind, "youtube", False)
+        server.forget_old_devices(self.now + (server.KEEP_DAYS + 1) * 86400)
+        self.assertNotIn(self.behind, server.S.device_kind)
+        self.assertEqual(server.S.behind_extender, {})
+        self.assertEqual(server.sql("SELECT device FROM behind_extender"), [])
 
 
 class ADeviceKnownOnlyByItsNumber(TwoDevices):
@@ -388,6 +505,42 @@ class ADeviceKnownOnlyByItsNumber(TwoDevices):
         preview = self.preview(self.cable, self.held)
         self.assertEqual([h["mac"] for h in preview["hardware"]], [CABLE])
         self.assertEqual(self.applies(preview, CABLE), {"YouTube blocked": True})
+
+    def test_its_group_wins_when_it_is_the_one_merged_into(self):
+        kids, adults = self.make_group("Kids", "tiktok"), self.make_group("Adults")
+        server.set_device_group(self.held, kids)
+        server.set_device_group(self.cable, adults)
+        preview = self.preview(self.held, self.cable)
+        self.assertEqual((preview["keep"], preview["group"], preview["group_name"]), (self.cable, kids, "Kids"))
+        shown = sorted(x["text"] for x in next(h for h in preview["hardware"] if h["mac"] == CABLE)["applies"])
+        self.ok("/api/merge", {"device": self.held, "with": self.cable, "seen": preview["marker"]})
+        self.assertEqual(server.S.dev_group, {self.cable: kids})
+        self.assertEqual(sorted(server.rules_now(self.cable).values()), shown)
+
+    CANT_UNDO = ("This can't be undone with Separate: QuietNet knows Den TV only by its number, so there is no "
+                 "hardware address to take out again. Its rules become the merged device's own for good. To go back, "
+                 "you would take them off again on the merged device's page, one at a time.")
+
+    def test_the_preview_does_not_promise_an_undo_when_one_is_known_only_by_its_number(self):
+        for device, other in ((self.cable, self.held), (self.held, self.cable)):
+            notes = self.preview(device, other)["notes"]
+            self.assertFalse(any("You can undo this with Separate" in note for note in notes), notes)
+            self.assertEqual(notes[-1], self.CANT_UNDO)
+
+    def test_a_merge_with_a_device_known_only_by_its_number_cannot_be_separated_afterwards(self):
+        kept = self.merge(self.cable, self.held)
+        self.assertEqual(server.hardware_of(kept), [CABLE])
+        status, out = self.post("/api/separate", {"device": kept, "mac": CABLE})
+        self.assertEqual((status, out["error"]),
+                         (400, "This device has only one hardware address, so there is nothing to separate."))
+
+    def test_no_undo_is_promised_for_a_number_merged_into_a_device_with_two_hardware_addresses(self):
+        # Separate could take one of the two network cards out again, but never give the number
+        # its name and rules back.
+        both = self.merge(self.cable, self.wifi)
+        notes = self.preview(both, self.held)["notes"]
+        self.assertFalse(any("You can undo this with Separate" in note for note in notes), notes)
+        self.assertEqual(notes[-1], self.CANT_UNDO)
 
 
 class TheNewDeviceGroupGivesWay(TwoDevices):
@@ -518,6 +671,45 @@ class AThirdDeviceStillBeingAskedAbout(Api, Setup):
         self.assertIn("%s may be the same device as Wilf's iPad, and you have not answered that yet. Until you do, the "
                       "merged device's rules apply to it too." % OLD, notes)
 
+    def test_a_device_being_held_to_anothers_rules_shows_them_for_both_hardware_addresses(self):
+        """The newcomer is still held to the phone's rules when the laptop is merged into it: the
+        preview must show those rules for both hardware addresses, because they apply afterwards."""
+        preview = self.ok("/api/merge", {"device": self.newcomer, "with": self.laptop})["preview"]
+        kept = self.ok("/api/merge", {"device": self.newcomer, "with": self.laptop,
+                                      "seen": preview["marker"]})["device"]
+        self.assertEqual(server.S.provisional, {kept: self.phone})
+        after = list(server.rules_now(kept).values())
+        self.assertEqual(after, ["YouTube blocked"])
+        for entry in preview["hardware"]:
+            self.assertEqual([rule["text"] for rule in entry["applies"]], after)
+            self.assertEqual(entry["stops"], [])
+        new = {entry["mac"]: [rule["new"] for rule in entry["applies"]] for entry in preview["hardware"]}
+        self.assertEqual(new, {PRIVATE: [False], LAPTOP: [True]})
+        self.assertTrue(blocked_for(OLD))
+        self.assertTrue(blocked_for(OTHER))
+
+    def test_the_group_and_live_cut_of_the_device_it_is_held_to_are_shown_as_well(self):
+        kids = self.make_group("Kids", "tiktok")
+        server.set_device_group(self.phone, kids)
+        server.set_live_cut(self.phone, True)
+        preview = self.ok("/api/merge", {"device": self.newcomer, "with": self.laptop})["preview"]
+        shown = [rule["text"] for rule in next(h for h in preview["hardware"] if h["mac"] == LAPTOP)["applies"]]
+        self.assertEqual(shown, ["In the Kids group", "YouTube blocked", "TikTok blocked for the Kids group",
+                                 "Cut live connections"])
+        kept = self.ok("/api/merge", {"device": self.newcomer, "with": self.laptop,
+                                      "seen": preview["marker"]})["device"]
+        self.assertEqual(list(server.rules_now(kept).values()), shown)
+
+    def test_merging_the_newcomer_into_another_device_closes_the_question_as_the_preview_shows(self):
+        # The owner says the newcomer is the laptop, so it is not the phone: the preview lists the
+        # phone's rules as stopping for it, and they do.
+        preview = self.ok("/api/merge", {"device": self.laptop, "with": self.newcomer})["preview"]
+        self.assertEqual(next(h for h in preview["hardware"] if h["mac"] == PRIVATE)["stops"], ["YouTube blocked"])
+        self.ok("/api/merge", {"device": self.laptop, "with": self.newcomer, "seen": preview["marker"]})
+        self.assertEqual(server.S.provisional, {})
+        self.assertFalse(blocked_for(OLD))
+        self.assertFalse(blocked_for(OTHER))
+
     def test_a_no_already_given_about_the_device_that_goes_holds_for_the_merged_device(self):
         self.ok("/api/different-device", {"device": self.newcomer})
         self.assertIn((self.newcomer, self.phone), server.S.not_same)
@@ -588,7 +780,28 @@ class SeparateIsShownFirst(TwoDevices):
         for rules in (None, "", "yes", True, ["copy"]):
             status, out = self.post("/api/separate", {"device": self.merged, "mac": WIFI, "seen": marker, "rules": rules})
             self.assertEqual((status, out["error"]), (400, "Please choose whether the rules go with it."), rules)
+        # And there is no default: leaving the answer out is refused like any other non-answer.
+        status, out = self.post("/api/separate", {"device": self.merged, "mac": WIFI, "seen": marker})
+        self.assertEqual((status, out.get("error")), (400, "Please choose whether the rules go with it."))
         self.assertEqual(tables(), before)
+        self.assertEqual(server.S.hw_device[WIFI], self.merged)
+
+    def test_a_device_that_is_not_being_held_to_anothers_rules_shows_nothing_held(self):
+        preview = self.split_preview(self.merged, WIFI)
+        self.assertEqual((preview["held"], preview["follows"]), ([], None))
+        self.assertFalse(any("you have not answered" in note for note in preview["notes"]))
+
+    def test_no_device_is_separated_when_quietnet_remembers_as_many_devices_as_it_can(self):
+        marker = self.split_preview(self.merged, WIFI)["marker"]
+        before = tables()
+        with mock.patch.object(server, "MAX_DEVICES", 1):           # this computer, the router and the laptop: over twice that
+            for body in ({"device": self.merged, "mac": WIFI},
+                         {"device": self.merged, "mac": WIFI, "rules": "copy", "seen": marker}):
+                status, out = self.post("/api/separate", body)
+                self.assertEqual((status, out["error"]), (400, "QuietNet is remembering as many devices as it can, "
+                                                               "so it can't make another one just now."))
+        self.assertEqual(tables(), before)
+        self.assertEqual(server.S.hw_device[WIFI], self.merged)
 
     def test_a_wrong_marker_changes_nothing(self):
         before = tables()
@@ -818,6 +1031,208 @@ class ASeparatedDeviceIsNotTakenForTheOther(Api, Setup):
         self.assertFalse(blocked_for(OLD))
 
 
+class SeparatingADeviceThatIsBeingHeldToAnothersRules(Api, Setup):
+    """A newcomer with a private Wi-Fi address is being held to a phone's rules, the question not
+    answered yet, when the owner merges the laptop into it by mistake and then undoes that with
+    Separate. Neither hardware address may get out from under the phone's rules that way."""
+
+    def setUp(self):
+        super().setUp()
+        self.start_clean()
+        self.table = {OLD: fresh(PRIVATE), OTHER: fresh(LAPTOP)}
+        self.look({OLD: fresh(PHONE), OTHER: fresh(LAPTOP)})
+        self.phone, self.laptop = self.give_rules(PHONE), self.number(LAPTOP)
+        self.look(self.table, later=60)                            # back with a new private address: held to the rules
+        self.newcomer = self.number(PRIVATE)
+        self.assertEqual(server.S.provisional, {self.newcomer: self.phone})
+        marker = self.ok("/api/merge", {"device": self.newcomer, "with": self.laptop})["preview"]["marker"]
+        self.kept = self.ok("/api/merge", {"device": self.newcomer, "with": self.laptop, "seen": marker})["device"]
+        full = dict(self.table, **{PI: fresh(PI_MAC), ROUTER: fresh(ROUTER_MAC)})
+        seen = mock.patch.object(server, "neighbour_table", return_value=full)
+        seen.start()
+        self.addCleanup(seen.stop)
+
+    def split_preview(self, mac):
+        return self.ok("/api/separate", {"device": self.kept, "mac": mac})["preview"]
+
+    def split(self, mac, rules):
+        marker = self.split_preview(mac)["marker"]
+        return self.ok("/api/separate", {"device": self.kept, "mac": mac, "rules": rules, "seen": marker})["device"]
+
+    def test_the_preview_names_the_rules_that_reach_the_device_through_an_unanswered_question(self):
+        preview = self.split_preview(PRIVATE)
+        self.assertEqual(preview["rules"], [])                      # nothing of its own
+        self.assertEqual((preview["held"], preview["follows"]), (["YouTube blocked"], self.phone))
+
+    def test_the_preview_says_the_held_rules_go_on_applying_to_both(self):
+        self.assertIn("%s may be the same device as Wilf's iPad, and you have not answered that yet. Until you do, "
+                      "the rules for Wilf's iPad go on applying to both: to %s and to the separated hardware address, "
+                      "whichever you choose here. QuietNet will ask about each of them." % (OLD, OLD),
+                      self.split_preview(PRIVATE)["notes"])
+
+    def test_the_group_of_the_device_it_is_held_to_is_named_among_what_is_held(self):
+        kids = self.make_group("Kids", "tiktok")
+        server.set_device_group(self.phone, kids)
+        self.assertEqual(self.split_preview(LAPTOP)["held"],
+                         ["In the Kids group", "YouTube blocked", "TikTok blocked for the Kids group"])
+
+    def test_separating_the_private_hardware_address_leaves_both_held(self):
+        new = self.split(PRIVATE, "copy")
+        self.assertEqual(server.S.provisional, {self.kept: self.phone, new: self.phone})
+        self.assertTrue(blocked_for(OLD))                           # the phone's new address: still under its block
+        self.assertTrue(blocked_for(OTHER))                         # the laptop: as before the separation
+        self.assertEqual(sorted(server.sql("SELECT device, follows FROM device_follow WHERE state='asked'")),
+                         sorted([(self.kept, self.phone), (new, self.phone)]))
+
+    def test_separating_with_no_rules_does_not_free_it_from_the_held_rules(self):
+        new = self.split(PRIVATE, "none")
+        self.assertFalse(server.own_rules(new))
+        self.assertEqual(server.S.provisional[new], self.phone)
+        self.assertTrue(blocked_for(OLD))
+
+    def test_separating_the_other_hardware_address_leaves_both_held_too(self):
+        new = self.split(LAPTOP, "none")
+        self.assertEqual(server.S.provisional, {self.kept: self.phone, new: self.phone})
+        self.assertTrue(blocked_for(OLD))
+        self.assertTrue(blocked_for(OTHER))
+
+    def test_both_are_still_held_after_later_looks(self):
+        self.split(PRIVATE, "none")
+        for minute in range(2, 40):
+            self.look(self.table, later=60 * minute)
+        self.assertTrue(blocked_for(OLD))
+        self.assertTrue(blocked_for(OTHER))
+
+    def test_both_are_still_held_after_a_restart(self):
+        new = self.split(PRIVATE, "none")
+        server.init_db()
+        self.assertEqual(server.S.provisional, {self.kept: self.phone, new: self.phone})
+        self.look(self.table, later=120)
+        self.assertTrue(blocked_for(OLD))
+        self.assertTrue(blocked_for(OTHER))
+
+    def test_the_question_is_then_asked_about_each_of_them(self):
+        new = self.split(PRIVATE, "none")
+        asked = {n["to_device"]: (n["from_device"], n["same"]) for n in server.S.device_notices}
+        self.assertEqual(asked, {self.kept: (self.phone, True), new: (self.phone, True)})
+
+    def test_answering_no_for_one_leaves_the_other_held(self):
+        new = self.split(PRIVATE, "none")
+        self.ok("/api/different-device", {"device": self.kept})     # the laptop is not the phone
+        self.assertEqual(server.S.provisional, {new: self.phone})
+        self.assertTrue(blocked_for(OLD))
+        self.assertFalse(blocked_for(OTHER))
+
+    def test_a_hold_that_ends_between_the_preview_and_the_confirm_changes_nothing(self):
+        marker = self.split_preview(PRIVATE)["marker"]
+        self.ok("/api/different-device", {"device": self.kept})     # answered after the owner read the preview
+        before = tables()
+        status, out = self.post("/api/separate", {"device": self.kept, "mac": PRIVATE, "rules": "copy", "seen": marker})
+        self.assertEqual((status, out["error"]), (409, server.PREVIEW_CHANGED))
+        self.assertEqual(tables(), before)
+        self.assertEqual(server.S.hw_device[PRIVATE], self.kept)
+
+    def test_the_note_of_the_separation_says_the_rules_still_apply(self):
+        self.split(PRIVATE, "none")
+        self.assertIn("You separated the hardware address %s from %s. It is a device of its own again, with no rules "
+                      "of its own. Its history so far stays with %s. It may still be the same device as Wilf's iPad, "
+                      "so the rules for Wilf's iPad apply to it until you say." % (PRIVATE, OLD, OLD), self.events())
+
+
+class AnUnnamedDeviceShownByADifferentAddress(TwoDevices):
+    """A device with no name is shown by an address, and which one changes from look to look when
+    it has two (a merged laptop on cable and Wi-Fi). That alone must not make a preview out of
+    date: nothing that would be done has changed."""
+
+    def setUp(self):
+        super().setUp()
+        self.merged = self.merge(self.cable, self.wifi)
+        self.look(self.table, later=60)
+
+    def shown_differently(self, later):
+        """One look later the cable's entry reads stale and the Wi-Fi's fresh, so the device is
+        shown by its other address."""
+        before = server.device_label(self.merged)
+        self.table = {AT_CABLE: stale(CABLE), AT_WIFI: fresh(WIFI)}
+        self.look(self.table, later=later)
+        self.assertEqual((before, server.device_label(self.merged)), (AT_CABLE, AT_WIFI))
+
+    def test_separate_still_goes_through_when_an_unnamed_device_is_shown_by_a_different_address_at_the_next_look(self):
+        preview = self.split_preview(self.merged, WIFI)
+        self.assertEqual(preview["label"], AT_CABLE)
+        self.shown_differently(65)
+        self.assertEqual(self.split_preview(self.merged, WIFI)["label"], AT_WIFI)
+        new = self.ok("/api/separate", {"device": self.merged, "mac": WIFI, "rules": "none",
+                                        "seen": preview["marker"]})["device"]
+        self.assertEqual(server.S.hw_device[WIFI], new)
+
+    def test_merge_still_goes_through_when_an_unnamed_device_is_shown_by_a_different_address_at_the_next_look(self):
+        self.table[OTHER] = fresh(PHONE)
+        self.look(self.table, later=62)
+        phone = self.number(PHONE)
+        preview = self.preview(self.merged, phone)
+        self.assertEqual(preview["label"], AT_CABLE)
+        self.shown_differently(65)
+        self.assertEqual(self.preview(self.merged, phone)["label"], AT_WIFI)
+        self.ok("/api/merge", {"device": self.merged, "with": phone, "seen": preview["marker"]})
+        self.assertEqual(server.S.hw_device[PHONE], self.merged)
+
+    def test_a_merge_is_still_refused_when_a_name_changed_after_the_preview(self):
+        self.table[OTHER] = fresh(PHONE)
+        self.look(self.table, later=62)
+        phone = self.number(PHONE)
+        marker = self.preview(self.merged, phone)["marker"]
+        server.set_device_name(phone, "Wilf's iPad")
+        status, out = self.post("/api/merge", {"device": self.merged, "with": phone, "seen": marker})
+        self.assertEqual((status, out["error"]), (409, server.PREVIEW_CHANGED))
+        self.assertIn(phone, server.S.device_kind)
+
+    def test_a_separation_is_still_refused_when_a_name_changed_after_the_preview(self):
+        marker = self.split_preview(self.merged, WIFI)["marker"]
+        server.set_device_name(self.merged, "Sam's laptop")
+        status, out = self.post("/api/separate", {"device": self.merged, "mac": WIFI, "rules": "none", "seen": marker})
+        self.assertEqual((status, out["error"]), (409, server.PREVIEW_CHANGED))
+        self.assertEqual(server.S.hw_device[WIFI], self.merged)
+
+    def test_the_marker_names_an_unnamed_device_by_its_number_not_an_address(self):
+        self.assertEqual(server.steady_label(self.merged), "device %d" % self.merged)
+        server.set_device_name(self.merged, "Sam's laptop")
+        self.assertEqual(server.steady_label(self.merged), "Sam's laptop")
+
+
+class AMergedDeviceAtTwoAddressesAtOnce(TwoDevices):
+    """Both cards of a merged laptop are confirmed at every look, so neither address is the more
+    recent. The card, the schedule and the messages must still name the same one."""
+
+    def setUp(self):
+        super().setUp()
+        self.merged = self.merge(self.cable, self.wifi)
+        server.set_device_name(self.merged, "Sam's laptop")
+        self.schedule(scope="dev:%d" % self.merged)
+        self.look(self.table, later=60)
+
+    def card(self):
+        return next(d for d in self.get("/api/devices?all=1")[1] if d["id"] == self.merged)
+
+    def test_a_merged_devices_schedule_names_the_address_its_card_is_listed_under(self):
+        schedule = self.get("/api/schedules")[1][0]
+        self.assertEqual(schedule["device"], self.merged)
+        self.assertEqual(schedule["scope"], "device:" + self.card()["ip"])
+
+    def test_of_two_addresses_confirmed_at_the_same_moment_the_card_is_listed_under_the_lower(self):
+        self.assertEqual(self.card()["ip"], AT_CABLE)
+        self.assertEqual(server.device_addresses(self.merged)[0], AT_CABLE)
+
+    def test_an_unnamed_merged_device_is_called_by_the_address_its_card_is_listed_under(self):
+        server.set_device_name(self.merged, "")
+        self.assertEqual(server.device_label(self.merged), self.card()["ip"])
+
+    def test_the_card_is_listed_under_the_address_confirmed_most_recently_when_one_is(self):
+        self.look({AT_CABLE: stale(CABLE), AT_WIFI: fresh(WIFI)}, later=65)
+        self.assertEqual(self.card()["ip"], AT_WIFI)
+        self.assertEqual(self.get("/api/schedules")[1][0]["scope"], "device:" + AT_WIFI)
+
+
 class WithoutALookStraightAfter(TwoDevices):
     """separate_by_hand without a neighbour table (not how the API calls it): the next look puts
     the addresses right."""
@@ -956,6 +1371,17 @@ class TheDashboardPage(unittest.TestCase):
                       self.part("scheduleForm"))
         self.assertIn("return known ? pickerLabel(known) : 'A device QuietNet no longer lists';", self.part("scopeText"))
 
+    def test_a_schedule_is_named_by_its_devices_number_before_any_address(self):
+        # A merged device can be at two addresses at once, and its card is listed under one.
+        text = self.part("scopeText")
+        self.assertIn("function scopeText(x){", text)
+        by_number = text.index("const mine = S.devices.find(d => d.id === x.device);")
+        self.assertIn("if(x.device != null){", text[:by_number])
+        self.assertIn("if(mine) return pickerLabel(mine);", text[by_number:])
+        self.assertLess(by_number, text.index("S.devices.find(v => v.ip === scope.slice(7))"))
+        self.assertIn("${esc(scopeText(x))}", self.part("viewSchedules"))
+        self.assertEqual(self.script.count("scopeText("), 2)            # the function and its one caller
+
     def test_the_group_page_lists_devices_by_name_and_names_them_by_card(self):
         group = self.part("viewGroup")
         self.assertIn("byName(S.devices.filter(d => d.group === g.id))", group)
@@ -1017,6 +1443,19 @@ class TheDashboardPage(unittest.TestCase):
         self.assertIn("else if(r) S.device = 'd' + r.device;", merge)
         self.assertIn('<button class="btn" data-act="merge" aria-haspopup="dialog">', self.part("deviceDetails"))
 
+    def test_the_page_does_not_say_every_merge_can_be_undone_with_separate(self):
+        details = self.part("deviceDetails")
+        self.assertNotIn("it can be undone with Separate", details)
+        self.assertIn("Two devices that each have a hardware address can be taken apart again with Separate; one "
+                      "recognised\n      only by its number can't, and the box says so before you confirm.", details)
+
+    def test_an_older_pi_without_merge_is_told_it_needs_updating(self):
+        merge = self.action("merge")
+        self.assertIn("if(r instanceof Error && r.status === 404) r.message = NEEDS_UPDATE + 'merged. Nothing was "
+                      "changed.';", merge)
+        self.assertLess(merge.index("r.status === 404"), merge.index("await oops(r)"))
+        self.assertIn("const NEEDS_UPDATE = 'This QuietNet needs updating before devices can be ';", self.page)
+
     def test_the_page_says_quietnet_never_merges_by_itself(self):
         self.assertIn("QuietNet never merges devices by itself.", self.part("deviceDetails"))
 
@@ -1062,6 +1501,23 @@ class TheDashboardPage(unittest.TestCase):
         self.assertIn("if(!rules) return;", separate[shown:done])
         self.assertIn("Do the rules go with it?", separate)
 
+    def test_an_older_pi_without_separate_is_told_it_needs_updating(self):
+        separate = self.action("separate")
+        self.assertIn("if(e.status === 404) e.message = NEEDS_UPDATE + 'separated. Nothing was changed.';", separate)
+        self.assertLess(separate.index("e.status === 404"), separate.index("await oops(e); return refresh(true);"))
+
+    def test_separate_shows_the_rules_being_held_to_the_device_as_a_block_of_their_own(self):
+        self.assertIn("lines:(p.rules || []).map(t => ({text:t}))}].concat(separateHeld(p)),", self.action("separate"))
+        held = self.part("separateHeld")
+        self.assertIn("return (p.held || []).length ? [{head:'Applies for now, until you answer \"Same device?\"'", held)
+        self.assertIn("lines:p.held.map(t => ({text:t, tag:'Stays for both', cls:'warn'}))}] : [];", held)
+
+    def test_separate_does_not_say_only_whole_house_rules_apply_when_rules_are_being_held(self):
+        separate = self.action("separate")
+        self.assertIn("notes:(p.notes || []).concat([(p.held || []).length", separate)
+        self.assertIn('Either way, what applies for now goes on applying to both until you answer "Same device?".',
+                      separate)
+
     def test_separate_has_no_default_answer_about_the_rules(self):
         separate = self.action("separate")
         self.assertIn("{label:'Separate, with the same rules', value:'copy'}", separate)
@@ -1083,7 +1539,7 @@ class TheDashboardPage(unittest.TestCase):
     def test_the_new_parts_carry_no_fixed_colours_or_inline_styles(self):
         new_rules = self.css[self.css.index(".modal .card.wide{"):self.css.index("/* The page frame")]
         self.assertNotRegex(new_rules, r"#[0-9a-fA-F]{3,8}\b")
-        for name in ("deviceDetails", "askPreview", "mergeBlocks", "addressWords"):
+        for name in ("deviceDetails", "askPreview", "mergeBlocks", "separateHeld", "addressWords"):
             self.assertNotIn("style=", self.part(name))
 
     def test_the_page_still_has_no_emoji(self):
