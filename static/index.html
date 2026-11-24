@@ -1124,12 +1124,23 @@ function noIpv6Switch(st){
 // then it is not offered.
 function ipv6SteerSwitch(st){
   if(st.ipv6_steer == null) return '';
-  return `<div class="row"><div class="grow"><h2>Take IPv6 away from steered devices</h2>
-    <p class="meta">Off unless you turn it on, and only for devices you have "Cut live connections" on for. QuietNet
+  const v6 = (st.enforcer || {}).ipv6_steering || {};
+  const meta = `<p class="meta">Off unless you turn it on, and only for devices you have "Cut live connections" on for. QuietNet
       tells each of those devices that it, not the hub, is the way out for IPv6, and answers their lookups with no IPv6
       addresses, so they use IPv4, where your blocks and cuts work. It leaves every other device alone, changes nothing
       lasting on the Pi, and never touches a device behind a range extender. Turn it off to stop at once and hand the
-      devices straight back to the hub; without the Pi they also right themselves within a minute or two.</p></div>
+      devices straight back to the hub; without the Pi they also right themselves within a minute or two.</p>`;
+  if(v6.offered !== true){
+    return `<div class="row"><div class="grow"><h2>Take IPv6 away from steered devices</h2>${meta}
+      <p class="small muted">Not available on this computer: it needs the nft firewall tool and "Cut live connections" working.</p></div></div>`;
+  }
+  let note = '';
+  if(st.ipv6_steer){
+    if(v6.problem) note = `<p class="small muted">${esc(v6.problem)}</p>`;
+    else if(!v6.hub_known) note = `<p class="small muted">Waiting to hear the hub announce IPv6; nothing is being changed yet.</p>`;
+    else note = `<p class="small muted">Taking IPv6 away from ${num(v6.steered)} device${v6.steered === 1 ? '' : 's'} now.</p>`;
+  }
+  return `<div class="row"><div class="grow"><h2>Take IPv6 away from steered devices</h2>${meta}${note}</div>
     <label class="switch"><input type="checkbox" id="ipv6SteerSwitch" ${st.ipv6_steer ? 'checked' : ''} aria-label="Take IPv6 away from steered devices"><span></span></label></div>`;
 }
 // What QuietNet knows about IPv6 on the home network, for "Set up a device". v6.hub_off is true only
@@ -1284,6 +1295,7 @@ function enforceCard(d){
       device no IPv6 addresses in its own answers, so most apps connect over IPv4. But lookups the device sends to the router's
       own IPv6 DNS server, and anything it reaches over IPv6, are not seen or cut.</p>` : ''}
     ${d.enforced && (e.problem || (e.problems || {})[d.ip]) ? `<p class="small err-text"><b>Not working yet:</b> ${esc(e.problem || e.problems[d.ip])}</p>` : ''}
+    ${d.enforced && ((e.ipv6_steering || {}).problems || {})[d.ip] ? `<p class="small muted">${esc(e.ipv6_steering.problems[d.ip])}</p>` : ''}
     ${sharedNote(d, e)}</div>
     <label class="switch"><input type="checkbox" id="enforceSwitch" ${d.enforced ? 'checked' : ''} aria-label="Cut live connections for this device"><span></span></label></div></div>`;
 }

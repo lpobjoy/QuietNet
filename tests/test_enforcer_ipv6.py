@@ -14,13 +14,14 @@ import struct
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import enforcer  # noqa: E402
 
-HUB_LL, HUB_MAC = "fe80::1", "99:99:99:99:99:99"
+HUB_LL, HUB_MAC = "fe80::1", "98:99:99:99:99:99"   # even first byte: a single device's address, not a group
 PI_MAC = "aa:aa:aa:aa:aa:aa"
 DEV_IP, DEV_LL, DEV_MAC = "192.168.1.23", "fe80::23", "10:22:33:44:55:66"
 # The steering claim for the device above, captured from a run and checked by hand: Ethernet to the
@@ -311,7 +312,7 @@ class EnforcerDrives(unittest.TestCase):
         for name, fake in (("interface_and_gateway", lambda: ("wlan0", "192.168.1.254")),
                            ("local_subnet", lambda iface: enforcer.ipaddress.IPv4Network("192.168.1.0/24")),
                            ("mac_of_interface", lambda iface: PI_MAC),
-                           ("sysctl_get", lambda key: "1" if "forward" in key else "0"),
+                           ("sysctl_get", lambda key: "1" if ("forward" in key and "ipv6" not in key) else "0"),
                            ("sysctl_set", lambda key, value: True)):
             p = mock.patch.object(enforcer, name, fake)
             p.start()
@@ -339,41 +340,550 @@ class EnforcerDrives(unittest.TestCase):
     def loaded(self):
         return [text for args, text in self.commands if args == ["nft", "-f", "-"]]
 
+    def tick(self):
+        """One whole enforcer pass in the running order (IPv6 first, then IPv4), as _run does."""
+        self.e._tick_v6()
+        self.e._tick()
+
     def test_the_tick_sends_the_claim(self):
+        self.e._tick()                        # IPv4 steers the device first, so it is one we hold
+        self.sent.frames.clear()
         self.e._tick_v6()
         self.assertEqual(self.sent.frames, [STEER_FRAME])
 
     def test_the_firewall_gets_the_ip6_redirect_after_steering(self):
-        self.e._tick_v6()
-        self.e._tick()
+        self.tick()                           # first tick: IPv4 steers; IPv6 claim lands the tick after
+        self.tick()
         self.assertTrue(any("dns_redirect6" in text for text in self.loaded()))
         self.assertTrue(any("dnat ip6 to [fd00::9]:53" in text for text in self.loaded()))
 
     def test_the_steered_set_is_written_to_the_notes_file(self):
+        self.e._tick()
         self.e._tick_v6()
         with open(os.path.join(self.dir, "enforcer_state.json")) as f:
             self.assertEqual(json.load(f)["v6_spoofed"], {DEV_MAC: DEV_LL})
 
-    def test_a_restart_adopts_and_hands_back_the_saved_devices(self):
+    def test_the_hub_is_written_to_the_notes_file_with_the_steered_set(self):
+        self.e._tick()
+        self.e._tick_v6()
+        with open(os.path.join(self.dir, "enforcer_state.json")) as f:
+            self.assertEqual(json.load(f)["v6_hub"], {"v6": HUB_LL, "mac": HUB_MAC})
+
+    def test_a_restart_hands_saved_devices_back_before_the_hub_is_heard(self):
         with open(os.path.join(self.dir, "enforcer_state.json"), "w") as f:
-            json.dump({"sysctls": {}, "spoofed": {}, "v6_spoofed": {DEV_MAC: DEV_LL}}, f)
-        self.config = {"enabled": False, "hub": {"v6": HUB_LL, "mac": HUB_MAC}, "devices": {}}
+            json.dump({"sysctls": {}, "spoofed": {}, "v6_spoofed": {DEV_MAC: DEV_LL},
+                       "v6_hub": {"v6": HUB_LL, "mac": HUB_MAC}}, f)
+        self.config = {"enabled": False, "hub": {}, "devices": {}}   # the hub is not known on the first tick
         self.e._recover()
         self.e._tick_v6()
-        self.assertTrue(any(f[-6:] == enforcer.mac_to_bytes(HUB_MAC) for f in self.sent.frames))
+        correction = enforcer.neighbour_advertisement(HUB_LL, HUB_MAC, DEV_LL, DEV_MAC,
+                                                       eth_src=PI_MAC, solicited=False, override=True)
+        self.assertIn(correction, self.sent.frames)
+        self.assertFalse(self.e._v6.active())
+        self.assertFalse(os.path.exists(os.path.join(self.dir, "enforcer_state.json")))
+
+    def test_a_restart_with_no_saved_hub_forgets_the_devices_and_sends_nothing(self):
+        with open(os.path.join(self.dir, "enforcer_state.json"), "w") as f:
+            json.dump({"sysctls": {}, "spoofed": {}, "v6_spoofed": {DEV_MAC: DEV_LL}}, f)
+        self.config = {"enabled": False, "hub": {}, "devices": {}}
+        self.e._recover()
+        self.e._tick_v6()
+        self.assertEqual([f for f in self.sent.frames if f[12:14] == b"\x86\xdd"], [])
         self.assertFalse(self.e._v6.active())
 
+    def test_a_saved_hub_that_is_not_a_valid_address_is_ignored(self):
+        with open(os.path.join(self.dir, "enforcer_state.json"), "w") as f:
+            json.dump({"sysctls": {}, "spoofed": {}, "v6_spoofed": {DEV_MAC: DEV_LL},
+                       "v6_hub": {"v6": "ff02::1", "mac": "ff:ff:ff:ff:ff:ff"}}, f)
+        self.config = {"enabled": False, "hub": {}, "devices": {}}
+        self.e._recover()
+        self.e._tick_v6()
+        self.assertEqual([f for f in self.sent.frames if f[12:14] == b"\x86\xdd"], [])
+
     def test_stopping_hands_the_device_back(self):
+        self.e._tick()
         self.e._tick_v6()
         self.sent.frames.clear()
         self.e._teardown()
-        self.assertTrue(any(f[-6:] == enforcer.mac_to_bytes(HUB_MAC) for f in self.sent.frames))
+        self.assertTrue(any(f[-6:] == enforcer.mac_to_bytes(HUB_MAC) for f in self.sent.frames
+                            if f[12:14] == b"\x86\xdd"))
 
     def test_the_status_reports_the_steering(self):
+        self.e._tick()
         self.e._tick_v6()
         status = self.e.status()["ipv6_steering"]
         self.assertTrue(status["offered"] and status["enabled"] and status["hub_known"])
         self.assertEqual(status["steered"], 1)
+
+    def test_no_claim_is_sent_when_only_iptables_is_installed(self):
+        self.e.backend = "iptables"
+        self.e._tick()
+        self.e._tick_v6()
+        self.assertEqual([f for f in self.sent.frames if f[12:14] == b"\x86\xdd"], [])
+        self.assertFalse(self.e._v6.active())
+
+    def test_the_status_says_ipv6_steering_is_not_offered_without_nft(self):
+        self.e.backend = "iptables"
+        self.assertEqual(self.e.ipv6_status(), {"offered": False})
+
+    def test_no_claim_is_sent_while_ipv6_forwarding_is_on_and_the_status_says_why(self):
+        self.patch_forwarding_on()
+        self.e._tick()
+        self.e._tick_v6()
+        self.assertEqual([f for f in self.sent.frames if f[12:14] == b"\x86\xdd"], [])
+        self.assertIn("pass IPv6 traffic on", self.e.ipv6_status()["problem"])
+
+    def patch_forwarding_on(self):
+        real = enforcer.sysctl_get
+        p = mock.patch.object(enforcer, "sysctl_get",
+                              lambda key: "1" if "forward" in key else "0")
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_no_claim_is_sent_while_ipv4_steering_is_paused(self):
+        # Make routing look blocked so IPv4 steering pauses and holds no device.
+        self.e._tick()
+        self.sent.frames.clear()
+        p = mock.patch.object(self.e, "_routing_ready", lambda: "a firewall is in the way")
+        p.start()
+        self.addCleanup(p.stop)
+        self.e._tick()                        # releases the IPv4 hold on the device (_spoofed emptied)
+        self.sent.frames.clear()
+        self.e._tick_v6()
+        self.assertEqual([f for f in self.sent.frames if f[12:14] == b"\x86\xdd"], [])
+
+    def test_the_tick_v6_reads_no_neighbour_table_of_its_own(self):
+        # gateway_mac reuses the table the IPv4 tick stored, so the IPv6 tick runs no `ip neigh`.
+        self.e._hosts = {"192.168.1.254": HUB_MAC}
+        calls = []
+        self.e.neighbours = lambda: calls.append(1) or {"192.168.1.254": HUB_MAC}
+        self.assertEqual(self.e.gateway_mac(), HUB_MAC)
+        self.assertEqual(calls, [])
+
+    def test_a_failed_ip6_load_is_retried_without_it_and_the_ipv4_rules_still_land(self):
+        # The device is steered, then an nft load with the ip6 chain is rejected.
+        self.e._tick()
+        self.e._tick_v6()
+        rejected = {"n": 0}
+
+        def run(args, **kw):
+            text = kw.get("input")
+            if args == ["nft", "-f", "-"] and text and "dns_redirect6" in text:
+                rejected["n"] += 1
+                self.commands.append((args, text))
+
+                class Bad:
+                    returncode, stderr, stdout = 1, "boom", ""
+                return Bad()
+            self.commands.append((args, text))
+
+            class R:
+                returncode, stderr, stdout = 0, "", ""
+            return R()
+
+        p = mock.patch.object(enforcer.subprocess, "run", run)
+        p.start()
+        self.addCleanup(p.stop)
+        self.e._applied = ""                  # force a reload
+        self.e._tick()
+        self.assertTrue(rejected["n"] >= 1)
+        self.assertTrue(self.e._v6_load_failed)
+        # The rules did land, without the ip6 chain.
+        self.assertTrue(any(t and "dns_redirect6" not in t and "table inet quietnet {" in t
+                            for a, t in self.commands if a == ["nft", "-f", "-"]))
+
+    def test_ipv6_steering_stops_and_reports_why_after_a_failed_load(self):
+        self.e._v6_load_failed = True
+        self.e._tick()
+        self.e._tick_v6()
+        self.assertEqual([f for f in self.sent.frames if f[12:14] == b"\x86\xdd"], [])
+        self.assertIn("nft firewall tool", self.e.ipv6_status()["problem"])
+
+    def test_turning_the_setting_off_and_on_tries_the_load_again(self):
+        self.e._v6_load_failed = True
+        self.config = dict(self.config, enabled=False)
+        self.e._tick_v6()
+        self.assertFalse(self.e._v6_load_failed)   # seen off: the next load may try the ip6 chain again
+
+    def test_the_running_loop_starts_the_listener_with_the_stop_signal(self):
+        started = []
+        self.e._open_socket = lambda: mock.Mock(send=self.sent, recv=mock.Mock(side_effect=OSError("closed")))
+        self.e._v6.listen = lambda stop: started.append(stop)
+        self.e.start()
+        self.addCleanup(self.e.stop)
+        for _ in range(100):
+            if started:
+                break
+            time.sleep(0.02)
+        self.assertEqual(started, [self.e._stop])
+
+    def test_a_fault_in_ipv6_steering_does_not_stop_the_ipv4_tick(self):
+        ticks = []
+        self.e._tick_v6 = mock.Mock(side_effect=RuntimeError("boom"))
+        self.e._tick = lambda: ticks.append(1)
+        self.e._open_socket = lambda: mock.Mock(send=self.sent, recv=mock.Mock(side_effect=OSError("closed")))
+        self.e._v6.listen = lambda stop: None
+        self.e.start()
+        self.addCleanup(self.e.stop)
+        self.e.poke()
+        for _ in range(100):
+            if ticks:
+                break
+            time.sleep(0.02)
+        self.assertTrue(ticks)
+
+    def test_it_is_not_offered_with_the_iptables_tool(self):
+        self.e.backend = "iptables"
+        self.assertFalse(self.e.status()["ipv6_steering"]["offered"])
+
+
+class FakeSock:
+    """A stand-in socket for the listener: it hands over the frames it was given, remembers the
+    multicast groups it was asked to join, and raises a timeout (running `then` first) once empty."""
+    def __init__(self, frames=(), then=None):
+        self.frames = list(frames)
+        self.then = then or (lambda: None)
+        self.options = []
+        self.bound = None
+        self.closed = False
+
+    def bind(self, addr):
+        self.bound = addr
+
+    def settimeout(self, _):
+        pass
+
+    def setsockopt(self, *a):
+        self.options.append(a)
+
+    def recv(self, _n):
+        if self.frames:
+            return self.frames.pop(0)
+        self.then()
+        raise socket.timeout()
+
+    def close(self):
+        self.closed = True
+
+
+class OnceStop:
+    """A stop signal that lets a listen loop run one round: it reads not-set until wait() or set() is
+    called, after which it reads set, so the loop finishes quickly without a real wait."""
+    def __init__(self):
+        self.flag = False
+
+    def is_set(self):
+        return self.flag
+
+    def set(self):
+        self.flag = True
+
+    def wait(self, _t=None):
+        self.flag = True
+        return True
+
+
+class ListenerSockets(unittest.TestCase):
+    """The listener joins the right groups, learns and answers from stand-in sockets, and stops
+    cleanly. No real socket is opened (AF_PACKET is None off Linux)."""
+
+    def patch(self, target, value):
+        p = mock.patch.object(target[0], target[1], value)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def wired(self, frames):
+        """A steerer with one device steered, the listener sockets replaced by stand-ins, and a stop
+        that fires once the frames run out."""
+        s, sent = steerer()
+        s.steer()
+        sent.frames.clear()
+        stop = OnceStop()
+        pkt = FakeSock(frames, then=stop.set)
+        join = FakeSock()
+        self.patch((enforcer, "AF_PACKET"), 17)
+        self.patch((enforcer.socket, "socket"), lambda family, *a: pkt if family == 17 else join)
+        self.patch((enforcer.socket, "if_nametoindex"), lambda n: 7)
+        return s, sent, pkt, join, stop
+
+    def test_joining_asks_for_the_hubs_solicited_node_group(self):
+        s, sent, pkt, join, stop = self.wired([])
+        s.listen(stop)
+        want = enforcer.v6_bytes("ff02::1:ff00:1") + struct.pack("@I", 7)
+        self.assertIn((socket.IPPROTO_IPV6, socket.IPV6_JOIN_GROUP, want), join.options)
+
+    def test_it_joins_the_mdns_and_report_groups_too(self):
+        s, sent, pkt, join, stop = self.wired([])
+        s.listen(stop)
+        joined = {o[2] for o in join.options}
+        self.assertIn(enforcer.v6_bytes("ff02::fb") + struct.pack("@I", 7), joined)
+        self.assertIn(enforcer.v6_bytes("ff02::16") + struct.pack("@I", 7), joined)
+
+    def test_a_steered_devices_check_heard_on_the_socket_is_answered(self):
+        s, sent, pkt, join, stop = self.wired([solicitation(DEV_LL, DEV_MAC, HUB_LL)])
+        s.listen(stop)
+        self.assertIn(STEER_FRAME, sent.frames)
+        self.assertEqual(pkt.bound, ("wlan0", enforcer.ETH_IPV6))
+
+    def test_a_link_local_is_learned_from_a_frame_heard(self):
+        other = "aa:00:00:00:00:01"
+        eth = enforcer.mac_to_bytes(PI_MAC) + enforcer.mac_to_bytes(other) + struct.pack(">H", enforcer.ETH_IPV6)
+        frame = eth + bytes([0x60, 0, 0, 0, 0, 0, 59, 64]) + enforcer.v6_bytes("fe80::55") + enforcer.v6_bytes("ff02::fb")
+        s, sent, pkt, join, stop = self.wired([frame])
+        s.listen(stop)
+        self.assertEqual(s._heard.get(other), "fe80::55")
+
+    def test_both_sockets_are_closed_when_asked_to_stop(self):
+        s, sent, pkt, join, stop = self.wired([])
+        s.listen(stop)
+        self.assertTrue(pkt.closed and join.closed)
+
+    def test_the_listener_holds_no_socket_while_the_setting_is_off(self):
+        opened = []
+        self.patch((enforcer, "AF_PACKET"), 17)
+        self.patch((enforcer.socket, "socket"), lambda *a: opened.append(1) or FakeSock())
+        s, _ = steerer()
+        s.enabled = False
+        s._steered = {}
+        s.listen(OnceStop())
+        self.assertEqual(opened, [])
+
+
+class ScopeIds(unittest.TestCase):
+    """An address that names a network card after a '%' is refused before it reaches a firewall rule."""
+
+    def rules(self, **over):
+        ipv6 = dict({"target": "fd00::9", "port": 53, "servers": [HUB_LL], "macs": [DEV_MAC]}, **over)
+        return enforcer.nft_ruleset({DEV_IP: {"off": True, "ips": set()}}, "192.168.1.60", 53, ipv6=ipv6)
+
+    def test_a_target_address_naming_a_network_card_is_refused(self):
+        for bad in ("fd00::5%eth0", "fe80::1%wlan0 } ; flush ruleset ; #"):
+            with self.assertRaises(ValueError, msg=bad):
+                self.rules(target=bad)
+
+    def test_a_server_address_naming_a_network_card_is_refused(self):
+        for bad in ("fe80::1%wlan0", "fe80::1%wlan0 } ; flush ruleset ; #"):
+            with self.assertRaises(ValueError, msg=bad):
+                self.rules(servers=[bad])
+
+    def test_the_checker_keeps_a_plain_address(self):
+        self.assertEqual(enforcer._checked_ipv6("fd00::9"), "fd00::9")
+
+
+class NothingIsSentToTheWrongAddress(unittest.TestCase):
+    """The safety check is applied where it is used, not only in the helper: no claim leaves for a
+    group, a non-link-local address, or the hub's, this computer's, a fixed or a group hardware address."""
+
+    def one(self, mac=DEV_MAC, ll=DEV_LL, **kw):
+        s, sent = steerer()
+        for k, v in kw.items():
+            setattr(s, k, v)
+        s.devices = {DEV_IP: {"mac": mac, "ll": ll}}
+        problems = s.steer()
+        return s, sent, problems
+
+    def test_the_routers_hardware_address_is_only_refused_by_the_forbidden_list(self):
+        # With an even first byte it is a single device's address, so the forbidden list is what stops it.
+        self.assertEqual(enforcer.na_claim_problem(DEV_LL, HUB_MAC, set()), "")
+
+    def test_no_claim_is_sent_to_the_all_nodes_group(self):
+        s, sent, problems = self.one(ll="ff02::1")
+        self.assertEqual(sent.frames, [])
+        self.assertIn(DEV_IP, problems)
+        self.assertFalse(s.active())
+
+    def test_no_claim_is_sent_to_an_address_that_is_not_link_local(self):
+        s, sent, problems = self.one(ll="2001:db8::23")
+        self.assertEqual(sent.frames, [])
+        self.assertIn(DEV_IP, problems)
+
+    def test_no_claim_is_sent_to_the_routers_hardware_address(self):
+        for mac in (HUB_MAC, HUB_MAC.upper()):
+            s, sent, problems = self.one(mac=mac)
+            self.assertEqual(sent.frames, [])
+            self.assertIn(DEV_IP, problems)
+
+    def test_no_claim_is_sent_to_this_computers_hardware_address(self):
+        s, sent, problems = self.one(mac=PI_MAC)
+        self.assertEqual(sent.frames, [])
+
+    def test_no_claim_is_sent_to_a_fixed_hardware_address(self):
+        s, sent, problems = self.one(fixed_macs={DEV_MAC})
+        self.assertEqual(sent.frames, [])
+
+    def test_no_claim_is_sent_to_a_group_hardware_address(self):
+        s, sent, problems = self.one(mac="33:33:00:00:00:01")
+        self.assertEqual(sent.frames, [])
+
+    def test_a_check_from_the_router_is_never_answered(self):
+        s, sent = steerer()
+        s.steer()
+        s._steered[HUB_MAC] = HUB_LL          # even if it somehow got in
+        sent.frames.clear()
+        s.handle_solicitation(solicitation("fe80::1", HUB_MAC, HUB_LL))
+        self.assertEqual(sent.frames, [])
+
+    def test_no_check_is_answered_while_the_setting_is_off(self):
+        s, sent = steerer()
+        s.steer()
+        sent.frames.clear()
+        s.enabled = False
+        s.handle_solicitation(solicitation(DEV_LL, DEV_MAC, HUB_LL))
+        self.assertEqual(sent.frames, [])
+
+    def test_the_correction_sent_on_turning_off_overrides(self):
+        s, sent = steerer()
+        s.steer()
+        sent.frames.clear()
+        s.enabled = False
+        s.steer()
+        self.assertEqual(len(sent.frames), 1)
+        frame = sent.frames[0]
+        self.assertEqual(frame[0:6], enforcer.mac_to_bytes(DEV_MAC))
+        self.assertEqual(frame[38:54], enforcer.v6_bytes(DEV_LL))
+        self.assertEqual(frame[58] & 0x20, 0x20)
+        self.assertEqual(frame[58] & 0x40, 0)
+
+
+class AnsweringChecks(unittest.TestCase):
+    """A reachability check is answered to the device's recorded link-local address, whatever source
+    the question used, and only for a device being steered (design (c2))."""
+
+    def test_a_check_from_a_public_source_is_answered_to_the_recorded_link_local(self):
+        s, sent = steerer()
+        s.steer()
+        sent.frames.clear()
+        s.handle_solicitation(solicitation("2a00:23c8::1234", DEV_MAC, HUB_LL))
+        self.assertEqual(len(sent.frames), 1)
+        self.assertEqual(sent.frames[0][38:54], enforcer.v6_bytes(DEV_LL))
+        self.assertNotEqual(sent.frames[0][38:54], enforcer.v6_bytes("2a00:23c8::1234"))
+
+    def test_a_check_is_not_answered_when_the_redirect_is_not_possible(self):
+        s, sent = steerer()
+        s.steer()
+        sent.frames.clear()
+        s.our_v6 = ""                          # redirect no longer possible, so ready() is false
+        s.handle_solicitation(solicitation(DEV_LL, DEV_MAC, HUB_LL))
+        self.assertEqual(sent.frames, [])
+
+
+class LearningLinkLocal(unittest.TestCase):
+    """The steerer learns a device's link-local address from frames it hears, and keeps a chosen device
+    steered at its last known address when the neighbour table loses it."""
+
+    def frame_from(self, src_mac, src_ip):
+        """A minimal IPv6 frame from one hardware address and IPv6 source, for note_frame."""
+        eth = enforcer.mac_to_bytes(PI_MAC) + enforcer.mac_to_bytes(src_mac) + struct.pack(">H", enforcer.ETH_IPV6)
+        ip6 = bytes([0x60, 0, 0, 0, 0, 0, 59, 64]) + enforcer.v6_bytes(src_ip) + enforcer.v6_bytes("ff02::fb")
+        return eth + ip6
+
+    def test_a_link_local_heard_from_a_frame_gets_the_device_steered(self):
+        s, sent = steerer()
+        s.devices = {DEV_IP: {"mac": DEV_MAC, "ll": ""}}
+        self.assertEqual(s.steer().get(DEV_IP, "")[:8], "QuietNet")   # no address yet: reported
+        self.assertEqual(sent.frames, [])
+        s.note_frame(self.frame_from(DEV_MAC, DEV_LL))
+        s.devices = {DEV_IP: {"mac": DEV_MAC, "ll": ""}}
+        s.steer()
+        self.assertEqual(sent.frames, [STEER_FRAME])
+
+    def test_a_chosen_device_stays_steered_when_the_table_loses_its_address(self):
+        s, sent = steerer()
+        s.steer()
+        sent.frames.clear()
+        s.devices = {DEV_IP: {"mac": DEV_MAC, "ll": ""}}   # table lost the link-local
+        s.steer()
+        self.assertEqual(sent.frames, [STEER_FRAME])       # re-claimed at the last known address
+        self.assertTrue(s.active())
+
+    def test_a_device_with_no_known_link_local_is_named_in_problems(self):
+        s, sent = steerer()
+        s.devices = {DEV_IP: {"mac": DEV_MAC, "ll": ""}}
+        problems = s.steer()
+        self.assertEqual(sent.frames, [])
+        self.assertIn(DEV_IP, problems)
+
+    def test_a_frame_from_the_hub_teaches_nothing(self):
+        s, sent = steerer()
+        s.note_frame(self.frame_from(HUB_MAC, "fe80::9"))
+        self.assertNotIn(HUB_MAC.lower(), s._heard)
+
+    def test_a_frame_with_a_non_link_local_source_teaches_nothing(self):
+        s, sent = steerer()
+        s.note_frame(self.frame_from("12:34:56:78:9a:bc", "2001:db8::9"))
+        self.assertNotIn("12:34:56:78:9a:bc", s._heard)
+
+    def test_a_frame_from_a_group_hardware_address_teaches_nothing(self):
+        s, sent = steerer()
+        s.note_frame(self.frame_from("33:33:00:00:00:01", "fe80::9"))
+        self.assertEqual(s._heard, {})
+
+
+class UnclearDevices(unittest.TestCase):
+    """A device marked unclear (several link-local addresses, perhaps behind an unrecognised extender)
+    is left alone and said so, and handed back if it was already steered."""
+
+    def test_an_unclear_device_is_not_steered_and_said_so(self):
+        s, sent = steerer()
+        s.devices = {DEV_IP: {"mac": DEV_MAC, "ll": "", "unclear": True}}
+        problems = s.steer()
+        self.assertEqual(sent.frames, [])
+        self.assertIn("share", problems[DEV_IP])
+
+    def test_a_device_that_becomes_unclear_is_handed_back(self):
+        s, sent = steerer()
+        s.steer()
+        sent.frames.clear()
+        s.devices = {DEV_IP: {"mac": DEV_MAC, "ll": "", "unclear": True}}
+        s.steer()
+        self.assertEqual(len(sent.frames), 1)
+        self.assertEqual(sent.frames[0][-6:], enforcer.mac_to_bytes(HUB_MAC))
+        self.assertFalse(s.active())
+
+
+class RangeExtenderReported(unittest.TestCase):
+    """A range-extender device passed through with no link-local address is reported and never steered."""
+
+    def test_an_extender_device_with_no_link_local_is_named_and_not_steered(self):
+        s, sent = steerer()
+        s.shared = {DEV_MAC.lower()}
+        s.devices = {DEV_IP: {"mac": DEV_MAC, "ll": ""}}
+        problems = s.steer()
+        self.assertEqual(sent.frames, [])
+        self.assertIn("range extender", problems[DEV_IP])
+
+
+class WithheldWhenNoRedirect(unittest.TestCase):
+    """No claim is sent unless its lookups can be answered: the redirect must be possible."""
+
+    def test_no_claim_without_a_lasting_address_of_our_own(self):
+        s, sent = steerer()
+        s.our_v6 = ""
+        s.steer()
+        self.assertEqual(sent.frames, [])
+        self.assertIn("lasting IPv6 address", s.why_not_ready())
+
+    def test_no_claim_while_not_listening_over_ipv6(self):
+        s, sent = steerer()
+        s.port = None
+        s.steer()
+        self.assertEqual(sent.frames, [])
+
+    def test_no_claim_when_the_firewall_cannot_load_the_redirect(self):
+        s, sent = steerer()
+        s.redirect_ok = False
+        s.steer()
+        self.assertEqual(sent.frames, [])
+
+    def test_a_steered_device_is_handed_back_when_the_redirect_stops_being_possible(self):
+        s, sent = steerer()
+        s.steer()
+        sent.frames.clear()
+        s.redirect_ok = False
+        s.steer()
+        self.assertEqual(len(sent.frames), 1)
+        self.assertEqual(sent.frames[0][-6:], enforcer.mac_to_bytes(HUB_MAC))
+        self.assertFalse(s.active())
 
 
 if __name__ == "__main__":

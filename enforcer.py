@@ -114,6 +114,17 @@ def v6_bytes(address):
     return ipaddress.IPv6Address(address).packed
 
 
+def _checked_ipv6(text):
+    """The address as checked text, or ValueError if it isn't a plain IPv6 address. Every IPv6
+    address that goes into a firewall rule passes through here first. An address with a network
+    card named after a '%' (fe80::1%wlan0) is refused: Python accepts any text at all after the
+    '%' and hands it back unchanged, so it could be read by the firewall as part of a rule."""
+    addr = ipaddress.IPv6Address(text)
+    if getattr(addr, "scope_id", None):
+        raise ValueError("not a plain IPv6 address: %r" % (text,))
+    return str(addr)
+
+
 def icmpv6_checksum(source, destination, body):
     """The ICMPv6 checksum for a message from `source` to `destination` (both IPv6 address text)
     carrying `body` (the ICMPv6 message, its checksum field left as zero).
@@ -240,11 +251,11 @@ def _ip6_dns_rules(ipv6):
     steered devices; only traffic from these is touched). Every address, port and hardware address is
     checked, so a bad one raises ValueError rather than reach the firewall. The match is by hardware
     address because a device has many IPv6 addresses and gets new ones often."""
-    target = ipaddress.IPv6Address(ipv6["target"])
+    target = _checked_ipv6(ipv6["target"])
     port = ipv6.get("port")
     if isinstance(port, bool) or not isinstance(port, int) or not 0 < port < 65536:
         raise ValueError("not a port number: %r" % (port,))
-    servers = sorted(str(ipaddress.IPv6Address(s)) for s in ipv6.get("servers", ()))
+    servers = sorted(_checked_ipv6(s) for s in ipv6.get("servers", ()))
     macs = sorted(_checked_mac(m) for m in ipv6.get("macs", ()))
     if not (servers and macs):
         return []
@@ -634,9 +645,13 @@ class IPv6Steerer:
         self.port = None              # the port QuietNet answers lookups on (None: no DNS redirect)
         self.servers = []             # the router's IPv6 DNS addresses to catch
         self.shared = set()           # range-extender hardware addresses (never steered)
-        self.devices = {}             # device IPv4 address -> {"mac": .., "ll": link-local address}
+        self.redirect_ok = True       # set by the Enforcer: can the IPv6 DNS redirect be loaded (nft, no failed load)?
+        self.devices = {}             # device IPv4 address -> {"mac": .., "ll": link-local address, "unclear": bool}
         self._steered = {}            # hardware address -> the link-local we last claimed the router at
+        self._heard = {}              # hardware address -> a link-local address heard from a frame on the wire
+        self._last_hub = {}           # the router's link-local and hardware addresses our claims were made against
         self._problems = {}           # device IPv4 address -> why it is not being steered
+        self._stop = None             # set while listen() runs, so delayed reachability answers can bow out
 
     def set_target(self, config):
         """Take in what to steer towards, worked out by the server (plan6). Stores it; sends nothing."""
@@ -659,9 +674,32 @@ class IPv6Steerer:
         return {str(m).lower() for m in bad if m} | self.shared
 
     def ready(self):
-        """Is everything in hand to send a claim safely: turned on, this computer's hardware address
-        known, and the router's link-local and hardware addresses known?"""
-        return bool(self.enabled and self.our_mac and self.hub.get("v6") and self.hub.get("mac"))
+        """Is everything in hand to send a claim safely AND answer the device's lookups: turned on,
+        this computer's hardware and IPv6 addresses known, the router's link-local and hardware
+        addresses known, a port to answer on, a router DNS address to catch, and the firewall able to
+        load the redirect? A claim is withheld unless its lookups can be answered, so a steered
+        device's IPv6 DNS is never left silent (design (c2): "DNS is answered")."""
+        return bool(self.enabled and self.our_mac and self.hub.get("v6") and self.hub.get("mac")
+                    and self.our_v6 and self.port and self.servers and self.redirect_ok)
+
+    def why_not_ready(self):
+        """A plain-English reason nothing is being steered, or '' when it is on and ready. Shown on
+        the dashboard so the owner can see why QuietNet is leaving devices' IPv6 alone."""
+        if not self.enabled:
+            return ""
+        if not self.our_mac:
+            return "QuietNet does not know this computer's hardware address yet, so it is leaving every device's IPv6 alone."
+        if not (self.hub.get("v6") and self.hub.get("mac")):
+            return "QuietNet has not heard the hub announce IPv6 yet, so it is leaving every device's IPv6 alone."
+        if not self.our_v6:
+            return "This computer has no lasting IPv6 address of its own to answer lookups from, so QuietNet is leaving every device's IPv6 alone."
+        if not self.port:
+            return "QuietNet is not listening for lookups over IPv6, so it is leaving every device's IPv6 alone."
+        if not self.servers:
+            return "QuietNet has not learned the hub's IPv6 DNS address to catch, so it is leaving every device's IPv6 alone."
+        if not self.redirect_ok:
+            return "The nft firewall tool is needed to answer these devices' IPv6 lookups (or its rules could not be loaded), so QuietNet is leaving every device's IPv6 alone."
+        return ""
 
     def steer(self):
         """Send each chosen device a claim that the router's address is at this computer, and hand
@@ -672,13 +710,29 @@ class IPv6Steerer:
             self.release_all()
             return self._problems
         hub_ll, forbidden = self.hub["v6"], self._forbidden()
-        wanted = {}
+        new_hub = {"v6": self.hub["v6"], "mac": self.hub["mac"]}
+        hub_changed = self._last_hub != new_hub
+        self._last_hub = new_hub
+        wanted = {}                       # hardware address -> the link-local we claim the router at
+        chosen = set()                    # every chosen hardware address, address known or not
         for ip, dev in self.devices.items():
-            mac, ll = str(dev.get("mac", "")), str(dev.get("ll", ""))
-            if not mac or not ll:
+            mac = str(dev.get("mac", ""))
+            if not mac:
+                continue
+            if dev.get("unclear"):
+                self._problems[ip] = ("More than one device seems to share this device's hardware address "
+                                      "(it may be behind a range extender), so QuietNet leaves its IPv6 alone.")
                 continue
             if mac.lower() in self.shared:
                 self._problems[ip] = "This device is behind a range extender, so QuietNet leaves its IPv6 alone."
+                continue
+            chosen.add(mac)
+            # Prefer a freshly heard address, then the plan's, then the one we last claimed, so a chosen
+            # device whose neighbour-table entry drops out stays steered at its last known address.
+            ll = self._heard.get(mac.lower(), "") or str(dev.get("ll", "")) or self._steered.get(mac, "")
+            if not ll:
+                self._problems[ip] = ("QuietNet has not yet learned this device's IPv6 link-local address, "
+                                      "so its IPv6 is not taken away yet.")
                 continue
             reason = na_claim_problem(ll, mac, forbidden)
             if reason:
@@ -692,7 +746,7 @@ class IPv6Steerer:
             wanted[mac] = ll
         changed = False
         for mac in list(self._steered):
-            if mac not in wanted:
+            if mac not in chosen:         # no longer chosen (or now shared/unclear): hand it back
                 self._correct(mac, self._steered[mac])
                 del self._steered[mac]
                 changed = True
@@ -700,17 +754,20 @@ class IPv6Steerer:
             if self._steered.get(mac) != ll:
                 self._steered[mac] = ll
                 changed = True
-        if changed:
+        if changed or (hub_changed and self._steered):
             self.save()
         return self._problems
 
     def _correct(self, mac, ll):
         """Tell one device the router's real hardware address again (override set), so it goes back to
-        the router. Returns False if the router's hardware address isn't known yet."""
-        if not (self.hub.get("v6") and self.hub.get("mac") and self.our_mac):
+        the router. Uses the router's live address when known, otherwise the one saved with the steered
+        devices (so a restart can hand them back before the router is heard again). Returns False if
+        neither is known, or this computer's hardware address isn't."""
+        hub = self.hub if (self.hub.get("v6") and self.hub.get("mac")) else self._last_hub
+        if not (hub.get("v6") and hub.get("mac") and self.our_mac):
             return False
         try:
-            self.send(neighbour_advertisement(self.hub["v6"], self.hub["mac"], ll, mac,
+            self.send(neighbour_advertisement(hub["v6"], hub["mac"], ll, mac,
                                               eth_src=self.our_mac, solicited=False, override=True))
             return True
         except (OSError, ValueError):
@@ -718,16 +775,45 @@ class IPv6Steerer:
 
     def release_all(self, rounds=1):
         """Hand every steered device back to the router (a few times, in case a frame is lost) and
-        forget them. Used when the setting goes off and when QuietNet stops; without the router's
-        hardware address the corrections can't be sent, but the devices are forgotten anyway and fix
-        themselves once the Pi stops answering their checks."""
+        forget them. Used when the setting goes off and when QuietNet stops; the correction is built
+        from the router's live or saved addresses. The devices are forgotten even where neither is
+        known (then they fix themselves once the Pi stops answering their checks)."""
         if not self._steered:
             return
         for _ in range(max(1, rounds)):
             for mac, ll in self._steered.items():
                 self._correct(mac, ll)
         self._steered = {}
+        self._last_hub = {}
         self.save()
+
+    def note_frame(self, frame):
+        """Learn a device's link-local IPv6 address from a frame heard on the wire, so a device that
+        has never spoken IPv6 to the Pi can still be steered. The Ethernet source hardware address is
+        matched with the IPv6 source address, and kept only when the source is a link-local address and
+        the hardware address is one single device's (not a group, not all zeros) and not a forbidden
+        one. A forged pair is harmless: a claim still goes only to that frame's own hardware address,
+        which a device ignores if the claimed address is not its own."""
+        if len(frame) < 54 or frame[12:14] != b"\x86\xdd":
+            return
+        src_mac = frame[6:12].hex(":")
+        try:
+            src = ipaddress.IPv6Address(frame[22:38])
+        except ValueError:
+            return
+        if not src.is_link_local or src.is_multicast:
+            return
+        raw = frame[6:12]
+        if raw == bytes(6) or raw[0] & 1:
+            return
+        if src_mac.lower() in self._forbidden():
+            return
+        if self._heard.get(src_mac.lower()) == str(src):
+            return
+        self._heard[src_mac.lower()] = str(src)
+        if len(self._heard) > 512:                      # drop the oldest to keep this bounded
+            for old in list(self._heard)[:len(self._heard) - 512]:
+                del self._heard[old]
 
     def handle_solicitation(self, frame):
         """Answer one device's check that the router is still reachable, for a device we are steering.
@@ -739,13 +825,40 @@ class IPv6Steerer:
         if not parsed or not self.ready():
             return
         asker_ip, asker_mac, wanted = parsed
-        if wanted != self.hub.get("v6") or self._steered.get(asker_mac) is None:
+        if wanted != self.hub.get("v6"):
             return
-        if na_claim_problem(asker_ip, asker_mac, self._forbidden()):
+        ll = self._steered.get(asker_mac)
+        if ll is None:                    # not a device we steer
             return
+        # Answer to the device's own recorded link-local address, not the question's source: a device
+        # resolving the router because of ordinary internet traffic asks from its public address, and a
+        # reply there would be thrown away. Validating the recorded address keeps the never-sent-to-the-
+        # wrong-address rule.
+        if na_claim_problem(ll, asker_mac, self._forbidden()):
+            return
+        self._answer_check(asker_mac, ll)
+
+    ANSWER_DELAYS = (0.05, 0.3, 1.0)      # seconds; extra answers so a re-send beats the real router's reply
+
+    def _answer_check(self, mac, ll):
+        """Send the reachability answer to one steered device at its recorded link-local address, now
+        and (while the listener is running) a few more times, so the Pi's answer beats the router's."""
+        self._send_advert(mac, ll)
+        if self._stop is not None:
+            for delay in self.ANSWER_DELAYS:
+                t = threading.Timer(delay, self._repeat_check, (mac, ll))
+                t.daemon = True
+                t.start()
+
+    def _repeat_check(self, mac, ll):
+        """One of the delayed reachability answers, sent only if the Pi is still steering that device."""
+        if self._stop is not None and not self._stop.is_set() and self._steered.get(mac) == ll:
+            self._send_advert(mac, ll)
+
+    def _send_advert(self, mac, ll):
+        """Send one "the router's address is at this computer" advertisement to one device."""
         try:
-            self.send(neighbour_advertisement(self.hub["v6"], self.our_mac, asker_ip, asker_mac,
-                                              eth_src=self.our_mac))
+            self.send(neighbour_advertisement(self.hub["v6"], self.our_mac, ll, mac, eth_src=self.our_mac))
         except (OSError, ValueError):
             pass
 
@@ -762,10 +875,29 @@ class IPv6Steerer:
         """Which devices are steered, by hardware address, for enforcer_state.json."""
         return dict(self._steered)
 
-    def adopt(self, saved):
-        """Take on the steered devices an earlier run saved, so a restart can hand them back."""
+    def state_hub(self):
+        """The router's link-local and hardware addresses our claims were made against, saved with the
+        steered devices so a restart can send the correction before the router is heard again, or {}."""
+        return dict(self._last_hub) if self._steered else {}
+
+    def adopt(self, saved, hub=None):
+        """Take on the steered devices an earlier run saved, so a restart can hand them back, together
+        with the router's addresses those claims were made against. The saved router is accepted only
+        when it is a valid link-local address and a single device's hardware address (nothing from the
+        notes file reaches a frame unchecked); otherwise it is left empty, which gives the old
+        behaviour (the devices are forgotten once a tick cannot correct them)."""
         if isinstance(saved, dict):
             self._steered = {m: l for m, l in saved.items() if isinstance(m, str) and isinstance(l, str)}
+        if isinstance(hub, dict):
+            v6, mac = hub.get("v6"), hub.get("mac")
+            try:
+                ok = (isinstance(v6, str) and ipaddress.IPv6Address(v6).is_link_local
+                      and isinstance(mac, str) and mac_to_bytes(mac) != bytes(6)
+                      and not (mac_to_bytes(mac)[0] & 1) and mac.lower() != str(self.our_mac).lower())
+            except (ValueError, AttributeError):
+                ok = False
+            if ok:
+                self._last_hub = {"v6": v6, "mac": mac}
 
     def active(self):
         """Is at least one device having its IPv6 taken away right now?"""
@@ -773,9 +905,11 @@ class IPv6Steerer:
 
     def status(self):
         """What the dashboard needs: whether it is turned on, how many devices are steered, whether
-        the router's IPv6 address is known yet, and any per-device problems."""
+        the router's IPv6 address is known yet, why nothing is steered (while on), and per-device
+        problems."""
         return {"enabled": self.enabled, "steered": len(self._steered),
                 "hub_known": bool(self.hub.get("v6") and self.hub.get("mac")),
+                "problem": self.why_not_ready(),
                 "problems": dict(self._problems)}
 
     # -- hearing the devices' questions (not reached by the tests; needs a real network) ----
@@ -799,7 +933,7 @@ class IPv6Steerer:
         return pkt, join
 
     def _join(self, join_sock, group):
-        """Join one solicited-node multicast group on the home network card, so its frames are heard."""
+        """Join one multicast group on the home network card, so its frames are heard."""
         try:
             mreq = v6_bytes(group) + struct.pack("@I", socket.if_nametoindex(self.iface))
             join_sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_JOIN_GROUP, mreq)
@@ -807,38 +941,71 @@ class IPv6Steerer:
         except (OSError, ValueError):
             return False
 
+    # Besides the hub's solicited-node group, listen on the groups phones send from their own
+    # link-local address (mDNS and group-membership reports), so link-local addresses can be learned
+    # even from a device that has never spoken IPv6 to the Pi. These joins vanish when the socket
+    # closes, so there is still no lasting host setting.
+    EXTRA_GROUPS = ("ff02::fb", "ff02::16")
+
     def listen(self, stop):
-        """Background loop: join the group the router's address is asked about and answer steered
-        devices' checks until `stop` is set. Re-joins when the router's address changes. Best effort:
-        if the sockets can't be opened it returns quietly, and QuietNet carries on without it."""
-        pkt, join = self.open_listener()
-        if pkt is None:
-            return
-        try:
-            pkt.settimeout(1)
-        except (OSError, AttributeError):
-            return
+        """Background loop until `stop` is set. While the setting is off and nobody is steered it holds
+        no sockets open and does nothing; once it is on (or devices are still being handed back) it
+        opens the packet socket, joins the groups the questions arrive on, learns link-local addresses
+        from the frames it hears and answers steered devices' reachability checks. Re-joins when the
+        router's address changes. Best effort: if the sockets can't be opened it waits and tries again,
+        and QuietNet carries on without it."""
+        self._stop = stop
+        pkt = join = None
         joined = None
-        while not stop.is_set():
-            group = solicited_node_multicast(self.hub["v6"]) if self.hub.get("v6") else None
-            if join is not None and group and group != joined and self._join(join, group):
-                joined = group
-            try:
-                frame = pkt.recv(256)
-            except socket.timeout:
-                continue
-            except OSError:
-                break
-            try:
-                self.handle_solicitation(frame)
-            except Exception as e:
-                self.log("IPv6 reachability answer problem: %s" % e)
+        try:
+            while not stop.is_set():
+                want = self.enabled or self._steered
+                if not want:
+                    pkt, join, joined = self._close_listener(pkt, join)
+                    stop.wait(1)
+                    continue
+                if pkt is None:
+                    pkt, join = self.open_listener()
+                    joined = None
+                    if pkt is None:
+                        stop.wait(1)
+                        continue
+                    try:
+                        pkt.settimeout(1)
+                    except (OSError, AttributeError):
+                        pkt, join, joined = self._close_listener(pkt, join)
+                        stop.wait(1)
+                        continue
+                groups = ([solicited_node_multicast(self.hub["v6"])] if self.hub.get("v6") else []) \
+                    + list(self.EXTRA_GROUPS)
+                if join is not None and groups != joined:
+                    for group in groups:
+                        self._join(join, group)
+                    joined = groups
+                try:
+                    frame = pkt.recv(256)
+                except socket.timeout:
+                    continue
+                except OSError:
+                    pkt, join, joined = self._close_listener(pkt, join)
+                    continue
+                try:
+                    self.note_frame(frame)
+                    self.handle_solicitation(frame)
+                except Exception as e:
+                    self.log("IPv6 reachability answer problem: %s" % e)
+        finally:
+            self._close_listener(pkt, join)
+
+    def _close_listener(self, pkt, join):
+        """Close both listening sockets (leaving any multicast group) and report (None, None, None)."""
         for s in (pkt, join):
             try:
                 if s is not None:
                     s.close()
             except OSError:
                 pass
+        return None, None, None
 
 
 # ---------------------------------------------------------------- the enforcer
@@ -894,6 +1061,9 @@ class Enforcer:
         self._v6 = IPv6Steerer(self.iface, self.our_mac, self._send_frame, log=log,
                                save=self._save_state) if plan6 else None
         self._v6_problems = {}
+        self._v6_problem = ""          # a whole-feature IPv6 problem to show (forwarding on, nft missing)
+        self._v6_load_failed = False   # the nft load with the ip6 chain was rejected, so stop claiming
+        self._hosts = {}               # the neighbour table the last IPv4 tick read, reused by IPv6 steering
 
     # -- availability -------------------------------------------------------
 
@@ -932,11 +1102,14 @@ class Enforcer:
     def ipv6_status(self):
         """What the dashboard shows about taking IPv6 away (option c2): whether it is offered at all
         here (the nft tool is needed), turned on, how many devices are steered, whether the router's
-        IPv6 address is known yet, and any per-device problems. See IPv6Steerer.status."""
-        if self._v6 is None:
+        IPv6 address is known yet, why nothing is steered, and any per-device problems. When the nft
+        tool is missing (or the enforcer has no IPv6 steering) nothing can be answered, so it reports
+        only {"offered": False}. See IPv6Steerer.status."""
+        if self._v6 is None or self.backend != "nft":
             return {"offered": False}
         info = self._v6.status()
-        info["offered"] = self.backend == "nft"
+        info["offered"] = True
+        info["problem"] = self._v6_problem or info.get("problem", "")
         info["problems"] = dict(info.get("problems") or {}, **self._v6_problems)
         return info
 
@@ -1027,18 +1200,52 @@ class Enforcer:
             self._teardown()
 
     def _tick_v6(self):
-        """One pass of IPv6 steering: take in what to steer towards and send the claims. Kept apart
-        from _tick so it can run even when IPv4 steering is held up, and so a fault in one does not
-        stop the other. The firewall's DNS redirect reads the result on the same tick (_apply_firewall)."""
+        """One pass of IPv6 steering. Kept apart from _tick so a fault in one does not stop the other;
+        the firewall's DNS redirect reads the result on the same tick (_apply_firewall). IPv6 follows
+        IPv4 steering: only devices the enforcer is actually holding (self._spoofed) are claimed, so a
+        device whose IPv4 steering is paused or not yet started is left alone and handed back. Nothing
+        is claimed without the nft tool to answer the lookups, or while this computer is set to pass
+        IPv6 on (then taking a device's IPv6 away would stop nothing)."""
         self._v6.iface, self._v6.our_mac = self.iface, self.our_mac
         self._v6.fixed_macs = {m for m in (self.our_mac, self.gateway_mac()) if m}
-        self._v6.set_target(self.plan6() or {})
-        self._v6_problems = self._v6.steer()
+        config = dict(self.plan6() or {})
+        if not config.get("enabled"):
+            self._v6_load_failed = False          # switched off: a later load may try the ip6 chain again
+        self._v6_problem = ""
+        # Only claim devices IPv4 steering actually holds, matched by hardware address.
+        with self._lock:
+            held = {ip: str(mac).lower() for ip, mac in self._spoofed.items()}
+        wanted = bool(config.get("enabled"))
+        all_devices = config.get("devices") or {}
+        devices = {ip: d for ip, d in all_devices.items()
+                   if held.get(ip) == str(d.get("mac", "")).lower()}
+        held_back = {ip: "QuietNet is not steering this device right now, so its IPv6 is left alone."
+                     for ip in all_devices if ip not in devices}
+        config["devices"] = devices
+        if self.backend != "nft":
+            config["enabled"] = False
+            if wanted:
+                self._v6_problem = ("Taking IPv6 away from steered devices needs the nft firewall tool, which is "
+                                    "not installed here, so QuietNet is leaving every device's IPv6 alone.")
+        elif sysctl_get("net.ipv6.conf.all.forwarding") == "1":
+            config["enabled"] = False
+            if wanted:
+                self._v6_problem = ("This computer is set to pass IPv6 traffic on, so taking IPv6 away from a device "
+                                    "would not stop anything. QuietNet is leaving devices' IPv6 alone. To use this, "
+                                    "switch IPv6 forwarding off on the Pi.")
+        self._v6.redirect_ok = (self.backend == "nft" and not self._v6_load_failed)
+        self._v6.set_target(config)
+        problems = self._v6.steer()
+        if wanted and config.get("enabled"):
+            problems = dict(held_back, **problems)
+        self._v6_problems = problems
 
     def gateway_mac(self):
-        """The router's hardware address as the neighbour table has it now, or '' if not known yet.
-        A claim is never sent to it (the router must not be told its own address is elsewhere)."""
-        return self.neighbours().get(self.gateway_ip, "")
+        """The router's hardware address, from the neighbour table the last IPv4 tick already read, or
+        '' if not known yet. A claim is never sent to it (the router must not be told its own address is
+        elsewhere). Reusing that table keeps the IPv6 tick from running its own `ip neigh`."""
+        mac = self._hosts.get(self.gateway_ip, "")
+        return mac or self.neighbours().get(self.gateway_ip, "")
 
     # -- notes on disk, so a crash can be undone -------------------------------
 
@@ -1053,6 +1260,7 @@ class Enforcer:
                 data = {"sysctls": self._saved_sysctls, "spoofed": self._spoofed}
                 if v6:
                     data["v6_spoofed"] = v6
+                    data["v6_hub"] = self._v6.state_hub()
                 with open(self.state_path, "w") as f:
                     json.dump(data, f)
             elif os.path.exists(self.state_path):
@@ -1082,9 +1290,10 @@ class Enforcer:
         if old is None:
             return
         if self._v6:
-            # Adopt the IPv6-steered devices too; a later tick re-claims those still chosen and hands
-            # back the rest (steer()), once the router's hardware address is heard again.
-            self._v6.adopt(old.get("v6_spoofed"))
+            # Adopt the IPv6-steered devices and the router's addresses saved with them, so the first
+            # tick hands every saved device back with a correction built from the saved router address;
+            # devices still chosen are claimed again once the router is next heard announcing.
+            self._v6.adopt(old.get("v6_spoofed"), old.get("v6_hub"))
         self._spoofed = {ip: mac for ip, mac in (old.get("spoofed") or {}).items() if isinstance(mac, str)}
         self._saved_sysctls = {k: v for k, v in (old.get("sysctls") or {}).items() if isinstance(v, str) and v}
         if self._spoofed:
@@ -1200,6 +1409,7 @@ class Enforcer:
         plan = {ip: r for ip, r in (self.plan() or {}).items() if not self.can_target(ip)}
         with self._lock:
             hosts = self.neighbours()
+            self._hosts = hosts                   # reused by the IPv6 tick, so it runs no `ip neigh` of its own
             gone = {ip: mac for ip, mac in self._spoofed.items() if ip not in plan or hosts.get(ip, mac) != mac}
             if gone and self._heal(gone, rounds=3):
                 for ip in gone:
@@ -1364,6 +1574,15 @@ class Enforcer:
             text = nft_ruleset(plan, self.local_ip, self.dns_port, ipv6=ipv6)
             if text != self._applied:
                 p = subprocess.run(["nft", "-f", "-"], input=text, text=True, capture_output=True)
+                if p.returncode and ipv6 is not None:
+                    # The load with the ip6 DNS redirect was rejected. Fall back to the rules without it,
+                    # so the IPv4 rules still land, and stop IPv6 claiming (the next IPv6 tick hands the
+                    # devices back, since redirect_ok is then false). Without this the whole table would
+                    # fail every tick and IPv4 rule changes would stop landing too.
+                    self.log("nft load failed with the IPv6 DNS redirect; loading without it: %s" % p.stderr.strip())
+                    self._v6_load_failed = True
+                    text = nft_ruleset(plan, self.local_ip, self.dns_port, ipv6=None)
+                    p = subprocess.run(["nft", "-f", "-"], input=text, text=True, capture_output=True)
                 if p.returncode:
                     self.log("nft load failed: %s" % p.stderr.strip())
                 else:

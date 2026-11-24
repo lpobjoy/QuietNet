@@ -503,6 +503,22 @@ class Devices(Api):
         server.init_db()
         self.assertFalse(server.S.no_ipv6_all)
 
+    def test_the_ipv6_steering_switch_is_off_until_the_owner_turns_it_on(self):
+        self.assertIs(self.get("/api/status")[1]["ipv6_steer"], False)
+        self.assertIs(server.plan6()["enabled"], False)
+
+    def test_the_ipv6_steering_switch_is_saved_and_shown_in_the_status(self):
+        self.ok("/api/ipv6-steer-switch", {"on": True})
+        self.assertTrue(self.get("/api/status")[1]["ipv6_steer"])
+        server.init_db()
+        self.assertTrue(server.S.ipv6_steer)
+        self.assertTrue(server.plan6()["enabled"])
+        self.ok("/api/ipv6-steer-switch", {"on": False})
+        self.assertFalse(server.S.ipv6_steer)
+        server.init_db()
+        self.assertFalse(server.S.ipv6_steer)
+        self.assertFalse(server.plan6()["enabled"])
+
     def test_the_no_ipv6_switch_bites_on_the_very_next_lookup_and_lets_go_as_fast(self):
         v6 = bytes.fromhex("2a001450400908000000000000000200")
         internet = lambda d: d[:2] + b"\x81\x80\x00\x01\x00\x01\x00\x00\x00\x00" + d[12:] \
@@ -1075,6 +1091,66 @@ class EnforceAndCloud(Api):
             self.assertEqual(self.get("/api/enforcer")[1], {"available": False, "reason": "not started", "active": False, "shared": {}})
         finally:
             server.ENF = real
+
+
+HUB_LL, HUB_MAC = "fe80::1", "98:99:99:99:99:99"
+
+
+class Plan6(Base):
+    """plan6() names the hub as the real router heard most recently, gives no redirect while IPv6
+    DNS is down, and names no device while the setting is off. Which devices lose IPv6 is checked
+    with the device tables in test_device_moves.py (WhereIPv6IsTakenAway)."""
+
+    def setUp(self):
+        super().setUp()
+        server.S.routers_v6 = {HUB_LL: {"mac": HUB_MAC, "heard": time.time()}}
+        server.S.router_v6_dns = {}
+        server.S.shared_macs = set()
+        for name, value in (("dns_ipv6", True), ("v6_dns", "fd00::53"), ("v6_own", {"fd00::53"}),
+                            ("dns_port", 53), ("ipv6_steer", True)):
+            old = getattr(server.S, name)
+            setattr(server.S, name, value)
+            self.addCleanup(setattr, server.S, name, old)
+
+    def test_while_the_setting_is_off_no_device_is_named_and_the_neighbour_table_is_not_read(self):
+        server.S.ipv6_steer = False
+        self.neighbours_now = {KID: "10:22:33:44:55:66"}
+        with mock.patch.object(server, "neighbours", lambda: dict(self.neighbours_now)), \
+                mock.patch.object(server, "neighbour_table", return_value={KID: ("10:22:33:44:55:66", "fresh")}):
+            server.note_ipv4_addresses()
+            server.set_live_cut(server.S.hw_device["10:22:33:44:55:66"], True)
+        with mock.patch.object(server, "neighbour_table", side_effect=AssertionError("read")):
+            plan = server.plan6()
+        self.assertEqual((plan["enabled"], plan["devices"]), (False, {}))
+
+    def test_the_hub_is_the_real_router_heard_most_recently(self):
+        server.S.routers_v6 = {"fe80::1": {"mac": HUB_MAC, "heard": 10},
+                               "fe80::2": {"mac": "aa:bb:cc:dd:ee:ff", "heard": 20},
+                               "fe80::3": {"heard": 30}}            # no hardware address: not a candidate
+        self.assertEqual(server.plan6()["hub"], {"v6": "fe80::2", "mac": "aa:bb:cc:dd:ee:ff"})
+
+    def test_no_hub_is_named_until_a_router_is_heard_with_a_hardware_address(self):
+        server.S.routers_v6 = {"fe80::3": {"heard": 30}}
+        self.assertEqual(server.plan6()["hub"], {})
+
+    def test_no_port_or_address_of_our_own_while_ipv6_dns_is_down(self):
+        server.S.dns_ipv6 = False
+        plan = server.plan6()
+        self.assertIsNone(plan["port"])
+        self.assertEqual(plan["our_v6"], "")
+
+    def test_the_port_and_address_are_given_while_ipv6_dns_is_up(self):
+        plan = server.plan6()
+        self.assertEqual(plan["port"], 53)
+        self.assertEqual(plan["our_v6"], "fd00::53")
+
+    def test_our_own_address_is_not_listed_as_a_server_to_catch(self):
+        server.S.router_v6_dns = {"fd00::53": time.time() + 100}   # this computer's own: skip it
+        self.assertNotIn("fd00::53", server.plan6()["servers"])
+
+    def test_an_expired_router_dns_server_is_not_caught(self):
+        server.S.router_v6_dns = {"fe80::dead": time.time() - 100}
+        self.assertNotIn("fe80::dead", server.plan6()["servers"])
 
 
 if __name__ == "__main__":

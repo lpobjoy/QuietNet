@@ -281,7 +281,7 @@ class State:
     v6_own = set()          # this computer's own IPv6 addresses (see refresh_ipv6_view)
     v6_prefixes = []        # the home network's public IPv6 ranges, from this computer's own addresses
     v6_devices = {}         # a device's IPv6 address -> its IPv4 address, matched by hardware address
-    v6_by_mac = {}          # hardware address -> {"ll": its link-local IPv6 address, "addrs": [all its IPv6 addresses]}
+    v6_by_mac = {}          # hardware address -> {"ll": its one link-local IPv6 address (empty if none or several), "lls": [every link-local], "addrs": [all its IPv6 addresses]}
     v6_shared = frozenset()  # IPv6 addresses behind a range extender (S.shared_macs): each keeps its own share of lookups
     v6_dns = ""             # the IPv6 address to give devices as their DNS server ('' = none suitable)
     v6_neighbours_ok = None  # could the IPv6 neighbour table be read at the last look? (None = not looked yet)
@@ -3392,15 +3392,19 @@ def plan6():
       - "devices" are the devices "Cut live connections" is on for and that the live neighbour table
         lists now (steered_now: no matching entry there, no steering, over IPv6 as over IPv4), keyed by
         the IPv4 address each is at, each with its hardware address and its own link-local IPv6
-        address, where both are known. A merged device with two hardware addresses is named once for
-        each, at the address each is at. Never named: a device known only by its number or behind a
-        range extender, and one whose hardware address is at two live addresses at once
-        (S.hw_unsettled), whose IPv6 addresses are matched to no device either;
+        address ("ll", or "" when this computer has not learned one yet). A merged device with two
+        hardware addresses is named once for each, at the address each is at. A device known only by
+        its number, or behind a range extender, is passed through with "ll": "" (and its hardware
+        address is listed in "shared") so the steerer can report it and never steer it. A device
+        whose hardware address is at two live addresses at once (S.hw_unsettled: its IPv6 addresses
+        are matched to no device either), or has more than one link-local address in the neighbour
+        table, is passed with "ll": "" and "unclear": True (it may be behind an extender not yet
+        recognised), so it too is left alone;
       - "our_v6" is a lasting IPv6 address of this computer to answer redirected lookups from (the one
         also offered to devices as a DNS server; '' when there is none, so no redirect is added);
       - "port" is the port QuietNet answers on while it is listening over IPv6 (None otherwise, so no
         redirect is added); "servers" the router's IPv6 DNS addresses to catch; "shared" the range
-        extenders, never steered."""
+        extenders' hardware addresses, never steered."""
     hub = {}
     now = time.time()
     with router_dns_lock:
@@ -3413,17 +3417,25 @@ def plan6():
     servers = ([hub["v6"]] if hub.get("v6") else []) + [a for a in named if a not in ours]
     by_mac = S.v6_by_mac
     devices = {}
+    extenders = set(S.shared_macs)
     for ip, (mac, number) in (steered_now() if S.ipv6_steer else {}).items():
-        if not mac or mac in S.shared_macs:
+        if not mac:
             continue
-        if S.devices_ready and (S.device_kind.get(number) != "hw" or mac in S.hw_unsettled):
+        if mac in S.shared_macs or (S.devices_ready and S.device_kind.get(number) != "hw"):
+            # Behind a range extender, or known only by its number: reported, never steered.
+            devices[ip] = {"mac": mac, "ll": ""}
+            extenders.add(mac)
             continue
-        info = by_mac.get(mac)
-        if info and info.get("ll"):
-            devices[ip] = {"mac": mac, "ll": info["ll"]}
+        info = by_mac.get(mac) or {}
+        lls = info.get("lls") or ([info["ll"]] if info.get("ll") else [])
+        if len(lls) > 1 or (S.devices_ready and mac in S.hw_unsettled):
+            # Several link-local addresses, or at two live addresses at once: left alone.
+            devices[ip] = {"mac": mac, "ll": "", "unclear": True}
+        else:
+            devices[ip] = {"mac": mac, "ll": lls[0] if lls else ""}
     return {"enabled": S.ipv6_steer, "hub": hub, "our_v6": S.v6_dns if S.dns_ipv6 else "",
             "port": S.dns_port if S.dns_ipv6 else None, "servers": servers,
-            "shared": list(S.shared_macs), "devices": devices}
+            "shared": sorted(extenders), "devices": devices}
 
 
 def ttl_positions(resp):
@@ -5787,13 +5799,18 @@ def refresh_ipv6_view():
     for addr, (mac, _) in (table6 or {}).items():
         if mac in extenders:
             continue
-        info = by_mac.setdefault(mac, {"ll": "", "addrs": []})
+        info = by_mac.setdefault(mac, {"ll": "", "lls": [], "addrs": []})
         info["addrs"].append(addr)
         try:
-            if ipaddress.IPv6Address(addr).is_link_local and not info["ll"]:
-                info["ll"] = addr
+            if ipaddress.IPv6Address(addr).is_link_local:
+                info["lls"].append(addr)
         except ValueError:
             pass
+    # A hardware address with more than one link-local address is treated as shared straight away:
+    # "ll" is left empty so plan6 never picks one of them. A single device with an old stale entry
+    # still listed is left alone until the old entry goes - the safe direction (design 4.4).
+    for info in by_mac.values():
+        info["ll"] = info["lls"][0] if len(info["lls"]) == 1 else ""
     S.v6_own, S.v6_prefixes, S.v6_devices, S.v6_dns = own, ranges, matched, for_devices
     S.v6_by_mac = by_mac
     S.v6_shared = shared
@@ -6023,6 +6040,7 @@ def router_advert_listener(sock=None):
     S.ra_since = time.monotonic()
     S.ra_listening = True
     window, looked = time.monotonic(), 0
+    last_poke = 0.0
     try:
         while True:
             try:
@@ -6049,8 +6067,11 @@ def router_advert_listener(sock=None):
                 note_router_dns(found["servers"], time.time(), found["lifetime"], found["prefixes"],
                                 sender=str(sender), mac=found["mac"])
                 # A real router announcing resets a steered device's idea of where the router is, so
-                # wake the enforcer to send the claim again at once (option c2).
-                if found["lifetime"] > 0 and ENF is not None:
+                # wake the enforcer to send the claim again at once (option c2). Only while the setting
+                # is on, and at most once a second, so with it off nothing is changed and a flood of
+                # announcements can't drive the enforcer's loop.
+                if found["lifetime"] > 0 and S.ipv6_steer and ENF is not None and now - last_poke >= 1:
+                    last_poke = now
                     ENF.poke()
     finally:
         S.ra_listening = False
@@ -7321,6 +7342,8 @@ class Web(BaseHTTPRequestHandler):
                 db.execute("INSERT OR REPLACE INTO settings(key, value) VALUES('ipv6_steer', ?)",
                            ("1" if S.ipv6_steer else "0",))
                 db.commit()
+            if ENF is not None:
+                ENF.poke()                        # hand the devices back (or start) at once, not in 2 seconds
             return self.send_json({"ok": True})
         if path == "/api/junk-switch":
             S.junk_on = bool(body.get("on"))

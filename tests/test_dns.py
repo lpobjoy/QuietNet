@@ -632,6 +632,22 @@ class ReplyAddress(unittest.TestCase):
         self.assertEqual(info, ipaddress.IPv6Address("fe80::1").packed + struct.pack("=I", 3))
         sock.sendto.assert_not_called()
 
+    def test_a_v6_lookup_is_received_with_where_it_was_sent(self):
+        info = ipaddress.IPv6Address("fe80::1").packed + struct.pack("=I", 3)
+        sock = mock.Mock(family=socket.AF_INET6)
+        sock.recvmsg.return_value = (b"q", [(socket.IPPROTO_IPV6, 50, info)], 0, ("fe80::9", 5000, 0, 3))
+        with mock.patch.object(server, "IPV6_PKTINFO", 50):
+            got = server.receive_lookup(sock, True)
+        self.assertEqual(got, (b"q", ("fe80::9", 5000, 0, 3), ("v6", "fe80::1", 3)))
+        sock.recvmsg.assert_called_once_with(4096, socket.CMSG_SPACE(20))
+
+    def test_a_v6_answer_falls_back_when_the_system_refuses_the_address(self):
+        sock = mock.Mock()
+        sock.sendmsg.side_effect = OSError
+        with mock.patch.object(server, "IPV6_PKTINFO", 50):
+            server.send_answer(sock, b"answer", ("fe80::9", 5000, 0, 3), ("v6", "fe80::1", 3))
+        sock.sendto.assert_called_once_with(b"answer", ("fe80::9", 5000, 0, 3))
+
     def test_the_listener_answers_from_the_address_each_lookup_was_sent_to(self):
         sock = mock.Mock(family=socket.AF_INET)
         sock.recvmsg.side_effect = [(query("www.bbc.co.uk"), self.pktinfo(self.PI), 0, ("192.168.1.23", 5000)),
@@ -1530,6 +1546,28 @@ class AddressesBuiltFromAHardwareAddress(Base):
     def test_an_ipv4_card_never_carries_the_hint(self):
         self.assertEqual(self.devices()[KID]["same_as"], "")
 
+    def test_the_view_keeps_each_devices_link_local_address_by_hardware_address(self):
+        self.view({KID: (self.KID_MAC, "fresh")},
+                  {"fe80::aa": (self.KID_MAC, "fresh"), "2001:db8::aa": (self.KID_MAC, "fresh")})
+        self.assertEqual(server.S.v6_by_mac,
+                         {self.KID_MAC: {"ll": "fe80::aa", "lls": ["fe80::aa"],
+                                         "addrs": ["fe80::aa", "2001:db8::aa"]}})
+
+    def test_a_hardware_address_with_two_link_local_addresses_keeps_no_single_one(self):
+        self.view({KID: (self.KID_MAC, "fresh")},
+                  {"fe80::aa": (self.KID_MAC, "fresh"), "fe80::bb": (self.KID_MAC, "fresh")})
+        self.assertEqual(server.S.v6_by_mac[self.KID_MAC]["ll"], "")
+        self.assertEqual(sorted(server.S.v6_by_mac[self.KID_MAC]["lls"]), ["fe80::aa", "fe80::bb"])
+
+    def test_a_range_extenders_addresses_are_left_out_of_the_view_by_hardware_address(self):
+        server.S.shared_macs = {self.KID_MAC}
+        self.view({KID: (self.KID_MAC, "fresh")}, {"fe80::aa": (self.KID_MAC, "fresh")})
+        self.assertNotIn(self.KID_MAC, server.S.v6_by_mac)
+
+    def test_an_unreadable_ipv6_neighbour_table_empties_the_view_by_hardware_address(self):
+        self.view({KID: (self.KID_MAC, "fresh")}, None)
+        self.assertEqual(server.S.v6_by_mac, {})
+
 
 def router_advert(*options):
     """A router announcement (ICMPv6 type 134) as it arrives on the socket: the 16-byte start, then
@@ -1764,6 +1802,46 @@ class RouterAnnouncements(Base):
         server.note_router_dns([], 1000.0, sender="fe80::1", mac=self.HUB_MAC)
         server.note_router_dns([], 1005.0, sender="fe80::2", mac="aa:bb:cc:dd:ee:02")
         self.assertEqual([r["address"] for r in server.ipv6_dns_view(1010.0)["routers"]], ["fe80::2", "fe80::1"])
+
+    def no_lifetime(self):
+        """A router announcement with router lifetime 0 (not a real router for devices)."""
+        data = bytearray(router_advert(self.LINK_ADDR, rdnss(600, self.HUB)))
+        data[6:8] = bytes(2)
+        return bytes(data)
+
+    def test_a_real_routers_announcement_wakes_the_enforcer_while_steering_is_on(self):
+        server.S.ipv6_steer = True
+        enf = mock.Mock()
+        with mock.patch.object(server, "ENF", enf):
+            self.listen([(router_advert(self.LINK_ADDR, rdnss(600, self.HUB)), ("fe80::1%wlan0", 0, 0, 3))])
+        enf.poke.assert_called_once_with()
+
+    def test_an_announcement_does_not_wake_the_enforcer_while_the_setting_is_off(self):
+        server.S.ipv6_steer = False
+        enf = mock.Mock()
+        with mock.patch.object(server, "ENF", enf):
+            self.listen([(router_advert(self.LINK_ADDR, rdnss(600, self.HUB)), ("fe80::1%wlan0", 0, 0, 3))])
+        enf.poke.assert_not_called()
+
+    def test_an_announcement_with_no_router_lifetime_does_not_wake_the_enforcer(self):
+        server.S.ipv6_steer = True
+        enf = mock.Mock()
+        with mock.patch.object(server, "ENF", enf):
+            self.listen([(self.no_lifetime(), ("fe80::1%wlan0", 0, 0, 3))])
+        enf.poke.assert_not_called()
+
+    def test_a_burst_of_announcements_wakes_the_enforcer_at_most_once_a_second(self):
+        server.S.ipv6_steer = True
+        enf = mock.Mock()
+        packet = (router_advert(self.LINK_ADDR, rdnss(600, self.HUB)), ("fe80::1%wlan0", 0, 0, 3))
+        with mock.patch.object(server, "ENF", enf):
+            self.listen([packet, packet, packet])
+        self.assertEqual(enf.poke.call_count, 1)
+
+    def test_an_announcement_is_read_safely_when_there_is_no_enforcer(self):
+        server.S.ipv6_steer = True
+        with mock.patch.object(server, "ENF", None):
+            self.listen([(router_advert(self.LINK_ADDR, rdnss(600, self.HUB)), ("fe80::1%wlan0", 0, 0, 3))])
 
     def test_the_listener_notes_when_it_began_and_forgets_it_when_it_stops(self):
         began = []
