@@ -465,7 +465,7 @@ class RangeExtenders(Base, Setup):
 
     def test_a_number_behind_an_extender_is_not_steered_on_a_stale_entry(self):
         # One hardware address answers for several devices there, so a stale entry says nothing
-        # about which device has the number (known issue 98).
+        # about which device has the number (known issue 99).
         self.become_an_extender({OLD: fresh(EXTENDER), NEW: fresh(EXTENDER)})
         server.set_live_cut(server.S.addr_only[NEW], True)
         self.assertEqual(sorted(self.plan({OLD: fresh(EXTENDER), NEW: fresh(EXTENDER)})), [NEW])
