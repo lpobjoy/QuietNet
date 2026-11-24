@@ -712,6 +712,26 @@ class Relaying(RelayCase):
         self.assertEqual(status, 400)
         self.assertIn("web address", json.loads(text)["error"])
 
+    def test_the_pis_question_about_a_needed_name_is_passed_back_whole(self):
+        # The Pi answers 409, with who needs the address, when a name a device's own system depends
+        # on is blocked without the person's say-so. The dashboard asks from that answer, so both
+        # the status and the body must come through the relay untouched.
+        b = self.signed_in()
+        pid, token = self.paired_pi(b)
+        answer = {"error": "Samsung TVs need this address.", "needed": "Samsung TVs", "domain": "samsungcloudsolution.net"}
+        t, _ = self.pretend_pi(token, status=409, body=json.dumps(answer))
+        status, text, _ = b.post("/pi/%s/api/block" % pid, data={"domain": "samsungcloudsolution.net"}, headers=self.API)
+        t.join(5)
+        self.assertEqual((status, json.loads(text)), (409, answer))
+
+    def test_the_persons_yes_reaches_the_pi_with_the_block(self):
+        b = self.signed_in()
+        pid, token = self.paired_pi(b)
+        t, seen = self.pretend_pi(token)
+        b.post("/pi/%s/api/block" % pid, data={"domain": "samsungcloudsolution.net", "sure": True}, headers=self.API)
+        t.join(5)
+        self.assertEqual(json.loads(seen["body"]), {"domain": "samsungcloudsolution.net", "sure": True})
+
     def test_calls_without_the_dashboard_header_are_refused(self):
         # A hostile website can make your browser send a request with your cookie, but it
         # cannot add this header. Refusing without it stops such forged requests.

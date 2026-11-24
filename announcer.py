@@ -24,7 +24,7 @@ Safety rules this module keeps (docs/ARCHITECTURE.md lists them with the reasons
     is not "nothing to say": the two DHCPv6 flags have no such value, so leaving them clear
     reads "DHCPv6 is not used here", which is the opposite of what a router that sets them
     says. The trial therefore holds back while the home router hands out addresses by DHCPv6
-    (see server.announce_hold_reason, and known issue 101 for what is left open).
+    (see server.announce_hold_reason, and known issue 102 for what is left open).
   - It can only ever name the computer that sends it (build_dns_announcement refuses anything
     else), and nothing but a checked hardware address and a checked address goes into it.
   - It is sent only while QuietNet really is answering lookups over IPv6 on the usual DNS port:
@@ -241,7 +241,7 @@ def card_facts(card=None, inet6_path="/proc/net/if_inet6", folder="/sys/class/ne
     throws away an answer from an address it did not ask, and waits. That has never been tried
     on a real Pi with two home-only addresses, and the announcer's own test question, asked
     from this computer, could not notice it going wrong. So the trial holds back until manual
-    step 78 has been run; taking the hold out is the owner's decision. The facts are still
+    step 79 has been run; taking the hold out is the owner's decision. The facts are still
     given so that devices already told can be sent a goodbye."""
     if card is None:
         card = enforcer.interface_and_gateway()[0]

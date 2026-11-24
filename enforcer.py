@@ -266,7 +266,7 @@ def _ip6_dns_rules(ipv6):
     Only lookups addressed to the router's IPv6 DNS addresses are caught, as the design says. A lookup
     a steered device sends to any other IPv6 DNS server (one built into the device, or typed in by
     hand) is not matched: it is dropped with the rest of the device's IPv6 and gets no answer, while
-    its IPv4 lookups are still answered. Known issue 100 records this."""
+    its IPv4 lookups are still answered. Known issue 101 records this."""
     target = _checked_ipv6(ipv6["target"])
     port = ipv6.get("port")
     if isinstance(port, bool) or not isinstance(port, int) or not 0 < port < 65536:

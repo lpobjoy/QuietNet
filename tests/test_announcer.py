@@ -1524,7 +1524,7 @@ class InTheServer(Api):
         self.assertEqual(server.announce_hold_reason(ADDR), "")
 
     def test_a_known_range_extender_holds_the_trial_back(self):
-        # Over IPv6 the devices behind one can't be told apart (issues 95 and 101).
+        # Over IPv6 the devices behind one can't be told apart (issues 96 and 102).
         self.router_heard()
         self.assertEqual(server.announce_hold_reason(ADDR), "")
         with mock.patch.object(server.S, "shared_macs", {"aa:bb:cc:00:00:01"}):
@@ -1608,7 +1608,7 @@ class InTheServer(Api):
         self.assertEqual(self.sent, [KNOWN_ANNOUNCEMENT] + [KNOWN_GOODBYE] * 3)
 
     def test_two_link_local_addresses_under_one_hardware_address_hold_the_trial_back(self):
-        # Several devices may be behind a range extender QuietNet has not recognised (issue 101).
+        # Several devices may be behind a range extender QuietNet has not recognised (issue 102).
         self.router_heard()
         self.assertEqual(server.announce_hold_reason(ADDR), "")
         with mock.patch.object(server.S, "v6_unclear", frozenset({"aa:bb:cc:00:00:01"})):
@@ -1947,24 +1947,24 @@ class WhatTheDocsSay(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         issues = read("docs", "KNOWN_ISSUES.md")
-        start = issues.index("### 101. ")
+        start = issues.index("### 102. ")
         cls.issue = " ".join(issues[start:issues.index("\n### ", start + 1)].split())
         cls.readme = " ".join(read("README.md").split())
         cls.testing = read("docs", "TESTING.md")
 
-    def test_known_issue_101_says_devices_never_set_up_can_be_brought_in(self):
+    def test_known_issue_102_says_devices_never_set_up_can_be_brought_in(self):
         self.assertIn("It can bring in devices that were never set up to use QuietNet.", self.issue)
         self.assertIn("A blocked answer is final", self.issue)
 
-    def test_known_issue_101_no_longer_calls_the_hub_off_case_harmless(self):
+    def test_known_issue_102_no_longer_calls_the_hub_off_case_harmless(self):
         self.assertNotIn("not known to cause harm", self.issue)
         self.assertIn("the only IPv6 DNS server", self.issue)
 
-    def test_known_issue_101_says_why_the_trial_holds_back_for_a_range_extender(self):
+    def test_known_issue_102_says_why_the_trial_holds_back_for_a_range_extender(self):
         self.assertIn("range extender", self.issue)
         self.assertIn("fewer than three looks", self.issue)
 
-    def test_known_issue_101_says_what_losing_the_only_ipv6_dns_server_does_to_an_android_phone(self):
+    def test_known_issue_102_says_what_losing_the_only_ipv6_dns_server_does_to_an_android_phone(self):
         self.assertIn("names no IPv6 DNS server", self.issue)
         self.assertIn("not tried on a phone", self.issue)
 
@@ -1972,16 +1972,16 @@ class WhatTheDocsSay(unittest.TestCase):
         self.assertIn("Devices you never set up to use QuietNet may start using it too", self.readme)
         self.assertIn("whole-house rules", self.readme)
 
-    def test_known_issue_101_no_longer_says_an_unrecognised_extenders_addresses_are_always_unmatched(self):
+    def test_known_issue_102_no_longer_says_an_unrecognised_extenders_addresses_are_always_unmatched(self):
         self.assertNotIn("with the device tables its IPv6 addresses are unmatched all the same", self.issue)
         self.assertIn("more than one link-local address", self.issue)
         self.assertIn("If only one device behind an unrecognised extender has ever spoken to the Pi over IPv6", self.issue)
 
-    def test_known_issue_101_says_answers_leave_from_the_address_that_was_asked(self):
+    def test_known_issue_102_says_answers_leave_from_the_address_that_was_asked(self):
         self.assertNotIn("the system picks which one each answer leaves from (the newer one", self.issue)
         self.assertIn("answers each lookup from the address it was sent to", self.issue)
 
-    def test_known_issue_101_says_what_the_dhcpv6_flags_of_the_announcement_mean(self):
+    def test_known_issue_102_says_what_the_dhcpv6_flags_of_the_announcement_mean(self):
         self.assertIn("The Pi's message has both DHCPv6 flags clear", self.issue)
         self.assertIn("not tried here", self.issue)
 
@@ -1991,7 +1991,7 @@ class WhatTheDocsSay(unittest.TestCase):
         self.assertNotIn("With two, the system chooses which one each reply leaves from", text)
 
     def test_there_are_manual_steps_for_the_routers_dhcpv6_flags_and_for_an_extender_seen_at_one_number(self):
-        self.assertRegex(self.testing, r"\n80\. \*\*The router's DHCPv6 flags\.\*\*")
+        self.assertRegex(self.testing, r"\n81\. \*\*The router's DHCPv6 flags\.\*\*")
         self.assertIn("**The one-number case.**", self.testing)
 
     def test_there_is_a_manual_step_for_a_device_that_was_never_pointed_at_quietnet(self):

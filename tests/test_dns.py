@@ -375,6 +375,20 @@ class Helpers(Base):
         self.assertEqual(server.verdict("telemetry.example.com"), "suspect")
         self.assertFalse(server.decision("telemetry.example.com", KID)[0])
 
+    def test_a_name_a_devices_own_system_depends_on_says_who_needs_it(self):
+        self.assertEqual(server.needed_by("samsungcloudsolution.net"), "Samsung TVs")
+        self.assertEqual(server.needed_by("samsungcloudsolution.com"), "Samsung TVs")
+
+    def test_a_sub_name_beneath_a_needed_name_is_not_itself_needed(self):
+        self.assertEqual(server.needed_by("log-config.samsungcloudsolution.net"), "")
+
+    def test_an_ordinary_name_is_needed_by_nobody(self):
+        for name in ("example.com", "bbc.co.uk", "doubleclick.net"):
+            self.assertEqual(server.needed_by(name), "", name)
+
+    def test_a_sub_name_beneath_a_needed_name_keeps_its_own_label(self):
+        self.assertEqual(server.verdict("log-config.samsungcloudsolution.net"), "suspect")
+
     def test_which_rule_sets_apply_to_a_device(self):
         self.assertEqual(server.scopes_for(None), ["all"])
         self.assertEqual(server.scopes_for(KID), ["all"])                 # an address no device is known for
@@ -926,7 +940,10 @@ class LookupsOverIPv6(Base):
         sock.recvfrom.side_effect = [(query("www.bbc.co.uk"), ("2001:db8:9:9::1", 5000, 0, 0)), KeyboardInterrupt()]
         submitted = []
         pool = mock.Mock(submit=lambda fn, data, addr, source: submitted.append(addr))
-        with mock.patch.object(server, "ThreadPoolExecutor", lambda max_workers: pool):
+        # The stand-in socket has recvfrom only, so the Linux "which address was this sent to"
+        # option, which reads with recvmsg, is switched off (ReplyAddress covers that option).
+        with mock.patch.object(server, "IPV6_RECVPKTINFO", None), \
+                mock.patch.object(server, "ThreadPoolExecutor", lambda max_workers: pool):
             with self.assertRaises(KeyboardInterrupt):
                 server.udp_server(sock)
         self.assertEqual(submitted, [])
@@ -937,7 +954,10 @@ class LookupsOverIPv6(Base):
         sock.recvfrom.side_effect = [(query("www.bbc.co.uk"), ("fe80::1", 5000, 0, 2)), KeyboardInterrupt()]
         submitted = []
         pool = mock.Mock(submit=lambda fn, data, addr, source: submitted.append(addr))
-        with mock.patch.object(server, "ThreadPoolExecutor", lambda max_workers: pool):
+        # The stand-in socket has recvfrom only, so the Linux "which address was this sent to"
+        # option, which reads with recvmsg, is switched off (ReplyAddress covers that option).
+        with mock.patch.object(server, "IPV6_RECVPKTINFO", None), \
+                mock.patch.object(server, "ThreadPoolExecutor", lambda max_workers: pool):
             with self.assertRaises(KeyboardInterrupt):
                 server.udp_server(sock)
         self.assertEqual(len(submitted), 1)
@@ -2790,13 +2810,21 @@ class Limits(unittest.TestCase):
 
     def taken_over_udp(self, senders, shares, family=socket.AF_INET):
         """Run a UDP listener over one lookup from each sender, with a pool that never answers;
-        returns the senders whose lookups were taken."""
+        returns the senders whose lookups were taken.
+
+        The stand-in socket hands lookups over through recvfrom only. On Linux a listener, IPv4
+        or IPv6, would otherwise ask which address each lookup was sent to and read with recvmsg
+        (see server.ask_for_reply_address), which the stand-in does not answer, so that option is
+        switched off here for both. These tests are about shares, the same on every system;
+        ReplyAddress covers the option itself."""
         sock = mock.Mock(family=family)
         sock.recvfrom.side_effect = [(query("www.bbc.co.uk"), (host, 5000 + i, 0, 0)) for i, host in enumerate(senders)] \
             + [KeyboardInterrupt()]
         taken = []
         pool = mock.Mock(submit=lambda fn, data, addr, source: taken.append(addr[0]))
         with mock.patch.object(server, "MAX_DNS_PER_DEVICE", 2), \
+                mock.patch.object(server, "IP_PKTINFO", None), \
+                mock.patch.object(server, "IPV6_RECVPKTINFO", None), \
                 mock.patch.object(server, "ThreadPoolExecutor", lambda max_workers: pool):
             with self.assertRaises(KeyboardInterrupt):
                 server.udp_server(sock, shares)
@@ -2836,7 +2864,9 @@ class Limits(unittest.TestCase):
             server.S.v6_devices = {}
             fn(data, addr, source)
         pool = mock.Mock(submit=answer_later)
+        # A stand-in socket with recvfrom only: see taken_over_udp for why the option is off.
         with mock.patch.object(server, "answer_query", return_value=None), \
+                mock.patch.object(server, "IPV6_RECVPKTINFO", None), \
                 mock.patch.object(server, "ThreadPoolExecutor", lambda max_workers: pool):
             with self.assertRaises(KeyboardInterrupt):
                 server.udp_server(sock, shares)
