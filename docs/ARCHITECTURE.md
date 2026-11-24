@@ -35,8 +35,8 @@ flowchart LR
 | `names.py` | ~1,080 | Finds names for the devices on the home network (see [Device names](#device-names)) |
 | `enforcer.py` | ~980 | Steers a chosen device's traffic through the Pi and drops what is blocked |
 | `cloud_agent.py` | ~370 | Holds an outbound connection to the relay and runs relayed requests locally |
-| `cloud/relay.py` | ~1,960 | The relay: accounts, pairing codes (and the install command shown with them), and the bridge between browser and Pi |
-| `static/index.html` | ~1,560 | The dashboard: one page, no build step, no outside scripts; its three looks are in its one style sheet |
+| `cloud/relay.py` | ~2,950 | The relay: accounts, pairing codes (and the install command shown with them), and the bridge between browser and Pi |
+| `static/index.html` | ~1,780 | The dashboard: one page, no build step, no outside scripts; its three looks are in its one style sheet |
 | `services.json` | | The apps and services that can be blocked, and the addresses each uses |
 | `junk_domains.txt` | | The built-in advert and tracker list |
 | `install.sh` | ~860 | The one-line installer for a Pi: installs Docker if asked, downloads QuietNet, starts and pairs it (see [The installer](#the-installer)) |
