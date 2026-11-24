@@ -85,7 +85,7 @@ These need a real network or a real host, and are not tested automatically:
 - The installer against a real system: real Docker, Docker's own install script, `sudo`, systemd-resolved and `ss` on real Raspberry Pi OS, Debian and Ubuntu (known issue 85). The automated tests use stand-ins for all of these.
 - The relay under load, or with many Pis, and behind Railway's real proxy (the per-address limits depend on it: known issue 79).
 - The router's real IPv6 announcements reaching the listener in the container, the redirect of other DNS servers through real `nft` and conntrack on `wlan0`, rules following real phones that change their private Wi-Fi address, and how apps behave when given no IPv6 addresses (known issues 5, 79 and 93). The redirect's `nft` text was loaded once into a real `nft` (1.1.3) in a container with no network: it loaded, loading it again replaced it, and deleting the table removed it.
-- Home-network names (single-word names included) through a real router, DNS over IPv6 on a real home network, the relay giving up root on Railway's volume, the Pi's time zone inside the container, and the other points listed in known issues 78 and 79.
+- Home-network names (single-word names included) through a real router, DNS over IPv6 on a real home network, the relay giving up root on Railway's volume, the relay's build and health check settings on Railway (known issue 95), the Pi's time zone inside the container, and the other points listed in known issues 78 and 79.
 
 A short manual check after changing the enforcer or the containers:
 
@@ -126,6 +126,10 @@ The licence gate can't be tried on Railway by the automated tests. After deployi
 4. **Read the log.** Use the relay normally for a few days: open a Pi, add and remove a test Pi. Then run `licence list`, then `show` for any account you don't recognise, and read the Railway log for lines starting "Licence gate:". With the owner granted there should be none for your account; any that appear say what would have been refused.
 5. **Gate on.** Set `QUIETNET_LICENCE_GATE=on` and redeploy. The log should say "Licence gate: on". Your Pis should still open. You need a test account with no licence and a paired test Pi, set up **before** turning the gate on (with the gate on, an account with no licence can't add or pair a Pi). Either set `QUIETNET_SIGNUP=open` briefly, create the test account (accounts made after the first start get no licence), add and pair a test Pi to it, then set sign-up back; or use a test account that existed at the first start and already has a paired Pi, and take its legacy licence away with `python relay.py licence revoke <test email> --reason "gate test"` (and `licence restore <test email>` afterwards). With the gate on, that account's paired test Pi should show "Remote access paused" on the home page and the paused page when opened; both rescue buttons should work (the Pi's dashboard at home should show the kill switch off, or blocking paused). The test Pi must stay paired and keep filtering.
 6. **Quick way back.** If anything pauses a paying account by mistake, remove `QUIETNET_LICENCE_GATE` (or set it to `off`) and redeploy; nothing else needs undoing.
+
+### Checking a relay deploy on Railway
+
+The relay's build and health check are set on the Railway service, not in the repository, so no automated test can see them. The tests only check that `cloud/README.md` names `cloud/Dockerfile` and `/healthz`, that the relay answers `/healthz`, and that no `railway.json` or `railway.toml` has come back. After a deploy that follows a change to the service's settings, follow "Checking a deploy" in `cloud/README.md` (known issue 95).
 
 ### Checking the installer on a real Pi
 

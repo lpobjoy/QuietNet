@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+Relay hosting (24 November):
+- **Changed: `railway.json` is gone.** Railway stops reading it on 1 December 2026, and its replacement (`.railway/railway.ts`) needs an outside package. The relay's settings now live on the Railway service: `RAILWAY_DOCKERFILE_PATH=cloud/Dockerfile`, healthcheck path `/healthz` (new; the file never set one) and restart policy On Failure. `cloud/README.md` lists them, the order to set them in for an existing relay, and how to check the next deploy; known issue 95.
+
 Licences on the relay, first phase (relay only; nothing changes on the Pi):
 - **New: one licence per account**, in new `licences` and `licence_log` tables. `licence_state()` works out the state (none, trial, active, cancelling, past due with 14 days' grace, expired, revoked; active counts as expired 3 days after its end date) and what it allows: remote access, updates, adding and pairing Pis.
 - **New: `QUIETNET_LICENCE_GATE`, off by default.** While off, nothing is refused; what would have been refused is logged (a log line and a `licence_log` row, at most once an hour per account and kind of refusal). With it on: the Pi's page becomes a "Remote access is paused" page and dashboard calls get `402`; adding a Pi needs a licence that allows it and a free seat; `POST /agent/pair` answers `403` with the reason and the licence state. Never `401` for a licence reason.

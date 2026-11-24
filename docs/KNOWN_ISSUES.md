@@ -113,6 +113,12 @@ The relay now keeps a licence per account and can enforce it (`QUIETNET_LICENCE_
 - **The legacy licences end 90 days after the first start.** Grant the owner's own account `--plan owner` (no end) before switching the gate on, or its Pis will pause when the legacy licence ends.
 - **The Pi's side isn't built yet.** Pis before 0.6 ignore the licence in poll answers and send no install id or agent header, so they get the older rescue call (kill switch off only) and every copy of them pairs as a separate Pi.
 
+### 95. The relay's Railway settings moved out of the repository (24 November)
+
+Railway warned that `railway.json` stops being read on 1 December 2026. Its replacement, `.railway/railway.ts`, needs Railway's npm package in the repository (the Python and Go versions need a pip package or a Go module), which QuietNet's standard-library-only rule does not allow. `railway.json` is gone; the relay's build and health check are set on the Railway service instead, and written down in `cloud/README.md`, "The service's settings". The file used to set only the Dockerfile path and the restart policy; the health check on `/healthz` is new.
+
+**Still to check on Railway:** before the first deploy without `railway.json`, that `RAILWAY_DOCKERFILE_PATH=cloud/Dockerfile` and the healthcheck path `/healthz` are set on the service. Then, after that deploy, the four checks in `cloud/README.md`, "Checking a deploy": the build log shows the Dockerfile's steps, the deploy log shows the health check passing on `/healthz`, `/healthz` answers `{"ok": true}`, and the start-up lines are as before. Nothing in the repository can check the settings on Railway themselves.
+
 ## Open: design decisions for the owner
 
 ### 5. IPv6: the enforcer, and devices known by two addresses
