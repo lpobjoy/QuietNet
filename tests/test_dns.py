@@ -1143,6 +1143,59 @@ class UnmatchedIPv6WhileADeviceIsTreatedDifferently(Base):
             resp = server.answer_query(query("dns.google"), self.PHONE_V6, fake_answer)
         self.assertEqual(resp[3] & 15, 5)
 
+    def known_only_by_itself(self):
+        """Give the IPv6 address a device known only by that address, as the clean-up pass does
+        for a lookup nobody could be matched to. Returns the device's number."""
+        with server.db_lock:
+            number = server.device_of_address(self.PHONE_V6, time.time())
+            server.db.commit()
+        self.assertEqual(server.S.addr_rules[self.PHONE_V6], number)
+        return number
+
+    def test_an_ipv6_address_known_only_by_itself_is_refused_while_a_device_has_rules(self):
+        # Its history was once filed under the address; that is not a match to the device asking,
+        # which may be the very one whose internet is switched off.
+        self.known_only_by_itself()
+        server.set_internet_off("device:" + KID, True)
+        self.assertTrue(self.refused())
+
+    def test_an_ipv6_address_known_only_by_itself_asks_for_a_look_at_once(self):
+        self.known_only_by_itself()
+        server.S.v6_watching = True
+        self.addCleanup(setattr, server.S, "v6_watching", False)
+        with mock.patch.object(server, "V6_ANSWER_WAIT", 0.01):
+            self.assertIsNone(server.matched_ipv6_device(self.PHONE_V6))
+        self.assertTrue(server.v6_wanted.is_set())
+
+    def test_an_ipv6_address_known_only_by_itself_is_answered_when_no_device_has_rules(self):
+        self.known_only_by_itself()
+        self.assertFalse(server.device_rules_exist())
+        self.assertFalse(self.refused())
+
+    def test_an_ipv6_address_known_only_by_itself_with_rules_of_its_own_gets_them(self):
+        number = self.known_only_by_itself()
+        server.set_internet_off("dev:%d" % number, True)
+        resp = server.answer_query(query("www.bbc.co.uk"), self.PHONE_V6, fake_answer)
+        self.assertEqual(resp[-4:], bytes(4))                         # blocked by its own switch, not refused
+
+    def test_an_ipv6_address_known_only_by_itself_in_a_group_gets_the_groups_rules(self):
+        number = self.known_only_by_itself()
+        with server.db_lock:
+            gid = server.db.execute("INSERT INTO groups(name) VALUES('Kids')").lastrowid
+            server.db.commit()
+        server.S.group_names[gid] = "Kids"
+        server.set_device_group(number, gid)
+        server.set_internet_off("group:%d" % gid, True)
+        resp = server.answer_query(query("www.bbc.co.uk"), self.PHONE_V6, fake_answer)
+        self.assertEqual(resp[-4:], bytes(4))
+
+    def test_an_ipv6_address_once_known_only_by_itself_gets_its_devices_rules_when_the_neighbours_match_it(self):
+        self.known_only_by_itself()
+        self.match_ipv6(self.PHONE_V6, KID)
+        server.set_internet_off("device:" + KID, True)
+        resp = server.answer_query(query("www.bbc.co.uk"), self.PHONE_V6, fake_answer)
+        self.assertEqual(resp[-4:], bytes(4))                         # blocked as the device, not refused
+
 
 class QuickLookForNewIPv6Addresses(Base):
     """A lookup from an IPv6 address no device is matched to asks for a look at the neighbours at

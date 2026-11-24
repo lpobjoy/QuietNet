@@ -982,8 +982,9 @@ function v6NeighbourNotice(){
 }
 // What the Pi has to say about bringing an older household's data up to date (st.devices):
 //  - notice: too little free space, or a move that failed. Nothing was changed in either case.
-//  - conflicts: rules the move left with a number, because the same device had rules under two
-//    numbers. The owner chooses; nothing is dropped or applied without being asked.
+//  - conflicts: rules the move set aside, because the same device had rules under two numbers and
+//    these were not the ones applying to it. They apply to no device until the owner chooses;
+//    nothing is dropped or applied without being asked. The text says which were which.
 //  - old_rules: an older QuietNet was run on this data afterwards and left names, groups or rules
 //    where this version no longer reads them. The owner is offered to bring them in.
 //  - report: what the move of rules did, in plain words, kept to read later.
@@ -997,7 +998,8 @@ function devicesNotice(){
       groups or rules were set there for ${num(dv.old_rules)} number${dv.old_rules === 1 ? '' : 's'}. This version is not
       using them. <button class="btn" data-act="oldrules">Bring them in</button></div>` : '')
     + (dv.conflicts || []).map(c => `<div class="notice warn"><b>Rules that need your decision.</b> ${esc(c.text)}
-      Until you choose, they stay with that number and apply to whichever device has it.
+      Give them to the device and they are added to its own rules. Leave them with the number and they apply to
+      whichever other device has that number.
       ${choose(c, 'give', 'Give them to the device', ' primary')}${choose(c, 'remove', 'Remove them', '')}${choose(c, 'keep', 'Leave them with the number', ' link')}</div>`).join('');
 }
 // What the move of names, groups and rules to the devices did, line by line, for the owner to read.
@@ -1113,12 +1115,14 @@ function movedNotices(ip){
     ${open(n)}</div>`).join('');
 }
 // The warning on a device's page (it may be another device with a new hardware address, it is
-// behind a range extender, or its hardware address is at two numbers). On an older Pi, which keeps
-// rules under addresses, a paused address offers "It's the same device".
+// behind a range extender, or its hardware address is at two numbers). On a Pi that still keeps
+// rules under addresses (an older one, or one that has not yet brought its data up to date), a
+// paused address offers "It's the same device": the rules kept under the number then apply to
+// the device that has it now. Nothing is joined there, so it has its own question (samehere).
 function deviceWarning(d){
   if(!d.warning) return '';
   return `<div class="notice warn">${esc(d.warning)}${d.paused
-    ? ` <button class="btn" data-act="moverules" data-from="${esc(d.ip)}" data-to="${esc(d.ip)}">It's the same device</button>` : ''}</div>`;
+    ? ` <button class="btn" data-act="samehere" data-ip="${esc(d.ip)}">It's the same device</button>` : ''}</div>`;
 }
 // What QuietNet did by itself to devices' rules in the last week (moved, paused, new-device group).
 function deviceEvents(){
@@ -1679,16 +1683,24 @@ const actions = {
   // Put a device into the open group (data-in="1") or take it out (data-in="").
   async moverules(d){
     const yes = await ask({title:'Is this the same device?', ok:'Yes, the same device',
-      text:'The two become one device from now on, with one name, one group, one set of blocks and schedules, one "cut live connections" switch and one history. Nothing either had is dropped.'});
+      text:'The two become one device from now on, with one name, one group, one set of blocks and schedules, one "cut live connections" switch and one history. If both are in a group, it keeps the group of the device the rules belong to, and "Recent changes to devices" says which group it left. No block, schedule or switch either had is dropped.'});
     if(!yes) return;
     const body = {from:d.from, to:d.to};
     if(d.todev){ body.to_device = d.todev; body.from_device = d.fromdev; }
     await api('/api/move-rules', body).catch(oops); refresh(true);
   },
+  // "It's the same device" on a card whose rules are paused (a Pi that keeps rules under
+  // addresses): the device that has the number now is the one the rules belong to.
+  async samehere(d){
+    const yes = await ask({title:'Is this the same device?', ok:'Yes, the same device',
+      text:'The rules kept under this number are paused because a different hardware address has it now. If it is the same device, they will apply to it again.'});
+    if(!yes) return;
+    await api('/api/move-rules', {from:d.ip, to:d.ip}).catch(oops); refresh(true);
+  },
   // "No, it's a different device": the other device's rules stop applying to this one, and stay
   // with the device they belong to.
   async notsame(d){ await api('/api/different-device', d.todev ? {ip:d.ip, device:d.todev} : {ip:d.ip}).catch(oops); refresh(true); },
-  // The owner's choice for rules that the move to the devices left with a number (st.devices.conflicts).
+  // The owner's choice for rules that the move to the devices set aside (st.devices.conflicts).
   async conflict(d){ await api('/api/rule-conflict', {id:+d.id, choice:d.choice}).catch(oops); refresh(true); },
   // Bring in names, groups and rules that an older QuietNet left where this version no longer reads them.
   async oldrules(){ await api('/api/move-old-rules', {}).catch(oops); refresh(true); },

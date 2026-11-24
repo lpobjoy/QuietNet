@@ -1260,8 +1260,12 @@ class TheDashboardPage(unittest.TestCase):
         self.assertIn('data-act="conflict" data-id="${esc(c.id)}" data-choice="${choice}"', self.notice)
         self.assertIn("api('/api/rule-conflict', {id:+d.id, choice:d.choice})", self.page)
 
-    def test_rules_left_for_the_owner_say_what_applies_until_a_choice_is_made(self):
-        self.assertIn("Until you choose, they stay with that number and apply to whichever device has it.", self.notice)
+    def test_rules_left_for_the_owner_say_what_each_choice_does(self):
+        # The Pi's own text says they apply to no device until a choice is made; the page adds
+        # what giving and leaving do.
+        self.assertIn("Give them to the device and they are added to its own rules.", self.notice)
+        self.assertIn("whichever other device has that number", self.notice)
+        self.assertNotIn("apply to whichever device has it", self.notice)
 
     def test_rules_an_older_version_left_behind_are_offered_not_brought_in_unasked(self):
         self.assertIn("dv.old_rules ?", self.notice)

@@ -375,6 +375,11 @@ class WhoseRulesALookupGets(Base, Setup):
         with mock.patch.object(server.S, "shared_macs", {PHONE}):
             self.assertEqual(server.ipv6_rules({V6_A: fresh(PHONE)}), {})
 
+    def test_an_ipv6_address_of_a_hardware_address_at_two_live_addresses_gets_no_rules_from_the_look(self):
+        self.assertEqual(server.ipv6_rules({V6_A: fresh(PHONE)}), {V6_A: self.phone})
+        with mock.patch.object(server.S, "hw_unsettled", frozenset({PHONE})):
+            self.assertEqual(server.ipv6_rules({V6_A: fresh(PHONE)}), {})
+
 
 class RangeExtenders(Base, Setup):
     def setUp(self):
@@ -448,6 +453,23 @@ class RangeExtenders(Base, Setup):
         self.assertEqual(self.plan(table), {})                      # but QuietNet can't tell who is there: no steering
         server.set_live_cut(server.S.addr_only[NEW], True)
         self.assertEqual({ip: rule["mac"] for ip, rule in self.plan(table).items()}, {NEW: EXTENDER})
+
+    def test_a_different_hardware_address_at_a_number_behind_an_extender_is_not_steered(self):
+        self.become_an_extender({OLD: fresh(EXTENDER), NEW: fresh(EXTENDER)})
+        server.set_live_cut(server.S.addr_only[NEW], True)
+        table = {OLD: fresh(EXTENDER), NEW: fresh(EXTENDER)}
+        # The first plan notes the hardware address that answers for the number.
+        self.assertEqual({ip: rule["mac"] for ip, rule in self.plan(table).items()}, {NEW: EXTENDER})
+        self.assertEqual(server.sql("SELECT mac FROM live_cut"), [(EXTENDER,)])
+        self.assertEqual(self.plan({OLD: fresh(EXTENDER), NEW: fresh(LAPTOP)}), {})     # another one answers there now
+
+    def test_a_number_behind_an_extender_is_not_steered_on_a_stale_entry(self):
+        # One hardware address answers for several devices there, so a stale entry says nothing
+        # about which device has the number (known issue 98).
+        self.become_an_extender({OLD: fresh(EXTENDER), NEW: fresh(EXTENDER)})
+        server.set_live_cut(server.S.addr_only[NEW], True)
+        self.assertEqual(sorted(self.plan({OLD: fresh(EXTENDER), NEW: fresh(EXTENDER)})), [NEW])
+        self.assertEqual(self.plan({OLD: fresh(EXTENDER), NEW: stale(EXTENDER)}), {})
 
     def test_a_device_newly_shown_behind_an_extender_is_not_put_in_the_new_device_group(self):
         visitors = self.make_group("Visitors", "tiktok")
@@ -572,10 +594,68 @@ class MayBeTheSameDevice(Api, Setup):
         server.init_db()
         self.assertIn((self.newcomer, self.phone), server.S.not_same)
 
+    def test_a_newcomer_answered_no_is_not_asked_about_again_when_it_takes_the_number_again(self):
+        self.ok("/api/different-device", {"device": self.newcomer})
+        self.look({OLD: PHONE}, later=120)                          # the phone is back at its number
+        self.look({OLD: PRIVATE}, later=180)                        # and the newcomer takes it again
+        self.assertEqual(server.S.provisional, {})
+        self.assertFalse(blocked_for(OLD))
+
+    def test_a_second_new_private_address_at_the_same_number_is_still_held_to_the_rules(self):
+        # "Forget this network" twice before the owner has answered must not be a way out.
+        self.look({OLD: PRIVATE_TOO}, later=120)
+        second = self.number(PRIVATE_TOO)
+        self.assertEqual(server.S.provisional, {self.newcomer: self.phone, second: self.phone})
+        self.assertTrue(blocked_for(OLD))
+        self.assertTrue(answered_blocked(OLD))
+
+    def test_the_owner_is_asked_about_the_second_newcomer_as_well(self):
+        self.look({OLD: PRIVATE_TOO}, later=120)
+        asked = {(n["to_device"], n["from_device"], n["same"]) for n in server.S.device_notices}
+        self.assertEqual(asked, {(self.newcomer, self.phone, True), (self.number(PRIVATE_TOO), self.phone, True)})
+        self.assertIn(OLD, [n["to"] for n in server.S.device_notices if n["to_device"] == self.number(PRIVATE_TOO)])
+
+    def test_saying_yes_for_the_second_newcomer_joins_it_to_the_first_device(self):
+        self.look({OLD: PRIVATE_TOO}, later=120)
+        self.ok("/api/move-rules", {"from_device": self.phone, "to_device": self.number(PRIVATE_TOO)})
+        self.assertEqual(server.S.hw_device[PRIVATE_TOO], self.phone)
+        self.look({OLD: PRIVATE_TOO}, later=180)
+        self.assertTrue(blocked_for(OLD))
+
+    def test_a_second_newcomer_is_not_held_once_the_owner_said_the_first_was_a_different_device(self):
+        self.ok("/api/different-device", {"device": self.newcomer})
+        self.look({OLD: PRIVATE_TOO}, later=120)                    # it took the number from a device with no rules
+        self.assertEqual(server.S.provisional, {})
+        self.assertFalse(blocked_for(OLD))
+
+    def test_a_second_newcomer_is_not_held_while_the_first_device_is_listed_at_another_number(self):
+        self.look({OLD: PRIVATE_TOO, NEW: stale(PHONE)}, later=120)     # the phone itself is somewhere else
+        self.assertNotIn(self.number(PRIVATE_TOO), server.S.provisional)
+        self.assertFalse(blocked_for(OLD))
+
+    def test_a_second_newcomer_is_not_held_while_the_first_newcomer_is_listed_at_another_number(self):
+        # The first newcomer may be the phone itself, and it is still about: whoever has the
+        # number now is not it, and the safer answer is no rules and no question.
+        self.look({OLD: PRIVATE_TOO, NEW: stale(PRIVATE)}, later=120)
+        self.assertNotIn(self.number(PRIVATE_TOO), server.S.provisional)
+        self.assertFalse(blocked_for(OLD))
+        self.assertTrue(blocked_for(NEW))                           # the first newcomer is still held, where it is
+
+    def test_a_newcomer_first_listed_on_an_entry_not_yet_confirmed_is_still_held_to_the_rules(self):
+        # A device that has just joined is listed with a stale entry until this computer first
+        # answers it, and a look can land in between. The number still changed hands.
+        self.look({NEW: TV}, later=120)
+        tv = self.give_rules(TV, "Lounge TV", "netflix")
+        self.look({NEW: stale(PRIVATE_TOO)}, later=180)
+        self.assertNotIn(PRIVATE_TOO, server.S.hw_device)           # a stale entry makes no device
+        self.assertFalse(blocked_for(NEW, "netflix.com"))           # and the TV's rules are not on the number
+        self.look({NEW: fresh(PRIVATE_TOO)}, later=185)
+        self.assertEqual(server.S.provisional.get(self.number(PRIVATE_TOO)), tv)
+        self.assertTrue(blocked_for(NEW, "netflix.com"))
+
     def test_a_newcomer_answered_no_goes_into_the_new_device_group(self):
         visitors = self.make_group("Visitors", "tiktok")
         server.set_new_device_group(visitors)
-        self.assertNotIn(self.newcomer, server.S.dev_group)         # not while it may be the phone
         self.ok("/api/different-device", {"ip": OLD})
         self.assertEqual(server.S.dev_group.get(self.newcomer), visitors)
         self.assertTrue(blocked_for(OLD, "tiktok.com"))
@@ -634,6 +714,45 @@ class WhenNoQuestionIsAsked(Base, Setup):
 
     def test_nobody_is_held_to_the_rules_of_a_device_that_is_still_on_the_network(self):
         self.look({OLD: PRIVATE, NEW: PHONE}, later=60)
+        self.assertEqual(server.S.provisional, {})
+        self.assertFalse(blocked_for(OLD))
+
+    def test_nobody_is_held_to_the_rules_of_a_device_whose_entry_elsewhere_has_only_gone_stale(self):
+        # Idle for a minute is not gone: the phone is listed at another number, so whoever has
+        # its old one is a different device.
+        self.look({OLD: fresh(PRIVATE), NEW: stale(PHONE)}, later=60)
+        self.assertEqual(server.S.provisional, {})
+        self.assertFalse(blocked_for(OLD))
+        self.assertTrue(blocked_for(NEW))                           # the phone keeps its rules where it is
+
+    def test_a_newcomer_at_an_address_the_device_left_long_ago_is_not_held_to_its_rules(self):
+        self.look({NEW: fresh(PHONE)}, later=60)                    # the phone moved to another number
+        self.assertEqual(server.S.addr_use[OLD][0], self.phone)     # the record still says it once had the old one
+        self.look({NEW: stale(PHONE), OLD: fresh(PRIVATE)}, later=20 * 86400)
+        self.assertEqual(server.S.provisional, {})
+        self.assertFalse(blocked_for(OLD))
+        self.assertFalse(answered_blocked(OLD))
+        self.assertEqual([n for n in server.S.device_notices if n["same"]], [])     # at most a suggestion
+
+    def test_a_newcomer_at_an_old_number_of_a_device_now_asleep_elsewhere_is_not_held_to_its_rules(self):
+        self.look({NEW: fresh(PHONE)}, later=60)
+        self.look({}, later=600)                                    # asleep: its entry has gone altogether
+        self.look({OLD: fresh(PRIVATE)}, later=20 * 86400)
+        self.assertEqual(server.S.provisional, {})
+        self.assertFalse(blocked_for(OLD))
+        self.assertTrue(blocked_for(NEW))                           # its rules wait at the number it sleeps at
+
+    def test_a_newcomer_at_a_devices_old_number_is_not_steered(self):
+        server.set_live_cut(self.phone, True)
+        self.look({NEW: fresh(PHONE)}, later=60)
+        table = {NEW: stale(PHONE), OLD: fresh(PRIVATE)}
+        self.look(table, later=20 * 86400)
+        self.assertEqual({ip: rule["mac"] for ip, rule in self.plan(table).items()}, {NEW: PHONE})
+
+    def test_an_address_record_left_by_a_restart_starts_no_follow(self):
+        server.init_db()
+        self.assertEqual(server.sql("SELECT device FROM address_use WHERE addr=?", (OLD,)), [(self.phone,)])
+        self.look({OLD: fresh(PRIVATE)}, later=60)
         self.assertEqual(server.S.provisional, {})
         self.assertFalse(blocked_for(OLD))
 
@@ -699,6 +818,44 @@ class RulesHeldAgainstANumber(Api, Setup):
         self.assertFalse(blocked_for(OLD))
         self.assertEqual(server.S.svc_blocks, {"dev:%d" % self.held: {"youtube"}})
 
+    def test_after_no_the_same_device_still_there_is_not_given_the_rules_again(self):
+        self.look({OLD: PHONE}, later=60)
+        self.ok("/api/different-device", {"ip": OLD})
+        self.look({OLD: PHONE}, later=65)
+        self.assertEqual(server.S.provisional, {})
+        self.assertFalse(blocked_for(OLD))
+
+    def test_the_no_for_rules_held_against_a_number_lasts_through_a_restart(self):
+        self.look({OLD: PHONE}, later=60)
+        self.ok("/api/different-device", {"ip": OLD})
+        server.init_db()
+        self.look({OLD: PHONE}, later=120)
+        self.assertEqual(server.S.provisional, {})
+        self.assertFalse(blocked_for(OLD))
+
+    def test_saying_yes_to_rules_held_against_a_number_keeps_their_group(self):
+        kids, teens = self.make_group("Kids", "tiktok"), self.make_group("Teens", "roblox")
+        server.set_device_group(self.held, kids)                    # the rules under the number say "in Kids"
+        self.look({OLD: PHONE}, later=60)
+        phone = self.number(PHONE)
+        server.set_device_group(phone, teens)
+        self.assertEqual(server.scopes_for(OLD)[1:], ["dev:%d" % phone, "group:%d" % teens,
+                                                      "dev:%d" % self.held, "group:%d" % kids])
+        self.ok("/api/move-rules", {"from": OLD, "to": OLD})
+        self.assertEqual(server.S.dev_group, {phone: kids})         # the group of the rules the owner accepted
+        self.assertTrue(blocked_for(OLD, "tiktok.com"))
+        self.assertIn("The two were in different groups. %s is now in the Kids group and no longer in the Teens "
+                      "group, so what is blocked or scheduled for the Teens group no longer applies to it. Change "
+                      "its group on its page if that is wrong." % OLD, self.events())
+
+    def test_a_device_given_rules_held_against_a_number_is_not_put_in_the_new_device_group(self):
+        visitors = self.make_group("Visitors", "tiktok")
+        server.set_new_device_group(visitors)                       # chosen before the device first appears
+        self.look({OLD: PHONE}, later=60)
+        self.assertEqual(server.S.provisional, {self.number(PHONE): self.held})
+        self.assertNotIn(self.number(PHONE), server.S.dev_group)
+        self.assertFalse(blocked_for(OLD, "tiktok.com"))
+
     def test_the_next_device_at_that_number_is_asked_about_too(self):
         self.look({OLD: PHONE}, later=60)
         self.ok("/api/different-device", {"ip": OLD})
@@ -727,6 +884,18 @@ class NewDeviceGroup(Base, Setup):
         self.assertEqual(server.sql("SELECT gid FROM group_member WHERE device=?", (new,)), [(self.gid,)])
         self.assertTrue(any("put in the Kids group" in t for t in self.events()))
         self.assertTrue(blocked_for(NEW, "tiktok.com"))
+
+    def test_a_device_held_to_another_devices_rules_is_not_put_in_the_group(self):
+        self.look({OLD: PHONE}, later=10)
+        phone = self.give_rules(PHONE)
+        server.set_new_device_group(self.gid)                        # chosen before the newcomer appears
+        self.look({OLD: PRIVATE}, later=60)
+        newcomer = self.number(PRIVATE)
+        self.assertEqual(server.S.provisional, {newcomer: phone})
+        self.assertNotIn(newcomer, server.S.dev_group)
+        self.assertEqual(server.sql("SELECT * FROM group_member"), [])
+        self.assertTrue(blocked_for(OLD))                            # the phone's rules
+        self.assertFalse(blocked_for(OLD, "tiktok.com"))             # not the new-device group's
 
     def test_the_group_goes_with_the_device_not_the_address(self):
         server.set_new_device_group(self.gid)
@@ -886,7 +1055,8 @@ class GoneQuietNotice(Api, Setup):
 
 
 class JoiningTwoDevices(Base, Setup):
-    """merge_devices: nothing either device carried is dropped."""
+    """merge_devices: every rule either device carried is kept, and a name or group that has to
+    give way (a device has one of each) is noted for the owner."""
 
     def setUp(self):
         super().setUp()
@@ -920,6 +1090,37 @@ class JoiningTwoDevices(Base, Setup):
         server.set_device_group(self.gone, kids)
         server.merge_devices(self.keep, self.gone)
         self.assertEqual((server.S.given, server.S.dev_group), ({self.keep: "Phone"}, {self.keep: adults}))
+
+    def test_joining_two_devices_in_different_groups_tells_the_owner_which_group_gave_way(self):
+        kids, adults = self.make_group("Kids", "tiktok"), self.make_group("Adults")
+        server.set_device_name(self.keep, "Phone")
+        server.set_device_group(self.keep, adults)
+        server.set_device_group(self.gone, kids)
+        server.merge_devices(self.keep, self.gone)
+        self.assertIn("The two were in different groups. Phone is now in the Adults group and no longer in the Kids "
+                      "group, so what is blocked or scheduled for the Kids group no longer applies to it. Change its "
+                      "group on its page if that is wrong.", self.events())
+
+    def test_the_group_of_the_device_the_rules_belong_to_can_be_the_one_kept(self):
+        kids, adults = self.make_group("Kids", "tiktok"), self.make_group("Adults")
+        server.set_device_group(self.keep, adults)
+        server.set_device_group(self.gone, kids)
+        server.merge_devices(self.keep, self.gone, prefer=self.gone)
+        self.assertEqual(server.S.dev_group, {self.keep: kids})
+        self.assertEqual(server.sql("SELECT device, gid FROM group_member"), [(self.keep, kids)])
+        self.assertTrue(any("now in the Kids group and no longer in the Adults group" in t for t in self.events()))
+
+    def test_no_note_about_groups_when_only_one_of_the_two_was_in_a_group(self):
+        server.set_device_group(self.gone, self.make_group("Kids"))
+        server.merge_devices(self.keep, self.gone)
+        self.assertEqual(self.events(), [])
+
+    def test_a_name_that_gives_way_when_two_devices_are_joined_is_noted(self):
+        server.set_device_name(self.keep, "Phone")
+        server.set_device_name(self.gone, "Tablet")
+        server.merge_devices(self.keep, self.gone)
+        self.assertIn('The two had different names. The device is called "Phone"; the name "Tablet" was not kept.',
+                      self.events())
 
     def test_both_addresses_get_the_rules_at_once(self):
         server.set_service_block("dev:%d" % self.keep, "youtube", True)
@@ -1002,15 +1203,81 @@ class DevicesWithRulesAreKept(Base, Setup):
         self.assertEqual((server.S.not_same, server.sql("SELECT * FROM device_follow")), (set(), []))
 
     def test_devices_with_rules_do_not_count_towards_the_limit_on_remembered_devices(self):
-        server.set_device_name(self.phone, "Wilf's iPad")
+        server.set_service_block("dev:%d" % self.phone, "youtube", True)    # a rule and no name
         with mock.patch.object(server, "MAX_DEVICES", 0):
             server.forget_old_devices(now=self.now)
         self.assertEqual({k for k, kind in server.S.device_kind.items() if kind == "hw"}, {self.phone})
 
+    def new_device_group(self):
+        """Choose a new-device group and have a visitor's device put in it. Returns (group, device)."""
+        visitors = self.make_group("Visitors", "tiktok")
+        server.set_new_device_group(visitors)
+        self.look({OLD: PHONE, NEW: LAPTOP, OTHER: GUEST}, later=60)
+        guest = self.number(GUEST)
+        self.assertEqual(server.S.dev_group, {guest: visitors})
+        return visitors, guest
+
+    def test_a_device_only_in_the_new_device_group_is_forgotten_after_a_month_away(self):
+        _, guest = self.new_device_group()
+        server.forget_old_devices(now=self.long_after)
+        self.assertNotIn(guest, server.S.device_kind)
+
+    def test_a_forgotten_new_device_leaves_no_group_membership_behind(self):
+        self.new_device_group()
+        server.forget_old_devices(now=self.long_after)
+        self.assertEqual((server.S.dev_group, server.sql("SELECT * FROM group_member")), ({}, []))
+
+    def test_a_device_in_the_new_device_group_with_a_name_is_never_forgotten(self):
+        visitors, guest = self.new_device_group()
+        server.set_device_name(guest, "Gran's phone")
+        server.forget_old_devices(now=self.long_after)
+        self.assertEqual(server.S.dev_group, {guest: visitors})
+
+    def test_a_device_the_owner_put_in_the_new_device_group_is_never_forgotten(self):
+        visitors, _ = self.new_device_group()
+        server.set_device_group(self.phone, visitors)               # the owner's own choice, not QuietNet's
+        self.assertTrue(self.kept())
+
+    def test_a_new_device_is_still_forgotten_after_the_owner_chooses_another_new_device_group(self):
+        _, guest = self.new_device_group()
+        server.set_new_device_group(None)
+        server.forget_old_devices(now=self.long_after)
+        self.assertNotIn(guest, server.S.device_kind)
+
+    def test_made_up_hardware_addresses_in_the_new_device_group_are_trimmed_to_the_limit(self):
+        visitors = self.make_group("Visitors", "tiktok")
+        server.set_new_device_group(visitors)
+        with mock.patch.object(server, "MAX_DEVICES", 5):
+            for i in range(30):                                      # a device making hardware addresses up
+                self.look({"192.168.1.%d" % (100 + i): "02:00:00:00:01:%02x" % i}, later=60 + i)
+            made = sum(1 for kind in server.S.device_kind.values() if kind == "hw")
+            self.look({OTHER: GUEST}, later=100)
+            self.assertNotIn(GUEST, server.S.hw_device)              # the table is full: no device for a real newcomer
+            server.forget_old_devices(now=self.now + 200)
+            self.assertLess(sum(1 for kind in server.S.device_kind.values() if kind == "hw"), made)
+            self.assertLessEqual(sum(1 for kind in server.S.device_kind.values() if kind == "hw"), 5)
+            self.assertEqual(len(server.sql("SELECT * FROM group_member")), len(server.S.dev_group))
+            self.look({OTHER: GUEST}, later=300)                     # and now the newcomer is a device, in the group
+            self.assertEqual(server.S.dev_group.get(self.number(GUEST)), visitors)
+
+    def test_a_database_made_before_memberships_were_marked_keeps_every_device_in_a_group(self):
+        server.set_device_group(self.phone, self.make_group("Kids"))
+        with server.db_lock:                                         # as this table was first made
+            server.db.execute("ALTER TABLE group_member RENAME TO old_members")
+            server.db.execute("CREATE TABLE group_member(device INTEGER PRIMARY KEY, gid INTEGER)")
+            server.db.execute("INSERT INTO group_member SELECT device, gid FROM old_members")
+            server.db.execute("DROP TABLE old_members")
+            server.db.commit()
+        server.init_db()
+        self.assertEqual(server.sql("SELECT device, auto FROM group_member"), [(self.phone, 0)])
+        self.assertTrue(self.kept())
+
 
 class DhcpSightings(Base, Setup):
     """A device says which address it is taking as it joins. That word changes whose rules the
-    address gets straight away; the neighbour table confirms or overrules it at the next look."""
+    address gets straight away. It stands until a look confirms someone at the address, the
+    device that said it is confirmed somewhere else or says it is taking another address, or two
+    minutes pass."""
 
     def setUp(self):
         super().setUp()
@@ -1075,6 +1342,43 @@ class DhcpSightings(Base, Setup):
         self.look({OLD: stale(TV)}, later=120)
         self.assertNotIn(OLD, server.S.addr_rules)
 
+    def test_a_later_word_from_the_same_device_withdraws_its_earlier_one(self):
+        # A device takes one address at a time: refused the number it asked for, it asks for the
+        # one the router offers, and its first word must not stay on the number it did not get.
+        server.note_dhcp(PHONE, OLD)
+        self.assertEqual(server.S.addr_rules[OLD], self.phone)
+        server.note_dhcp(PHONE, OTHER)
+        self.assertEqual(sorted(server.S.dhcp_claims), [OTHER])
+        self.assertEqual((server.S.addr_rules[OLD], server.S.addr_rules[OTHER]), (self.tv, self.phone))
+
+    def test_a_device_confirmed_at_another_address_loses_its_word_for_this_one(self):
+        server.note_dhcp(PHONE, OLD)
+        self.look({OLD: stale(TV), OTHER: fresh(PHONE)}, later=120)
+        self.assertEqual((server.S.addr_rules[OLD], server.S.dhcp_claims), (self.tv, {}))
+
+    def test_an_idle_device_keeps_its_own_rules_when_another_asks_for_its_address_and_is_refused(self):
+        # The laptop has the number the phone used to have, and is idle (its entry is stale). The
+        # phone rejoins, asks for its old number, is refused and is given another.
+        self.look({OLD: fresh(LAPTOP)}, later=120)
+        laptop = self.number(LAPTOP)
+        server.set_service_block("dev:%d" % laptop, "tiktok", True)
+        self.look({OLD: stale(LAPTOP)}, later=200)
+        server.note_dhcp(PHONE, OLD)
+        self.look({OLD: stale(LAPTOP), OTHER: fresh(PHONE)}, later=201)
+        self.assertEqual(server.S.addr_rules[OLD], laptop)
+        self.assertFalse(answered_blocked(OLD))                     # not the phone's YouTube block
+        self.assertTrue(answered_blocked(OLD, "www.tiktok.com"))    # its own rules
+        self.assertTrue(answered_blocked(OTHER))                    # and the phone has its own where it is
+
+    def test_a_device_still_confirmed_where_it_was_loses_its_word_for_another_address(self):
+        # Anyone can send such a request. A device the table has at one number can't hold
+        # another device's number to its own rules by saying it is taking it.
+        self.look({NEW: fresh(PHONE), OLD: stale(TV)}, later=120)
+        server.note_dhcp(PHONE, OLD)
+        self.assertEqual(server.S.addr_rules[OLD], self.phone)      # until the look a second later
+        self.look({NEW: fresh(PHONE), OLD: stale(TV)}, later=121)
+        self.assertEqual((server.S.addr_rules[OLD], server.S.dhcp_claims), (self.tv, {}))
+
     def test_the_word_lapses_if_nothing_confirms_it(self):
         clock = [1000.0]
         with mock.patch.object(server.time, "monotonic", lambda: clock[0]):
@@ -1112,8 +1416,8 @@ class DhcpSightings(Base, Setup):
 
     def test_only_so_many_words_are_remembered(self):
         with mock.patch.object(server, "DHCP_MAX_CLAIMS", 3), mock.patch.object(server, "DHCP_MAX_PER_SECOND", 100):
-            for i in range(6):
-                server.note_dhcp(GUEST, "192.168.1.%d" % (100 + i))
+            for i in range(6):                                       # six hardware addresses, each asking for its own
+                server.note_dhcp("00:11:22:33:55:%02x" % i, "192.168.1.%d" % (100 + i))
         self.assertEqual(len(server.S.dhcp_claims), 3)
         self.assertIn("192.168.1.105", server.S.dhcp_claims)
 
@@ -1181,8 +1485,9 @@ class LookSoon(unittest.TestCase):
 
 
 class WhereTheEnforcerSteers(Base, Setup):
-    """The address to steer comes only from the live neighbour table, with a fresh entry whose
-    hardware address is the device's own."""
+    """The address to steer comes only from the live neighbour table: an entry, fresh or stale,
+    holding the device's own hardware address, at the address its rules are held at. Never from
+    the record of who used an address, and never from a DHCP request."""
 
     def setUp(self):
         super().setUp()
@@ -1200,9 +1505,55 @@ class WhereTheEnforcerSteers(Base, Setup):
         self.assertEqual({ip: rule["mac"] for ip, rule in self.plan({NEW: fresh(PHONE)}).items()}, {NEW: PHONE})
         self.assertEqual(server.S.enforced, {self.phone})
 
-    def test_a_stale_neighbour_entry_never_steers(self):
+    def steered(self, table):
+        """{address: hardware address} the plan steers with this (stand-in) live neighbour table."""
+        return {ip: rule["mac"] for ip, rule in self.plan(table).items()}
+
+    def test_a_device_whose_entry_has_gone_stale_is_still_steered_where_its_rules_are_held(self):
+        # A steered device's entry is stale most of the time: this computer sends it nothing
+        # between its lookups. Handing it back then would let a bedtime that starts cut nothing.
         self.look({OLD: stale(PHONE)}, later=60)
-        self.assertEqual(self.plan({OLD: stale(PHONE)}), {})
+        self.assertEqual(self.steered({OLD: stale(PHONE)}), {OLD: PHONE})
+
+    def test_a_device_stays_in_the_plan_when_the_look_saw_it_fresh_and_the_tick_sees_it_stale(self):
+        self.assertEqual(server.S.addr_device.get(OLD), self.phone)
+        self.assertEqual(self.steered({OLD: stale(PHONE)}), {OLD: PHONE})
+
+    def test_a_device_stays_in_the_plan_when_the_look_saw_it_stale_and_the_tick_sees_it_fresh(self):
+        self.look({OLD: stale(PHONE)}, later=60)
+        self.assertNotIn(OLD, server.S.addr_device)
+        self.assertEqual(self.steered({OLD: fresh(PHONE)}), {OLD: PHONE})
+
+    def test_the_plan_is_the_same_whether_the_entry_reads_fresh_or_stale(self):
+        # So the enforcer has nobody to hand back, and no rules to unload, when the entry lapses.
+        server.set_internet_off("dev:%d" % self.phone, True)
+        self.assertEqual(self.plan({OLD: fresh(PHONE)}), self.plan({OLD: stale(PHONE)}))
+        self.assertTrue(self.plan({OLD: stale(PHONE)})[OLD]["off"])
+
+    def test_a_stale_entry_is_not_steered_once_the_same_hardware_address_is_fresh_at_another_address(self):
+        # Even before the next look: the device is at the other address now.
+        self.assertEqual(self.steered({OLD: stale(PHONE), NEW: fresh(PHONE)}), {})
+        self.look({OLD: stale(PHONE), NEW: fresh(PHONE)}, later=60)
+        self.assertEqual(self.steered({OLD: stale(PHONE), NEW: fresh(PHONE)}), {NEW: PHONE})
+
+    def test_a_stale_entry_with_a_hardware_address_not_known_as_a_device_never_steers(self):
+        self.assertEqual(self.steered({OLD: stale(TV)}), {})
+        self.look({OLD: stale(TV)}, later=60)
+        self.assertEqual(self.steered({OLD: stale(TV)}), {})
+
+    def test_a_stale_entry_at_an_address_the_last_look_confirmed_for_another_device_never_steers(self):
+        self.look({OLD: fresh(LAPTOP)}, later=60)
+        self.assertEqual(self.steered({OLD: stale(PHONE)}), {})
+        server.set_live_cut(self.number(LAPTOP), True)              # even when that device has the cut on too
+        self.assertEqual(self.steered({OLD: stale(PHONE)}), {})
+
+    def test_a_dhcp_request_from_another_device_does_not_stop_a_device_being_steered(self):
+        # Anyone can send one, so it must not be a way to slip out of the cut. The steering
+        # message goes to the device's own hardware address and reaches nobody else.
+        self.look({OLD: stale(PHONE)}, later=60)
+        with mock.patch.object(server, "look_soon"):
+            server.note_dhcp(GUEST, OLD)
+        self.assertEqual(self.steered({OLD: stale(PHONE)}), {OLD: PHONE})
 
     def test_a_stale_address_record_never_steers(self):
         # The record says the phone used this address; the live table says nothing. No steering.
@@ -1260,8 +1611,11 @@ class WhereTheEnforcerSteers(Base, Setup):
             self.assertEqual(server.enforcement_plan(), {})
 
     def test_an_address_that_is_not_an_ipv4_address_never_reaches_the_plan(self):
-        with server.db_lock:
-            self.assertEqual(server.live_cut_devices({"192.168.1.54; drop": fresh(PHONE), "fe80::1": fresh(PHONE)}), {})
+        # Even if the map itself held such a key, the check on the address is what refuses it.
+        bad = {"192.168.1.54; drop": self.phone, V6_A: self.phone, "fe80::1": self.phone}
+        with server.db_lock, mock.patch.object(server.S, "rules4", bad):
+            self.assertEqual(server.live_cut_devices({"192.168.1.54; drop": fresh(PHONE), V6_A: fresh(PHONE),
+                                                      "fe80::1": fresh(PHONE)}), {})
 
 
 class DecisionStaysFast(Base, Setup):
@@ -1545,6 +1899,87 @@ class TheOlderDatabase(OlderHousehold):
         self.assertEqual(server.different_device_by_hand(1), server.STILL_MOVING)
         self.assertEqual(server.move_old_rules(), server.STILL_MOVING)
 
+    def test_the_refusal_says_what_the_move_is_waiting_for(self):
+        for state, words in (("waiting", "Free some space"), ("failed", "restarted")):
+            with mock.patch.object(server.S, "devices_state", state):
+                for said in (server.same_device_by_hand(1, 2), server.different_device_by_hand(1), server.move_old_rules()):
+                    self.assertIn(words, said)
+                    self.assertNotIn("a few minutes", said)
+
+    def api(self, path, body):
+        """One POST to the dashboard, with a stand-in web server for this one test."""
+        if not getattr(self, "serving", False):
+            Api.setUpClass()
+            self.addCleanup(Api.tearDownClass)
+            self.serving = True
+        return Api("call").call("POST", path, body)
+
+    def test_the_paused_cards_same_device_button_makes_the_rules_apply_again_before_the_move(self):
+        self.look({self.SPOT: self.ANOTHER})
+        self.assertEqual(server.S.paused_ips, {self.SPOT})
+        with mock.patch.object(server, "neighbours", return_value={self.SPOT: self.ANOTHER}):
+            self.assertEqual(self.api("/api/move-rules", {"from": self.SPOT, "to": self.SPOT}), (200, {"ok": True}))
+        self.assertEqual((server.S.paused_ips, server.S.dev_mac[self.SPOT]), (set(), self.ANOTHER))
+        self.assertTrue(answered_blocked(self.SPOT, "www.bbc.co.uk"))
+        self.look({self.SPOT: self.ANOTHER}, later=60)              # and the pause does not come back
+        self.assertEqual(server.S.paused_ips, set())
+        self.assertEqual(server.sql("SELECT mac, paused FROM device_mac WHERE ip=?", (self.SPOT,)), [(self.ANOTHER, 0)])
+
+    def test_the_same_device_button_is_refused_when_nobody_is_seen_at_the_number(self):
+        self.look({self.SPOT: self.ANOTHER})
+        status, out = self.api("/api/move-rules", {"from": self.SPOT, "to": self.SPOT})     # the stand-in table is empty
+        self.assertEqual(status, 400)
+        self.assertIn("can't see which device has this number", out["error"])
+        self.assertEqual(server.S.paused_ips, {self.SPOT})
+
+    def test_the_same_device_button_does_nothing_for_a_number_whose_rules_are_not_paused(self):
+        with mock.patch.object(server, "neighbours", return_value={self.KEPT: self.ANOTHER}):
+            self.assertEqual(server.same_device_at_address(self.KEPT), "There are no paused rules under that number.")
+        self.assertEqual(server.S.dev_mac[self.KEPT], older.PHONE)
+
+    def test_the_same_device_button_is_refused_for_this_computer_and_the_router(self):
+        for fixed in (PI, ROUTER):
+            self.assertIn("this computer or the router", server.same_device_at_address(fixed))
+
+    def test_moving_rules_between_two_numbers_is_still_refused_before_the_move_in_words_that_fit(self):
+        for state, words in (("waiting", "Free some space"), ("failed", "restarted"), ("old", "a few minutes")):
+            with mock.patch.object(server.S, "devices_state", state):
+                status, out = self.api("/api/move-rules", {"from": self.SPOT, "to": self.KEPT})
+            self.assertEqual(status, 400)
+            self.assertIn(words, out["error"])
+        self.assertEqual(server.S.off, {"device:" + self.SPOT})
+
+    def test_a_different_device_at_a_paused_address_is_not_held_to_the_absent_devices_live_cut(self):
+        server.set_live_cut(self.SPOT, True, self.ITS_TV)
+        self.assertTrue(server.live_cut_on(self.SPOT))
+        self.look({self.SPOT: self.ANOTHER})
+        self.assertEqual(server.S.paused_ips, {self.SPOT})
+        self.assertFalse(server.live_cut_on(self.SPOT))
+        self.assertFalse(server.other_dns_blocked_for(self.SPOT))
+
+    def test_a_different_device_at_a_paused_address_still_gets_its_ipv6_addresses(self):
+        server.set_live_cut(self.SPOT, True, self.ITS_TV)
+        server.set_internet_off("device:" + self.SPOT, False)       # only the cut is left under the address
+        asked = query("www.bbc.co.uk", 28)                          # a question for the name's IPv6 addresses
+        records = lambda: server.answer_query(asked, self.SPOT, fake_answer)[6:8]       # noqa: E731
+        self.assertEqual(records(), b"\x00\x00")                    # the TV, with the cut on: no records
+        self.look({self.SPOT: self.ANOTHER})
+        self.assertEqual(records(), b"\x00\x01")                    # the visitor at its number: the real answer
+
+    def test_a_paused_address_is_marked_in_the_device_list(self):
+        self.look({self.SPOT: self.ANOTHER})
+        card = [d for d in server.api_devices() if d["ip"] == self.SPOT][0]
+        self.assertIsNone(card["id"])
+        self.assertTrue(card["paused"])
+        self.assertIn("paused", card["warning"])
+
+    def test_a_live_cut_under_an_address_is_marked_in_the_device_list(self):
+        server.set_live_cut(self.KEPT, True, older.PHONE)
+        cards = {d["ip"]: d for d in server.api_devices()}
+        self.assertEqual((cards[self.KEPT]["enforced"], cards[self.KEPT]["paused"], cards[self.KEPT]["warning"]),
+                         (True, False, ""))
+        self.assertFalse(cards[self.SPOT]["enforced"])
+
     def test_the_owner_is_told_rules_do_not_follow_a_device_while_the_move_is_waiting(self):
         with mock.patch.object(server, "space_for_move", return_value=(False, 900, 12)):
             self.assertEqual(server.move_to_devices(), "waiting")
@@ -1634,6 +2069,11 @@ class MovingTheRules(OlderHousehold):
     def test_a_new_device_held_in_the_new_device_group_at_a_paused_number_keeps_that_group(self):
         self.assertEqual(server.S.dev_group[self.device(GUEST)], 2)
 
+    def test_a_group_quietnet_gave_a_device_by_itself_is_still_marked_as_its_own_doing_after_the_move(self):
+        # So that it is no reason, on its own, to remember the device for ever.
+        marks = dict(server.sql("SELECT device, auto FROM group_member"))
+        self.assertEqual(marks, {self.device(PHONE): 0, self.device(GUEST): 1})
+
     def test_rules_nobody_was_recorded_for_stay_with_their_number(self):
         held = self.held(self.E)
         self.assertEqual(server.S.device_kind[held], "addr")
@@ -1653,22 +2093,72 @@ class MovingTheRules(OlderHousehold):
         self.assertEqual(server.S.svc_blocks["dev:%d" % self.held(self.F)], {"roblox"})
         self.assertNotIn(EXTENDER, server.S.hw_device)
 
-    def test_rules_from_two_numbers_of_one_device_are_not_merged(self):
+    # The TV had rules under two numbers and was last at C. The older QuietNet applied to it the
+    # set kept under the number it was NOT at (B: internet off), never the set under its own (C:
+    # Netflix blocked). The move must leave it exactly so.
+
+    def test_the_rules_that_were_applying_to_a_device_with_two_sets_stay_with_it(self):
         tv = self.device(TV)
-        self.assertEqual(server.S.svc_blocks["dev:%d" % tv], {"netflix"})      # where it was last seen: in use
-        self.assertNotIn("dev:%d" % tv, server.S.off)                          # the other set is not newly applied
-        self.assertIn("dev:%d" % self.held(self.B), server.S.off)              # nor dropped: left with its number
+        self.assertIn("dev:%d" % tv, server.S.off)                             # kept under B: these were applying
+        self.look({self.C: TV})
+        self.assertTrue(answered_blocked(self.C, "www.bbc.co.uk"))             # so its internet is still off
+
+    def test_the_rules_that_were_not_applying_are_not_newly_applied_to_it(self):
+        tv = self.device(TV)
+        self.assertNotIn("dev:%d" % tv, server.S.svc_blocks)                   # kept under C: these were not
+        server.set_internet_off("dev:%d" % tv, False)                          # (so a lookup can show it)
+        self.look({self.C: TV})
+        self.assertFalse(answered_blocked(self.C, "www.netflix.com"))
+
+    def test_rules_from_two_numbers_of_one_device_are_not_merged(self):
+        self.assertEqual(server.S.svc_blocks["dev:%d" % self.held(self.C)], {"netflix"})   # not dropped: set aside
+        self.assertNotIn("dev:%d" % self.held(self.C), server.S.off)
+        self.assertNotIn(self.B, server.S.addr_only)                           # B's set went to the TV itself
 
     def test_the_conflict_is_listed_for_the_owner_with_what_was_left(self):
         conflicts = server.api_status()["devices"]["conflicts"]
         self.assertEqual([(c["device"], c["held"], c["addr"]) for c in conflicts],
-                         [(self.device(TV), self.held(self.B), self.B)])
-        self.assertIn("The same device had rules under two numbers. Those kept under %s are in use. Those kept under %s "
-                      "were left with that number: called \"Old telly\"; internet switched off." % (self.C, self.B),
-                      conflicts[0]["text"])
+                         [(self.device(TV), self.held(self.C), self.C)])
+        self.assertEqual(conflicts[0]["text"],
+                         "The same device had rules under two numbers. It was last at %s, so the rules kept under %s "
+                         "were the ones applying to it, and they still are. Those kept under %s were not applying to "
+                         "it. They are set aside and apply to no device until you choose: called \"Lounge TV\"; "
+                         "1 blocked service (Netflix)." % (self.C, self.B, self.C))
 
-    def test_the_rules_left_with_the_number_keep_applying_there(self):
-        self.assertTrue(answered_blocked(self.B, "www.bbc.co.uk"))
+    def test_the_rules_set_aside_apply_to_no_lookup_until_the_owner_chooses(self):
+        # Not even before the first look, when nothing says yet which device is at that number.
+        self.assertNotIn(self.C, server.S.addr_rules)
+        self.assertFalse(answered_blocked(self.C, "www.netflix.com"))
+        server.init_db()                                                       # nor after a restart
+        self.assertFalse(answered_blocked(self.C, "www.netflix.com"))
+
+    def test_the_device_is_not_given_the_rules_set_aside_when_it_is_seen_at_that_number(self):
+        self.look({self.C: TV})
+        self.assertEqual((server.S.provisional, server.S.device_notices), ({}, []))
+        self.assertEqual(server.scopes_for(self.C), ["all", "dev:%d" % self.device(TV)])
+
+    def test_another_device_seen_at_that_number_is_not_given_the_rules_set_aside(self):
+        # They are certainly the TV's: the older QuietNet paused them for anyone else there.
+        self.look({self.C: PRIVATE})
+        self.assertEqual(server.S.provisional, {})
+        self.assertFalse(answered_blocked(self.C, "www.netflix.com"))
+
+    def test_the_number_whose_rules_are_set_aside_says_so_on_its_page(self):
+        self.look({OTHER: TV})
+        self.assertEqual(server.S.device_warnings[self.held(self.C)], server.SET_ASIDE_WARNING)
+
+    def test_rules_set_aside_cannot_be_joined_to_a_device_except_by_the_owners_choice(self):
+        self.look({self.C: PRIVATE})
+        error = server.same_device_by_hand(self.device(PRIVATE), self.held(self.C))
+        self.assertIn("waiting for your decision", error)
+        self.assertEqual(server.S.svc_blocks["dev:%d" % self.held(self.C)], {"netflix"})
+
+    def test_the_question_goes_with_the_device_when_it_is_joined_to_another(self):
+        self.look({OTHER: PRIVATE})
+        newcomer, held = self.device(PRIVATE), self.held(self.C)
+        server.merge_devices(newcomer, self.device(TV))             # the owner says the two are one device
+        self.assertEqual([(c["device"], c["held"]) for c in server.S.rule_conflicts], [(newcomer, held)])
+        self.assertEqual(server.S.set_aside, frozenset({held}))     # still applying to nobody
 
     def test_choosing_give_adds_them_to_the_device(self):
         cid = server.S.rule_conflicts[0]["id"]
@@ -1677,21 +2167,39 @@ class MovingTheRules(OlderHousehold):
         self.assertIn("dev:%d" % tv, server.S.off)
         self.assertEqual(server.S.svc_blocks["dev:%d" % tv], {"netflix"})
         self.assertEqual((server.S.rule_conflicts, server.sql("SELECT * FROM rule_conflict")), ([], []))
-        self.assertNotIn(self.B, server.S.addr_only)
+        self.assertNotIn(self.C, server.S.addr_only)
+        self.look({self.C: TV})
+        self.assertTrue(answered_blocked(self.C, "www.bbc.co.uk"))
 
     def test_choosing_remove_removes_them(self):
-        cid, held = server.S.rule_conflicts[0]["id"], self.held(self.B)
+        cid, held = server.S.rule_conflicts[0]["id"], self.held(self.C)
         self.assertIsNone(server.settle_conflict(cid, "remove"))
-        self.assertNotIn("dev:%d" % held, server.S.off)
-        self.assertNotIn("dev:%d" % self.device(TV), server.S.off)
+        self.assertNotIn("dev:%d" % held, server.S.svc_blocks)
+        self.assertIn("dev:%d" % self.device(TV), server.S.off)                # the TV's own are untouched
         self.assertEqual(server.S.rule_conflicts, [])
-        self.assertFalse(answered_blocked(self.B, "www.bbc.co.uk"))
+        self.assertFalse(answered_blocked(self.C, "www.netflix.com"))
 
     def test_choosing_keep_leaves_them_with_the_number_and_closes_the_question(self):
-        cid, held = server.S.rule_conflicts[0]["id"], self.held(self.B)
+        cid, held = server.S.rule_conflicts[0]["id"], self.held(self.C)
         self.assertIsNone(server.settle_conflict(cid, "keep"))
-        self.assertIn("dev:%d" % held, server.S.off)
-        self.assertEqual(server.S.rule_conflicts, [])
+        self.assertEqual(server.S.svc_blocks["dev:%d" % held], {"netflix"})
+        self.assertEqual((server.S.rule_conflicts, server.S.set_aside), ([], frozenset()))
+        self.assertTrue(answered_blocked(self.C, "www.netflix.com"))           # from now on: whoever has the number
+
+    def test_choosing_keep_does_not_give_them_to_the_device_they_were_set_aside_from(self):
+        cid, held = server.S.rule_conflicts[0]["id"], self.held(self.C)
+        server.settle_conflict(cid, "keep")
+        self.look({self.C: TV})                                                # the TV is sitting at that very number
+        self.assertEqual((server.S.provisional, server.S.device_notices), ({}, []))
+        self.assertEqual(server.scopes_for(self.C), ["all", "dev:%d" % self.device(TV)])
+        server.init_db()                                                       # and that is remembered
+        self.assertIn((self.device(TV), held), server.S.not_same)
+
+    def test_after_keep_another_device_seen_at_the_number_is_asked_about_as_for_any_rules_held_there(self):
+        cid, held = server.S.rule_conflicts[0]["id"], self.held(self.C)
+        server.settle_conflict(cid, "keep")
+        self.look({self.C: PRIVATE})
+        self.assertEqual(server.S.provisional, {self.device(PRIVATE): held})
 
     def test_the_choice_can_be_made_through_the_dashboard(self):
         cid = server.S.rule_conflicts[0]["id"]
@@ -1709,9 +2217,9 @@ class MovingTheRules(OlderHousehold):
             self.assertEqual(server.settle_conflict(*wrong), "QuietNet doesn't know that choice.")
         self.assertEqual(len(server.S.rule_conflicts), 1)
 
-    def test_two_names_on_one_device_keep_the_one_from_where_it_was_last_seen(self):
-        self.assertEqual(server.S.given[self.device(TV)], "Lounge TV")
-        self.assertEqual(server.S.given[self.held(self.B)], "Old telly")   # it went with the rules left at that number
+    def test_a_name_stays_with_the_rules_it_was_kept_with(self):
+        self.assertEqual(server.S.given[self.device(TV)], "Old telly")     # kept under B, with the rules that stay
+        self.assertEqual(server.S.given[self.held(self.C)], "Lounge TV")   # it went with the rules set aside
 
     def test_no_rule_is_dropped_or_added_by_the_move(self):
         scopes = lambda table: sorted(s for (s,) in server.sql("SELECT scope FROM %s" % table))   # noqa: E731
@@ -1793,13 +2301,15 @@ class MovingTheRules(OlderHousehold):
 
 class MovingTheRulesSmallerCases(OlderHousehold):
     A, B = "192.168.1.101", "192.168.1.102"
+    GUESSED = "192.168.1.108"
 
     def household(self, old):
         now = self.now
         old.execute("INSERT INTO groups(id, name) VALUES(1, 'Kids')")
-        old.executemany("INSERT INTO known_macs VALUES(?,?,?,?)", [(PHONE, self.A, now - 86400, now - 60)])
+        old.executemany("INSERT INTO known_macs VALUES(?,?,?,?)", [(PHONE, self.B, now - 86400, now - 60)])
         old.execute("INSERT INTO seen VALUES(?,?,?,?)", (ROUTER, ROUTER_MAC, "hub", now))
-        # The phone: internet off and a block under A; only the same block again under B.
+        # The phone, last at B: internet off and a block under A (the set that was applying to
+        # it); only the same block again under B.
         old.execute("INSERT INTO device_mac(ip, mac, paused) VALUES(?,?,0)", (self.A, PHONE))
         old.execute("INSERT INTO device_mac(ip, mac, paused) VALUES(?,?,0)", (self.B, PHONE))
         old.execute("INSERT INTO internet_off VALUES(?)", ("device:" + self.A,))
@@ -1820,6 +2330,12 @@ class MovingTheRulesSmallerCases(OlderHousehold):
         # Cut live connections with the hardware address noted, and nothing else recorded.
         old.execute("INSERT INTO enforced VALUES(?,?)", ("192.168.1.106", LAPTOP))
         old.execute("INSERT INTO enforced VALUES(?,?)", ("192.168.1.107", ""))
+        # Internet off under a number the visitor's device was last seen at and the last scan found it at,
+        # but with no record that the rule is that device's: a best guess is not good enough for a rule.
+        old.execute("INSERT INTO known_macs VALUES(?,?,?,?)", (GUEST, self.GUESSED, now - 86400, now - 60))
+        old.execute("INSERT INTO seen VALUES(?,?,?,?)", (self.GUESSED, GUEST, "visitor", now - 3600))
+        old.execute("INSERT INTO internet_off VALUES(?)", ("device:" + self.GUESSED,))
+        old.execute("INSERT INTO devices VALUES(?,?)", (self.GUESSED, "Front room"))
 
     def setUp(self):
         super().setUp()
@@ -1857,6 +2373,137 @@ class MovingTheRulesSmallerCases(OlderHousehold):
     def test_a_live_cut_with_no_hardware_address_noted_stays_with_its_number(self):
         held = server.S.addr_only["192.168.1.107"]
         self.assertEqual((held in server.S.enforced, server.S.enforced_mac[held]), (True, ""))
+
+    def test_rules_at_a_number_a_device_was_only_last_seen_at_stay_with_the_number(self):
+        held = server.S.addr_only[self.GUESSED]
+        self.assertEqual(server.S.device_kind[held], "addr")
+        self.assertIn("dev:%d" % held, server.S.off)
+        self.assertEqual(server.S.given[held], "Front room")
+
+    def test_the_device_last_seen_at_that_number_is_not_given_the_rules_on_a_guess(self):
+        guest = server.S.hw_device[GUEST]
+        self.assertNotIn("dev:%d" % guest, server.S.off)
+        self.assertNotIn(guest, server.S.given)
+
+    def test_the_report_says_rules_left_on_a_guess_stayed_with_their_number(self):
+        self.assertIn("QuietNet could not tell for certain which device the rules kept under %s are for (internet "
+                      "switched off), so they stay with that number and apply to whichever device has it. When "
+                      "QuietNet sees a device there it will ask you whether they are that device's." % self.GUESSED,
+                      server.S.move_report)
+
+
+class RulesUnderTwoNumbersOfOneDevice(OlderHousehold):
+    """The move must leave a device that had rules under two numbers with exactly the rules that
+    were applying to it the day before: those kept under the number it was NOT last at."""
+
+    KIDS, VISITORS = 1, 2
+    P_OTHER, P_HERE = "192.168.1.111", "192.168.1.112"      # the phone, last at P_HERE
+    L_OTHER, L_HERE = "192.168.1.113", "192.168.1.114"      # the laptop, last at L_HERE
+    T_ONE, T_TWO = "192.168.1.115", "192.168.1.116"         # the TV, last seen at neither
+    G_HERE, G_TWO, G_THREE = "192.168.1.121", "192.168.1.122", "192.168.1.123"   # the visitor's device, last at G_HERE
+
+    def household(self, old):
+        now = self.now
+        old.execute("INSERT INTO groups(id, name) VALUES(1, 'Kids')")
+        old.execute("INSERT INTO groups(id, name) VALUES(2, 'Visitors')")
+        old.executemany("INSERT INTO known_macs VALUES(?,?,?,?)", [
+            (PHONE, self.P_HERE, now - 5 * 86400, now - 60), (LAPTOP, self.L_HERE, now - 5 * 86400, now - 60),
+            (TV, "192.168.1.120", now - 5 * 86400, now - 60), (GUEST, self.G_HERE, now - 5 * 86400, now - 60)])
+        for mac, addresses in ((PHONE, (self.P_OTHER, self.P_HERE)), (LAPTOP, (self.L_OTHER, self.L_HERE)),
+                               (TV, (self.T_ONE, self.T_TWO)), (GUEST, (self.G_HERE, self.G_TWO, self.G_THREE))):
+            for address in addresses:
+                old.execute("INSERT INTO device_mac(ip, mac, paused) VALUES(?,?,0)", (address, mac))
+        # The phone: in Kids with YouTube blocked under the number it is not at (so that was
+        # applying); in Visitors with its internet off under the number it has (so that was not).
+        old.execute("INSERT INTO devices VALUES(?,?)", (self.P_OTHER, "Xbox"))
+        old.execute("INSERT INTO device_group VALUES(?,?)", (self.P_OTHER, 1))
+        old.execute("INSERT INTO service_blocks VALUES(?,?)", ("device:" + self.P_OTHER, "youtube"))
+        old.execute("INSERT INTO device_group VALUES(?,?)", (self.P_HERE, 2))
+        old.execute("INSERT INTO internet_off VALUES(?)", ("device:" + self.P_HERE,))
+        # The laptop: TikTok blocked under the number it is not at; the same block AND internet
+        # off under the number it has.
+        old.execute("INSERT INTO service_blocks VALUES(?,?)", ("device:" + self.L_OTHER, "tiktok"))
+        old.execute("INSERT INTO service_blocks VALUES(?,?)", ("device:" + self.L_HERE, "tiktok"))
+        old.execute("INSERT INTO internet_off VALUES(?)", ("device:" + self.L_HERE,))
+        # The TV: rules under two numbers, and the old record puts it at neither.
+        old.execute("INSERT INTO internet_off VALUES(?)", ("device:" + self.T_ONE,))
+        old.execute("INSERT INTO service_blocks VALUES(?,?)", ("device:" + self.T_TWO, "netflix"))
+        # The visitor's device: rules under three numbers.
+        old.execute("INSERT INTO service_blocks VALUES(?,?)", ("device:" + self.G_HERE, "youtube"))
+        old.execute("INSERT INTO service_blocks VALUES(?,?)", ("device:" + self.G_TWO, "tiktok"))
+        old.execute("INSERT INTO service_blocks VALUES(?,?)", ("device:" + self.G_THREE, "roblox"))
+
+    def setUp(self):
+        super().setUp()
+        server.load_lists()
+        self.assertEqual(server.move_to_devices(), "ready")
+
+    def look(self, table, later=0):
+        full = {PI: PI_MAC, ROUTER: ROUTER_MAC}
+        full.update(table)
+        server.refresh_devices(full, now=self.now + later)
+
+    def aside(self, address):
+        """The conflict about the rules that were kept under this address."""
+        return [c for c in server.S.rule_conflicts if c["addr"] == address][0]
+
+    def test_an_internet_switch_that_was_not_applying_is_not_switched_on_by_the_move(self):
+        phone = server.S.hw_device[PHONE]
+        self.assertNotIn("dev:%d" % phone, server.S.off)
+        self.assertEqual(server.S.svc_blocks["dev:%d" % phone], {"youtube"})
+        self.look({self.P_HERE: PHONE})
+        self.assertFalse(answered_blocked(self.P_HERE, "www.bbc.co.uk"))   # online the day before, online now
+        self.assertTrue(answered_blocked(self.P_HERE))                     # with the block it had
+
+    def test_the_internet_switch_that_was_not_applying_is_set_aside_for_the_owner(self):
+        held = server.S.addr_only[self.P_HERE]
+        self.assertIn("dev:%d" % held, server.S.off)
+        self.assertEqual(self.aside(self.P_HERE)["device"], server.S.hw_device[PHONE])
+
+    def test_a_device_keeps_the_name_kept_with_the_rules_that_stay_with_it(self):
+        self.assertEqual(server.S.given[server.S.hw_device[PHONE]], "Xbox")
+
+    def test_a_set_that_asks_for_more_than_the_one_that_was_applying_is_never_folded_in(self):
+        # Folding it in would switch the laptop's internet off with nothing listed to choose.
+        laptop = server.S.hw_device[LAPTOP]
+        self.assertNotIn("dev:%d" % laptop, server.S.off)
+        self.assertEqual(server.S.svc_blocks["dev:%d" % laptop], {"tiktok"})
+        self.assertEqual(self.aside(self.L_HERE)["held"], server.S.addr_only[self.L_HERE])
+
+    def test_with_three_sets_the_last_of_the_others_in_order_is_the_one_that_was_applying(self):
+        guest = server.S.hw_device[GUEST]
+        self.assertEqual(server.S.svc_blocks["dev:%d" % guest], {"roblox"})
+        self.assertEqual(server.S.svc_blocks["dev:%d" % server.S.addr_only[self.G_HERE]], {"youtube"})
+        self.assertEqual(server.S.svc_blocks["dev:%d" % server.S.addr_only[self.G_TWO]], {"tiktok"})
+        self.assertEqual(len([c for c in server.S.rule_conflicts if c["device"] == guest]), 2)
+
+    def test_when_the_old_record_cannot_say_where_the_device_was_the_first_set_in_order_is_kept(self):
+        tv = server.S.hw_device[TV]
+        self.assertIn("dev:%d" % tv, server.S.off)
+        self.assertEqual(server.S.svc_blocks["dev:%d" % server.S.addr_only[self.T_TWO]], {"netflix"})
+
+    def test_the_owner_is_told_when_the_choice_between_two_sets_was_a_guess(self):
+        self.assertEqual(self.aside(self.T_TWO)["text"],
+                         "The same device had rules under two numbers, and QuietNet can't tell which were applying "
+                         "to it. Those kept under %s are in use. Those kept under %s are set aside and apply to no "
+                         "device until you choose: 1 blocked service (Netflix)." % (self.T_ONE, self.T_TWO))
+
+    def test_every_set_set_aside_is_listed_for_the_owner(self):
+        self.assertEqual(sorted(c["addr"] for c in server.S.rule_conflicts),
+                         [self.P_HERE, self.L_HERE, self.T_TWO, self.G_HERE, self.G_TWO])
+        self.assertEqual(server.S.set_aside, frozenset(c["held"] for c in server.S.rule_conflicts))
+
+    def test_choosing_give_keeps_the_group_the_set_aside_rules_named_and_says_which_gave_way(self):
+        phone = server.S.hw_device[PHONE]
+        self.assertEqual(server.S.dev_group[phone], self.KIDS)
+        self.assertIn("in the Visitors group; internet switched off", self.aside(self.P_HERE)["text"])
+        self.assertIsNone(server.settle_conflict(self.aside(self.P_HERE)["id"], "give"))
+        self.assertEqual(server.S.dev_group[phone], self.VISITORS)
+        self.assertIn("dev:%d" % phone, server.S.off)
+        self.assertEqual(server.sql("SELECT device, gid FROM group_member WHERE device=?", (phone,)), [(phone, self.VISITORS)])
+        self.assertIn("The two were in different groups. Xbox is now in the Visitors group and no longer in the Kids "
+                      "group, so what is blocked or scheduled for the Kids group no longer applies to it. Change its "
+                      "group on its page if that is wrong.", [t for (t,) in server.sql("SELECT text FROM events")])
 
 
 class WhenTheRulesCannotBeMoved(OlderHousehold):
@@ -1962,7 +2609,7 @@ class RulesAnOlderVersionLeftBehind(OlderHousehold):
         self.assertEqual(server.api_status()["devices"]["old_rules"], 1)
 
     def test_they_are_not_in_use_until_the_owner_says(self):
-        self.assertNotIn("device:192.168.1.90", [sc for sc in server.S.off if sc.startswith("dev:")])
+        self.assertEqual([sc for sc in server.S.off if sc.startswith("dev:")], [])
         self.assertFalse(answered_blocked("192.168.1.90", "www.bbc.co.uk"))
 
     def test_bringing_them_in_holds_them_against_the_device(self):

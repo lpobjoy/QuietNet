@@ -695,9 +695,11 @@ class DashboardDeviceMoves(unittest.TestCase):
         self.assertIn("n.same && n.held", self.notices)
         self.assertIn("Are they for this device?", self.notices)
 
-    def test_saying_it_is_the_same_device_says_the_two_become_one_and_nothing_is_dropped(self):
+    def test_saying_it_is_the_same_device_says_the_two_become_one_and_what_gives_way(self):
         self.assertIn("The two become one device from now on", self.page)
-        self.assertIn("Nothing either had is dropped.", self.page)
+        self.assertIn("If both are in a group, it keeps the group of the device the rules belong to", self.page)
+        self.assertIn("No block, schedule or switch either had is dropped.", self.page)
+        self.assertNotIn("Nothing either had is dropped", self.page)
 
     def test_the_same_number_notice_asks_whether_it_is_the_same_device(self):
         self.assertIn("n.same", self.notices)
@@ -714,7 +716,13 @@ class DashboardDeviceMoves(unittest.TestCase):
 
     def test_a_paused_device_can_be_confirmed_as_the_same_device_from_its_warning(self):
         self.assertIn("d.paused", self.warning)
-        self.assertIn('data-from="${esc(d.ip)}" data-to="${esc(d.ip)}"', self.warning)
+        self.assertIn('data-act="samehere" data-ip="${esc(d.ip)}"', self.warning)
+        self.assertIn("api('/api/move-rules', {from:d.ip, to:d.ip})", self.page)
+
+    def test_the_paused_cards_question_says_the_rules_apply_again_not_that_two_devices_are_joined(self):
+        asked = self.page[self.page.index("async samehere(d){"):self.page.index("// \"No, it's a different device\"")]
+        self.assertIn("they will apply to it again", asked)
+        self.assertNotIn("become one device", asked)
 
     def test_recent_changes_are_on_the_home_page_only_when_there_are_some(self):
         self.assertIn("${deviceEvents()}", self.home)

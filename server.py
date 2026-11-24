@@ -334,6 +334,9 @@ class State:
     addr_rules = {}         # address, IPv4 or IPv6 -> the number of the device whose rules a lookup from it gets
     rules4 = {}             # the IPv4 part of that, from the last look at the neighbour table (note_ipv4_addresses)
     rules6 = {}             # the IPv6 part, from the last look at the IPv6 neighbours (refresh_ipv6_view)
+    had4 = {}               # IPv4 address -> the device the looks last gave that address's rules to (S.rules4),
+                            # remembered while a hardware address not confirmed yet is listed there and until
+                            # that device is listed anywhere else: who a newcomer there took over from
     dhcp_claims = {}        # IPv4 address -> (hardware address, when by time.monotonic(), the device confirmed
                             # there at the time): a device's own word, heard as it joined, that it is taking
                             # that address (note_dhcp)
@@ -343,7 +346,9 @@ class State:
     dev_first = {}          # device number -> when it was first seen
     dev_last = {}           # device number -> when it was last seen
     seeded = False          # has a first look been taken? Until then no device counts as "new" (new-device group)
-    rule_conflicts = []     # rules the move left with a number for the owner to decide on: see load_move_notes
+    rule_conflicts = []     # rules the move set aside for the owner to decide on: see load_move_notes
+    set_aside = frozenset()  # the devices (known only by a number) holding those rules: until the owner has
+                            # chosen they apply to no lookup, and no device is given them (load_move_notes)
     move_report = []        # plain-English lines saying what the move of rules to the devices did
     old_rules = 0           # numbers that carry names or rules in the tables from before the device tables,
                             # though those are no longer read: an older QuietNet has been run on this data
@@ -556,7 +561,7 @@ def load_rules():
         S.svc_blocks = blocks
         S.dev_mac, S.paused_ips, S.provisional, S.not_same = {}, set(), {}, set()
         S.device_warnings, S.device_notices = {}, []
-        S.rule_conflicts, S.move_report, S.old_rules = [], [], 0
+        S.rule_conflicts, S.move_report, S.old_rules, S.set_aside = [], [], 0, frozenset()
         if S.devices_ready:
             S.given = {number: name for number, name in db.execute("SELECT id, name FROM device WHERE name != ''")}
             S.dev_group = dict(db.execute("SELECT device, gid FROM group_member"))
@@ -748,11 +753,13 @@ def oldest_to_drop():
 #   queries.device  the device each lookup belonged to WHEN IT WAS MADE, so a device keeps its
 #                 history across every address it has had, and an address handed to another device
 #                 does not hand over the history with it.
-#   group_member  which group a device is in.
+#   group_member  which group a device is in, and whether QuietNet put it there by itself (`auto`:
+#                 the new-device group) or the owner chose it.
 #   live_cut      the devices "cut live connections" is on for.
 #   device_follow a device that also gets another device's rules until the owner says whether the
 #                 two are the same ("asked"), and pairs the owner said are different ("no").
-#   rule_conflict rules the move from an older version left with a number, for the owner to decide.
+#   rule_conflict rules the move from an older version set aside, for the owner to decide: they
+#                 apply to nobody until then.
 #   A device's own internet switch, blocked services and schedules are kept in the same tables as
 #   a group's and the whole house's, under the scope "dev:<number>".
 #
@@ -777,7 +784,8 @@ DEVICE_TABLES_SQL = (
     # device's count for today is answered from the index alone.
     "CREATE INDEX IF NOT EXISTS q_device_ts ON queries(device, ts, blocked)",
     # Rules held against the device (version 2 of the device tables).
-    "CREATE TABLE IF NOT EXISTS group_member(device INTEGER PRIMARY KEY, gid INTEGER)",
+    # `auto` is 1 for a membership QuietNet gave by itself (the new-device group), 0 for one the owner chose.
+    "CREATE TABLE IF NOT EXISTS group_member(device INTEGER PRIMARY KEY, gid INTEGER, auto INTEGER DEFAULT 0)",
     "CREATE TABLE IF NOT EXISTS live_cut(device INTEGER PRIMARY KEY, mac TEXT)",
     "CREATE TABLE IF NOT EXISTS device_follow(device INTEGER, follows INTEGER, state TEXT, since REAL, "
     "PRIMARY KEY(device, follows))",
@@ -801,6 +809,17 @@ def make_device_tables():
         db.execute("ALTER TABLE queries ADD COLUMN device INTEGER")
     for statement in DEVICE_TABLES_SQL:
         db.execute(statement)
+    mark_own_memberships()
+
+
+def mark_own_memberships():
+    """Give the table of group members its `auto` column if it lacks it (a database whose rules
+    were moved to the devices before the column was added). Every membership already there counts
+    as the owner's own choice (0), so no device is forgotten that was kept before. The table holds
+    one small row per device in a group, so this is instant. Call holding db_lock; the caller
+    commits."""
+    if "auto" not in {row[1] for row in db.execute("PRAGMA table_info(group_member)")}:
+        db.execute("ALTER TABLE group_member ADD COLUMN auto INTEGER DEFAULT 0")
 
 
 def rules_on_devices():
@@ -828,10 +847,11 @@ def load_devices():
         S.pi_device, S.hub_device, S.hub_mac = None, None, ""
         S.dev_first, S.dev_last, S.seeded = {}, {}, False
         with rule_map_lock:
-            S.addr_rules, S.rules4, S.rules6, S.dhcp_claims = {}, {}, {}, {}
+            S.addr_rules, S.rules4, S.rules6, S.dhcp_claims, S.had4 = {}, {}, {}, {}, {}
         S.history_fill = False
         S.devices_ready = devices_made() and rules_on_devices()
         if S.devices_ready:
+            mark_own_memberships()
             load_device_rows()
             if db.in_transaction:
                 db.commit()
@@ -988,13 +1008,20 @@ def rebuild_address_map():
 #      before it can ask anything, and Linux then rewrites the entry. None of this is kept across
 #      a restart, and none of it comes from address_use;
 #   3. a device's own word, heard as it joined (a DHCP request: note_dhcp), that it is taking an
-#      address. Until the next look confirms who is there, a lookup from that address gets that
+#      address. Until a look confirms who is there, a lookup from that address gets that
 #      device's rules if QuietNet knows the device, and otherwise nobody's but the whole house's:
 #      the rules of the device that had the address before are paused on it. This is what stops a
-#      phone given the TV's old number being treated as the TV for its first seconds;
+#      phone given the TV's old number being treated as the TV for its first seconds. A device
+#      takes one address at a time, so its word is withdrawn when it says it is taking another
+#      address, or when a look confirms it at another address: a device that asked for its old
+#      number back and was refused must not leave its rules on the device that has that number
+#      now;
 #   4. the IPv6 neighbours (S.rules6, from refresh_ipv6_view);
 #   5. a device known only by that address (S.addr_only): rules kept against a number apply to
-#      lookups from that number while no device known by its hardware address is there.
+#      lookups from that number while no device known by its hardware address is there. Not the
+#      rules the move set aside for the owner to choose (S.set_aside): those apply to no lookup
+#      until the owner has chosen. And an IPv6 address known only by itself, carrying nothing,
+#      does not count as matched when a lookup comes from it (ipv6_match).
 #
 # An address in none of these gets the whole house's rules only. One hardware address at two live
 # addresses keeps its rules at the one it had first; the other gets none until the first goes
@@ -1004,14 +1031,17 @@ def rebuild_rule_map():
     """Put S.addr_rules together afresh from its parts (see the notes above). The finished
     dictionary replaces the old one in a single step, so a lookup reading it never sees it half
     made. Only dictionary work: no database, no tools. Words heard from DHCP that are older than
-    DHCP_HOLD are dropped here."""
+    DHCP_HOLD are dropped here. Rules the move set aside for the owner to choose (S.set_aside)
+    are left out: they apply to no lookup until the owner has chosen."""
     with rule_map_lock:
         now = time.monotonic() if S.dhcp_claims else 0.0
-        rules = dict(S.addr_only)
+        aside = S.set_aside
+        rules = {addr: number for addr, number in S.addr_only.items() if number not in aside}
         rules.update(S.rules6)
         rules.update(S.rules4)
         confirmed = S.map4
-        for addr, (mac, when, _) in list(S.dhcp_claims.items()):
+        for addr, claim in list(S.dhcp_claims.items()):
+            mac, when = claim[0], claim[1]
             if now - when > DHCP_HOLD:
                 del S.dhcp_claims[addr]
                 continue
@@ -1024,7 +1054,7 @@ def rebuild_rule_map():
                 continue
             if claimant is not None:
                 rules[addr] = claimant
-            elif addr in S.addr_only:
+            elif addr in S.addr_only and S.addr_only[addr] not in aside:
                 rules[addr] = S.addr_only[addr]
             else:
                 rules.pop(addr, None)
@@ -1052,6 +1082,13 @@ def note_dhcp(mac, address):
     ask for a look at the neighbour table in a moment, which settles it. Returns True if the word
     was taken in.
 
+    A device takes one address at a time, so this word replaces any earlier one from the same
+    hardware address for another address. A device that rejoins asks for the number it had
+    before; if the router has since given that number to another device it refuses, and the
+    device then asks for the number it is offered. Without this the first word would leave the
+    asker's rules on the other device's number for as long as that device was idle. A look that
+    confirms the asker at another address withdraws the word too (note_ipv4_addresses).
+
     Anyone on the home network can send such a request with any hardware address in it, so it is
     never allowed to overrule what the neighbour table confirmed at the last look, it never makes
     a device, it never steers (the enforcer goes by the live neighbour table alone), and it lapses
@@ -1077,6 +1114,8 @@ def note_dhcp(mac, address):
         if dhcp_window[1] >= DHCP_MAX_PER_SECOND:
             return False
         dhcp_window[1] += 1
+        for other in [a for a, claim in S.dhcp_claims.items() if claim[0] == mac and a != address]:
+            del S.dhcp_claims[other]
         if address not in S.dhcp_claims and len(S.dhcp_claims) >= DHCP_MAX_CLAIMS:
             del S.dhcp_claims[min(S.dhcp_claims, key=lambda a: S.dhcp_claims[a][1])]
         S.dhcp_claims[address] = (mac, now, S.map4.get(address))
@@ -1142,7 +1181,11 @@ def note_ipv4_addresses(table=None, now=None):
       - A new hardware address is a new device. Nothing is merged automatically. A device seen
         for the first time goes into the new-device group if one is chosen (note_new_device),
         unless it may be a known device with a new private Wi-Fi address (note_followers): then
-        that device's rules apply to it for now and the owner is asked.
+        that device's rules apply to it for now and the owner is asked. Whether a number changed
+        hands is judged from what these looks themselves saw (S.had4), never from the record of
+        who used an address, and never while the earlier device is listed anywhere in the table.
+      - A device's word that it was taking an address (note_dhcp) is dropped once the table
+        confirms someone new there, or confirms the device that said it at another address.
     This computer and the home router are the two fixed devices and are never mixed with others."""
     if not S.devices_ready:
         return
@@ -1198,14 +1241,21 @@ def note_ipv4_addresses(table=None, now=None):
                         made.add(number)
                 mapped[ip] = (number, True)
                 S.hw_seen[mac] = now
+        # Every device whose hardware address is listed anywhere in the table, fresh or stale.
+        listed = {S.hw_device.get(mac) for mac in by_mac}
         known, present, took_over = {}, {}, []      # present: device -> (address, hardware address) confirmed now
         for ip, (number, confirmed) in mapped.items():
             if number is None:
                 continue
             known[ip] = number
-            before = S.addr_use.get(ip)
-            if confirmed and before and before[0] != number:
-                took_over.append((ip, number, before[0]))
+            # Did this address change hands? Only the looks themselves say so (S.had4: the device
+            # the last looks gave this address's rules to), never the record of who used an
+            # address (address_use), which reaches back a month. And not when that device is
+            # listed anywhere in the table, even on a stale entry: it has moved, and whoever has
+            # its old number now is somebody else.
+            before = S.had4.get(ip)
+            if confirmed and before is not None and before != number and before not in listed:
+                took_over.append((ip, number, before))
             use_address(ip, number, now, confirmed)
             if confirmed:
                 seen_now(number, now)
@@ -1217,22 +1267,42 @@ def note_ipv4_addresses(table=None, now=None):
         # as that device is not listed anywhere in the table now. Nobody else has spoken from the
         # address, or the table would name them; and if the device were dropped here, its first
         # lookup after waking would get only the whole house's rules.
-        listed = {S.hw_device.get(mac) for mac in by_mac}
         rules = {addr: number for addr, number in S.rules4.items()
                  if addr not in seen_at and number not in listed and S.device_kind.get(number) == "hw"}
         rules.update(held)
         rules.update(known)
+        # Who had each address last, for the next look's "did it change hands?". Kept while the
+        # address is listed with a hardware address QuietNet has no device for yet (a newcomer's
+        # entry reads stale until this computer first answers it), dropped once the device is
+        # listed anywhere, or once a device QuietNet knows has spoken from the address since.
+        had = {addr: number for addr, number in S.had4.items()
+               if number not in listed and S.device_kind.get(number) == "hw"
+               and (addr not in seen_at or S.hw_device.get(seen_at[addr][0]) is None)}
+        had.update(rules)
+        S.had4 = had
+        confirmed_at = {}                       # hardware address -> the addresses it is confirmed at now
+        for addr, (number, confirmed) in mapped.items():
+            if confirmed and number is not None:
+                confirmed_at.setdefault(seen_at[addr][0], set()).add(addr)
         with rule_map_lock:
             S.rules4 = rules
-            for addr, (mac, when, before) in list(S.dhcp_claims.items()):
+            for addr, claim in list(S.dhcp_claims.items()):
+                mac, when, before = claim
+                if when >= looked:
+                    continue                    # heard after this look read the table
                 there = known.get(addr) if addr in known and mapped[addr][1] else None
-                if when < looked and there is not None and there != before:
+                elsewhere = confirmed_at.get(mac, set()) - {addr}
+                if (there is not None and there != before) or (elsewhere and mac not in S.shared_macs):
                     # The neighbour table has confirmed someone new there since the word was
                     # heard (the device that said it, or another): the table decides from now on.
+                    # Or it has confirmed the device that said it at another address: it is
+                    # there, not here, and its rules must not stay on whoever has this one. (A
+                    # device that really has just moved is then covered by the looks alone: its
+                    # rules reach the new address once its entry at the old one lapses.)
                     del S.dhcp_claims[addr]
         rebuild_address_map()
         first_look = not S.seeded
-        note_followers(present, took_over, made, now)
+        note_followers(present, took_over, made, now, listed)
         if not first_look:
             for number in sorted(made):
                 note_new_device(number, present.get(number, ("", ""))[0], now)
@@ -1413,27 +1483,37 @@ def end_follow(number, now=None, why=""):
     return other
 
 
-def note_followers(present, took_over, made, now):
+def note_followers(present, took_over, made, now, listed=()):
     """Start and end the "may be the same device" follows after one look (see the notes above).
     `present` is {device: (address, hardware address)} for the devices confirmed just now,
-    `took_over` a list of (address, device there now, device that had it before) for addresses
-    that changed hands at this look, `made` the devices first seen at this look.
-    Call holding db_lock; the caller commits.
+    `took_over` a list of (address, device there now, device the looks last gave that address's
+    rules to) for addresses that changed hands at this look, `made` the devices first seen at
+    this look, and `listed` the devices whose hardware address is anywhere in the neighbour table
+    now, on a fresh entry or a stale one. Call holding db_lock; the caller commits.
 
     A follow starts when:
       - a device with a private Wi-Fi address and nothing of its own takes over the address of a
-        device that has a name or rules, is known by its hardware address, is not on the network
-        now, and was last seen before (or within QUIET_AFTER of) the newcomer's first appearance;
+        device that has a name or rules, is known by its hardware address, is listed nowhere in
+        the neighbour table now, and was last seen before (or within QUIET_AFTER of) the
+        newcomer's first appearance. "Takes over" means the looks themselves had that address as
+        that device's until now (S.had4): never the record of who used an address (address_use),
+        which would hold every newcomer at a number the device left weeks ago to its rules;
       - or the address of such a device starts being answered for by a Wi-Fi range extender, so
         that QuietNet can no longer tell which device is there: its rules keep applying to that
         number (the device known only by that address follows it);
       - or a device known by its hardware address is confirmed at an address that a device known
         only by that address holds a name or rules against.
-    Never for this computer or the router, never onto a device that is itself following another,
-    and never for two devices the owner has already said are different."""
+    A newcomer that takes the number of a device which is itself being held to another's rules
+    follows that other device instead: a phone that forgets the network twice before the owner
+    has answered is still held to its rules, and nothing ever follows a follower.
+    Never for this computer or the router, never for two devices the owner has already said are
+    different, and never onto rules the move set aside for the owner to choose (S.set_aside):
+    that question is the owner's, and they apply to nobody until it is answered."""
     carrying = {number for number in devices_with_rules() if worth_following(number)}
+    aside = S.set_aside
     for number, other in list(S.provisional.items()):
-        if number not in S.device_kind or other not in S.device_kind or other not in carrying:
+        if (number not in S.device_kind or other not in S.device_kind or other not in carrying
+                or other in aside):
             S.provisional.pop(number, None)
             db.execute("DELETE FROM device_follow WHERE device=? AND follows=?", (number, other))
             rules_changed()
@@ -1441,8 +1521,11 @@ def note_followers(present, took_over, made, now):
             end_follow(number, now, "%s is on the network again, so the device now at %s is a different one and its "
                                     "rules no longer apply to that device." % (device_label(other), present[number][0]))
     for addr, number, other in took_over:
-        if (number in S.provisional or other in S.provisional or (number, other) in S.not_same
-                or S.device_kind.get(other) != "hw" or other not in carrying or other in present
+        # The device that had the number may itself have been held to another device's rules:
+        # the rules belong to that one, so that is the one to follow.
+        other = S.provisional.get(other, other)
+        if (number in S.provisional or other in S.provisional or other == number or (number, other) in S.not_same
+                or S.device_kind.get(other) != "hw" or other not in carrying or other in present or other in listed
                 or number not in present or own_rules(number, count_group=False)):
             continue
         if S.device_kind.get(number) == "addr" and present[number][1] in S.shared_macs:
@@ -1462,7 +1545,7 @@ def note_followers(present, took_over, made, now):
     for number, (addr, _) in sorted(present.items()):
         other = S.addr_only.get(addr)
         if (other is None or other == number or S.device_kind.get(number) != "hw" or other not in carrying
-                or number in S.provisional or (number, other) in S.not_same):
+                or other in aside or number in S.provisional or (number, other) in S.not_same):
             continue
         made.discard(number)
         start_follow(number, other, addr,
@@ -1479,7 +1562,7 @@ def note_new_device(number, addr, now):
     if gid is None or S.device_kind.get(number) != "hw" or number in S.dev_group or number in S.provisional:
         return
     S.dev_group[number] = gid
-    db.execute("INSERT OR REPLACE INTO group_member(device, gid) VALUES(?,?)", (number, gid))
+    db.execute("INSERT OR REPLACE INTO group_member(device, gid, auto) VALUES(?,?,1)", (number, gid))
     add_event(addr, "A new device appeared%s and was put in the %s group, as you asked for new devices."
               % (" at " + addr if addr else "", S.group_names[gid]), now)
     rules_changed()
@@ -1537,6 +1620,8 @@ def device_warnings_now(seen_at, unsettled):
     for mac in unsettled:
         if mac in S.hw_device:
             out[S.hw_device[mac]] = UNSETTLED_WARNING
+    for number in S.set_aside:
+        out[number] = SET_ASIDE_WARNING
     for number, other in S.provisional.items():
         if S.device_kind.get(other) == "addr":
             out[number] = ("Rules were kept under this device's number before QuietNet could tell which device has "
@@ -1670,11 +1755,14 @@ def tidy_history(now=None):
         time.sleep(0.05)                     # give the history writer and the dashboard a turn at the lock
 
 
-# Devices that carry something the owner set or is being asked about are never forgotten: a group,
-# "cut live connections", a rule or schedule of their own, or either side of a "same device?"
-# question. (A name is spared separately, in forget_old_devices.)
+# Devices that carry something the owner set or is being asked about are never forgotten: a group
+# the owner put them in, "cut live connections", a rule or schedule of their own, or either side of
+# a "same device?" question. (A name is spared separately, in forget_old_devices.) The new-device
+# group QuietNet itself gave a device (group_member.auto) is no reason to keep it: every new
+# hardware address gets that group, so a device making hardware addresses up would otherwise fill
+# the device table for good, and no real newcomer could then be given a device.
 KEPT_DEVICES_SQL = """
-    SELECT device FROM group_member UNION SELECT device FROM live_cut
+    SELECT device FROM group_member WHERE auto=0 UNION SELECT device FROM live_cut
     UNION SELECT device FROM device_follow WHERE state='asked'
     UNION SELECT follows FROM device_follow WHERE state='asked'
     UNION SELECT CAST(SUBSTR(scope, 5) AS INTEGER) FROM internet_off WHERE scope LIKE 'dev:%'
@@ -1686,10 +1774,11 @@ def forget_old_devices(now=None):
     """Keep the device tables small, each hour: forget address records and devices not seen for
     KEEP_DAYS (as long as history is kept, so a forgotten device has no history left), and beyond
     MAX_ADDRESS_USE and MAX_DEVICES the longest unseen. The two fixed devices are never forgotten,
-    and neither is a device with a name, a group, rules of its own or an open "same device?"
-    question (KEPT_DEVICES_SQL): a child's tablet left in a drawer for two months must still be
-    under its bedtime when it comes out. A forgotten device that comes back is a new device with a
-    new number."""
+    and neither is a device with a name, a group the owner put it in, rules of its own or an open
+    "same device?" question (KEPT_DEVICES_SQL): a child's tablet left in a drawer for two months
+    must still be under its bedtime when it comes out. A device whose only mark is the new-device
+    group QuietNet itself gave it is forgotten like any other, its membership with it. A forgotten
+    device that comes back is a new device with a new number, and gets that group again."""
     if not S.devices_ready:
         return
     now = time.time() if now is None else now
@@ -1703,7 +1792,7 @@ def forget_old_devices(now=None):
                    % KEPT_DEVICES_SQL, (cutoff,))
         db.execute("DELETE FROM device WHERE id IN (SELECT id FROM device WHERE kind IN ('hw', 'addr') AND name='' "
                    "AND id NOT IN (%s) ORDER BY last DESC LIMIT -1 OFFSET ?)" % KEPT_DEVICES_SQL, (MAX_DEVICES,))
-        for table in ("device_hw", "address_use", "moved_address"):
+        for table in ("device_hw", "address_use", "moved_address", "group_member"):
             db.execute("DELETE FROM %s WHERE device NOT IN (SELECT id FROM device)" % table)
         db.execute("DELETE FROM device_follow WHERE device NOT IN (SELECT id FROM device) "
                    "OR follows NOT IN (SELECT id FROM device)")
@@ -1712,9 +1801,15 @@ def forget_old_devices(now=None):
         load_device_rows()
         db.commit()
         S.not_same = {pair for pair in S.not_same if pair[0] in S.device_kind and pair[1] in S.device_kind}
+        if any(number not in S.device_kind for number in S.dev_group):
+            # A forgotten device leaves no group membership behind (only the new-device group
+            # QuietNet itself gave it can be forgotten with it: see KEPT_DEVICES_SQL).
+            S.dev_group = {number: gid for number, gid in S.dev_group.items() if number in S.device_kind}
+            rules_changed()
         load_move_notes()
         S.map4 = {addr: number for addr, number in S.map4.items() if number in S.device_kind}
         S.map6 = {addr: number for addr, number in S.map6.items() if number in S.device_kind}
+        S.had4 = {addr: number for addr, number in S.had4.items() if number in S.device_kind}
         with rule_map_lock:
             S.rules4 = {addr: number for addr, number in S.rules4.items() if number in S.device_kind}
             S.rules6 = {addr: number for addr, number in S.rules6.items() if number in S.device_kind}
@@ -2017,14 +2112,22 @@ def move_rules_to_devices(now):
       - A name with no rules goes to the device its address was given to in the first part, even
         on a best guess: a name restricts nobody.
       - The rules behind a range extender's hardware address stay with the number, as before.
-      - Two addresses whose rules are certainly ONE device's (the old tables could hold both, with
-        whichever the device was not at being the one applied): those from the address it was most
-        recently at are kept with the device. The others are left with their number, exactly as
-        they were, and listed for the owner to choose (rule_conflict): give them to the device,
-        remove them, or leave them. If they ask for nothing the first set doesn't, there is
-        nothing to choose and they are folded in.
-      - Two names landing on one device: the one from the address it was most recently at is
-        kept; the other is recorded in the notes and the report.
+      - Two addresses whose rules are certainly ONE device's. The old tables could hold both, and
+        the older QuietNet then applied to the device the set kept under the number it was NOT
+        at, never the set under the number it had. So the set that was applying is the one kept
+        with the device: the one from a number other than the one it was last recorded at (with
+        more than two, the last of those in text order, as the old pass left it). Every other
+        set that asks for something that one doesn't, the set under its present number among
+        them, is SET ASIDE for the owner to choose (rule_conflict): it is kept against a device
+        known only by that number, applies to no lookup and is given to no device until the
+        owner has chosen to give it to the device, remove it, or leave it with the number
+        (S.set_aside). So the device has exactly the rules it had the day before. A set that
+        asks for nothing the kept one doesn't is folded in. Only when the old record can't say
+        where the device was last (it was at none of the numbers, or the times are equal) is the
+        choice a guess: then the first in order is kept and the owner is told it is a guess.
+      - Two names landing on one device: the name kept with the rules that stay with it wins
+        (failing that, the one from the address it was most recently at); the other is recorded
+        in the notes and the report. A set that is set aside keeps its own name with it.
       - A device never seen before that was in the new-device group at a paused address keeps
         that group.
     Afterwards the old tables are emptied (their rows now live against devices; the copy kept
@@ -2139,7 +2242,18 @@ def move_rules_to_devices(now):
     for number in sorted(targets):
         sets = sorted(targets[number], key=lambda s: (-s[1], -recent(s[0]["addr"], number), s[0]["addr"]))
         ruled = [s for s in sets if has_rules(s[0])]
-        parked = []                             # addresses whose rules were left with their number
+        parked = []                             # addresses whose rules were set aside for the owner
+        was_at = None                           # the number the device was last recorded at, when that can be told
+        if kinds[number] == "hw" and len(ruled) > 1:
+            # (Every set with rules that reaches a device known by its hardware address came on
+            # certain evidence, and they are in order of when the device was last at each.)
+            if recent(ruled[0][0]["addr"], number) > recent(ruled[1][0]["addr"], number):
+                # The older QuietNet gave a device the rules kept under a number it was NOT at
+                # (with several, the last in text order). That set was the one applying, so it
+                # is the one that stays with the device.
+                was_at = ruled[0][0]["addr"]
+                applying = max(ruled[1:], key=lambda s: s[0]["addr"])
+                ruled = [applying] + [s for s in ruled if s is not applying]
         if ruled:
             first = ruled[0][0]
             give(number, first, with_name=False)
@@ -2172,13 +2286,22 @@ def move_rules_to_devices(now):
                 parked.append(things["addr"])
                 held = device("addr", "addr:" + things["addr"])
                 give(held, things)
-                text = ("The same device had rules under two numbers. Those kept under %s are in use. Those kept "
-                        "under %s were left with that number: %s." % (first["addr"], things["addr"],
-                                                                       rules_in_words(things, groups, schedules)))
+                words = rules_in_words(things, groups, schedules)
+                if was_at:
+                    text = ("The same device had rules under two numbers. It was last at %s, so the rules kept "
+                            "under %s were the ones applying to it, and they still are. Those kept under %s were "
+                            "not applying to it. They are set aside and apply to no device until you choose: %s."
+                            % (was_at, first["addr"], things["addr"], words))
+                else:
+                    text = ("The same device had rules under two numbers, and QuietNet can't tell which were "
+                            "applying to it. Those kept under %s are in use. Those kept under %s are set aside "
+                            "and apply to no device until you choose: %s." % (first["addr"], things["addr"], words))
                 db.execute("INSERT INTO rule_conflict(device, held, addr, text, ts) VALUES(?,?,?,?,?)",
                            (number, held, things["addr"], text, now))
                 counts["conflicts"] += 1
                 lines.append(text + " Choose on the home page what to do with them.")
+        if was_at:
+            sets = [ruled[0]] + [s for s in sets if s is not ruled[0]]   # the name kept with the rules that stay
         named = [things for things, _ in sets if things["name"] and things["addr"] not in parked]
         if named:
             db.execute("UPDATE device SET name=? WHERE id=?", (named[0]["name"], number))
@@ -2191,7 +2314,7 @@ def move_rules_to_devices(now):
                     add_event(things["addr"], text, now)
     for mac, gid in guests:
         if mac not in shared and mac not in hub_macs:
-            db.execute("INSERT OR IGNORE INTO group_member(device, gid) VALUES(?,?)", (by_hardware(mac), gid))
+            db.execute("INSERT OR IGNORE INTO group_member(device, gid, auto) VALUES(?,?,1)", (by_hardware(mac), gid))
     for table in ("internet_off", "service_blocks"):
         db.execute("DELETE FROM %s WHERE scope LIKE 'device:%%'" % table)
     for table in ("devices", "device_group", "enforced", "device_mac"):
@@ -2214,13 +2337,21 @@ def move_rules_to_devices(now):
 
 
 def load_move_notes():
-    """Load what the move of rules to the devices left for the owner: the rules it left with a
-    number for the owner to decide on (S.rule_conflicts, each {"id", "device", "held", "addr",
-    "text"}), its report in plain words (S.move_report), and how many numbers carry names or rules
-    in the old tables again (S.old_rules; see old_rules_waiting). Call holding db_lock."""
+    """Load what the move of rules to the devices left for the owner: the rules it set aside for
+    the owner to decide on (S.rule_conflicts, each {"id", "device", "held", "addr", "text"}; the
+    devices holding them are S.set_aside, and until the owner has chosen they apply to no lookup:
+    rebuild_rule_map, note_followers), its report in plain words (S.move_report), and how many
+    numbers carry names or rules in the old tables again (S.old_rules; see old_rules_waiting).
+    Call holding db_lock."""
     S.rule_conflicts = [{"id": cid, "device": number, "held": held, "addr": addr, "text": text}
                         for cid, number, held, addr, text in db.execute(
                             "SELECT id, device, held, addr, text FROM rule_conflict ORDER BY id")]
+    aside = frozenset(c["held"] for c in S.rule_conflicts)
+    if aside != S.set_aside:
+        with rule_map_lock:
+            S.set_aside = aside
+        rebuild_rule_map()
+        rules_changed()
     try:
         report = json.loads(get_setting("rules_move_report", "[]") or "[]")
     except ValueError:
@@ -2244,7 +2375,7 @@ def move_old_rules():
     move (move_rules_to_devices), in one transaction. Any error rolls it back and changes nothing.
     Returns an error message, or None when done."""
     if not S.devices_ready:
-        return STILL_MOVING
+        return not_ready_message()
     with db_lock:
         save_address_use()                  # what the looks have seen, before the tables are read back
         if db.in_transaction:
@@ -2265,21 +2396,31 @@ def move_old_rules():
 
 
 def settle_conflict(cid, choice):
-    """The owner's choice for one set of rules the move left with a number (S.rule_conflicts):
-    "give" joins them to the device they were certainly for (merge_devices: nothing either had is
-    dropped), "remove" removes them, and "keep" leaves them with the number, where they apply to
-    whichever device has it. Either way the question is closed. Returns an error message, or None
-    when done."""
+    """The owner's choice for one set of rules the move set aside (S.rule_conflicts): "give" joins
+    them to the device they were certainly for (merge_devices: every rule either had is kept, and
+    where both are in a group the device takes the group the set-aside rules named, with a note
+    of the one it left), "remove" removes them, and "keep" leaves them with the number, where
+    from then on they apply to whichever device has it, as rules held against a number do.
+    "Keep" also remembers that they are not that device's (S.not_same), so that closing the
+    question does not at once give them to that very device and ask about it again. Either way
+    the question is closed. Returns an error message, or None when done."""
     entry = next((c for c in S.rule_conflicts if c["id"] == cid), None)
     if entry is None or choice not in ("give", "remove", "keep"):
         return "QuietNet doesn't know that choice."
     number, held = entry["device"], entry["held"]
     if choice == "give" and number in S.device_kind and held in S.device_kind:
-        merge_devices(number, held, "You gave the rules kept under %s to %s." % (entry["addr"], device_label(number)))
+        merge_devices(number, held, "You gave the rules kept under %s to %s." % (entry["addr"], device_label(number)),
+                      prefer=held)
     with db_lock:
         if choice == "remove" and held in S.device_kind:
             clear_device_rules(held)
             add_event(entry["addr"], "You removed the rules kept under %s." % entry["addr"])
+        if choice == "keep" and number in S.device_kind and held in S.device_kind:
+            S.not_same.add((number, held))
+            db.execute("INSERT OR REPLACE INTO device_follow(device, follows, state, since) VALUES(?,?,?,?)",
+                       (number, held, "no", time.time()))
+            add_event(entry["addr"], "You left the rules kept under %s with that number. They apply to whichever "
+                                     "device has it, but not to %s." % (entry["addr"], device_label(number)))
         db.execute("DELETE FROM rule_conflict WHERE id=?", (cid,))
         db.commit()
         load_move_notes()
@@ -2955,16 +3096,30 @@ def live_cut_devices(table=None):
     ({ip: (hardware address, freshness)}); read here when not given.
 
     With rules held against the device, the address to steer comes ONLY from the live neighbour
-    table, never from a record of where the device used to be:
-      - the entry must be confirmed (fresh, or of unknown freshness where the system gives none).
-        A stale entry never steers: the device may have left, and the address may be another's;
-      - the device the last look put at that address (S.addr_device, itself only confirmed
-        addresses) must be one the cut is on for, and the hardware address in the entry must be
-        that device's own. For a device known only by its address (behind a Wi-Fi range extender)
-        the switch must be that number's own, and the entry must hold the hardware address noted
-        when the cut was switched on, which is noted now if it was not known then;
+    table, never from a record of where the device used to be (address_use) and never from a
+    device's own word (a DHCP request):
+      - the table read for this tick must list the address, and with the device's own hardware
+        address. The entry may be fresh or stale. A steered device's entry is stale for most of
+        the time: Linux counts an entry as confirmed only for about half a minute after this
+        computer itself last sent that device something (a DNS answer, a name question), and
+        steering sends the device nothing of the kind. Dropping a device whenever its entry read
+        stale would hand it back to the router between lookups, and a bedtime starting then would
+        cut nothing. The steering message is addressed to that hardware address alone, so a
+        different device at the address can't be steered by it; and when another device speaks
+        from the address, Linux rewrites the entry and the address leaves the plan;
+      - the address must be one the look at the neighbour table gave to that device (S.rules4:
+        confirmed there, or its entry gone stale with the device confirmed nowhere else). That
+        map is never filled from address_use or DHCP, and is empty after a restart until a look;
+      - a stale entry is passed over when the same hardware address has an entry that is not
+        stale at another address in this table: the device is there now, and the stale one is the
+        address it left;
+      - a device known only by its address (behind a Wi-Fi range extender) is steered only on its
+        own switch, only while its entry is not stale (one hardware address answers for several
+        devices there, so a stale entry says nothing about which), and only while the entry
+        holds the hardware address noted when the cut was switched on, which is noted now if it
+        was not known then;
       - every address reaches the firewall through ipaddress.IPv4Address.
-    No fresh match, no steering. This computer and the router are never steered.
+    No matching entry in the table, no steering. This computer and the router are never steered.
 
     On an older database not moved to the device tables yet: the address the switch is kept
     under, with the hardware address noted when it was switched on ('' if not known), unless its
@@ -2974,29 +3129,35 @@ def live_cut_devices(table=None):
     if not S.enforced:
         return {}
     table = neighbour_table() if table is None else table
-    current, out = S.addr_device, {}
+    entries, fresh_at = {}, {}              # fresh_at: hardware address -> addresses where its entry is not stale
     for ip, entry in (table or {}).items():
         mac, fresh = entry if isinstance(entry, tuple) and len(entry) == 2 else (entry, "")
         mac = clean_mac(mac)
-        if not mac or fresh == "stale":
+        if not mac:
             continue
         try:
             ip = str(ipaddress.IPv4Address(str(ip)))
         except ValueError:
             continue
-        number = current.get(ip)
+        entries[ip] = (mac, fresh)
+        if fresh != "stale":
+            fresh_at.setdefault(mac, set()).add(ip)
+    held, out = S.rules4, {}
+    for ip, (mac, fresh) in entries.items():
+        number = held.get(ip)
         kind = S.device_kind.get(number)
         if not live_cut_on(number):
             continue
         if kind == "hw":
-            if S.hw_device.get(mac) != number:
+            if S.hw_device.get(mac) != number or (fresh == "stale" and fresh_at.get(mac)):
                 continue
         elif kind == "addr":
             # Known only by its number: steered only on its own switch (never because a device it
-            # stands in for has the cut on: QuietNet can't tell which device is there), and only
-            # while the hardware address noted for it still answers there.
+            # stands in for has the cut on: QuietNet can't tell which device is there), only on an
+            # entry that is not stale, and only while the hardware address noted for it still
+            # answers there.
             noted = S.enforced_mac.get(number, "")
-            if number not in S.enforced or (noted and noted != mac):
+            if fresh == "stale" or number not in S.enforced or (noted and noted != mac):
                 continue
             if not noted:
                 S.enforced_mac[number] = mac
@@ -3037,7 +3198,8 @@ def enforcement_plan():
     {victim_ip: {"off": all-internet?, "ips": {addresses to drop}, "mac": hardware address or ''}}
 
     Which addresses to steer, and the hardware address expected at each, come from the live
-    neighbour table (live_cut_devices): a device is steered wherever it is confirmed now, and
+    neighbour table (live_cut_devices): a device is steered wherever that table lists its own
+    hardware address at the address its rules are held at, on a fresh entry or a stale one, and
     nowhere else. The enforcer checks the hardware address again before it sends anything.
 
     'off' covers the kill switch, the device's internet switch and an 'all internet' schedule.
@@ -3501,8 +3663,19 @@ def ask_for_ipv6_look(client):
 def ipv6_match(client):
     """What this IPv6 address is matched to, or None: the number of the device whose rules it gets
     (S.addr_rules) once the device tables are in use, and on an older database the IPv4 address of
-    the device with the same hardware address (S.v6_devices). One dictionary lookup."""
-    return S.addr_rules.get(client) if S.devices_ready else S.v6_devices.get(client)
+    the device with the same hardware address (S.v6_devices).
+
+    A device known only by this very address that carries no group and no rules of its own is not
+    a match. It is only where the history of an address nobody could be matched to was filed, and
+    the device asking may be one with rules (its neighbour entry has gone, or it is behind a Wi-Fi
+    range extender). So such an address is looked for again and refused like any unmatched one,
+    not answered under the whole house's rules. Reads S only: a few dictionary lookups."""
+    if not S.devices_ready:
+        return S.v6_devices.get(client)
+    number = S.addr_rules.get(client)
+    if number is not None and S.addr_only.get(client) == number and not own_rules(number, count_name=False):
+        return None
+    return number
 
 
 def matched_ipv6_device(client):
@@ -3558,19 +3731,22 @@ def answer_query(data, client, forwarder, over_tcp=False):
     elif S.devices_ready:
         # Rules are held against the device: one dictionary lookup says whose rules this address
         # gets (S.addr_rules), over IPv4 and IPv6 alike. An IPv4 address no device is known for
-        # gets the whole house's rules. An IPv6 address that can't be matched is looked for at
+        # gets the whole house's rules. An IPv6 address that can't be matched (one known only by
+        # itself, with nothing held against it, counts as unmatched: ipv6_match) is looked for at
         # once (matched_ipv6_device); if it still can't be, and any device is treated differently
         # from the whole house (device_rules_exist), the lookup is refused, rather than answered
         # as if it came from no device in particular. A refused device tries its next DNS server.
         # That may be QuietNet's IPv4 address, or the router's own IPv6 DNS server, which is a way
         # round QuietNet, not an outage (docs/KNOWN_ISSUES.md, issue 5).
-        who = S.addr_rules.get(client)
         if client and ":" in client:
+            who = ipv6_match(client)
             if who is None:
                 who = matched_ipv6_device(client)
                 if who is None and device_rules_exist():
                     return reply(data, qend, 5)
             client = S.v6_devices.get(client, client)   # the history still files it under its IPv4 address
+        else:
+            who = S.addr_rules.get(client)
         if who is None:
             who = source
     elif client and ":" in client:
@@ -4131,8 +4307,22 @@ EXTENDER_OWNER = ("This device connects through a Wi-Fi range extender that show
 UNSETTLED_WARNING = ("This device's hardware address is at more than one number at once. Its rules apply only at "
                      "the number it had first, until the other goes or QuietNet has seen enough to know it is a "
                      "Wi-Fi range extender.")
+SET_ASIDE_WARNING = ("These rules were kept under this number for a device that also had rules under another number. "
+                     "They were not applying to it, so they are set aside and apply to no device until you choose "
+                     "what to do with them on the home page.")
 STILL_MOVING = ("QuietNet has not finished bringing your data up to date, so it can't do that yet. Try again in "
                 "a few minutes.")
+MOVE_WAITING = ("QuietNet needs more free space on this computer before it can bring your data up to date, so it "
+                "can't do that yet. Free some space and it will try again within the hour.")
+MOVE_FAILED = ("QuietNet could not bring your data up to date, so it can't do that yet. It will try again the next "
+               "time QuietNet is restarted.")
+
+
+def not_ready_message():
+    """Why something that needs the device tables can't be done yet, in words that fit the state
+    of the move (S.devices_state): waiting for free space, failed until the next restart, or
+    simply not finished (STILL_MOVING)."""
+    return {"waiting": MOVE_WAITING, "failed": MOVE_FAILED}.get(S.devices_state, STILL_MOVING)
 
 
 def clean_mac(text):
@@ -4355,6 +4545,32 @@ def pause_old_rules(present, fixed, now):
     S.device_warnings = warnings
 
 
+def same_device_at_address(ip):
+    """Older database only: the owner's "It's the same device" on a card whose rules are paused
+    because a different hardware address has its number now (pause_old_rules). The rules kept
+    under that address are recorded as belonging to the hardware address there now, so they apply
+    again. This is the one answer the owner can still give before the move to the device tables
+    has been done; without it a phone back at its old number with a new private Wi-Fi address
+    would have its rules paused with no way to lift the pause. Returns an error message, or None
+    when done."""
+    if ip in fixed_addresses():
+        return "Rules can't be moved to or from this computer or the router."
+    mac = clean_mac(neighbours().get(ip, ""))       # read before taking the lock: it runs a system tool
+    with db_lock:
+        if S.devices_ready:
+            return "QuietNet has just finished bringing your data up to date. Open this page again and answer there."
+        if ip not in S.paused_ips or not own_rules(ip):
+            return "There are no paused rules under that number."
+        if not mac:
+            return "QuietNet can't see which device has this number now. Try again in a minute."
+        set_owner(ip, mac)
+        S.device_warnings.pop(ip, None)
+        add_event(ip, "You said the device now at %s is %s, so its rules apply to it." % (ip, device_label(ip)))
+        db.commit()
+    rules_changed()
+    return None
+
+
 # ----- the owner's answers to "is it the same device?"
 
 def device_ip(text):
@@ -4536,13 +4752,17 @@ def clear_device_rules(number):
         db.execute("DELETE FROM %s WHERE scope=?" % table, (scope,))
 
 
-def merge_devices(keep, gone, note=""):
+def merge_devices(keep, gone, note="", prefer=None):
     """The owner says two entries are one device: join `gone` into `keep`. Everything `gone` has
     goes to `keep`: its hardware addresses, its addresses and the record of them, and its history.
-    Nothing either carried is dropped: `keep` ends with its own name (else `gone`'s), its own
-    group (else `gone`'s), and every internet switch, blocked service, schedule and "cut live
-    connections" that either had. `gone` is then no more, and its number is never used again.
-    `note` is kept for the owner. Never for this computer or the router.
+    `keep` ends with every internet switch, blocked service, schedule and "cut live connections"
+    that either had. A device has one name and is in one group, so where both had one, one gives
+    way, and the owner is told which in the recent changes, every time: the name kept is `keep`'s
+    own (else `gone`'s); the group kept is that of `prefer` (one of the two; `keep` when not
+    given), else the other's. A group that gives way takes its blocks and schedules off the
+    device, which is why it is never dropped without a word. `gone` is then no more, and its
+    number is never used again. `note` is kept for the owner. Never for this computer or the
+    router.
 
     Changes S and the database in one step, holding db_lock; the history is then given its new
     device in small steps, letting go of the lock between them, as clear_history does."""
@@ -4550,6 +4770,7 @@ def merge_devices(keep, gone, note=""):
         save_address_use()                  # first, and by itself: it saves (commits) what the looks have seen
         ks, gs = "dev:%d" % keep, "dev:%d" % gone
         name = S.given.get(keep) or S.given.get(gone) or ""
+        name_lost = S.given.get(gone) if S.given.get(keep) and S.given.get(gone) not in (None, name) else None
         first = min([t for t in (S.dev_first.get(keep), S.dev_first.get(gone)) if t] or [0])
         last = max(S.dev_last.get(keep, 0), S.dev_last.get(gone, 0))
         db.execute("UPDATE device SET name=?, first=?, last=? WHERE id=?", (name, first, last, keep))
@@ -4557,7 +4778,11 @@ def merge_devices(keep, gone, note=""):
         S.given.pop(gone, None)
         if name:
             S.given[keep] = name
-        gid = S.dev_group.get(keep, S.dev_group.get(gone))
+        first, second = S.dev_group.get(keep), S.dev_group.get(gone)
+        if prefer == gone:
+            first, second = second, first
+        gid = first if first is not None else second
+        group_lost = second if first is not None and second is not None and second != first else None
         S.dev_group.pop(gone, None)
         db.execute("DELETE FROM group_member WHERE device=?", (gone,))
         if gid is not None:
@@ -4595,7 +4820,10 @@ def merge_devices(keep, gone, note=""):
         db.execute("DELETE FROM device_follow WHERE device=? AND follows=?", (keep, gone))
         S.provisional = {n: d for n, d in S.provisional.items() if gone not in (n, d)}
         S.not_same = {pair for pair in S.not_same if gone not in pair}
-        db.execute("DELETE FROM rule_conflict WHERE held=? OR device=?", (gone, gone))
+        # A question about rules set aside for the device that goes is now about the kept device;
+        # one about rules the device that goes was holding is answered by this very joining.
+        db.execute("UPDATE rule_conflict SET device=? WHERE device=?", (keep, gone))
+        db.execute("DELETE FROM rule_conflict WHERE held=? OR held=device", (gone,))
         db.execute("DELETE FROM device WHERE id=?", (gone,))
         S.device_kind.pop(gone, None)
         S.dev_first.pop(gone, None)
@@ -4608,11 +4836,22 @@ def merge_devices(keep, gone, note=""):
         with rule_map_lock:
             S.addr_only = {addr: n for addr, n in S.addr_only.items() if n != gone}
             S.rules4 = {addr: (keep if n == gone else n) for addr, n in S.rules4.items()}
+            S.had4 = {addr: (keep if n == gone else n) for addr, n in S.had4.items()}
             S.rules6 = {addr: (keep if n == gone else n) for addr, n in S.rules6.items()}
         rebuild_address_map()
         rebuild_rule_map()
+        here = (device_addresses(keep) + [""])[0]
         if note:
-            add_event((device_addresses(keep) + [""])[0], note)
+            add_event(here, note)
+        if group_lost is not None:
+            kept_group, lost_group = S.group_names.get(gid, "other"), S.group_names.get(group_lost, "other")
+            add_event(here, "The two were in different groups. %s is now in the %s group and no longer in the %s "
+                            "group, so what is blocked or scheduled for the %s group no longer applies to it. Change "
+                            "its group on its page if that is wrong."
+                      % (device_label(keep), kept_group, lost_group, lost_group))
+        if name_lost:
+            add_event(here, 'The two had different names. The device is called "%s"; the name "%s" was not kept.'
+                      % (name, name_lost))
         db.commit()
         load_move_notes()
         load_schedules()                    # also tells the enforcer and the answer cache that rules changed
@@ -4637,9 +4876,11 @@ def same_device_by_hand(to_device, from_device=None):
     joins the phone it always was, and rules that were kept under a number alone go to the device
     that has it. Refused for this computer and the router, and, unless QuietNet was already
     giving it those rules, for a device that has rules of its own: joining then needs the owner
-    to see what would apply afterwards, which the device page's "Merge" will show."""
+    to see what would apply afterwards, which the device page's "Merge" will show. Refused too
+    for rules the move set aside for the owner to choose: that choice is made on the home page
+    (settle_conflict)."""
     if not S.devices_ready:
-        return STILL_MOVING
+        return not_ready_message()
     asked = S.provisional.get(to_device)
     if from_device is None:
         from_device = asked
@@ -4653,6 +4894,8 @@ def same_device_by_hand(to_device, from_device=None):
                 "be joined to another device. The rules keep applying to that number.")
     if not own_rules(from_device):
         return "There are no rules to move."
+    if from_device in S.set_aside or to_device in S.set_aside:
+        return "Those rules are waiting for your decision under \"Rules that need your decision\" on the home page."
     if asked != from_device and holds_rules(to_device):
         return ("That device already has rules of its own. Remove them first if you want to move "
                 "the other device's rules to it.")
@@ -4663,8 +4906,10 @@ def same_device_by_hand(to_device, from_device=None):
         # tablet because it came back with a new hardware address.
         set_device_group(to_device, None)
     newcomer = S.given.get(to_device) or "the device at %s" % (device_addresses(to_device) + ["a new number"])[0]
+    # Where both are in a group, the one kept is that of the device the rules belong to: it is
+    # those rules the owner is accepting. merge_devices notes the group that gave way.
     merge_devices(keep, gone, "You said %s is the same device as %s, so they are now one device with one set of "
-                              "rules." % (newcomer, device_label(from_device)))
+                              "rules." % (newcomer, device_label(from_device)), prefer=from_device)
     return None
 
 
@@ -4673,7 +4918,7 @@ def different_device_by_hand(number):
     the device it might have been (end_follow). Those rules stay with the device they belong to.
     Returns an error message, or None when done."""
     if not S.devices_ready:
-        return STILL_MOVING
+        return not_ready_message()
     with db_lock:
         other = S.provisional.get(number)
         if other is None:
@@ -5430,7 +5675,7 @@ def api_status():
         # The device tables: "ready", or where the one-off move of an older household's data has
         # got to (see move_to_devices), with anything the owner should be told, and whether older
         # history is still being given its device. "report" is what the move of rules to the
-        # devices did, in plain words; "conflicts" the rules it left with a number for the owner
+        # devices did, in plain words; "conflicts" the rules it set aside for the owner
         # to decide on (see settle_conflict); "old_rules" how many numbers carry names or rules an
         # older QuietNet left in tables this version no longer reads (see move_old_rules).
         "devices": {"state": S.devices_state, "notice": S.devices_notice, "filling": S.history_fill,
@@ -6349,7 +6594,11 @@ class Web(BaseHTTPRequestHandler):
                 if device_ip(body["from"]) is None or device_ip(body["to"]) is None:
                     return self.send_json({"error": "Those aren't device addresses."}, 400)
                 if not S.devices_ready:
-                    return self.send_json({"error": STILL_MOVING}, 400)
+                    # An older database not moved yet: the one answer still possible is "the
+                    # device here now is the one these paused rules belong to".
+                    same = device_ip(body["from"]) == device_ip(body["to"])
+                    error = same_device_at_address(device_ip(body["to"])) if same else not_ready_message()
+                    return self.send_json({"error": error}, 400) if error else self.send_json({"ok": True})
                 to_device = device_for_address(body["to"])
                 from_device = None if body["from"] == body["to"] else next(
                     (n["from_device"] for n in list(S.device_notices)
@@ -6367,7 +6616,7 @@ class Web(BaseHTTPRequestHandler):
                 number = device_for_address(body["ip"]) if S.devices_ready else None
             error = different_device_by_hand(number)
             return self.send_json({"error": error}, 400) if error else self.send_json({"ok": True})
-        if path == "/api/rule-conflict":      # the owner's choice for rules the move left with a number
+        if path == "/api/rule-conflict":      # the owner's choice for rules the move set aside
             cid = body.get("id")
             if not isinstance(cid, int) or isinstance(cid, bool) or not isinstance(body.get("choice"), str):
                 return self.send_error(400)
