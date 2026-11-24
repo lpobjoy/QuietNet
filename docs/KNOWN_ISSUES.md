@@ -206,6 +206,18 @@ This check used the published release notes. It is not a scan of the built image
 
 ## Fixed
 
+### Found in the second check of the relay licence build (24 November)
+
+A second check of the first phase of licences, after the fixes below, found five more faults, each confirmed by a second reviewer. All were fixed the same day.
+
+| Problem | What was done |
+| --- | --- |
+| **The go-live steps gave no way to find every account.** `licence show` needs an email the owner already knows, so an account made while sign-up was open could keep its 90-day legacy licence with nobody told | New `python relay.py licence list`: every account, its licence (id, state, plan, end date) and its Pis, then the total; it changes nothing. The go-live steps and the manual checks use it |
+| **An account with no licence was told it had 2 seats**: "This account has no QuietNet licence yet" then "Pis: 0 of 2" on the Licence card, the same in `licence show`, and `"seats": 2` in poll answers | Without a licence the card and `show` say just "Pis: N", and the poll answer leaves `seats` out. The seat checks themselves are unchanged |
+| **The "Licence gate: on/off" start-up line could be missing from Railway's log**, which the docs say to check: start-up lines were printed without being flushed, so through a pipe they sat in Python's buffer until the next log line, or were lost if the relay stopped first | Every start-up line goes through `say()`, which flushes it, and the relay's image sets `PYTHONUNBUFFERED=1` |
+| **The manual licence checks couldn't be followed as written**: granting seats equal to the number of Pis made adding the test Pi log a would-be refusal the step said not to expect, and the gate-on step needed an unlicensed test account with a paired Pi that couldn't be made once the gate was on (or at all, with sign-up at its default) | Step 3 asks for more seats than Pis; step 5 says to set up the test account and its Pi before turning the gate on, or to use `licence revoke` and `licence restore` on an account that already has one |
+| **`docs/API.md` said `past_due` lasts "14 days from the failed payment"**, which the relay doesn't record | It now says what the code does: until `grace_until`, or 14 days after the end date if that is not set, and with neither, no end |
+
 ### Found in the check of the relay licence build (24 November)
 
 Independent reviewers checked the first phase of licences on the relay, and a second reviewer confirmed each fault. All were fixed the same day.

@@ -16,7 +16,7 @@ Pis, and your account's licence. It never stores your browsing history or rules 
 those stay on the Pi.
 
 The owner manages licences from a command line on the same computer (see
-licence_command): python relay.py licence show|grant|revoke|restore|seats ...
+licence_command): python relay.py licence show|list|grant|revoke|restore|seats ...
 """
 import argparse
 import base64
@@ -51,7 +51,7 @@ from urllib.parse import parse_qs, urlparse
 #   small HTML pages      the page layout
 #   web server            Relay: accounts, pairing, the Pi-side calls, and browser -> Pi relaying
 #   not running as root   drop_privileges: hands the data folder to an ordinary user and becomes it
-#   owner's command line  licence_command: python relay.py licence show|grant|revoke|restore|seats
+#   owner's command line  licence_command: python relay.py licence show|list|grant|revoke|restore|seats
 #
 # THREADS: one per connection (RelayServer), at most MAX_CONNECTIONS at once, of which at most MAX_POLLS
 # may be Pis waiting for work. A Pi's poll and a browser's relayed call are both threads that sleep
@@ -948,10 +948,16 @@ def licence_for_pi(info, used, now):
     """The 'licence' object added to every poll answer (version 1). 'remote' and 'updates' say what
     the relay will actually allow, so with the gate off both are true whatever the state; 'state'
     is always the real state. Only numbers, fixed words and true or false: the Pi shows its own
-    wording, never text from the relay."""
+    wording, never text from the relay.
+
+    'seats' is left out for state 'none': an account with no licence has no seats to tell of (the
+    relay still uses a default of DEFAULT_SEATS internally, only so the seat checks behave the same
+    while the gate is off)."""
     out = {"v": 1, "state": info["state"], "remote": bool(info["remote"] or not gate_on()),
            "updates": bool(info["updates"] or not gate_on()), "until": int(info["until"]),
-           "seats": int(info["seats"]), "used": int(used), "now": int(now)}
+           "used": int(used), "now": int(now)}
+    if info["state"] != "none":
+        out["seats"] = int(info["seats"])
     if info["state"] == "past_due" and info["grace_until"]:
         out["grace_until"] = int(info["grace_until"])
     return out
@@ -1983,17 +1989,19 @@ class Relay(BaseHTTPRequestHandler):
     def licence_card(self, uid, info, now):
         """The Licence card on the home page: one sentence for the licence's state, a warning in its
         last 7 days (see ending_soon), and how many of its seats are in use, with any Pis waiting to
-        be paired (with a code still in date) named after it."""
+        be paired (with a code still in date) named after it. With no licence (state 'none') only
+        the number of Pis is shown, as "Pis: 1": there is no licence to cover any."""
         lid = ('<p class="meta">Licence %s</p>' % html.escape(info["id"])) if info["id"] else ""
         soon = ending_soon(info, now)
         warn = ('<div class="notice warn" role="status">%s</div>' % html.escape(soon)) if soon else ""
         used = seats_used(uid)
         waiting = seats_promised(uid, now) - used
         more = (" (%d waiting to be paired)" % waiting) if waiting > 0 else ""
+        limit = "" if info["state"] == "none" else " of %d" % int(info["seats"])
         return ('<section class="card licence" aria-labelledby="licenceTitle"><h2 id="licenceTitle">Licence</h2>'
-                '<p class="mt">%s</p>%s<p class="meta mt">Pis: %s of %s%s</p>%s</section>') % (
+                '<p class="mt">%s</p>%s<p class="meta mt">Pis: %s%s%s</p>%s</section>') % (
             html.escape(licence_sentence(info)), warn, html.escape(str(used)),
-            html.escape(str(info["seats"])), html.escape(more), lid)
+            html.escape(limit), html.escape(more), lid)
 
     def add_pi_section(self, uid, info, now):
         """The 'Add a QuietNet' part of the home page: the form, or, when the licence gate is on and
@@ -2644,6 +2652,7 @@ def drop_privileges(folder, setting=None, system=os):
 # ------------------------------------------------------------------ owner's command line
 #
 #   python relay.py licence show <email>
+#   python relay.py licence list
 #   python relay.py licence grant <email> --plan owner|gift|legacy [--days N] [--seats N]
 #   python relay.py licence revoke <email> --reason "..."
 #   python relay.py licence restore <email>
@@ -2691,11 +2700,13 @@ def some_text(text):
 
 def licence_parser():
     """The arguments the licence command line takes (see the box above)."""
-    parser = LicenceParser(prog="python relay.py licence", description="Look at or change one account's licence.")
-    actions = parser.add_subparsers(dest="action", metavar="show|grant|revoke|restore|seats")
+    parser = LicenceParser(prog="python relay.py licence",
+                           description="List the accounts, or look at or change one account's licence.")
+    actions = parser.add_subparsers(dest="action", metavar="show|list|grant|revoke|restore|seats")
     actions.required = True
     show = actions.add_parser("show", help="show an account's licence and its recent log")
     show.add_argument("email")
+    actions.add_parser("list", help="list every account with its licence and Pi count")
     grant = actions.add_parser("grant", help="give an account an active licence")
     grant.add_argument("email")
     grant.add_argument("--plan", required=True, choices=GRANT_PLANS)
@@ -2737,6 +2748,38 @@ def end_words(period_end):
     return "until " + long_date(period_end) if period_end else "no end date"
 
 
+def pis_words(uid, info):
+    """'Pis: 1 of 2' for an account whose licence covers 2, or just 'Pis: 1' with no licence (state
+    'none'), which covers none, for the command line's messages."""
+    if info["state"] == "none":
+        return "Pis: %d" % seats_used(uid)
+    return "Pis: %d of %d" % (seats_used(uid), info["seats"])
+
+
+def cmd_list(args, out):
+    """licence list: every account on the relay, one line each, with its licence (id, state now,
+    plan and end) and its paired Pis, then the total. Changes nothing. It is how the owner finds
+    accounts whose emails they don't already know, before switching the gate on."""
+    accounts = sql("SELECT id, email FROM users ORDER BY id")
+    if not accounts:
+        print("No accounts on this relay yet.", file=out)
+        return 0
+    now = time.time()
+    lines = []
+    for uid, email in accounts:
+        row = licence_row(uid)
+        info = licence_state(row, now)
+        if row:
+            what = "licence %s, %s, plan %s, %s" % (info["id"], info["state"], info["plan"] or "none",
+                                                     end_words(info["until"]))
+        else:
+            what = "no licence"
+        lines.append("%s (number %d): %s. %s" % (email, uid, what, pis_words(uid, info)))
+    lines.append("%d account%s" % (len(accounts), "" if len(accounts) == 1 else "s"))
+    print("\n".join(lines), file=out)
+    return 0
+
+
 def cmd_show(args, out):
     """licence show: the account's licence as it stands, and its last ten log lines."""
     uid, email = account_by_email(args.email)
@@ -2755,8 +2798,8 @@ def cmd_show(args, out):
             lines.append("Payment grace until: %s" % long_date(info["grace_until"]))
         if row["reason"]:
             lines.append("Reason: %s" % row["reason"])
-    lines.append("Pis: %d of %d" % (seats_used(uid), info["seats"]))
-    lines.append("Allows: remote access %s, updates %s, adding Pis %s" % tuple(
+    lines.append(pis_words(uid, info))
+    lines.append("Allows:remote access %s, updates %s, adding Pis %s" % tuple(
         "yes" if info[k] else "no" for k in ("remote", "updates", "pair")))
     lines.append(gate_status())
     log = sql("SELECT at, what FROM licence_log WHERE user_id=? ORDER BY at DESC LIMIT 10", (uid,))
@@ -2833,7 +2876,7 @@ def cmd_seats(args, out):
     return 0
 
 
-LICENCE_COMMANDS = {"show": cmd_show, "grant": cmd_grant, "revoke": cmd_revoke, "restore": cmd_restore,
+LICENCE_COMMANDS = {"show": cmd_show, "list": cmd_list, "grant": cmd_grant, "revoke": cmd_revoke, "restore": cmd_restore,
                     "seats": cmd_seats}
 
 
@@ -2869,7 +2912,10 @@ def main(argv=None):
     """Run the relay: open the listening port, stop being root, open the database and serve until
     stopped. With 'licence' as the first word, run the owner's licence command line instead.
 
-    The port is opened first, while still root, so a low port number (below 1024) still works."""
+    The port is opened first, while still root, so a low port number (below 1024) still works.
+    Every start-up line goes through say(), which flushes it at once: on Railway the output is a
+    pipe, and an unflushed line (such as which licence gate is in force) could sit in Python's
+    buffer until the next log line, or be lost if the relay is stopped first."""
     argv = sys.argv[1:] if argv is None else argv
     if argv and argv[0] == "licence":
         raise SystemExit(licence_command(argv[1:]))
@@ -2880,19 +2926,19 @@ def main(argv=None):
     os.makedirs(DATA, exist_ok=True)
     note = drop_privileges(DATA)
     if note:
-        print(note)
+        say(note)
     init_db()
     if not DASHBOARD:
-        print("Warning: dashboard file not found; remote dashboard pages won't render.")
+        say("Warning: dashboard file not found; remote dashboard pages won't render.")
     warning = signup_warning()
     if warning:
-        print(warning)
-    print(signup_status())
-    print(gate_status())
+        say(warning)
+    say(signup_status())
+    say(gate_status())
     warning = latest_warning()
     if warning:
-        print(warning)
-    print("QuietNet relay listening on port %d" % PORT)
+        say(warning)
+    say("QuietNet relay listening on port %d" % PORT)
     server.serve_forever()
 
 

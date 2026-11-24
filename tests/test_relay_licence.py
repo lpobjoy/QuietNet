@@ -496,6 +496,11 @@ class HomePage(LicenceCase):
         text = self.signed_in().get("/")[1]
         self.assertIn("This account has no QuietNet licence yet.", text)
 
+    def test_the_licence_card_shows_no_seat_limit_without_a_licence(self):
+        text = self.signed_in().get("/")[1]
+        self.assertIn("Pis: 0</p>", text)
+        self.assertNotIn("Pis: 0 of", text)
+
     def test_the_licence_card_wording_follows_each_state(self):
         later = time.time() + 20 * DAY
         expected = {
@@ -872,6 +877,11 @@ class PollAnswers(LicenceCase):
         self.assertEqual((answer["licence"]["remote"], answer["licence"]["updates"], answer["licence"]["until"]),
                          (False, False, JAN4))
 
+    def test_a_poll_answer_has_no_seats_without_a_licence(self):
+        lic = self.poll(self.token)[1]["licence"]
+        self.assertEqual((lic["state"], lic["used"]), ("none", 1))
+        self.assertNotIn("seats", lic)
+
     def test_an_unlicensed_poll_is_answered_200_and_the_token_keeps_working(self):
         self.gate(on=True)
         for _ in range(2):
@@ -1196,6 +1206,45 @@ class CommandLine(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("Licence: none.", out)
 
+    def test_licence_show_gives_no_seat_limit_without_a_licence(self):
+        out = self.run_command("show", "owner@example.com")[1]
+        self.assertIn("Pis: 0\n", out)
+        self.assertNotIn("Pis: 0 of", out)
+
+    def add_pi(self, uid, pid="pi-1"):
+        """Put one paired Pi on account `uid` straight in the database."""
+        relay.sql("INSERT INTO pis(id,user_id,name,paired,created) VALUES(?,?,'Home Pi',1,1.0)", (pid, uid), commit=True)
+
+    def everything_stored(self):
+        """Every row of the tables the command line could change, to compare before and after."""
+        return {t: relay.sql("SELECT * FROM %s ORDER BY rowid" % t) for t in ("users", "pis", "licences", "licence_log")}
+
+    def test_licence_list_shows_every_account_with_its_licence_and_pis(self):
+        relay.sql("INSERT INTO users(email,pw,created) VALUES('stranger@example.com','x',2.0)", commit=True)
+        other = relay.sql("SELECT id FROM users WHERE email='stranger@example.com'", one=True)[0]
+        self.run_command("grant", "owner@example.com", "--plan", "legacy", "--days", "90", "--seats", "3")
+        self.add_pi(self.uid)
+        lid, end = self.stored()["id"], self.stored()["period_end"]
+        code, out, _ = self.run_command("list")
+        self.assertEqual(code, 0)
+        self.assertEqual(out.splitlines(), [
+            "owner@example.com (number %d): licence %s, active, plan legacy, until %s. Pis: 1 of 3"
+            % (self.uid, lid, relay.long_date(end)),
+            "stranger@example.com (number %d): no licence. Pis: 0" % other,
+            "2 accounts"])
+
+    def test_licence_list_on_an_empty_relay_says_so_and_exits_zero(self):
+        relay.sql("DELETE FROM users", commit=True)
+        code, out, err = self.run_command("list")
+        self.assertEqual((code, out, err), (0, "No accounts on this relay yet.\n", ""))
+
+    def test_licence_list_changes_nothing(self):
+        self.run_command("grant", "owner@example.com", "--plan", "owner")
+        self.add_pi(self.uid)
+        before = self.everything_stored()
+        self.assertEqual(self.run_command("list")[0], 0)
+        self.assertEqual(self.everything_stored(), before)
+
     def test_the_account_is_found_by_its_current_email_whatever_its_letter_case(self):
         relay.sql("UPDATE users SET email='new@example.com'", commit=True)
         self.assertEqual(self.run_command("grant", " NEW@example.com ", "--plan", "owner")[0], 0)
@@ -1256,6 +1305,44 @@ class CommandLine(unittest.TestCase):
         with self.assertRaises(SystemExit) as stopped:
             relay.main(["licenses"])
         self.assertIn("doesn't know", str(stopped.exception.code))
+
+
+# ------------------------------------------------------------------ start-up
+
+class FlushRecorder:
+    """A stand-in for standard output that keeps apart what was written and what was flushed, as a
+    pipe's buffer would."""
+
+    def __init__(self):
+        """Start with nothing written and nothing flushed."""
+        self.waiting, self.flushed = "", ""
+
+    def write(self, text):
+        """Hold `text` until the next flush, as a buffer does."""
+        self.waiting += text
+        return len(text)
+
+    def flush(self):
+        """Pass on everything held so far."""
+        self.flushed, self.waiting = self.flushed + self.waiting, ""
+
+
+class StartUp(unittest.TestCase):
+    def test_start_up_lines_are_flushed_before_serving(self):
+        out = FlushRecorder()
+        at_serve = {}
+        server = mock.Mock()
+        server.serve_forever.side_effect = lambda: at_serve.update(flushed=out.flushed, waiting=out.waiting)
+        folder = tempfile.TemporaryDirectory(prefix="quietnet-relay-start-")
+        self.addCleanup(folder.cleanup)
+        with mock.patch.object(relay, "RelayServer", return_value=server), \
+                mock.patch.object(relay, "drop_privileges", return_value=None), \
+                mock.patch.object(relay, "init_db"), mock.patch.object(relay, "DATA", folder.name), \
+                mock.patch.object(relay, "LICENCE_GATE", "on"), mock.patch.object(sys, "stdout", out):
+            relay.main([])
+        self.assertEqual(at_serve["waiting"], "")
+        self.assertIn("Licence gate: on.", at_serve["flushed"])
+        self.assertIn("QuietNet relay listening on port", at_serve["flushed"])
 
 
 if __name__ == "__main__":

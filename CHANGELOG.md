@@ -10,7 +10,7 @@ Licences on the relay, first phase (relay only; nothing changes on the Pi):
 - **New: seats and install ids.** A licence covers 2 Pis unless the owner changes it. A Pi may send its install id when pairing; pairing again with the same id replaces its old, offline entry, and is refused while that entry is online (a copied SD card).
 - **New: poll answers carry a `licence` object** (and `latest` when `QUIETNET_LATEST` is set). Polling is otherwise unchanged; older Pis ignore the extra keys. The Pi's `X-QuietNet-Agent` header is recorded.
 - **New: a Licence card on the home page** with one sentence per state and "Pis: N of M"; paused Pis say "Remote access paused".
-- **New: the owner's command line**, `python relay.py licence show|grant|revoke|restore|seats`, which gives up root before opening the database. Documented in `cloud/README.md` with the go-live steps; manual checks in `docs/TESTING.md`; gaps in known issue 94.
+- **New: the owner's command line**, `python relay.py licence show|list|grant|revoke|restore|seats`, which gives up root before opening the database. Documented in `cloud/README.md` with the go-live steps; manual checks in `docs/TESTING.md`; gaps in known issue 94.
 
 Check of the relay licence build (24 November). Each is in `docs/KNOWN_ISSUES.md`, "Found in the check of the relay licence build":
 - **Fixed: rescue presses had no limit.** Each account may press 20 times an hour; beyond that `429`, nothing sent and nothing logged. `licence_log` keeps the newest 1000 lines per account that the account caused (the owner's own lines are always kept).
@@ -20,6 +20,12 @@ Check of the relay licence build (24 November). Each is in `docs/KNOWN_ISSUES.md
 - **New: a warning on the Licence card in a licence's last 7 days** (not for plans that renew by themselves).
 - **Fixed: a blank `--reason` exited with 1**; it is now a wrong command (2).
 - Tests: the agent-header test checks each value on its own; "nothing reached the Pi" is checked with a stand-in for the bridge; the relay tests no longer take on a developer's `QUIETNET_LICENCE_GATE` or `QUIETNET_LATEST`. Docs corrected: which checks log, the cross-site form list, and `--seats` on a re-grant.
+
+Second check of the relay licence build (24 November). Each is in `docs/KNOWN_ISSUES.md`, "Found in the second check of the relay licence build":
+- **New: `python relay.py licence list`** prints every account with its licence and Pis, and changes nothing, so the owner can find accounts whose emails they don't know before switching the gate on. The go-live steps use it.
+- **Fixed: an account with no licence was told it had 2 seats.** The Licence card and `licence show` now say just "Pis: N" without a licence, and the poll answer leaves `seats` out for state `none`.
+- **Fixed: the start-up lines could be missing from Railway's log**, "Licence gate: on" or "off" among them, because they sat unflushed in Python's buffer. They are now flushed at once, and the relay's image sets `PYTHONUNBUFFERED=1`.
+- Docs corrected: the manual licence checks (a free seat for the test Pi, and how to set up an unlicensed test account before the gate is on), and when `past_due` ends (`grace_until`, or 14 days after the end date).
 
 Second check of the robustness review's fixes (23 November). Each is in `docs/KNOWN_ISSUES.md`, "Faults in the robustness review's fixes":
 - Two devices that swap addresses each keep their own rules (they used to swap rules). A device whose rules can't be moved to its new address has them applied there, live cut included, until the owner sorts it out.
