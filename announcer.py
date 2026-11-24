@@ -27,9 +27,15 @@ Safety rules this module keeps (docs/ARCHITECTURE.md lists them with the reasons
     before every message, and every CHECK_EVERY seconds between them, QuietNet asks itself a
     test question at the very address it is about to name. If there is no answer, devices are
     told at once to stop using it.
+  - It holds back, with a plain reason for the dashboard, whenever the rest of QuietNet says
+    announcing could harm a household device (the `hold_reason` it is given: see
+    server.announce_hold_reason), and when the home network card has more than one home-only
+    address, since answers could then leave from the one that was not announced.
   - Devices are told to stop (the same message with a lifetime of 0, sent GOODBYES times) when
-    the trial is switched off and when QuietNet is stopped cleanly. If the Pi loses power
-    instead, devices drop it by themselves when the lifetime runs out (DNS_LIFETIME seconds).
+    the trial is switched off and when QuietNet is stopped cleanly. A goodbye that could not
+    be sent is tried again at every look until one goes or the lifetime has run out, and the
+    log never says devices were told when they were not. If the Pi loses power instead, devices
+    drop it by themselves when the lifetime runs out (DNS_LIFETIME seconds).
 
 This needs a Linux machine and the right to send raw network messages (NET_RAW, which the
 QuietNet container has). On anything else it reports itself unavailable and does nothing. It
@@ -167,15 +173,15 @@ def build_dns_announcement(our_mac, our_address, lifetime, withdrawn=()):
 
 # ---------------------------------------------------------------- facts about this computer
 
-def link_local_of(card, path="/proc/net/if_inet6"):
-    """The working home-only (link-local, fe80) IPv6 address of one of this computer's network
-    cards, as text, or '' if it has none or the list (`path`, Linux only) can't be read.
+def link_locals_of(card, path="/proc/net/if_inet6"):
+    """Every working home-only (link-local, fe80) IPv6 address of one of this computer's network
+    cards, as text, lowest first; an empty list if it has none or the list of addresses (`path`,
+    Linux only) can't be read.
 
     An address that failed its "is anyone else using this?" check (0x08), is being given up
-    (0x20) or is still being checked (0x40) does not count: the card is not sending from it. If
-    the card has several, the lowest is used, so the answer is the same every time. The card's
-    name is only compared with the file's own last column."""
-    found = []
+    (0x20) or is still being checked (0x40) does not count: the card is not sending from it. The
+    card's name is only compared with the file's own last column."""
+    found = set()
     try:
         with open(path) as f:
             for line in f:
@@ -184,10 +190,18 @@ def link_local_of(card, path="/proc/net/if_inet6"):
                     continue
                 addr = ipaddress.IPv6Address(bytes.fromhex(cols[0]))
                 if addr in LINK_LOCAL and not int(cols[4], 16) & 0x68:
-                    found.append(addr)
+                    found.add(addr)
     except (OSError, ValueError):
-        return ""
-    return str(min(found)) if found else ""
+        return []
+    return [str(addr) for addr in sorted(found)]
+
+
+def link_local_of(card, path="/proc/net/if_inet6"):
+    """The working home-only (link-local, fe80) IPv6 address of one of this computer's network
+    cards, as text, or '' if it has none or the list can't be read. If the card has several, the
+    lowest is given, so the answer is the same every time. See link_locals_of."""
+    found = link_locals_of(card, path)
+    return found[0] if found else ""
 
 
 def hardware_address_of(card, folder="/sys/class/net"):
@@ -207,7 +221,14 @@ def card_facts(card=None, inet6_path="/proc/net/if_inet6", folder="/sys/class/ne
     """What is needed to announce from this computer: (network card, its hardware address, its
     home-only IPv6 address, ''), or (None, None, None, why not) with a plain-English reason for
     the dashboard. The card is the one this computer's home network is on (the one its default
-    route uses), unless `card` names one (the tests do). Reads small files; runs no tools."""
+    route uses), unless `card` names one (the tests do). Reads small files; runs no tools.
+
+    A card with more than one working home-only address gives all three facts (the lowest
+    address) AND a reason not to announce. QuietNet's answers over IPv6 leave from whichever of
+    the card's addresses the system picks, which need not be the one a device asked; a device
+    throws away an answer from another address and waits. The announcer's own test question
+    can't notice, because an answer to this computer itself always leaves from the address
+    asked. The facts are still given so that devices already told can be sent a goodbye."""
     if card is None:
         card = enforcer.interface_and_gateway()[0]
     if not isinstance(card, str) or not CARD_NAME.fullmatch(card) or ".." in card:
@@ -218,11 +239,16 @@ def card_facts(card=None, inet6_path="/proc/net/if_inet6", folder="/sys/class/ne
         own_hardware_address(mac)
     except ValueError:
         return None, None, None, "This computer's home network card has no hardware address QuietNet can send from."
-    address = link_local_of(card, inet6_path)
-    if not address:
+    addresses = link_locals_of(card, inet6_path)
+    if not addresses:
         return None, None, None, ("This computer's home network card has no IPv6 address of its own, so there is nothing "
                                   "to announce. IPv6 may be switched off on this computer.")
-    return card, mac, address, ""
+    if len(addresses) > 1:
+        return card, mac, addresses[0], (
+            "This computer's home network card has more than one home-only IPv6 address (%s), so QuietNet cannot be "
+            "sure its answers would leave from the one it announced. It is not announcing itself. Remove the extra "
+            "address, or leave the trial off." % " and ".join(addresses[:4]))
+    return card, mac, addresses[0], ""
 
 
 def why_unavailable():
@@ -292,19 +318,26 @@ class Announcer:
     is switched off, when QuietNet stops answering over IPv6, and when QuietNet is stopped.
 
     Give it dns_listening(), which says whether QuietNet's own IPv6 DNS listener is open on the
-    usual port. Call start() once; it does nothing on the network until `on` is true. switch()
-    turns the trial on or off, status() is what the dashboard shows, and stop() says goodbye at
-    shut-down. One background thread does all the sending, one step() at a time."""
+    usual port, and hold_reason(address), which gives a plain-English reason not to announce
+    that address just now ('' when there is none). Call start() once; it does nothing on the
+    network until `on` is true. switch() turns the trial on or off, status() is what the
+    dashboard shows, and stop() says goodbye at shut-down. One background thread does all the
+    sending, one step() at a time."""
 
     def __init__(self, dns_listening, on=False, log=print, facts=card_facts, answers=dns_answers,
-                 open_sender=open_sender, clock=time.monotonic, pause=time.sleep, unavailable=None):
+                 open_sender=open_sender, clock=time.monotonic, pause=time.sleep, unavailable=None,
+                 hold_reason=None):
         """Remember the choices; touch nothing on the network. `on` is the owner's saved choice
-        (off unless they switched it on). The rest are stand-ins for the tests: `facts` gives
-        the card, hardware address and address to announce (card_facts), `answers` asks the
-        test question (dns_answers), `open_sender` opens the sending socket, `clock` and `pause`
-        are the steady timer and the wait between goodbyes, and `unavailable` is the reason the
-        trial can't run here ('' if it can; None works it out)."""
+        (off unless they switched it on). `hold_reason(address)` is asked before every
+        announcement and at every look between them: any text it returns is shown on the
+        dashboard and nothing is announced (None: there is never such a reason). The rest are
+        stand-ins for the tests: `facts` gives the card, hardware address and address to announce
+        (card_facts), `answers` asks the test question (dns_answers), `open_sender` opens the
+        sending socket, `clock` and `pause` are the steady timer and the wait between goodbyes,
+        and `unavailable` is the reason the trial can't run here ('' if it can; None works it
+        out)."""
         self.dns_listening = dns_listening
+        self.hold_reason = hold_reason
         self.on = bool(on)
         self.log = log
         self.unavailable = why_unavailable() if unavailable is None else unavailable
@@ -317,8 +350,13 @@ class Announcer:
         self._open_sender = open_sender
         self._clock = clock
         self._pause = pause
-        self._told = set()            # addresses devices were told to use and not yet told to drop
-        self._cleared = False         # has a goodbye gone out since this run last could not announce?
+        # Addresses devices were told to use and have not yet been told to drop -> when (self._clock())
+        # each was last announced. One is forgotten only when a goodbye naming it really left, or when
+        # DNS_LIFETIME seconds have passed since it was announced (devices have dropped it by themselves).
+        self._told = {}
+        self._last = None             # (card, hardware address, address) of the last announcement that went out
+        self._cleared = False         # has the once-only goodbye been dealt with since this run last could not announce?
+        self._unsent_logged = False   # has the log said that the goodbye at switching off could not be sent?
         self._sent_at = None          # when (self._clock()) the last announcement went out
         self._sent = 0                # announcements sent since it last began announcing
         self._sock = None
@@ -339,7 +377,7 @@ class Announcer:
         """Turn the trial on or off (the owner's choice; the caller saves it). Returns at once:
         the background thread starts announcing, or sends the goodbyes, within a moment."""
         self.on = bool(on)
-        if self.on and self.state == "off":
+        if self.on and self.state in ("off", "stopping"):
             self.state = "starting"
         elif not self.on and self.state in ("announcing", "starting"):
             self.state = "stopping"
@@ -349,7 +387,8 @@ class Announcer:
         """What the dashboard shows (the "dns_announce" part of GET /api/status): {"on": the
         owner's choice, "available": can the trial run on this computer at all, "state": "off",
         "starting", "announcing", "held" (on, but not announcing; "reason" says why),
-        "stopping" or "unavailable", "reason": plain English or '', "address": the address being
+        "stopping" (off, and telling devices to stop; "reason" is not empty while that message
+        could not be sent yet) or "unavailable", "reason": plain English or '', "address": the address being
         announced or '', "sent": when (time.time()) the last announcement went out or None,
         "lifetime": seconds devices keep it after the last one, "every": seconds between
         announcements}. Never waits for the sending thread."""
@@ -400,21 +439,17 @@ class Announcer:
         to do until switch() or stop() is called).
 
         Off, or stopping: if devices were told to use this computer, tell them to stop; close the
-        socket. On: find the card and its addresses, check QuietNet is answering lookups over IPv6
-        at the address to be named, and if anything is missing hold back, telling devices to stop
-        if they were told before (or once, in case an earlier run that ended without warning left
-        them using it). Otherwise send an announcement if one is due: the first few FIRST_GAP
-        seconds apart, then every ANNOUNCE_EVERY seconds."""
+        socket (see _finish). On: find the card and its addresses, check QuietNet is taking and
+        answering lookups over IPv6 at the address to be named and that nothing says announcing
+        could do harm (hold_reason), and if anything is missing hold back, telling devices to
+        stop if they were told before (or once, in case an earlier run that ended without warning
+        left them using it). Otherwise send an announcement if one is due: the first few
+        FIRST_GAP seconds apart, then every ANNOUNCE_EVERY seconds."""
         with self._lock:
+            self._forget_what_has_run_out()
             if not self.on or self._stop.is_set():
-                if self._told:
-                    self._say_goodbye()
-                    self.log("IPv6 DNS announcement trial: stopped. Devices were told to stop using this "
-                             "computer for IPv6 DNS.")
-                self._close()
-                self._sent_at, self._sent, self._cleared = None, 0, False
-                self.state, self.reason, self.address = "off", "", ""
-                return None
+                return self._finish()
+            self._unsent_logged = False
             if self.unavailable:
                 self.state, self.reason, self.address = "unavailable", self.unavailable, ""
                 return None
@@ -422,16 +457,22 @@ class Announcer:
             if not problem and not self._listening():
                 problem = ("QuietNet is not taking lookups over IPv6 on the usual DNS port (%d) on this computer, "
                            "so it is not announcing itself." % DNS_PORT)
+            if not problem:
+                problem = self._held_back(address)
             if not problem and not self._answering(address, card):
                 problem = ("QuietNet did not answer a test lookup over IPv6, so it is not announcing itself. "
                            "It checks again every %d seconds." % CHECK_EVERY)
             if problem:
                 return self._hold(problem, card, mac, address)
-            if self._told - {address}:
-                # This computer's address has changed since devices were told: call the old one off,
-                # then announce the new one straight away.
+            if set(self._told) - {address}:
+                # Devices still hold an earlier address of this computer: call it off. The goodbye
+                # names the present address as well, so once it has gone (or if the present address
+                # was never announced) the present one is announced straight away, and the first
+                # few announcements go close together again. A goodbye that could not be sent is
+                # tried again at the next look without disturbing the announcements.
                 self._say_goodbye(card, mac, address)
-                self._sent_at, self._sent = None, 0
+                if address not in self._told:
+                    self._sent_at, self._sent = None, 0
             now = self._clock()
             if self._sent_at is None or now - self._sent_at >= self._gap():
                 try:
@@ -445,11 +486,61 @@ class Announcer:
                 if self.state != "announcing":
                     self.log("IPv6 DNS announcement trial: announcing %s on %s, about every %d seconds."
                              % (address, card, ANNOUNCE_EVERY))
-                self._told = {address}
+                self._told[address] = now
+                self._last = (card, mac, address)
                 self._cleared = False
                 self._sent_at, self._sent, self.last_sent = now, self._sent + 1, time.time()
                 self.state, self.reason, self.address = "announcing", "", address
             return max(1.0, min(CHECK_EVERY, self._sent_at + self._gap() - now))
+
+    def _forget_what_has_run_out(self):
+        """Forget every address last announced DNS_LIFETIME seconds ago or more: devices have
+        dropped it by themselves, so no goodbye is owed for it. This is what stops a goodbye that
+        can never be sent from being tried for ever."""
+        now = self._clock()
+        for address in [a for a, at in self._told.items() if now - at >= DNS_LIFETIME]:
+            del self._told[address]
+
+    def _finish(self):
+        """The trial is switched off, or QuietNet is stopping: tell devices to stop using this
+        computer if they were told to use it, close the socket, and return when to look again
+        (None: not until switch() is called).
+
+        The log says devices were told only when a goodbye really left. If none could be sent
+        (the card refused, or is gone) after the trial was switched off, the state stays
+        "stopping" and the goodbye is tried again every CHECK_EVERY seconds, until one goes or
+        the DNS_LIFETIME seconds devices keep the address for have passed. At shut-down there is
+        one go only, since the program is about to end, and the log says plainly if it failed."""
+        owed = bool(self._told)
+        while self._told and self._say_goodbye():
+            pass
+        minutes = DNS_LIFETIME // 60
+        if self._told and not self._stop.is_set():
+            self._close()
+            if not self._unsent_logged:
+                self.log("IPv6 DNS announcement trial: switched off, but this computer could not send the message "
+                         "telling devices to stop using it for IPv6 DNS. It tries again every %d seconds; devices "
+                         "stop by themselves within %d minutes." % (CHECK_EVERY, minutes))
+                self._unsent_logged = True
+            self._sent_at, self._sent = None, 0
+            self.state, self.address = "stopping", ""
+            self.reason = ("This computer could not send the message yet. It tries again every %d seconds, and "
+                           "devices stop by themselves within %d minutes." % (CHECK_EVERY, minutes))
+            return CHECK_EVERY
+        if owed and not self._told:
+            self.log("IPv6 DNS announcement trial: stopped. Devices were told to stop using this "
+                     "computer for IPv6 DNS.")
+        elif owed:
+            self.log("IPv6 DNS announcement trial: stopped, but this computer could not send the message telling "
+                     "devices to stop using it for IPv6 DNS. They stop by themselves within %d minutes." % minutes)
+        elif self._unsent_logged:
+            self.log("IPv6 DNS announcement trial: stopped. The message telling devices to stop never got out; "
+                     "the %d minutes they keep this computer for have now passed." % minutes)
+        self._close()
+        self._told, self._last, self._unsent_logged = {}, None, False
+        self._sent_at, self._sent, self._cleared = None, 0, False
+        self.state, self.reason, self.address = "off", "", ""
+        return None
 
     def _gap(self):
         """Seconds between the announcement just sent and the next one."""
@@ -462,6 +553,18 @@ class Announcer:
         except Exception:
             return False
 
+    def _held_back(self, address):
+        """A plain-English reason, from the rest of QuietNet, not to announce this address just
+        now, or '' if there is none (see server.announce_hold_reason). If asking fails, that is
+        itself a reason: the trial must never announce on a guess."""
+        if self.hold_reason is None:
+            return ""
+        try:
+            return str(self.hold_reason(address) or "")
+        except Exception:
+            return ("QuietNet could not tell whether it is safe to announce itself, so it is not announcing. "
+                    "It checks again every %d seconds." % CHECK_EVERY)
+
     def _answering(self, address, card):
         """Does QuietNet answer a test question at the address about to be announced? False if
         asking fails."""
@@ -472,10 +575,13 @@ class Announcer:
 
     def _hold(self, problem, card, mac, address):
         """Hold back: something needed for announcing is missing (`problem`, plain English for
-        the dashboard). If devices were told to use this computer, or no goodbye has gone out yet
-        since this run began holding back, tell them to stop now. That second case covers a
-        QuietNet that ended without warning while announcing and came back unable to answer.
-        Returns how long until the next look."""
+        the dashboard). If devices were told to use this computer, or the once-only goodbye has
+        not been dealt with since this run began holding back, tell them to stop now. That second
+        case covers a QuietNet that ended without warning while announcing and came back unable
+        to answer. A goodbye that could not be sent is tried again at every look (this is called
+        every CHECK_EVERY seconds while held) until one goes or the addresses have run out. The
+        pacing is set back, so announcing starts again at once, with its first few announcements
+        close together, when the problem goes. Returns how long until the next look."""
         if self._told or not self._cleared:
             self._say_goodbye(card, mac, address)
         if self.state != "held" or self.reason != problem:
@@ -486,27 +592,50 @@ class Announcer:
 
     def _say_goodbye(self, card=None, mac=None, address=None):
         """Tell every device to stop using this computer for IPv6 DNS: the announcement again
-        with a lifetime of 0, naming the current address and any earlier one devices may still
-        hold, sent GOODBYES times because Wi-Fi can lose a message sent to everyone. If the card
-        or its addresses can't be found there is nothing to send from, and devices drop it by
-        themselves within DNS_LIFETIME seconds. Returns True if at least one goodbye was sent."""
+        with a lifetime of 0, naming the address it is sent from and up to MAX_WITHDRAWN earlier
+        ones devices may still hold, sent GOODBYES times because Wi-Fi can lose a message sent to
+        everyone. Returns True if at least one goodbye was sent.
+
+        Where it is sent from: the card, hardware address and address given, or else the card's
+        present ones; and if those can't be found or make no frame, the ones the last
+        announcement went out with. The frame is sent whole through a packet socket, so it can
+        still leave after the card has lost its IPv6 address.
+
+        An address is forgotten only when a goodbye naming it really left. If none could be sent,
+        the addresses devices were told stay remembered, and the callers try again at the next
+        look (see _hold and _finish). The once-only goodbye of a run that never announced
+        (nothing remembered) is not tried again after a send that failed, so a computer that may
+        not send raw frames does not try for ever."""
         if card is None or mac is None or address is None:
-            card, mac, address, problem = self._facts()
-            if problem:
-                self._told = set()
-                return False
+            try:
+                card, mac, address, _ = self._facts()
+            except Exception:
+                card = mac = address = None
+        sources = [] if card is None or mac is None or address is None else [(card, mac, address)]
+        if self._told and self._last is not None and self._last not in sources:
+            sources.append(self._last)
+        frame, named = None, []
+        for card, mac, address in sources:
+            named = [address] + sorted(set(self._told) - {address})[:MAX_WITHDRAWN]
+            try:
+                frame = build_dns_announcement(mac, address, 0, named[1:])
+                break
+            except ValueError:
+                continue
+        if frame is None:
+            return False                # nothing to send from; whatever devices were told stays remembered
         sent = False
-        try:
-            frame = build_dns_announcement(mac, address, 0, sorted(self._told - {address})[:MAX_WITHDRAWN])
-        except ValueError:
-            frame = None
-        for n in range(GOODBYES if frame else 0):
+        for n in range(GOODBYES):
             if n:
                 self._pause(GOODBYE_GAP)
-            if not self._send(card, frame):
-                sent = True
-        self._told = set()
-        self._cleared = True
+            if self._send(card, frame):
+                break                   # refused: the rest would be too; the next look tries again
+            sent = True
+        if sent:
+            for told in named:
+                self._told.pop(told, None)
+        if sent or not self._told:
+            self._cleared = True
         return sent
 
     def _send(self, card, frame):

@@ -6,10 +6,14 @@ Run with:  python3 -m unittest discover tests
 
 Standard library only. Nothing is sent onto a network: the sending socket, the network card's
 details and the clock are stand-ins, and the only real connections are test questions to a
-stand-in DNS server on 127.0.0.1. No raw socket is opened and no system tool is run.
+stand-in DNS server on 127.0.0.1 (and on ::1, where the computer has it). No raw socket is opened
+and no system tool is run.
 """
+import contextlib
 import inspect
+import io
 import os
+import re
 import socket
 import sys
 import tempfile
@@ -22,9 +26,17 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from test_dashboard_api import Api  # noqa: E402
 from test_quietnet import Base, server  # noqa: E402
 import announcer  # noqa: E402
+import enforcer  # noqa: E402
 
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CARD, MAC, ADDR = "wlan0", "b8:27:eb:12:34:56", "fe80::ba27:ebff:fe12:3456"
 OTHER = "fe80::1234"
+
+
+def read(*parts):
+    """The text of one of the repository's files."""
+    with open(os.path.join(ROOT, *parts), encoding="utf-8") as f:
+        return f.read()
 
 # Whole frames for the hardware address and address above, made once and read back with tcpdump
 # (`tcpdump -vv -e -r`), which reported for each: "[icmp6 sum ok] ICMP6, router advertisement",
@@ -258,6 +270,24 @@ class ThisComputersCard(unittest.TestCase):
                    "fe800000000000000000000000000002 03 40 20 80    wlan0\n")
         self.assertEqual(announcer.link_local_of("wlan0", self.inet6), "fe80::2")
 
+    def test_every_working_home_only_address_of_the_card_is_listed_lowest_first(self):
+        self.write("fe80000000000000ba27ebfffe123456 03 40 20 80    wlan0\n"
+                   "fe800000000000000000000000000002 03 40 20 80    wlan0\n"
+                   "fe800000000000000000000000000003 03 40 20 40    wlan0\n"      # still being checked
+                   "fe800000000000000000000000000001 02 40 20 80     eth0\n")
+        self.assertEqual(announcer.link_locals_of("wlan0", self.inet6), ["fe80::2", ADDR])
+        self.assertEqual(announcer.link_locals_of("wlan0", os.path.join(self.folder, "missing")), [])
+
+    def test_a_card_with_two_home_only_addresses_gives_the_facts_and_a_reason_not_to_announce(self):
+        # QuietNet's answers could leave from the one that was not announced; the facts are still
+        # given, so devices already told can be sent a goodbye.
+        self.write("fe80000000000000ba27ebfffe123456 03 40 20 80    wlan0\n"
+                   "fe800000000000000000000000000002 03 40 20 80    wlan0\n")
+        card, mac, address, reason = self.facts()
+        self.assertEqual((card, mac, address), ("wlan0", MAC, "fe80::2"))
+        self.assertIn("more than one home-only IPv6 address (fe80::2 and %s)" % ADDR, reason)
+        self.assertIn("Remove the extra address, or leave the trial off.", reason)
+
     def test_a_list_that_cannot_be_read_gives_no_address(self):
         self.assertEqual(announcer.link_local_of("wlan0", os.path.join(self.folder, "missing")), "")
         self.write("this is not the list\nzz80000000000000ba27ebfffe123456 03 40 20 80 wlan0\n")
@@ -299,14 +329,19 @@ class ThisComputersCard(unittest.TestCase):
 
 
 class StandInDns:
-    """A DNS server on 127.0.0.1 for the test question. `answer(question)` gives the reply to
-    send back, or None to stay silent."""
+    """A DNS server on 127.0.0.1 (or on ::1 when asked) for the test question.
+    `answer(question)` gives the reply to send back, or None to stay silent. Raises OSError if
+    the computer has no such address."""
 
-    def __init__(self, answer):
+    def __init__(self, answer, family=socket.AF_INET, address="127.0.0.1"):
         self.answer = answer
         self.asked = []
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.sock.bind(("127.0.0.1", 0))
+        self.sock = socket.socket(family, socket.SOCK_DGRAM)
+        try:
+            self.sock.bind((address, 0))
+        except OSError:
+            self.sock.close()
+            raise
         self.sock.settimeout(0.05)
         self.port = self.sock.getsockname()[1]
         self.done = threading.Event()
@@ -403,6 +438,50 @@ class TheTestQuestion(Base):
         with mock.patch.object(socket, "if_nametoindex", side_effect=OSError("no such card")):
             self.assertFalse(announcer.dns_answers(ADDR, "nocard0", wait=0.05))
 
+    # -- over IPv6, which is the only way a Pi ever asks ---------------------------
+
+    def test_quietnet_answering_over_ipv6_counts_as_answering(self):
+        try:
+            dns = StandInDns(lambda q: server.answer_query(q, "::1", lambda d, **kw: self.fail("asked the internet")),
+                             socket.AF_INET6, "::1")
+        except OSError:
+            self.skipTest("this computer has no IPv6 loopback address")
+        self.addCleanup(dns.close)
+        self.assertTrue(announcer.dns_answers("::1", port=dns.port, wait=0.2))
+        self.assertEqual(len(dns.asked), 1)
+
+    def answering_sockets(self, made):
+        """A stand-in for socket.socket: each socket it makes is noted in `made` as (family,
+        kind, socket), connects anywhere, and answers whatever is sent with a well-formed reply
+        carrying the same number."""
+        def make(family, kind):
+            """One stand-in socket."""
+            sock = mock.Mock()
+            sock.send.side_effect = lambda q: sock.recv.configure_mock(return_value=q[:2] + b"\x80\x81" + bytes(8))
+            made.append((family, kind, sock))
+            return sock
+        return make
+
+    def test_a_home_only_address_is_asked_over_ipv6_through_its_own_card(self):
+        made = []
+        with mock.patch.object(socket, "socket", self.answering_sockets(made)), \
+                mock.patch.object(socket, "if_nametoindex", return_value=7) as index:
+            self.assertTrue(announcer.dns_answers(ADDR, CARD))
+        index.assert_called_once_with(CARD)
+        (family, kind, sock), = made
+        self.assertEqual((family, kind), (socket.AF_INET6, socket.SOCK_DGRAM))
+        sock.connect.assert_called_once_with((ADDR, 53, 0, 7))
+        sock.close.assert_called_once_with()
+
+    def test_an_address_that_works_anywhere_is_asked_without_naming_a_card(self):
+        made = []
+        with mock.patch.object(socket, "socket", self.answering_sockets(made)), \
+                mock.patch.object(socket, "if_nametoindex", side_effect=AssertionError("looked up a card")):
+            self.assertTrue(announcer.dns_answers("2001:db8::53", CARD))
+        (family, kind, sock), = made
+        self.assertEqual((family, kind), (socket.AF_INET6, socket.SOCK_DGRAM))
+        sock.connect.assert_called_once_with(("2001:db8::53", 53, 0, 0))
+
 
 class FakeSender:
     """Stands in for the raw sending socket: notes each frame and where it was sent."""
@@ -413,6 +492,8 @@ class FakeSender:
     def sendto(self, frame, where):
         if self.test.send_fails:
             raise self.test.send_fails
+        if self.test.refuse_goodbyes and not any(lifetime for _, lifetime in dns_servers(frame)):
+            raise OSError("Network is down")
         self.test.sent.append((bytes(frame), where))
         return len(frame)
 
@@ -426,6 +507,8 @@ class Trial(unittest.TestCase):
     def setUp(self):
         self.now = 1000.0
         self.sent, self.opened, self.closed, self.send_fails = [], [], 0, None
+        self.refuse_goodbyes = False          # true: the stand-in card sends announcements but refuses goodbyes
+        self.hold, self.hold_asked = "", []   # the reason to hold back the rest of QuietNet gives ('' = none)
         self.listening, self.answering, self.asked = True, True, []
         self.facts = (CARD, MAC, ADDR, "")
         self.facts_asked = 0
@@ -444,11 +527,27 @@ class Trial(unittest.TestCase):
             self.opened.append(card)
             return FakeSender(self)
 
+        def hold_reason(address):
+            self.hold_asked.append(address)
+            return self.hold
+
         an = announcer.Announcer(lambda: self.listening, on=on, log=self.logged.append, facts=facts, answers=answers,
                                  open_sender=open_sender, clock=lambda: self.now, pause=self.pauses.append,
-                                 unavailable=unavailable)
+                                 unavailable=unavailable, hold_reason=hold_reason)
         self.addCleanup(an.stop, 2)
         return an
+
+    def settled(self):
+        """An announcer past its first quick announcements, so the next one is 200 seconds away."""
+        an = self.make(on=True)
+        for _ in range(announcer.FIRST_ANNOUNCEMENTS):
+            an.step()
+            self.now += announcer.FIRST_GAP
+        return an
+
+    def goodbyes(self):
+        """How many frames sent so far are goodbyes (no address offered, every lifetime 0)."""
+        return sum(1 for frame, _ in self.sent if not any(lifetime for _, lifetime in dns_servers(frame)))
 
     def lifetimes(self):
         """The DNS lifetime of this computer's address in each frame sent so far."""
@@ -624,16 +723,32 @@ class Trial(unittest.TestCase):
         self.assertEqual(self.lifetimes(), [600, 0, 0, 0])
 
     def test_announcing_starts_again_at_once_when_quietnet_answers_again(self):
-        an = self.make(on=True)
-        an.step()
+        # From the settled state, where the next announcement would not be due for 200 seconds.
+        an = self.settled()
         self.answering = False
         self.now += 20
         an.step()
         self.answering = True
         self.now += 20
         an.step()
-        self.assertEqual(self.lifetimes(), [600, 0, 0, 0, 600])
+        self.assertEqual(self.lifetimes(), [600] * 3 + [0] * 3 + [600])
         self.assertEqual(an.status()["state"], "announcing")
+
+    def test_starting_again_the_first_three_announcements_go_sixteen_seconds_apart_again(self):
+        an = self.settled()
+        self.answering = False
+        self.now += 20
+        an.step()
+        self.answering = True
+        self.now += 20
+        began, times = self.now, []
+        for _ in range(40):
+            before = len(self.sent)
+            an.step()
+            if len(self.sent) > before:
+                times.append(self.now - began)
+            self.now += 1
+        self.assertEqual(times, [0, 16, 32])
 
     def test_started_while_unable_to_answer_it_tells_devices_to_stop_once(self):
         # QuietNet may have ended without warning while announcing; devices could still hold it.
@@ -651,6 +766,111 @@ class Trial(unittest.TestCase):
         status = an.status()
         self.assertEqual((status["state"], status["address"], status["sent"]), ("held", "", None))
         self.assertIn("not taking lookups over IPv6 on the usual DNS port (53)", status["reason"])
+
+    def test_once_held_back_the_status_no_longer_says_when_it_last_announced(self):
+        an = self.make(on=True)
+        an.step()
+        self.listening = False
+        self.now += 20
+        an.step()
+        status = an.status()
+        self.assertEqual((status["state"], status["address"], status["sent"]), ("held", "", None))
+
+    def test_switched_on_from_off_the_status_says_starting_until_the_first_step(self):
+        an = self.make()
+        an.switch(True)
+        self.assertEqual((an.status()["on"], an.status()["state"]), (True, "starting"))
+
+    def test_switched_off_while_announcing_the_status_says_stopping_until_the_goodbye(self):
+        an = self.make(on=True)
+        an.step()
+        an.switch(False)
+        self.assertEqual((an.status()["on"], an.status()["state"]), (False, "stopping"))
+
+    def test_while_stopping_the_status_gives_no_address_and_no_time(self):
+        an = self.make(on=True)
+        an.step()
+        an.switch(False)
+        status = an.status()
+        self.assertEqual((status["address"], status["sent"]), ("", None))
+
+    # -- holding back when the rest of QuietNet gives a reason ---------------------
+
+    def test_nothing_is_announced_while_there_is_a_reason_to_hold_back(self):
+        self.hold = "Some devices here connect through a Wi-Fi range extender."
+        an = self.make(on=True)
+        for _ in range(30):
+            an.step()
+            self.now += 20
+        self.assertEqual(self.offers(), 0)
+        self.assertEqual((an.status()["state"], an.status()["reason"]), ("held", self.hold))
+
+    def test_with_no_reason_to_hold_back_the_frames_are_byte_for_byte_as_before(self):
+        an = self.make(on=True)
+        an.step()
+        an.switch(False)
+        an.step()
+        self.assertEqual([frame for frame, _ in self.sent], [KNOWN_ANNOUNCEMENT] + [KNOWN_GOODBYE] * 3)
+        self.assertEqual(self.hold_asked, [ADDR])
+
+    def test_the_reason_is_asked_about_the_very_address_about_to_be_announced(self):
+        self.facts = (CARD, MAC, OTHER, "")
+        self.make(on=True).step()
+        self.assertEqual(self.hold_asked, [OTHER])
+
+    def test_the_reason_is_asked_before_every_announcement_and_between_them(self):
+        an = self.make(on=True)
+        for _ in range(12):
+            self.now += an.step()
+        self.assertEqual(len(self.hold_asked), 12)
+
+    def test_a_reason_appearing_while_announcing_sends_the_goodbye_and_holds(self):
+        an = self.settled()
+        self.hold = "A range extender has been noticed."
+        self.now += 20
+        an.step()
+        self.assertEqual([frame for frame, _ in self.sent], [KNOWN_ANNOUNCEMENT] * 3 + [KNOWN_GOODBYE] * 3)
+        self.assertEqual(an.status()["state"], "held")
+
+    def test_while_the_reason_lasts_the_goodbye_is_sent_once_and_not_again(self):
+        an = self.settled()
+        self.hold = "A range extender has been noticed."
+        for _ in range(10):
+            self.now += 20
+            an.step()
+        self.assertEqual(self.lifetimes(), [600] * 3 + [0] * 3)
+
+    def test_announcing_resumes_at_once_when_the_reason_clears(self):
+        an = self.settled()
+        self.hold = "A range extender has been noticed."
+        self.now += 20
+        an.step()
+        self.hold = ""
+        self.now += 20
+        an.step()
+        self.assertEqual(self.lifetimes(), [600] * 3 + [0] * 3 + [600])
+        self.assertEqual(an.status()["state"], "announcing")
+
+    def test_the_test_question_is_not_asked_while_there_is_a_reason_to_hold_back(self):
+        self.hold = "A range extender has been noticed."
+        self.make(on=True).step()
+        self.assertEqual(self.asked, [])
+
+    def test_a_hold_back_check_that_breaks_counts_as_a_reason(self):
+        an = self.make(on=True)
+        an.hold_reason = mock.Mock(side_effect=RuntimeError("broken"))
+        an.step()
+        self.assertEqual((self.offers(), an.status()["state"]), (0, "held"))
+        self.assertIn("could not tell whether it is safe to announce itself", an.status()["reason"])
+
+    def test_an_announcer_given_no_hold_back_check_announces(self):
+        sent = []
+        sender = mock.Mock()
+        sender.sendto.side_effect = lambda frame, where: sent.append(bytes(frame))
+        an = announcer.Announcer(lambda: True, on=True, log=lambda line: None, facts=lambda: (CARD, MAC, ADDR, ""),
+                                 answers=lambda a, c: True, open_sender=lambda card: sender, unavailable="")
+        an.step()
+        self.assertEqual(sent, [KNOWN_ANNOUNCEMENT])
 
     # -- stopping ----------------------------------------------------------------
 
@@ -724,6 +944,266 @@ class Trial(unittest.TestCase):
             time.sleep(0.01)
         self.assertEqual(self.lifetimes(), [600, 0, 0, 0])
 
+    def test_the_wait_at_a_clean_stop_covers_a_check_under_way_and_the_goodbyes(self):
+        # main() calls AN.stop() with the wait it comes with; the thread is a daemon, so if the
+        # wait ran out the program would end before the goodbyes left.
+        wait = inspect.signature(announcer.Announcer.stop).parameters["wait"].default
+        check = announcer.PROBE_TRIES * announcer.PROBE_WAIT            # a test question already under way
+        goodbyes = (announcer.GOODBYES - 1) * announcer.GOODBYE_GAP     # the pauses between the goodbyes
+        self.assertEqual(announcer.GOODBYE_GAP, 0.3)
+        self.assertLessEqual(check + goodbyes + 1, wait)                # a second to spare
+        grace = int(re.search(r"stop_grace_period: (\d+)s", read("docker-compose.yml")).group(1))
+        enforcer_wait = inspect.signature(enforcer.Enforcer.stop).parameters["wait"].default
+        self.assertLessEqual(enforcer_wait + wait, grace)               # both waits fit the container's stop time
+
+    # -- a goodbye that could not be sent ------------------------------------------
+
+    def test_a_goodbye_the_card_refused_is_tried_again_at_the_next_look(self):
+        an = self.make(on=True)
+        an.step()
+        self.answering, self.send_fails = False, OSError("Network is down")
+        self.now += 20
+        an.step()
+        self.assertEqual((self.lifetimes(), an.status()["state"]), ([600], "held"))
+        self.send_fails = None
+        self.now += 20
+        an.step()
+        self.assertEqual([frame for frame, _ in self.sent], [KNOWN_ANNOUNCEMENT] + [KNOWN_GOODBYE] * 3)
+
+    def test_a_goodbye_that_went_at_the_second_go_is_not_sent_again(self):
+        an = self.make(on=True)
+        an.step()
+        self.answering, self.send_fails = False, OSError("Network is down")
+        self.now += 20
+        an.step()
+        self.send_fails = None
+        for _ in range(5):
+            self.now += 20
+            an.step()
+        self.assertEqual(self.lifetimes(), [600, 0, 0, 0])
+
+    def test_a_goodbye_that_never_got_out_is_given_up_once_the_dns_lifetime_has_passed(self):
+        an = self.make(on=True)
+        an.step()
+        self.answering, self.send_fails = False, OSError("Network is down")
+        for _ in range(announcer.DNS_LIFETIME // 20):
+            self.now += 20
+            an.step()
+        tried = len(self.opened)
+        self.assertGreater(tried, 10)                    # it kept trying while devices still held the address
+        self.send_fails = None
+        for _ in range(5):
+            self.now += 20
+            an.step()
+        self.assertEqual((self.lifetimes(), len(self.opened)), ([600], tried))
+
+    def test_started_without_the_right_to_send_the_goodbye_is_not_retried_for_ever(self):
+        self.listening, self.send_fails = False, PermissionError("Operation not permitted")
+        an = self.make(on=True)
+        for _ in range(6):
+            an.step()
+            self.now += 20
+        self.assertEqual(len(self.opened), 1)
+
+    def test_when_the_card_loses_its_address_the_goodbye_goes_from_the_last_announced_one(self):
+        # The frame is sent whole, so it needs no IPv6 address on the card any more.
+        an = self.make(on=True)
+        an.step()
+        self.facts = (None, None, None, "This computer's home network card has no IPv6 address of its own.")
+        self.now += 20
+        an.step()
+        self.assertEqual(self.sent[1:], [(KNOWN_GOODBYE, (CARD, 0x86DD))] * 3)
+        self.assertEqual(an.status()["state"], "held")
+
+    def test_switching_off_while_the_card_has_no_address_still_sends_the_goodbye(self):
+        an = self.make(on=True)
+        an.step()
+        self.facts = (None, None, None, "This computer's home network card has no IPv6 address of its own.")
+        an.switch(False)
+        an.step()
+        self.assertEqual([frame for frame, _ in self.sent], [KNOWN_ANNOUNCEMENT] + [KNOWN_GOODBYE] * 3)
+        self.assertEqual(an.status()["state"], "off")
+
+    def test_a_clean_stop_while_the_card_has_no_address_still_sends_the_goodbye(self):
+        an = self.make(on=True)
+        an.step()
+        self.facts = (None, None, None, "This computer's home network card has no IPv6 address of its own.")
+        an.ask_to_stop()
+        an.step()
+        self.assertEqual([frame for frame, _ in self.sent], [KNOWN_ANNOUNCEMENT] + [KNOWN_GOODBYE] * 3)
+
+    def test_a_goodbye_still_goes_when_asking_about_the_card_breaks(self):
+        an = self.make(on=True)
+        an.step()
+        an._facts = mock.Mock(side_effect=RuntimeError("broken"))
+        an.switch(False)
+        an.step()
+        self.assertEqual([frame for frame, _ in self.sent], [KNOWN_ANNOUNCEMENT] + [KNOWN_GOODBYE] * 3)
+
+    def test_switching_off_just_after_the_card_went_missing_still_sends_the_goodbye(self):
+        # One look found no card and could send nothing; the card is back when the trial is switched off.
+        an = self.make(on=True)
+        an.step()
+        working = self.facts
+        self.facts, self.send_fails = (None, None, None, "QuietNet could not find the network card."), OSError("No such device")
+        self.now += 20
+        an.step()
+        self.facts, self.send_fails = working, None
+        an.switch(False)
+        an.step()
+        self.assertEqual([frame for frame, _ in self.sent], [KNOWN_ANNOUNCEMENT] + [KNOWN_GOODBYE] * 3)
+
+    def test_a_clean_stop_just_after_the_card_went_missing_still_sends_the_goodbye(self):
+        an = self.make(on=True)
+        an.step()
+        working = self.facts
+        self.facts, self.send_fails = (None, None, None, "QuietNet could not find the network card."), OSError("No such device")
+        self.now += 20
+        an.step()
+        self.facts, self.send_fails = working, None
+        an.ask_to_stop()
+        an.step()
+        self.assertEqual([frame for frame, _ in self.sent], [KNOWN_ANNOUNCEMENT] + [KNOWN_GOODBYE] * 3)
+
+    def test_an_address_lost_while_the_card_was_missing_is_still_called_off_when_a_new_one_appears(self):
+        an = self.make(on=True)
+        an.step()
+        self.facts, self.send_fails = (None, None, None, "QuietNet could not find the network card."), OSError("No such device")
+        self.now += 20
+        an.step()
+        self.facts, self.send_fails = (CARD, MAC, OTHER, ""), None
+        self.now += 20
+        an.step()
+        self.assertEqual([dns_servers(frame) for frame, _ in self.sent],
+                         [[(ADDR, 600)]] + [[(OTHER, 0), (ADDR, 0)]] * 3 + [[(OTHER, 600)]])
+
+    def test_an_old_address_whose_goodbye_keeps_failing_does_not_make_announcements_come_faster(self):
+        # The new address is announced; the goodbye for the old one is refused at every look. That
+        # must not start the quick first announcements again each time.
+        an = self.make(on=True)
+        an.step()
+        self.facts, self.refuse_goodbyes = (CARD, MAC, OTHER, ""), True
+        began, times = self.now + 20, []
+        for _ in range(12):
+            self.now += 20
+            before = len(self.sent)
+            an.step()
+            if len(self.sent) > before:
+                times.append(self.now - began)
+        self.assertEqual(times, [0, 20, 40])             # the first three, then nothing until 200 seconds on
+        self.assertEqual(self.goodbyes(), 0)
+
+    def test_the_log_never_says_devices_were_told_when_no_goodbye_left(self):
+        an = self.make(on=True)
+        an.step()
+        self.send_fails = OSError("Network is down")
+        an.switch(False)
+        an.step()
+        self.assertEqual(self.goodbyes(), 0)
+        self.assertFalse(any("were told to stop" in line for line in self.logged))
+        self.assertTrue(any("switched off, but this computer could not send the message telling devices to stop"
+                            in line for line in self.logged))
+
+    def test_a_clean_stop_that_cannot_send_the_goodbye_says_so_in_the_log(self):
+        an = self.make(on=True)
+        an.step()
+        self.send_fails = OSError("Network is down")
+        an.ask_to_stop()
+        self.assertIsNone(an.step())
+        self.assertFalse(any("were told to stop" in line for line in self.logged))
+        self.assertIn("IPv6 DNS announcement trial: stopped, but this computer could not send the message telling "
+                      "devices to stop using it for IPv6 DNS. They stop by themselves within 10 minutes.", self.logged)
+
+    def test_switched_off_with_a_goodbye_still_owed_it_keeps_looking_every_twenty_seconds(self):
+        an = self.make(on=True)
+        an.step()
+        self.send_fails = OSError("Network is down")
+        an.switch(False)
+        self.assertEqual(an.step(), announcer.CHECK_EVERY)
+        status = an.status()
+        self.assertEqual((status["on"], status["state"], status["address"]), (False, "stopping", ""))
+        self.assertIn("could not send the message yet", status["reason"])
+
+    def test_switching_off_keeps_trying_the_goodbye_until_it_goes(self):
+        an = self.make(on=True)
+        an.step()
+        self.send_fails = OSError("Network is down")
+        an.switch(False)
+        for _ in range(3):
+            an.step()
+            self.now += 20
+        self.send_fails = None
+        self.assertIsNone(an.step())
+        self.assertEqual([frame for frame, _ in self.sent], [KNOWN_ANNOUNCEMENT] + [KNOWN_GOODBYE] * 3)
+        self.assertEqual((an.status()["state"], an.status()["reason"]), ("off", ""))
+        self.assertTrue(self.logged[-1].endswith("Devices were told to stop using this computer for IPv6 DNS."))
+
+    def test_the_line_saying_the_goodbye_could_not_be_sent_is_logged_once_not_at_every_look(self):
+        an = self.make(on=True)
+        an.step()
+        self.send_fails = OSError("Network is down")
+        an.switch(False)
+        for _ in range(8):
+            an.step()
+            self.now += 20
+        self.assertEqual(sum(1 for line in self.logged if "could not send the message" in line), 1)
+
+    def test_switched_off_and_never_able_to_send_it_gives_up_after_the_ten_minutes_and_says_so(self):
+        an = self.make(on=True)
+        an.step()
+        self.send_fails = OSError("Network is down")
+        an.switch(False)
+        waits = []
+        for _ in range(announcer.DNS_LIFETIME // 20 + 1):
+            waits.append(an.step())
+            self.now += 20
+        self.assertEqual((waits[0], waits[-1], an.status()["state"]), (announcer.CHECK_EVERY, None, "off"))
+        self.assertIn("The message telling devices to stop never got out", self.logged[-1])
+        self.assertFalse(any("were told to stop" in line for line in self.logged))
+
+    def test_switched_on_again_while_a_goodbye_is_owed_it_announces_again(self):
+        an = self.make(on=True)
+        an.step()
+        self.send_fails = OSError("Network is down")
+        an.switch(False)
+        an.step()
+        self.send_fails = None
+        an.switch(True)
+        self.assertEqual(an.status()["state"], "starting")
+        self.now += 20
+        an.step()
+        self.assertEqual((self.lifetimes(), an.status()["state"]), ([600, 600], "announcing"))
+
+    # -- a card with two home-only addresses ----------------------------------------
+
+    def test_a_card_with_two_home_only_addresses_is_not_announced_from_and_the_reason_says_so(self):
+        self.facts = (CARD, MAC, "fe80::2", "This computer's home network card has more than one home-only IPv6 address.")
+        an = self.make(on=True)
+        for _ in range(5):
+            an.step()
+            self.now += 20
+        self.assertEqual(self.offers(), 0)
+        self.assertEqual((an.status()["state"], an.status()["reason"]), ("held", self.facts[3]))
+
+    def test_devices_are_still_told_to_stop_when_a_second_address_appears_while_announcing(self):
+        an = self.make(on=True)
+        an.step()
+        self.facts = (CARD, MAC, "fe80::2", "This computer's home network card has more than one home-only IPv6 address.")
+        self.now += 20
+        an.step()
+        self.assertEqual([dns_servers(frame) for frame, _ in self.sent],
+                         [[(ADDR, 600)]] + [[("fe80::2", 0), (ADDR, 0)]] * 3)
+
+    def test_switching_off_with_two_addresses_on_the_card_still_sends_the_goodbye(self):
+        an = self.make(on=True)
+        an.step()
+        self.facts = (CARD, MAC, "fe80::2", "This computer's home network card has more than one home-only IPv6 address.")
+        an.switch(False)
+        an.step()
+        self.assertEqual([dns_servers(frame) for frame, _ in self.sent],
+                         [[(ADDR, 600)]] + [[("fe80::2", 0), (ADDR, 0)]] * 3)
+        self.assertEqual(an.status()["state"], "off")
+
     def test_a_stop_while_off_sends_nothing(self):
         an = self.make()
         an.start()
@@ -752,14 +1232,35 @@ class Trial(unittest.TestCase):
     # -- when things are missing or change -----------------------------------------
 
     def test_a_changed_address_is_called_off_and_the_new_one_announced_at_once(self):
-        an = self.make(on=True)
-        an.step()
+        # From the settled state, where the next announcement would not be due for 200 seconds.
+        an = self.settled()
         self.facts = (CARD, MAC, OTHER, "")
         self.now += 20
         an.step()
         self.assertEqual([dns_servers(frame) for frame, _ in self.sent],
-                         [[(ADDR, 600)]] + [[(OTHER, 0), (ADDR, 0)]] * 3 + [[(OTHER, 600)]])
+                         [[(ADDR, 600)]] * 3 + [[(OTHER, 0), (ADDR, 0)]] * 3 + [[(OTHER, 600)]])
         self.assertEqual(an.status()["address"], OTHER)
+
+    def test_a_changed_address_is_announced_at_once_even_just_after_an_announcement(self):
+        an = self.make(on=True)
+        an.step()
+        self.facts = (CARD, MAC, OTHER, "")
+        self.now += 5
+        an.step()
+        self.assertEqual(dns_servers(self.sent[-1][0]), [(OTHER, 600)])
+
+    def test_a_changed_address_gets_its_first_three_announcements_sixteen_seconds_apart(self):
+        an = self.settled()
+        self.facts = (CARD, MAC, OTHER, "")
+        self.now += 20
+        began, times = self.now, []
+        for _ in range(40):
+            before = self.offers()
+            an.step()
+            if self.offers() > before:
+                times.append(self.now - began)
+            self.now += 1
+        self.assertEqual(times, [0, 16, 32])
 
     def test_every_frame_ever_sent_has_a_correct_check_number_and_router_lifetime_zero(self):
         an = self.make(on=True)
@@ -896,7 +1397,7 @@ class InTheServer(Api):
 
     def test_switching_it_on_through_the_api_starts_the_announcements(self):
         out = self.ok("/api/dns-announce-switch", {"on": True})
-        self.assertEqual((out["ok"], out["on"]), (True, True))
+        self.assertEqual((out["ok"], out["on"], out["state"]), (True, True, "starting"))
         self.an.step()
         self.assertEqual(self.sent, [KNOWN_ANNOUNCEMENT])
         self.assertEqual(self.get("/api/status")[1]["dns_announce"]["state"], "announcing")
@@ -904,7 +1405,8 @@ class InTheServer(Api):
     def test_switching_it_off_through_the_api_sends_the_goodbye(self):
         self.ok("/api/dns-announce-switch", {"on": True})
         self.an.step()
-        self.ok("/api/dns-announce-switch", {"on": False})
+        out = self.ok("/api/dns-announce-switch", {"on": False})
+        self.assertEqual((out["on"], out["state"], out["address"]), (False, "stopping", ""))
         self.an.step()
         self.assertEqual(self.sent, [KNOWN_ANNOUNCEMENT] + [KNOWN_GOODBYE] * 3)
 
@@ -952,6 +1454,136 @@ class InTheServer(Api):
             view = server.ipv6_dns_view()
         self.assertEqual((view["router_dns_not_ours"], view["in_use"], view["routers"]), ([], False, []))
 
+    # -- reasons to hold back (server.announce_hold_reason) ---------------------------
+
+    def router_heard(self, ago=10, servers=("fe80::1",)):
+        """As if a real router announced IPv6 `ago` seconds ago, naming these IPv6 DNS servers."""
+        server.S.ra_heard, server.S.ra_heard_at = time.time() - ago, time.monotonic() - ago
+        server.S.router_v6_dns = {addr: time.time() + 600 for addr in servers}
+
+    def listening_for(self, seconds, can_hear=True):
+        """As if the announcement listener had been running, and able to hear, for this long."""
+        server.S.ra_listening, server.S.v6_can_hear = True, can_hear
+        server.S.ra_since = server.S.v6_hear_since = time.monotonic() - seconds
+
+    def test_the_announcer_is_given_the_servers_reason_to_hold_back(self):
+        self.assertIs(server.make_announcer().hold_reason, server.announce_hold_reason)
+
+    def test_it_may_announce_when_the_router_names_an_ipv6_dns_server_of_its_own(self):
+        self.router_heard(servers=("fe80::1",))
+        self.assertEqual(server.announce_hold_reason(ADDR), "")
+
+    def test_it_holds_back_when_a_router_hands_out_ipv6_but_names_no_ipv6_dns_server(self):
+        # QuietNet's would be an Android phone's only one, and losing it can drop the phone off Wi-Fi.
+        self.router_heard(servers=())
+        self.listening_for(server.ANNOUNCE_AFTER_QUIET * 3)
+        reason = server.announce_hold_reason(ADDR)
+        self.assertIn("Your router hands out IPv6 but names no IPv6 DNS server of its own.", reason)
+        self.assertIn("Android phones could drop off Wi-Fi", reason)
+
+    def test_a_server_whose_time_has_run_out_does_not_count_as_named(self):
+        self.router_heard()
+        server.S.router_v6_dns = {"fe80::1": time.time() - 1}
+        self.assertIn("names no IPv6 DNS server of its own", server.announce_hold_reason(ADDR))
+
+    def test_its_own_announcement_does_not_count_as_another_server(self):
+        self.router_heard(servers=(ADDR,))
+        self.assertIn("names no IPv6 DNS server of its own", server.announce_hold_reason(ADDR))
+
+    def test_this_computers_other_addresses_do_not_count_as_another_server(self):
+        self.router_heard(servers=("fd00::5",))
+        with mock.patch.object(server.S, "v6_own", {"fd00::5", ADDR}):
+            self.assertIn("names no IPv6 DNS server of its own", server.announce_hold_reason(ADDR))
+
+    def test_it_may_announce_when_no_router_has_been_heard_for_the_set_time(self):
+        # No router, so no device has an IPv6 route, and none counts its IPv6 as set up.
+        self.listening_for(server.ANNOUNCE_AFTER_QUIET + 1)
+        self.assertEqual(server.announce_hold_reason(ADDR), "")
+
+    def test_it_holds_back_while_it_has_not_listened_long_enough_to_know(self):
+        self.listening_for(server.ANNOUNCE_AFTER_QUIET - 30)
+        self.assertIn("still listening for your router's IPv6 announcements", server.announce_hold_reason(ADDR))
+
+    def test_the_time_it_listens_is_longer_than_a_router_may_leave_between_announcements(self):
+        self.assertGreater(server.ANNOUNCE_AFTER_QUIET, 1800)
+
+    def test_it_holds_back_when_it_cannot_hear_the_routers_announcements(self):
+        self.assertIn("can't hear your router's IPv6 announcements", server.announce_hold_reason(ADDR))
+        self.listening_for(server.ANNOUNCE_AFTER_QUIET * 3, can_hear=False)
+        self.assertIn("can't hear your router's IPv6 announcements", server.announce_hold_reason(ADDR))
+
+    def test_a_router_heard_within_the_hour_still_counts_however_long_the_listening(self):
+        self.router_heard(ago=server.RA_HOLD_MAX - 60, servers=())
+        self.listening_for(server.RA_HOLD_MAX * 3)
+        self.assertIn("names no IPv6 DNS server of its own", server.announce_hold_reason(ADDR))
+
+    def test_a_router_last_heard_over_an_hour_ago_counts_as_no_router(self):
+        self.router_heard(ago=server.RA_HOLD_MAX + 1, servers=())
+        self.listening_for(server.RA_HOLD_MAX * 3)
+        self.assertEqual(server.announce_hold_reason(ADDR), "")
+
+    def test_a_known_range_extender_holds_the_trial_back(self):
+        # Over IPv6 every device behind one is judged under a single device's rules (issue 95).
+        self.router_heard()
+        self.assertEqual(server.announce_hold_reason(ADDR), "")
+        with mock.patch.object(server.S, "shared_macs", {"aa:bb:cc:00:00:01"}):
+            reason = server.announce_hold_reason(ADDR)
+        self.assertIn("Wi-Fi range extender", reason)
+        self.assertIn("could give one device another's rules", reason)
+
+    def test_the_reason_to_hold_back_is_worked_out_without_the_database(self):
+        self.router_heard()
+        with mock.patch.object(server, "sql", side_effect=AssertionError("asked the database")), \
+                mock.patch.object(server, "db", None):
+            self.assertEqual(server.announce_hold_reason(ADDR), "")
+
+    def wired(self):
+        """An announcer joined to the server's own reason to hold back, with a stand-in card and
+        socket; self.sent collects its frames."""
+        an = announcer.Announcer(lambda: True, on=True, facts=lambda: (CARD, MAC, ADDR, ""), answers=lambda a, c: True,
+                                 open_sender=self.an._open_sender, pause=lambda s: None, unavailable="",
+                                 log=lambda line: None, hold_reason=server.announce_hold_reason)
+        self.addCleanup(an.stop, 2)
+        return an
+
+    def test_with_a_router_that_names_no_dns_server_nothing_is_announced(self):
+        self.router_heard(servers=())
+        an = self.wired()
+        an.step()
+        self.assertFalse(any(lifetime for frame in self.sent for _, lifetime in dns_servers(frame)))
+        self.assertEqual(an.status()["state"], "held")
+        self.assertIn("names no IPv6 DNS server of its own", an.status()["reason"])
+
+    def test_when_the_routers_server_stops_being_named_it_says_goodbye_once_and_not_again(self):
+        self.router_heard()
+        an = self.wired()
+        an.step()
+        server.S.router_v6_dns = {}
+        for _ in range(4):
+            an.step()
+        self.assertEqual(self.sent, [KNOWN_ANNOUNCEMENT] + [KNOWN_GOODBYE] * 3)
+
+    def test_a_range_extender_noticed_while_announcing_calls_the_announcement_off(self):
+        self.router_heard()
+        an = self.wired()
+        an.step()
+        with mock.patch.object(server.S, "shared_macs", {"aa:bb:cc:00:00:01"}):
+            an.step()
+            self.assertEqual(an.status()["state"], "held")
+        self.assertEqual(self.sent, [KNOWN_ANNOUNCEMENT] + [KNOWN_GOODBYE] * 3)
+
+    def test_holding_back_changes_nothing_the_dashboard_says_about_ipv6_and_bypassing(self):
+        # hub_off and the "Can bypass over IPv6" labels never look at the announcer's reasons.
+        self.router_heard(servers=())
+        self.listening_for(server.RA_HOLD_MAX * 3)
+        now, mono = time.time(), time.monotonic()
+        before = server.ipv6_dns_view(now, mono)
+        self.assertNotEqual(server.announce_hold_reason(ADDR), "")
+        self.assertEqual(server.ipv6_dns_view(now, mono), before)
+        for reader in (server.ipv6_dns_view, server.api_devices):
+            self.assertNotIn("announce_hold_reason", inspect.getsource(reader))
+            self.assertNotIn("AN.", inspect.getsource(reader))
+
     def test_a_clean_stop_asks_for_the_goodbye_first_and_waits_for_it_last(self):
         text = inspect.getsource(server.main)
         tidy_up = text[text.index("finally:"):]
@@ -963,6 +1595,102 @@ class InTheServer(Api):
         text = inspect.getsource(server.main)
         self.assertIn("AN = make_announcer()", text)
         self.assertLess(text.index("start_dns(args.dns_port)"), text.index("AN.start()"))
+
+    def test_the_announcer_starts_only_once_the_dashboard_is_open_and_a_stop_request_is_caught(self):
+        # Started any earlier, a start-up that then failed would leave an announcement with no goodbye.
+        text = inspect.getsource(server.main)
+        self.assertEqual(text.count("AN.start()"), 1)
+        started = text.index("AN.start()")
+        self.assertLess(text.index("ThreadingHTTPServer(("), started)
+        self.assertLess(text.index("signal.signal(signal.SIGTERM, _stop_requested)"), started)
+        self.assertLess(text.index("try:"), started)
+        self.assertLess(started, text.index("web.serve_forever()"))
+        self.assertLess(started, text.index("finally:"))
+
+
+class StartingUp(Base):
+    """main() run for real, with everything that touches the network replaced by a stand-in: when
+    the announcer starts, and that a failure after it has started still ends in the goodbye."""
+
+    def setUp(self):
+        super().setUp()
+        self.sent = []
+        test = self
+
+        class Sender:
+            """Notes each frame instead of sending it."""
+
+            def sendto(self, frame, where):
+                test.sent.append(bytes(frame))
+
+            def close(self):
+                pass
+
+        self.an = announcer.Announcer(lambda: True, on=True, facts=lambda: (CARD, MAC, ADDR, ""),
+                                      answers=lambda a, c: True, open_sender=lambda card: Sender(),
+                                      pause=lambda s: None, unavailable="", log=lambda line: None)
+        self.addCleanup(self.an.stop, 2)
+        self.web = mock.Mock()
+        nothing = lambda *a, **kw: None     # noqa: E731
+        stand_ins = [mock.patch.object(server, name, value) for name, value in (
+            ("AN", None), ("ENF", None), ("CA", None),             # main() sets these; put back afterwards
+            ("make_announcer", lambda: self.an), ("start_dns", nothing), ("find_local_ip", lambda: "192.168.1.2"),
+            ("log_writer", nothing), ("router_advert_listener", nothing), ("address_watcher", nothing),
+            ("ThreadingHTTPServer", mock.Mock(return_value=self.web)))]
+        stand_ins += [mock.patch.object(server.enforcer, "Enforcer", mock.Mock()),
+                      mock.patch.object(server.cloud_agent, "CloudAgent", mock.Mock()),
+                      mock.patch.object(server.signal, "signal", nothing),
+                      mock.patch.object(server.S, "local_ip", server.S.local_ip),
+                      mock.patch.object(sys, "argv", ["server.py", "--no-browser", "--no-device-names"])]
+        for p in stand_ins:
+            p.start()
+            self.addCleanup(p.stop)
+
+    def run_main(self):
+        """Run main() with what it prints thrown away."""
+        with contextlib.redirect_stdout(io.StringIO()):
+            server.main()
+
+    def test_a_start_up_that_fails_before_the_dashboard_opens_announces_nothing(self):
+        server.ThreadingHTTPServer.side_effect = OSError("Address already in use")
+        with self.assertRaises(OSError):
+            self.run_main()
+        time.sleep(0.05)
+        self.assertEqual(self.sent, [])
+        self.assertIsNone(self.an._thread)
+
+    def test_a_start_up_that_fails_while_making_the_enforcer_announces_nothing(self):
+        server.enforcer.Enforcer.side_effect = RuntimeError("broken")
+        with self.assertRaises(RuntimeError):
+            self.run_main()
+        time.sleep(0.05)
+        self.assertEqual(self.sent, [])
+        self.assertIsNone(self.an._thread)
+
+    def test_a_stop_request_after_the_announcer_has_started_ends_in_the_goodbye(self):
+        def serve_forever():
+            """Wait for the first announcement, then act as a stop request does."""
+            deadline = time.time() + 5
+            while not self.sent and time.time() < deadline:
+                time.sleep(0.01)
+            raise KeyboardInterrupt
+
+        self.web.serve_forever.side_effect = serve_forever
+        self.run_main()
+        self.assertEqual(self.sent, [KNOWN_ANNOUNCEMENT] + [KNOWN_GOODBYE] * 3)
+
+    def test_a_dashboard_that_breaks_after_the_announcer_has_started_still_ends_in_the_goodbye(self):
+        def serve_forever():
+            """Wait for the first announcement, then fail."""
+            deadline = time.time() + 5
+            while not self.sent and time.time() < deadline:
+                time.sleep(0.01)
+            raise RuntimeError("the dashboard broke")
+
+        self.web.serve_forever.side_effect = serve_forever
+        with self.assertRaises(RuntimeError):
+            self.run_main()
+        self.assertEqual(self.sent, [KNOWN_ANNOUNCEMENT] + [KNOWN_GOODBYE] * 3)
 
 
 class OnTheDashboard(unittest.TestCase):
@@ -979,6 +1707,11 @@ class OnTheDashboard(unittest.TestCase):
         start = self.page.index("function %s(" % name)
         return self.page[start:self.page.index("\nfunction ", start + 1)]
 
+    def words(self, name):
+        """The same, with every run of spaces and line breaks made one space, so a sentence can
+        be looked for wherever its lines happen to break."""
+        return " ".join(self.part(name).split())
+
     def test_it_is_labelled_a_trial_in_its_heading(self):
         self.assertIn('<h2>Announce QuietNet as an IPv6 DNS server <span class="badge warn">Trial</span></h2>',
                       self.part("dnsAnnounceSwitch"))
@@ -987,14 +1720,37 @@ class OnTheDashboard(unittest.TestCase):
         self.assertIn("A trial, off unless you turn it on.", self.part("dnsAnnounceSwitch"))
 
     def test_it_says_plainly_that_it_does_not_stop_devices_getting_round_quietnet(self):
-        text = self.part("dnsAnnounceSwitch")
+        text = self.words("dnsAnnounceSwitch")
         self.assertIn("<b>It does not stop any device getting round QuietNet.</b>", text)
-        self.assertIn('devices marked "Can bypass\n      over IPv6" still can', text)
+        self.assertIn('devices marked "Can bypass over IPv6" still can', text)
+
+    def test_the_switch_says_devices_never_set_up_may_start_using_quietnet_and_get_whole_house_rules(self):
+        # The announcement goes to every device, not only those the owner pointed at QuietNet.
+        text = self.words("dnsAnnounceSwitch")
+        self.assertIn("<b>Devices you never set up to use QuietNet may start using it too.</b>", text)
+        self.assertIn('Their lookups then get your whole-house rules (advert blocking, whole-house blocked services and '
+                      'schedules, and "internet off" for the whole house)', text)
+        self.assertIn("the rules of any group they are in, including the group new devices are put in", text)
+        self.assertIn("and are written to the history", text)
+
+    def test_the_switch_says_what_to_do_if_a_device_that_was_left_out_stops_working(self):
+        self.assertIn("If a device you left out stops working after you turn this on, turn it off.",
+                      self.words("dnsAnnounceSwitch"))
+
+    def test_the_switch_says_that_with_the_routers_ipv6_off_quietnet_is_the_only_ipv6_dns_server(self):
+        self.assertIn("With IPv6 switched off on your router, QuietNet is the only IPv6 DNS server devices are told of",
+                      self.words("dnsAnnounceSwitch"))
+
+    def test_the_switch_says_when_it_holds_back(self):
+        text = self.words("dnsAnnounceSwitch")
+        self.assertIn("while a Wi-Fi range extender is in use", text)
+        self.assertIn("while your router hands out IPv6 without naming an IPv6 DNS server of its own", text)
+        self.assertIn("until it has listened to your router for long enough to know", text)
 
     def test_it_warns_what_happens_if_the_pi_loses_power(self):
-        text = self.part("dnsAnnounceSwitch")
-        self.assertIn("If this computer loses power without warning, devices that chose it may be slow to look names up", text)
-        self.assertIn("${mins} minutes", text)
+        text = self.words("dnsAnnounceSwitch")
+        self.assertIn("If this computer loses power without warning, devices that chose it, including ones you never "
+                      "set up, may be slow to look names up for up to ${mins} minutes.", text)
 
     def test_it_says_how_to_undo_it(self):
         self.assertIn("Turning this off, or stopping QuietNet in the ordinary way, tells devices to stop at once.",
@@ -1031,6 +1787,10 @@ class OnTheDashboard(unittest.TestCase):
     def test_announcing_is_not_described_as_devices_using_it(self):
         self.assertIn("That does not mean they do.", self.part("dnsAnnounceState"))
 
+    def test_a_goodbye_that_could_not_be_sent_yet_is_explained_in_the_pis_words_escaped(self):
+        self.assertIn("if(a.state === 'stopping') return `<p class=\"small\">Telling devices to stop using this computer "
+                      "for IPv6 DNS… ${esc(a.reason || '')}</p>`;", self.part("dnsAnnounceState"))
+
     def test_being_switched_on_but_not_announcing_is_shown_as_a_warning(self):
         self.assertIn('if(a.state === \'held\') return `<div class="notice warn"><b>Switched on, but not announcing.</b>',
                       self.part("dnsAnnounceState"))
@@ -1039,6 +1799,41 @@ class OnTheDashboard(unittest.TestCase):
         for part in (self.part("dnsAnnounceSwitch"), self.part("dnsAnnounceState")):
             self.assertNotIn("style=", part)
             self.assertNotRegex(part, r"#[0-9a-fA-F]{3,6}\b")
+
+
+class WhatTheDocsSay(unittest.TestCase):
+    """The warnings the owner must be able to find in the written guides, not only on the page."""
+
+    @classmethod
+    def setUpClass(cls):
+        issues = read("docs", "KNOWN_ISSUES.md")
+        start = issues.index("### 101. ")
+        cls.issue = " ".join(issues[start:issues.index("\n### ", start + 1)].split())
+        cls.readme = " ".join(read("README.md").split())
+        cls.testing = read("docs", "TESTING.md")
+
+    def test_known_issue_101_says_devices_never_set_up_can_be_brought_in(self):
+        self.assertIn("It can bring in devices that were never set up to use QuietNet.", self.issue)
+        self.assertIn("A blocked answer is final", self.issue)
+
+    def test_known_issue_101_no_longer_calls_the_hub_off_case_harmless(self):
+        self.assertNotIn("not known to cause harm", self.issue)
+        self.assertIn("the only IPv6 DNS server", self.issue)
+
+    def test_known_issue_101_says_why_the_trial_holds_back_for_a_range_extender(self):
+        self.assertIn("range extender", self.issue)
+        self.assertIn("fewer than three looks", self.issue)
+
+    def test_known_issue_101_says_what_losing_the_only_ipv6_dns_server_does_to_an_android_phone(self):
+        self.assertIn("names no IPv6 DNS server", self.issue)
+        self.assertIn("not tried on a phone", self.issue)
+
+    def test_the_readme_says_devices_never_set_up_may_start_using_quietnet(self):
+        self.assertIn("Devices you never set up to use QuietNet may start using it too", self.readme)
+        self.assertIn("whole-house rules", self.readme)
+
+    def test_there_is_a_manual_step_for_a_device_that_was_never_pointed_at_quietnet(self):
+        self.assertRegex(self.testing, r"\n\d+\. \*\*A device that was never pointed at QuietNet\.\*\*")
 
 
 if __name__ == "__main__":

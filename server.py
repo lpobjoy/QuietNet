@@ -6155,10 +6155,73 @@ def ipv6_dns_listening():
     return bool(S.dns_ipv6) and S.dns_port == announcer.DNS_PORT
 
 
+# How long, in seconds, the announcement listener must have been running, and able to hear, with
+# no real router heard, before the trial announcer takes it that the home has no IPv6 router (see
+# announce_hold_reason). A router may leave up to 1800 seconds between its announcements (RFC 4861).
+ANNOUNCE_AFTER_QUIET = 2000
+
+
+def announce_hold_reason(address=""):
+    """A plain-English reason the trial announcer must not announce this computer as an IPv6 DNS
+    server just now, or '' if it may. `address` is the address it is about to name. The announcer
+    asks before every announcement and every 20 seconds between them, and holds back (telling
+    devices to stop, if it was announcing) while there is a reason. Reads memory only: no
+    database, no tools. Two things hold it back, each because announcing could cut off or
+    disturb a device by accident:
+
+    1. A Wi-Fi range extender is known (S.shared_macs). Over IPv6 every device behind one is
+       still matched to a single device's rules (refresh_ipv6_view). Left alone that only touches
+       a device given this computer's IPv6 address by hand; the announcement would invite every
+       device behind the extender to ask over IPv6, and one could then be blocked by another's
+       "internet off" or bedtime.
+
+    2. This computer could be the ONLY IPv6 DNS server devices are told of while they have IPv6
+       from a router. An Android phone counts its IPv6 as set up once it has an address, a route
+       and a DNS server; if this computer supplied the only DNS server, every goodbye (switching
+       the trial off, a clean stop, QuietNet not answering for a moment) would take that away,
+       and Android answers by dropping off Wi-Fi or switching IPv6 off. So it may announce only
+       when one of these is known:
+         - a real router was heard in the last hour (RA_HOLD_MAX, by the steady timer) and an
+           IPv6 DNS server that is not this computer is being named; or
+         - the listener has been running, and able to hear, for ANNOUNCE_AFTER_QUIET seconds
+           without a break and no real router has been heard in the last hour: no device then
+           has an IPv6 route, so none counts its IPv6 as set up.
+       Anything else, including a listener that isn't running and "not yet known" after a
+       restart, holds it back. A DNS server handed out only by DHCPv6 is never heard here, and
+       Android ignores those anyway.
+
+    This is for the announcer alone. It must never feed ipv6_dns_view(), `hub_off` or the "Can
+    bypass over IPv6" labels, and it changes nothing they read."""
+    if S.shared_macs:
+        return ("Some devices here connect through a Wi-Fi range extender, and over IPv6 QuietNet can't yet tell "
+                "them apart, so announcing could give one device another's rules. QuietNet is not announcing itself.")
+    now, mono = time.time(), time.monotonic()
+    with router_dns_lock:
+        named = [a for a, until in S.router_v6_dns.items() if until > now]
+        heard_at = S.ra_heard_at
+    ours = set(S.v6_own) | {address}
+    since, hear_since = S.ra_since, S.v6_hear_since
+    if heard_at is not None and mono - heard_at < RA_HOLD_MAX:
+        if any(a not in ours for a in named):
+            return ""
+        return ("Your router hands out IPv6 but names no IPv6 DNS server of its own. If QuietNet were the only one, "
+                "Android phones could drop off Wi-Fi each time it stopped announcing, so the trial is holding back.")
+    if not (S.ra_listening and since is not None and hear_since is not None and S.v6_can_hear is True):
+        return ("QuietNet can't hear your router's IPv6 announcements on this computer, so it can't tell whether "
+                "announcing itself is safe. It is not announcing itself.")
+    if mono - max(since, hear_since) >= ANNOUNCE_AFTER_QUIET:
+        return ""
+    return ("QuietNet is still listening for your router's IPv6 announcements before it announces itself. That can "
+            "take up to %d minutes after QuietNet starts." % (ANNOUNCE_AFTER_QUIET // 60 + 1))
+
+
 def make_announcer():
     """The trial that announces this computer as an IPv6 DNS server (announcer.py), switched on
-    only if the owner has saved it so ("dns_announce" in the settings table; off otherwise)."""
-    return announcer.Announcer(ipv6_dns_listening, on=get_setting("dns_announce", "0") == "1")
+    only if the owner has saved it so ("dns_announce" in the settings table; off otherwise). It
+    is given the two things it asks the filter: whether lookups are taken over IPv6 on port 53,
+    and whether there is a reason to hold back (announce_hold_reason)."""
+    return announcer.Announcer(ipv6_dns_listening, on=get_setting("dns_announce", "0") == "1",
+                               hold_reason=announce_hold_reason)
 
 
 def hint_refresher():
@@ -7445,8 +7508,7 @@ def main():
     start_dns(args.dns_port)
     threading.Thread(target=router_advert_listener, daemon=True).start()
     global AN
-    AN = make_announcer()               # sends nothing unless the owner switched the trial on
-    AN.start()
+    AN = make_announcer()               # made here so the dashboard can show it; started last of all, below
 
     global ENF
     ENF = enforcer.Enforcer(S.local_ip, enforcement_plan, plan_neighbours, data_dir=DATA,
@@ -7475,6 +7537,10 @@ def main():
         threading.Timer(0.5, webbrowser.open, (url,)).start()
     signal.signal(signal.SIGTERM, _stop_requested)
     try:
+        # The trial announcer starts last: the dashboard (its off switch) is open and a stop request
+        # is caught, so from here the clean-up below always sends its goodbye. A start-up that fails
+        # before this point has announced nothing.
+        AN.start()
         web.serve_forever()
     except KeyboardInterrupt:
         pass
