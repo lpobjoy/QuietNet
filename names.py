@@ -464,6 +464,41 @@ def parse_dhcp(data):
     return {"mac": mac, "name": name, "vendor": vendor}
 
 
+def dhcp_address(data):
+    """Which IPv4 address a device said it is taking, in a DHCP message it sent: (hardware address,
+    address), or None if the message is not a readable one from a device, or does not say.
+
+    Only two kinds of message say it: a 'request' (the device asks to use the address the server
+    offered, or the one it had before: option 50; or, renewing an address it already holds, its
+    own address in the 'client address' field) and an 'inform' (a device that set its address by
+    hand, in the 'client address' field). A 'discover' only says what the device would like, and
+    the server may give it another, so it is not used. The same checks as parse_dhcp: the fixed
+    start, the options read with a limit on how many and every length checked against the packet.
+    An address of all zeros is "none".
+
+    This is what the device itself claims. Anyone on the home network can send it; server.py
+    (note_dhcp) treats it as a hint that the neighbour table then confirms or overrules."""
+    if len(data) < 240 or data[0] != 1 or data[1] != 1 or data[2] != 6 or data[236:240] != b"\x63\x82\x53\x63":
+        return None
+    mac = ":".join("%02x" % b for b in data[28:34])
+    options = {}
+    read_dhcp_options(data, 240, len(data), options)
+    overload = options.get(52, b"")[:1]
+    if overload in (b"\x01", b"\x03"):
+        read_dhcp_options(data, 108, 236, options)          # the 'file' field
+    if overload in (b"\x02", b"\x03"):
+        read_dhcp_options(data, 44, 108, options)           # the 'server name' field
+    kind = options.get(53, b"")[:1]
+    wanted = options.get(50, b"")
+    if kind == b"\x03" and len(wanted) == 4 and wanted != bytes(4):
+        address = wanted
+    elif kind in (b"\x03", b"\x08") and bytes(data[12:16]) != bytes(4):
+        address = bytes(data[12:16])
+    else:
+        return None
+    return mac, socket.inet_ntoa(address)
+
+
 # ------------------------------------------------------------------ UPnP (SSDP)
 
 def parse_ssdp(data):
@@ -682,11 +717,15 @@ class Namer:
     The network is reached only through make_socket and connect, which the tests replace."""
 
     def __init__(self, reverse=None, make_socket=socket.socket, connect=socket.create_connection,
-                 domain_file="/etc/resolv.conf", packet_capture=None):
+                 domain_file="/etc/resolv.conf", packet_capture=None, on_address=None):
         """`reverse` is the reverse-lookup function (ip -> name or ''), supplied by server.py.
         `packet_capture` says whether the DHCP listener reads packets without holding port 67
-        (see open_dhcp_listener); by default it does wherever the system offers it (Linux)."""
+        (see open_dhcp_listener); by default it does wherever the system offers it (Linux).
+        `on_address(hardware address, address)` is called, if given, whenever a device is heard
+        saying which IPv4 address it is taking (see dhcp_address); server.py uses it to know at
+        once when an address changes hands."""
         self.reverse = reverse
+        self.on_address = on_address
         self.packet_capture = hasattr(socket, "AF_PACKET") if packet_capture is None else packet_capture
         self.make_socket = make_socket
         self.connect = connect
@@ -1068,8 +1107,13 @@ class Namer:
                 remember(self.heard_mdns, source, {"when": time.monotonic(), "mac": mac, "said": said})
 
     def hear_dhcp(self, data, source):
-        """Keep what one DHCP request says, by the hardware address of the device that sent it."""
+        """Keep what one DHCP request says, by the hardware address of the device that sent it,
+        and pass on which address the device said it is taking (on_address), if it said."""
         said = parse_dhcp(data)
         if said:
             with self.lock:
                 remember(self.heard_dhcp, said["mac"], {"name": said["name"], "vendor": said["vendor"]})
+        if self.on_address is not None:
+            taking = dhcp_address(data)
+            if taking:
+                self.on_address(*taking)

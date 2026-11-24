@@ -353,7 +353,8 @@ class Groups(Api):
         self.ok("/api/device-group", {"ip": KID, "group": gid})
         self.ok("/api/group", {"id": gid, "name": "Children"})
         _, groups = self.get("/api/groups")
-        self.assertEqual(groups, [{"id": gid, "name": "Children", "off": False, "members": [KID], "services": 0}])
+        self.assertEqual(groups, [{"id": gid, "name": "Children", "off": False, "members": [KID],
+                                   "devices": [self.device(KID)], "services": 0}])
 
     def test_a_group_needs_a_name(self):
         status, out = self.post("/api/group", {"name": "   "})
@@ -369,7 +370,7 @@ class Groups(Api):
         tvs = self.ok("/api/group", {"name": "TVs"})["id"]
         self.ok("/api/device-group", {"ip": KID, "group": kids})
         self.ok("/api/device-group", {"ip": KID, "group": tvs})
-        self.assertEqual(server.S.dev_group, {KID: tvs})
+        self.assertEqual(server.S.dev_group, {self.device(KID): tvs})
 
     def test_choosing_no_group_takes_the_device_out(self):
         gid = self.ok("/api/group", {"name": "Kids"})["id"]
@@ -520,7 +521,7 @@ class Devices(Api):
 
     def test_a_device_with_cut_live_connections_is_still_marked_as_able_to_bypass_over_ipv6(self):
         self.log(KID, "www.bbc.co.uk")
-        server.S.enforced = {KID}
+        server.set_live_cut(self.device(KID), True)
         server.S.v6_prefixes = [server.ipaddress.IPv6Network("2001:db8:1:2::/64")]
         d = self.get("/api/devices")[1][0]
         self.assertEqual((d["enforced"], d["v6_bypass"]), (True, True))
@@ -963,12 +964,24 @@ class Scanning(Api):
 class EnforceAndCloud(Api):
     def test_cut_live_connections_is_remembered_per_device(self):
         self.ok("/api/enforce", {"ip": KID, "on": True})
-        self.assertEqual(server.S.enforced, {KID})
+        kid = self.device(KID)
+        self.assertEqual(server.S.enforced, {kid})
         server.S.enforced = set()
         server.init_db()
-        self.assertEqual(server.S.enforced, {KID})                      # survives a restart
+        self.assertEqual(server.S.enforced, {kid})                      # survives a restart
         self.ok("/api/enforce", {"ip": KID, "on": False})
         self.assertEqual(server.S.enforced, set())
+
+    def test_cut_live_connections_can_be_switched_by_the_devices_number(self):
+        kid = self.device(KID)
+        self.ok("/api/enforce", {"device": kid, "on": True})
+        self.assertEqual(server.S.enforced, {kid})
+        self.ok("/api/enforce", {"device": kid, "on": False})
+        self.assertEqual(server.S.enforced, set())
+
+    def test_switching_cut_live_connections_off_for_an_address_nothing_is_known_at_makes_no_device(self):
+        self.ok("/api/enforce", {"ip": KID, "on": False})
+        self.assertEqual((server.S.enforced, server.S.addr_only), (set(), {}))
 
     def test_only_a_plain_ipv4_address_can_be_enforced(self):
         # This value ends up inside a firewall rule, so nothing else may get through.
@@ -998,17 +1011,24 @@ class EnforceAndCloud(Api):
         server.sql("INSERT INTO seen(ip,mac,host,ts) VALUES(?,?,?,?)", (KID, "aa:aa:aa:aa:aa:01", "", 0), commit=True)
         self.neighbours_now = {KID: "bb:bb:bb:bb:bb:02"}                 # the old scan is out of date
         self.ok("/api/enforce", {"ip": KID, "on": True})
-        self.assertEqual(server.S.enforced_mac[KID], "bb:bb:bb:bb:bb:02")
+        kid = self.device(KID)                                           # known only by its address so far
+        self.assertEqual(server.S.enforced_mac[kid], "bb:bb:bb:bb:bb:02")
         server.init_db()
-        self.assertEqual(server.S.enforced_mac[KID], "bb:bb:bb:bb:bb:02")    # kept across a restart
+        self.assertEqual(server.S.enforced_mac[kid], "bb:bb:bb:bb:bb:02")    # kept across a restart
 
     def test_an_unknown_hardware_address_is_filled_in_when_first_seen(self):
         self.ok("/api/enforce", {"ip": KID, "on": True})
-        self.assertEqual(server.S.enforced_mac[KID], "")
-        server.learn_enforced_mac(KID, "cc:cc:cc:cc:cc:03")
-        server.learn_enforced_mac(KID, "dd:dd:dd:dd:dd:04")                 # only the first is kept
+        kid = self.device(KID)
+        self.assertEqual(server.S.enforced_mac[kid], "")
+        extender = "cc:cc:cc:cc:cc:02"                                   # a range extender answers at that number
+        with mock.patch.object(server.S, "shared_macs", {extender}):
+            server.note_ipv4_addresses({KID: (extender, "fresh")})
+            with server.db_lock:
+                self.assertEqual(server.live_cut_devices({KID: (extender, "fresh")}), {KID: (extender, kid)})
+                # A different hardware address there later is not steered, and only the first is kept.
+                self.assertEqual(server.live_cut_devices({KID: ("dd:dd:dd:dd:dd:04", "fresh")}), {})
         server.init_db()
-        self.assertEqual(server.S.enforced_mac[KID], "cc:cc:cc:cc:cc:03")
+        self.assertEqual(server.S.enforced_mac[kid], extender)
 
     def test_remote_access_reports_off_when_the_link_is_not_running(self):
         real = server.CA

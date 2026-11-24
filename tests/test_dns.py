@@ -376,9 +376,12 @@ class Helpers(Base):
 
     def test_which_rule_sets_apply_to_a_device(self):
         self.assertEqual(server.scopes_for(None), ["all"])
-        self.assertEqual(server.scopes_for(KID), ["all", "device:" + KID])
-        server.S.dev_group = {KID: 3}
-        self.assertEqual(server.scopes_for(KID), ["all", "device:" + KID, "group:3"])
+        self.assertEqual(server.scopes_for(KID), ["all"])                 # an address no device is known for
+        kid = self.device(KID)
+        self.assertEqual(server.scopes_for(kid), ["all", "dev:%d" % kid])
+        self.assertEqual(server.scopes_for(KID), ["all", "dev:%d" % kid])  # its address stands for the device
+        server.S.dev_group = {kid: 3}
+        self.assertEqual(server.scopes_for(kid), ["all", "dev:%d" % kid, "group:3"])
 
     def test_scope_names_in_plain_words(self):
         server.S.group_names = {3: "Kids"}
@@ -393,9 +396,10 @@ class Helpers(Base):
             self.assertIsNone(server.CLOCK.fullmatch(bad), bad)
 
     def test_scope_format_is_strict(self):
-        for good in ("all", "device:192.168.1.23", "device:fe80::1", "group:12"):
+        for good in ("all", "device:192.168.1.23", "device:fe80::1", "group:12", "dev:7"):
             self.assertTrue(server.SCOPE.fullmatch(good), good)
-        for bad in ("", "ALL", "group:", "group:x", "device:", "device:192.168.1.23; drop", "all\n"):
+        for bad in ("", "ALL", "group:", "group:x", "device:", "device:192.168.1.23; drop", "all\n", "dev:", "dev:x",
+                    "dev:-1", "dev:1 or 1"):
             self.assertIsNone(server.SCOPE.fullmatch(bad), bad)
 
 
@@ -484,11 +488,11 @@ class OtherDnsServices(Base):
 
     def test_a_dns_service_is_blocked_for_a_device_in_a_group(self):
         server.S.group_names[7] = "Kids"
-        server.S.dev_group[ADULT] = 7
+        server.set_device_group(self.device(ADULT), 7)
         self.assertEqual(self.ask("dns.google", client=ADULT)[-4:], bytes(4))
 
     def test_a_dns_service_is_blocked_for_a_device_with_live_cut_on(self):
-        server.S.enforced.add(ADULT)
+        server.set_live_cut(self.device(ADULT), True)
         self.assertEqual(self.ask("dns.google", client=ADULT)[-4:], bytes(4))
 
     def test_a_dns_service_is_blocked_for_a_device_with_its_own_schedule(self):
@@ -526,7 +530,7 @@ class OtherDnsServices(Base):
 
     def test_a_dns_service_lookup_is_remembered_against_the_device(self):
         self.ask("doh.opendns.com")
-        self.assertGreater(server.S.other_dns.get(KID, 0), time.time() - 60)
+        self.assertGreater(server.other_dns_since(KID, time.time() - 60), 0)
 
     def test_ordinary_google_names_are_not_affected(self):
         self.assertEqual(self.ask("www.google.com")[-4:], bytes([93, 184, 216, 34]))
@@ -674,8 +678,7 @@ class RememberedAnswers(Base):
 
     def test_a_device_whose_rules_block_a_name_is_not_given_the_remembered_answer(self):
         self.ask("www.disneyplus.com", client=ADULT)
-        server.S.svc_blocks["device:" + KID] = {"disneyplus"}       # in memory only, so nothing is forgotten
-        self.addCleanup(server.S.svc_blocks.pop, "device:" + KID, None)
+        server.set_service_block("device:" + KID, "disneyplus", True)
         self.assertEqual(self.ask("www.disneyplus.com", client=KID)[-4:], bytes(4))
 
     def test_a_failure_from_the_internet_is_not_remembered(self):
@@ -832,11 +835,11 @@ class LookupsOverIPv6(Base):
 
     def test_a_device_switched_off_by_its_ipv4_address_gets_the_blocked_answer_from_its_matched_ipv6_address(self):
         server.set_internet_off("device:" + KID, True)
-        server.S.v6_devices = {self.PHONE_V6: KID}
+        self.match_ipv6(self.PHONE_V6, KID)
         self.assertEqual(self.answer(self.PHONE_V6)[-4:], bytes(4))
 
     def test_a_matched_ipv6_lookup_is_filed_under_the_devices_ipv4_address(self):
-        server.S.v6_devices = {self.PHONE_V6: KID}
+        self.match_ipv6(self.PHONE_V6, KID)
         self.answer(self.PHONE_V6)
         self.assertEqual(drain_log()[0][1], KID)
 
@@ -1123,20 +1126,16 @@ class UnmatchedIPv6WhileADeviceIsTreatedDifferently(Base):
         self.assertFalse(self.refused())
 
     def test_a_device_with_only_cut_live_connections_makes_unmatched_ipv6_lookups_refused(self):
-        server.S.enforced = {KID}
+        server.set_live_cut(self.device(KID), True)
         self.assertTrue(self.refused())
 
     def test_an_unmatched_ipv6_lookup_gets_no_ipv6_addresses_back_while_a_device_has_cut_live_connections(self):
-        server.S.enforced = {KID}
+        server.set_live_cut(self.device(KID), True)
         self.assertTrue(self.refused(qtype=28))
 
     def test_a_member_of_a_group_with_no_rules_makes_unmatched_ipv6_lookups_refused(self):
         with mock.patch.object(server.S, "dev_group", {KID: 7}):
             self.assertEqual(server.S.svc_blocks, {})
-            self.assertTrue(self.refused())
-
-    def test_a_new_device_held_in_the_new_device_group_makes_unmatched_ipv6_lookups_refused(self):
-        with mock.patch.object(server.S, "guest_group", {KID: ("aa:bb:cc:dd:ee:09", 7)}):
             self.assertTrue(self.refused())
 
     def test_an_unmatched_lookup_for_another_dns_service_is_refused_while_a_device_is_in_a_rule_less_group(self):
@@ -1166,7 +1165,7 @@ class QuickLookForNewIPv6Addresses(Base):
         def wait_for(done, timeout):
             """Pretend the look happened while the lookup waited."""
             if matched:
-                server.S.v6_devices = {self.PHONE_V6: matched}
+                self.match_ipv6(self.PHONE_V6, matched)
             return True
         waited.wait_for.side_effect = wait_for
         return waited
@@ -1177,8 +1176,8 @@ class QuickLookForNewIPv6Addresses(Base):
         self.assertTrue(server.v6_wanted.is_set())
 
     def test_a_lookup_from_a_matched_ipv6_address_asks_for_nothing(self):
-        server.S.v6_devices = {self.PHONE_V6: KID}
-        self.assertEqual(server.matched_ipv6_device(self.PHONE_V6), KID)
+        phone = self.match_ipv6(self.PHONE_V6, KID)
+        self.assertEqual(server.matched_ipv6_device(self.PHONE_V6), phone)
         self.assertFalse(server.v6_wanted.is_set())
 
     def test_nothing_is_asked_for_while_the_watcher_is_not_running(self):
@@ -1245,7 +1244,7 @@ class QuickLookForNewIPv6Addresses(Base):
         server.S.v6_looking = True
         self.addCleanup(setattr, server.S, "v6_looking", False)
         with mock.patch.object(server, "v6_looked", self.looked(matched=KID)):
-            self.assertEqual(server.matched_ipv6_device(self.PHONE_V6), KID)
+            self.assertEqual(server.matched_ipv6_device(self.PHONE_V6), self.device(KID))
 
     def test_a_lookup_whose_address_has_used_up_its_asks_is_not_held_up_when_no_look_is_coming(self):
         self.ask_after_each_look(self.PHONE_V6, server.V6_ASKS_PER_ADDRESS)
@@ -1366,12 +1365,12 @@ class QuickLookForNewIPv6Addresses(Base):
     def test_a_waiting_lookup_wakes_as_soon_as_the_real_look_finishes(self):
         def look():
             """The watcher's look: match the phone, as the neighbour table now would."""
-            server.S.v6_devices = {self.PHONE_V6: KID}
+            self.match_ipv6(self.PHONE_V6, KID)
         with mock.patch.object(server, "refresh_ipv6_view", side_effect=look), \
-                mock.patch.object(server, "V6_ANSWER_WAIT", 5):
+                mock.patch.object(server, "note_ipv6_addresses"), mock.patch.object(server, "V6_ANSWER_WAIT", 5):
             threading.Timer(0.05, server.ipv6_look).start()
             started = time.monotonic()
-            self.assertEqual(server.matched_ipv6_device(self.PHONE_V6), KID)
+            self.assertEqual(server.matched_ipv6_device(self.PHONE_V6), self.device(KID))
         self.assertLess(time.monotonic() - started, 3)
 
     def test_decision_is_never_asked_to_wait_for_a_look(self):
@@ -1756,7 +1755,6 @@ class NoIPv6ForLiveCutDevices(Base):
 
     def setUp(self):
         super().setUp()
-        server.S.paused_ips = set()
         with server.answer_cache_lock:
             server.answer_cache.clear()
         self.asked = []
@@ -1780,39 +1778,42 @@ class NoIPv6ForLiveCutDevices(Base):
         return resp[3] & 0x0F == 0 and resp[6:8] == b"\x00\x00"
 
     def test_an_ipv6_address_lookup_from_a_live_cut_device_gets_no_records(self):
-        server.S.enforced = {KID}
+        server.set_live_cut(self.device(KID), True)
         resp = self.ask(KID)
         self.assertTrue(self.is_empty(resp))
         self.assertEqual(self.asked, [])
 
     def test_an_https_lookup_from_a_live_cut_device_gets_no_records(self):
-        server.S.enforced = {KID}
+        server.set_live_cut(self.device(KID), True)
         self.assertTrue(self.is_empty(self.ask(KID, qtype=65)))
         self.assertTrue(self.is_empty(self.ask(KID, qtype=64)))
 
     def test_an_ipv4_address_lookup_from_a_live_cut_device_is_answered_as_normal(self):
-        server.S.enforced = {KID}
+        server.set_live_cut(self.device(KID), True)
         resp = self.ask(KID, qtype=1)
         self.assertEqual(resp[-4:], bytes([93, 184, 216, 34]))
         self.assertEqual(len(self.asked), 1)
 
     def test_a_device_without_live_cut_still_gets_its_ipv6_address(self):
-        server.S.enforced = {KID}
+        server.set_live_cut(self.device(KID), True)
         resp = self.ask(ADULT)
         self.assertIn(self.V6, resp)
 
-    def test_a_device_whose_rules_are_paused_still_gets_its_ipv6_address(self):
-        server.S.enforced, server.S.paused_ips = {KID}, {KID}
+    def test_a_different_device_now_at_a_live_cut_devices_address_still_gets_its_ipv6_address(self):
+        phone = self.live_cut(KID, "aa:bb:cc:00:00:23")
+        self.assertTrue(self.is_empty(self.ask(KID)))
+        server.note_ipv4_addresses({KID: ("00:11:22:00:00:99", "fresh")})     # another device is given the number
+        self.assertNotEqual(server.S.addr_rules[KID], phone)
         self.assertIn(self.V6, self.ask(KID))
 
     def test_a_live_cut_devices_empty_answer_is_not_remembered_for_other_devices(self):
-        server.S.enforced = {KID}
+        server.set_live_cut(self.device(KID), True)
         self.ask(KID)
         self.assertIn(self.V6, self.ask(ADULT))
         self.assertEqual(len(self.asked), 1)
 
     def test_a_remembered_ipv6_answer_is_not_given_to_a_live_cut_device(self):
-        server.S.enforced = {KID}
+        server.set_live_cut(self.device(KID), True)
         self.assertIn(self.V6, self.ask(ADULT))
         self.assertTrue(self.is_empty(self.ask(KID)))
 

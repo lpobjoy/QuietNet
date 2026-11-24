@@ -873,8 +873,7 @@ class DeviceList(Api):
         server.sql("INSERT INTO seen(ip, mac, host, ts) VALUES(?,?,?,?)", (OLD_SPOT, TV, "", self.now - 600), commit=True)
         self.look({NEW_SPOT: fresh(TV), OLD_SPOT: fresh(PHONE)})
         self.lookup(OLD_SPOT)
-        with mock.patch.object(server.S, "device_warnings", {OLD_SPOT: "A different device has this number now."}), \
-                mock.patch.object(server.S, "dev_mac", {OLD_SPOT: TV}):
+        with mock.patch.object(server.S, "device_warnings", {server.S.hw_device[TV]: "Its hardware address is at two numbers."}):
             listed = self.devices(everything=True)
         self.assertEqual(sorted(d["ip"] for d in listed), [OLD_SPOT, NEW_SPOT])
 
@@ -917,81 +916,87 @@ class DeviceList(Api):
         d = self.devices()[0]
         self.assertEqual((d["name"], d["off"]), ("Living room TV", True))
 
-    def test_an_old_address_that_still_carries_rules_keeps_an_entry_of_its_own(self):
+    def test_a_rule_given_by_a_devices_old_address_reaches_the_device_and_adds_no_entry(self):
         tv = self.tv_moves()
-        server.set_service_block("device:" + OLD_SPOT, "youtube", True)
-        listed = {d["ip"]: d for d in self.devices()}
-        self.assertEqual((listed[OLD_SPOT]["id"], listed[OLD_SPOT]["kind"]), (None, "addr"))
-        self.assertEqual(listed[NEW_SPOT]["id"], tv)
+        server.set_service_block("device:" + OLD_SPOT, "youtube", True)       # the TV was the last device seen there
+        listed = self.devices(everything=True)
+        self.assertEqual([(d["id"], d["ip"]) for d in listed], [(tv, NEW_SPOT)])
+        self.assertEqual(server.S.svc_blocks, {"dev:%d" % tv: {"youtube"}})
 
-    def old_address_alone(self):
-        """The entry for the TV's old address after it moved, with the TV itself still listed at
-        its new one and no owner recorded for the old address."""
-        self.assertEqual(server.S.dev_mac, {})
-        listed = self.devices()
-        self.assertEqual(sorted(d["ip"] for d in listed), [OLD_SPOT, NEW_SPOT])
-        by_address = {d["ip"]: d for d in listed}
-        self.assertEqual(by_address[NEW_SPOT]["id"], server.S.hw_device[TV])
-        self.assertEqual((by_address[OLD_SPOT]["id"], by_address[OLD_SPOT]["kind"]), (None, "addr"))
-        return by_address[OLD_SPOT]
+    def left_and_replaced(self):
+        """The TV leaves and a phone is given its number, so the TV has no address of its own.
+        Returns the TV's number."""
+        tv, _ = self.address_changes_hands()
+        self.assertEqual([d["id"] for d in self.devices()], [server.S.hw_device[PHONE]])
+        return tv
 
-    def test_an_address_with_internet_off_and_no_recorded_owner_keeps_an_entry_of_its_own(self):
-        self.tv_moves()
-        server.set_internet_off("device:" + OLD_SPOT, True)
-        self.assertTrue(self.old_address_alone()["off"])
+    def entry_of(self, number):
+        """The entry of one device in the full list (GET /api/devices?all=1)."""
+        return [d for d in self.devices(everything=True) if d["id"] == number][0]
 
-    def test_an_address_with_only_a_name_and_no_recorded_owner_keeps_an_entry_of_its_own(self):
-        self.tv_moves()
-        self.ok("/api/device-name", {"ip": OLD_SPOT, "name": "Old telly"})
-        self.assertEqual(self.old_address_alone()["name"], "Old telly")
+    def test_a_device_that_left_keeps_its_internet_switch_and_is_still_listed(self):
+        tv = self.left_and_replaced()
+        server.set_internet_off("dev:%d" % tv, True)
+        self.assertEqual((self.entry_of(tv)["ip"], self.entry_of(tv)["off"]), ("", True))
 
-    def test_an_address_with_only_a_group_and_no_recorded_owner_keeps_an_entry_of_its_own(self):
-        self.tv_moves()
+    def test_a_device_that_left_keeps_its_name_and_is_still_listed(self):
+        tv = self.left_and_replaced()
+        self.ok("/api/device-name", {"device": tv, "name": "Old telly"})
+        self.assertEqual(self.entry_of(tv)["name"], "Old telly")
+
+    def test_a_device_that_left_keeps_its_group_and_is_still_listed(self):
+        tv = self.left_and_replaced()
         gid = self.ok("/api/group", {"name": "Kids"})["id"]
-        self.ok("/api/device-group", {"ip": OLD_SPOT, "group": gid})
-        self.assertEqual(self.old_address_alone()["group"], gid)
+        self.ok("/api/device-group", {"device": tv, "group": gid})
+        self.assertEqual(self.entry_of(tv)["group"], gid)
 
-    def test_an_address_with_only_a_schedule_and_no_recorded_owner_keeps_an_entry_of_its_own(self):
-        self.tv_moves()
-        self.schedule(scope="device:" + OLD_SPOT)
-        self.old_address_alone()
+    def test_a_device_with_only_a_schedule_and_no_history_is_listed(self):
+        tv = self.left_and_replaced()
+        server.sql("DELETE FROM queries", commit=True)
+        self.schedule(scope="dev:%d" % tv)
+        self.assertEqual(self.entry_of(tv)["id"], tv)
 
-    def test_an_address_with_only_cut_live_connections_and_no_recorded_owner_keeps_an_entry_of_its_own(self):
-        self.tv_moves()
-        with mock.patch.object(server.S, "enforced", {OLD_SPOT}):
-            self.assertTrue(self.old_address_alone()["enforced"])
+    def test_a_device_that_left_keeps_cut_live_connections_and_is_still_listed(self):
+        tv = self.left_and_replaced()
+        self.ok("/api/enforce", {"device": tv, "on": True})
+        self.assertTrue(self.entry_of(tv)["enforced"])
 
-    def test_a_rule_set_while_a_device_was_away_is_still_listed_when_it_returns_elsewhere(self):
+    def test_the_device_now_at_a_number_does_not_get_the_rules_of_the_device_that_left(self):
+        tv = self.left_and_replaced()
+        server.set_internet_off("dev:%d" % tv, True)
+        phone = [d for d in self.devices() if d["ip"] == OLD_SPOT][0]
+        self.assertEqual((phone["id"], phone["off"]), (server.S.hw_device[PHONE], False))
+
+    def test_a_rule_set_while_a_device_was_away_goes_with_it_when_it_returns_elsewhere(self):
         self.look({OLD_SPOT: fresh(PHONE)}, ago=600)
         self.lookup(OLD_SPOT)
         self.look({})                                         # the phone leaves; its card stays, under its last address
         self.assertEqual([d["ip"] for d in self.devices()], [OLD_SPOT])
         self.ok("/api/internet", {"scope": "device:" + OLD_SPOT, "off": True})
         self.ok("/api/device-name", {"ip": OLD_SPOT, "name": "Sam's phone"})
-        self.assertEqual(server.S.dev_mac, {})                # no owner is recorded for a device that is away
         self.look({NEW_SPOT: fresh(PHONE)})                   # and it comes back at another address
         listed = self.devices()
-        self.assertEqual(sorted(d["ip"] for d in listed), [OLD_SPOT, NEW_SPOT])
-        by_address = {d["ip"]: d for d in listed}
-        old = by_address[OLD_SPOT]
-        self.assertEqual((old["id"], old["kind"], old["off"], old["name"]), (None, "addr", True, "Sam's phone"))
-        self.assertEqual((by_address[NEW_SPOT]["id"], by_address[NEW_SPOT]["off"]), (server.S.hw_device[PHONE], False))
+        self.assertEqual([(d["ip"], d["id"], d["off"], d["name"]) for d in listed],
+                         [(NEW_SPOT, server.S.hw_device[PHONE], True, "Sam's phone")])
 
-    def test_an_address_whose_name_was_cleared_is_not_listed_on_its_own(self):
-        self.tv_moves()
-        self.ok("/api/device-name", {"ip": OLD_SPOT, "name": "Old telly"})
-        self.ok("/api/device-name", {"ip": OLD_SPOT, "name": ""})
-        self.assertEqual(server.sql("SELECT ip, name FROM devices"), [(OLD_SPOT, "")])     # the empty row is still there
-        self.assertEqual([d["ip"] for d in self.devices(everything=True)], [NEW_SPOT])
+    def test_a_device_whose_name_was_cleared_is_not_listed_for_that_alone(self):
+        tv = self.left_and_replaced()
+        server.sql("DELETE FROM queries", commit=True)
+        self.ok("/api/device-name", {"device": tv, "name": "Old telly"})
+        self.assertIn(tv, [d["id"] for d in self.devices(everything=True)])
+        self.ok("/api/device-name", {"device": tv, "name": ""})
+        self.assertNotIn(tv, [d["id"] for d in self.devices(everything=True)])
 
-    def test_an_address_with_a_name_and_no_history_at_all_is_listed(self):
+    def test_naming_an_address_no_device_is_known_for_makes_it_a_device_known_by_that_address(self):
         self.ok("/api/device-name", {"ip": OTHER, "name": "Spare tablet"})
-        self.assertEqual([(d["ip"], d["id"], d["name"]) for d in self.devices()], [(OTHER, None, "Spare tablet")])
+        self.assertEqual([(d["ip"], d["kind"], d["name"]) for d in self.devices()], [(OTHER, "addr", "Spare tablet")])
+        self.assertEqual(self.devices()[0]["id"], server.S.addr_only[OTHER])
 
-    def test_an_address_whose_rules_follow_a_device_is_listed_even_with_no_history(self):
-        server.S.dev_mac = {OTHER: LAPTOP}
-        d = self.devices()[0]
-        self.assertEqual((d["ip"], d["mac"], d["id"]), (OTHER, LAPTOP, None))
+    def test_a_request_that_names_a_card_by_its_address_reaches_the_device_that_card_shows(self):
+        self.address_changes_hands()
+        self.ok("/api/device-name", {"ip": OLD_SPOT, "name": "Sam's phone"})
+        self.assertEqual(server.S.given, {server.S.hw_device[PHONE]: "Sam's phone"})
+
 
     def test_lookups_waiting_to_be_filed_count_for_the_device_that_has_the_address_now(self):
         self.look({OLD_SPOT: fresh(TV)})
@@ -1208,7 +1213,8 @@ class DeviceList(Api):
         self.assertTrue(finished)
 
     def test_the_status_says_the_device_tables_are_ready(self):
-        self.assertEqual(self.get("/api/status")[1]["devices"], {"state": "ready", "notice": "", "filling": False})
+        self.assertEqual(self.get("/api/status")[1]["devices"],
+                         {"state": "ready", "notice": "", "filling": False, "report": [], "conflicts": [], "old_rules": 0})
 
 
 class TheDashboardPage(unittest.TestCase):
@@ -1239,11 +1245,57 @@ class TheDashboardPage(unittest.TestCase):
         self.assertIn("${devicesNotice()}", home)
 
     def test_the_note_about_the_move_is_escaped(self):
-        self.assertIn("${esc(note)}", self.notice)
-        self.assertNotIn("${note}", self.notice)
+        self.assertIn("${esc(dv.notice)}", self.notice)
+        self.assertNotIn("${dv.notice}", self.notice)
+        self.assertNotIn("${dv.old_rules}", self.notice)
+        self.assertNotIn("${c.", self.notice)
+        self.assertNotIn("${line}", self.notice)
+
+    def test_rules_left_for_the_owner_to_decide_are_shown_with_the_three_choices(self):
+        self.assertIn("(dv.conflicts || []).map(c =>", self.notice)
+        self.assertIn("${esc(c.text)}", self.notice)
+        for choice, label in (("give", "Give them to the device"), ("remove", "Remove them"),
+                              ("keep", "Leave them with the number")):
+            self.assertIn("choose(c, '%s', '%s'" % (choice, label), self.notice)
+        self.assertIn('data-act="conflict" data-id="${esc(c.id)}" data-choice="${choice}"', self.notice)
+        self.assertIn("api('/api/rule-conflict', {id:+d.id, choice:d.choice})", self.page)
+
+    def test_rules_left_for_the_owner_say_what_applies_until_a_choice_is_made(self):
+        self.assertIn("Until you choose, they stay with that number and apply to whichever device has it.", self.notice)
+
+    def test_rules_an_older_version_left_behind_are_offered_not_brought_in_unasked(self):
+        self.assertIn("dv.old_rules ?", self.notice)
+        self.assertIn("${num(dv.old_rules)}", self.notice)
+        self.assertIn('<button class="btn" data-act="oldrules">Bring them in</button>', self.notice)
+        self.assertIn("api('/api/move-old-rules', {})", self.page)
+
+    def test_the_report_of_the_move_is_on_the_home_page_and_escaped(self):
+        home = self.page[self.page.index("function viewHome(){"):self.page.index("// The household setting \"Stop every device")]
+        self.assertIn("${moveReport()}", home)
+        self.assertIn("${esc(line)}", self.notice)
+        self.assertIn("if(!lines.length) return '';", self.notice)
+
+    def test_the_page_names_a_device_by_its_number_as_well_as_its_address_when_it_changes_it(self):
+        self.assertIn("const who = ip => { const id = deviceId(ip); return id ? {ip, device:id} : {ip}; };", self.page)
+        for call in ("api('/api/device-name', Object.assign(who(ip), {name}))",
+                     "api('/api/device-group', Object.assign(who(S.device), {group:",
+                     "api('/api/enforce', Object.assign(who(S.device), {on:e.target.checked}))"):
+            self.assertIn(call, self.page)
+
+    def test_the_page_keeps_a_devices_rules_under_its_number_when_it_has_one(self):
+        self.assertIn("return id ? 'dev:' + id : 'device:' + ip;", self.page)
+        self.assertIn("${controls(scopeOf(S.device), 'this device')}", self.page)
+        self.assertIn("jobs.push(ctl(scopeOf(S.device)))", self.page)
+
+    def test_the_page_matches_a_schedule_to_a_device_by_its_number(self):
+        self.assertIn("x.scope === scope || (x.device != null && scope === 'dev:' + x.device)", self.page)
+        self.assertIn("S.schedules.filter(x => forScope(x, scope))", self.page)
+        self.assertIn("if(x.device != null) S.edit.scope = 'dev:' + x.device;", self.page)
 
     def test_the_note_about_the_move_copes_with_a_pi_that_sends_none(self):
-        self.assertIn("((S.status || {}).devices || {}).notice", self.notice)
+        self.assertIn("const dv = (S.status || {}).devices || {};", self.notice)
+        self.assertIn("(dv.conflicts || [])", self.notice)
+        self.assertIn("((S.status || {}).devices || {}).report || []", self.notice)
 
 
 OLD_TABLES = """
@@ -1388,12 +1440,13 @@ class BeforeTheMove(OlderHousehold):
         server.forget_old_devices()
         self.assertEqual(server.S.addr_device, {})
 
-    def test_the_minute_look_that_moves_rules_still_works(self):
+    def test_the_minute_look_still_notes_which_device_an_addresss_rules_belong_to(self):
         server.refresh_devices({PI: "b8:27:eb:00:00:01", ROUTER: ROUTER_MAC, OTHER: PHONE}, now=self.now)
         self.assertEqual(server.S.dev_mac, {OTHER: PHONE})
 
     def test_the_status_says_the_move_has_not_been_tried(self):
-        self.assertEqual(server.api_status()["devices"], {"state": "old", "notice": "", "filling": False})
+        told = server.api_status()["devices"]
+        self.assertEqual((told["state"], told["notice"], told["filling"]), ("old", "", False))
 
 
 class TheMove(OlderHousehold):
@@ -1452,18 +1505,20 @@ class TheMove(OlderHousehold):
     def test_no_part_written_copy_is_left_behind(self):
         self.assertEqual([f for f in os.listdir(self.folder) if ".part" in f], [])
 
-    def test_names_groups_and_rules_stay_under_their_addresses(self):
-        self.assertEqual(server.sql("SELECT ip, name FROM devices"), [(OTHER, "Sam's phone")])
-        self.assertEqual(server.S.svc_blocks, {"device:" + OTHER: {"youtube"}})
-        self.assertEqual(server.sql("SELECT name FROM device WHERE name!=''"), [])
+    def test_names_and_rules_go_from_their_addresses_to_the_device(self):
+        phone = server.S.hw_device[PHONE]
+        self.assertEqual(server.sql("SELECT id, name FROM device WHERE name!=''"), [(phone, "Sam's phone")])
+        self.assertEqual(server.S.svc_blocks, {"dev:%d" % phone: {"youtube"}})
+        self.assertEqual(server.sql("SELECT ip, name FROM devices"), [])
 
     def test_the_owner_is_told_what_was_done_and_where_the_copy_is(self):
-        notes = [text for (text,) in server.sql("SELECT text FROM events")]
-        self.assertEqual(len(notes), 1)
+        notes = [text for (text,) in server.sql("SELECT text FROM events ORDER BY id")]
+        self.assertEqual(len(notes), 2)                       # the history, then the rules
         self.assertIn(server.BEFORE_DEVICES, notes[0])
+        self.assertIn("with the device itself", notes[1])
 
     def test_the_owner_is_told_how_long_the_copy_is_kept(self):
-        note = server.sql("SELECT text FROM events")[0][0]
+        note = server.sql("SELECT text FROM events ORDER BY id")[0][0]
         self.assertIn("for %d days and then deleted" % server.KEEP_DAYS, note)
         self.assertIn("Forgetting everyone's history deletes it too", note)
 
@@ -1515,7 +1570,8 @@ class TheMove(OlderHousehold):
     def test_old_history_waits_for_its_device_until_the_fill(self):
         self.assertEqual(server.sql("SELECT COUNT(*) FROM queries WHERE device IS NOT NULL")[0][0], 0)
         self.assertTrue(server.S.history_fill)
-        self.assertEqual(server.api_status()["devices"], {"state": "ready", "notice": "", "filling": True})
+        told = server.api_status()["devices"]
+        self.assertEqual((told["state"], told["notice"], told["filling"]), ("ready", "", True))
 
     def test_the_clean_up_pass_leaves_older_history_for_the_fill(self):
         self.assertEqual(server.tidy_history(), 0)
@@ -1727,6 +1783,7 @@ class WhenTheMoveCannotBeDone(OlderHousehold):
         self.assertEqual(server.sql("SELECT client FROM queries WHERE domain='www.bbc.co.uk'"), [(OTHER,)])
         self.assertIn(OTHER, {d["ip"] for d in server.api_devices()})
         self.assertEqual(server.S.svc_blocks, {"device:" + OTHER: {"youtube"}})
+        self.assertEqual(server.S.given, {OTHER: "Sam's phone"})
 
     def test_a_failed_move_still_blocks_what_was_blocked(self):
         self.fail_part_way()
@@ -1873,7 +1930,9 @@ class TheKeeper(OlderHousehold):
         def stop(seconds):
             raise self.Stop()
         # The keeper looks for the router afresh before the move: hand it a stand-in routing table.
+        # The keeper looks at the neighbours before its first pause: a stand-in, never the real table.
         with mock.patch.object(server.time, "sleep", stop), mock.patch.object(server, "fill_old_history") as fill, \
+                mock.patch.object(server, "note_ipv4_addresses"), \
                 mock.patch.object(server.enforcer, "interface_and_gateway", lambda: ("wlan0", ROUTER)):
             with self.assertRaises(self.Stop):
                 server.device_keeper()
@@ -2059,14 +2118,15 @@ class TheKeepersRounds(Devices):
         self.assertLessEqual(set(slept), {server.ADDRESS_LOOK})
         return move, look, tidy, forget
 
-    def test_the_keeper_looks_at_the_neighbours_after_every_pause(self):
+    def test_the_keeper_looks_at_the_neighbours_before_every_pause(self):
         move, look, tidy, forget = self.run_rounds(3)
-        self.assertEqual(look.call_count, 3)
+        self.assertEqual(look.call_count, 4)                  # before each of three pauses, and before the fourth
         move.assert_not_called()
 
-    def test_the_first_look_comes_only_after_the_first_pause(self):
+    def test_the_first_look_comes_before_the_first_pause(self):
+        # Whose rules each address gets is not kept across a restart: it must be worked out at once.
         move, look, tidy, forget = self.run_rounds(0)
-        look.assert_not_called()
+        self.assertEqual(look.call_count, 1)
 
     def test_the_clean_up_pass_runs_once_a_minute_not_on_every_look(self):
         move, look, tidy, forget = self.run_rounds(server.TIDY_EVERY // server.ADDRESS_LOOK)
@@ -2100,7 +2160,7 @@ class TheKeepersRounds(Devices):
                     mock.patch.object(server, "note_ipv4_addresses", side_effect=RuntimeError("no")) as look:
                 with self.assertRaises(self.Stop):
                     server.device_keeper()
-        self.assertEqual(look.call_count, 3)
+        self.assertEqual(look.call_count, 4)                  # it kept coming round, fault after fault
 
     def test_too_little_free_space_is_tried_again_after_an_hour_not_before(self):
         server.S.devices_ready, server.S.devices_state = False, "waiting"

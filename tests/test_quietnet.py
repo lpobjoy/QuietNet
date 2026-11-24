@@ -20,6 +20,7 @@ import server  # noqa: E402
 import enforcer  # noqa: E402
 
 KID, ADULT = "192.168.1.23", "192.168.1.40"
+KID_MAC = "aa:bb:cc:00:00:23"       # the hardware address the tests see at KID when it matters
 
 
 def at(day, hhmm):
@@ -52,8 +53,10 @@ class Base(unittest.TestCase):
             server.load_lists()
         for table in ("blocked", "allowed", "groups", "device_group", "service_blocks",
                       "internet_off", "schedules", "queries", "enforced", "device_mac", "known_macs", "events",
-                      "shared_macs", "device", "device_hw", "address_use", "moved_address"):
+                      "shared_macs", "device", "device_hw", "address_use", "moved_address", "devices",
+                      "group_member", "live_cut", "device_follow", "rule_conflict"):
             server.sql("DELETE FROM %s" % table, commit=True)
+        server.sql("DELETE FROM settings WHERE key IN ('macs_seeded', 'rules_move_report')", commit=True)
         server.sql("DELETE FROM settings WHERE key IN ('other_dns_all', 'no_ipv6_all')", commit=True)
         server.init_db()
         server.S.junk_on, server.S.paused_until = True, 0
@@ -89,6 +92,33 @@ class Base(unittest.TestCase):
         self.assertIsNone(server.save_schedule(body))
         return server.S.schedules[-1]
 
+    def device(self, ip):
+        """The number of the device listed under this address, made if no device is known there."""
+        return server.device_for_address(ip, make=True)
+
+    def match_ipv6(self, v6, ip):
+        """Have this IPv6 address matched to the device listed under the IPv4 address `ip`, as a
+        look at the IPv6 neighbours would: its lookups get that device's rules, and are filed
+        under the IPv4 address. Returns the device's number."""
+        number = self.device(ip)
+        server.S.v6_devices = dict(server.S.v6_devices, **{v6: ip})
+        with server.rule_map_lock:
+            server.S.rules6 = dict(server.S.rules6, **{v6: number})
+        server.rebuild_rule_map()
+        return number
+
+    def live_cut(self, ip=KID, mac=KID_MAC):
+        """Switch "cut live connections" on for the device at this address, which the (stand-in)
+        neighbour table shows there, confirmed just now. Returns the device's number."""
+        table = {ip: (mac, "fresh")}
+        server.note_ipv4_addresses(table)
+        seen = mock.patch.object(server, "neighbour_table", return_value=table)
+        seen.start()
+        self.addCleanup(seen.stop)
+        number = server.S.addr_device[ip]
+        server.set_live_cut(number, True)
+        return number
+
 
 class Rules(Base):
     def test_adverts_blocked_everything_else_allowed(self):
@@ -116,9 +146,9 @@ class Rules(Base):
     def test_group_rules_reach_members_only(self):
         with server.db_lock:
             gid = server.db.execute("INSERT INTO groups(name) VALUES('Kids')").lastrowid
-            server.db.execute("INSERT INTO device_group VALUES(?,?)", (KID, gid))
             server.db.commit()
         server.init_db()
+        server.set_device_group(self.device(KID), gid)
         server.set_service_block("group:%d" % gid, "fortnite", True)
         self.assertTrue(is_blocked("launcher.epicgames.com", KID))
         self.assertFalse(is_blocked("launcher.epicgames.com", ADULT))
@@ -357,7 +387,7 @@ class EnforcementPlan(Base):
         server.record_resolved("www.disneyplus.com", self._answer("www.disneyplus.com", "203.0.113.5"))
         server.record_resolved("www.bbc.co.uk", self._answer("www.bbc.co.uk", "151.101.0.81"))
         server.set_service_block("device:" + KID, "disneyplus", True)
-        server.S.enforced = {KID}
+        self.live_cut()
         plan = server.enforcement_plan()
         self.assertIn(KID, plan)
         self.assertFalse(plan[KID]["off"])
@@ -367,18 +397,18 @@ class EnforcementPlan(Base):
     def test_plan_is_full_cut_when_device_internet_is_off(self):
         server.record_resolved("www.bbc.co.uk", self._answer("www.bbc.co.uk", "151.101.0.81"))
         server.set_internet_off("device:" + KID, True)
-        server.S.enforced = {KID}
+        self.live_cut()
         self.assertTrue(server.enforcement_plan()[KID]["off"])
 
     def test_no_enforced_devices_means_empty_plan(self):
-        server.S.enforced = set()
+        self.assertEqual(server.S.enforced, set())
         self.assertEqual(server.enforcement_plan(), {})
 
     def test_advert_list_addresses_are_not_cut_by_address(self):
         # Advert names often share addresses with ordinary sites, so they stay a DNS-only block.
         server.record_resolved("ads.doubleclick.net", self._answer("ads.doubleclick.net", "142.250.1.1"))
         self.assertTrue(server.decision("ads.doubleclick.net", KID)[0])
-        server.S.enforced = {KID}
+        self.live_cut()
         self.assertNotIn("142.250.1.1", server.enforcement_plan()[KID]["ips"])
 
     def test_an_all_internet_schedule_is_a_full_cut(self):
@@ -386,25 +416,25 @@ class EnforcementPlan(Base):
                 "start": "00:00", "end": "23:59", "off": True, "services": []}
         self.assertIsNone(server.save_schedule(body))
         server.S.sched_cache = (0.0, [])
-        server.S.enforced = {KID}
+        self.live_cut()
         self.assertTrue(server.enforcement_plan()[KID]["off"])
 
     def test_pausing_also_pauses_your_own_blocks_in_the_plan(self):
         server.block("example.org")
         server.record_resolved("example.org", self._answer("example.org", "198.51.100.7"))
-        server.S.enforced = {KID}
+        self.live_cut()
         self.assertIn("198.51.100.7", server.enforcement_plan()[KID]["ips"])
         server.S.paused_until = time.time() + 600
         self.assertNotIn("198.51.100.7", server.enforcement_plan()[KID]["ips"])
 
     def test_the_plan_says_which_device_it_means(self):
-        server.S.enforced, server.S.enforced_mac = {KID}, {KID: "aa:bb:cc:dd:ee:ff"}
+        self.live_cut(KID, "aa:bb:cc:dd:ee:ff")
         self.assertEqual(server.enforcement_plan()[KID]["mac"], "aa:bb:cc:dd:ee:ff")
 
     def test_the_plan_does_not_ask_again_about_names_it_has_already_worked_out(self):
         # It runs every two seconds; re-checking thousands of unchanged names each time wastes the Pi.
         server.record_resolved("www.bbc.co.uk", self._answer("www.bbc.co.uk", "151.101.0.81"))
-        server.S.enforced = {KID}
+        self.live_cut()
         server.enforcement_plan()
         with mock.patch.object(server, "decision", wraps=server.decision) as asked:
             server.enforcement_plan()
@@ -412,7 +442,7 @@ class EnforcementPlan(Base):
 
     def test_a_rule_change_is_seen_by_the_next_plan(self):
         server.record_resolved("example.org", self._answer("example.org", "198.51.100.7"))
-        server.S.enforced = {KID}
+        self.live_cut()
         self.assertNotIn("198.51.100.7", server.enforcement_plan()[KID]["ips"])
         server.block("example.org")
         self.assertIn("198.51.100.7", server.enforcement_plan()[KID]["ips"])
@@ -420,14 +450,14 @@ class EnforcementPlan(Base):
     def test_a_new_address_for_a_blocked_name_is_added_to_the_next_plan(self):
         server.block("example.org")
         server.record_resolved("example.org", self._answer("example.org", "198.51.100.7"))
-        server.S.enforced = {KID}
+        self.live_cut()
         server.enforcement_plan()
         server.record_resolved("example.org", self._answer("example.org", "198.51.100.8"))
         self.assertIn("198.51.100.8", server.enforcement_plan()[KID]["ips"])
 
     def test_a_name_seen_after_the_last_plan_is_added_to_the_next_one(self):
         server.block("example.org")
-        server.S.enforced = {KID}
+        self.live_cut()
         server.enforcement_plan()
         server.record_resolved("example.org", self._answer("example.org", "198.51.100.7"))
         self.assertIn("198.51.100.7", server.enforcement_plan()[KID]["ips"])
@@ -438,7 +468,7 @@ class EnforcementPlan(Base):
         server.record_resolved("www.google.com", self._answer("www.google.com", "142.250.1.10"))
         server.record_resolved("rr1.googlevideo.com", self._answer("rr1.googlevideo.com", "173.194.0.5"))
         server.set_service_block("device:" + KID, "youtube", True)
-        server.S.enforced = {KID}
+        self.live_cut()
 
     def test_an_address_shared_with_an_allowed_name_is_not_dropped(self):
         self._youtube_blocked_for_the_kid()
@@ -593,8 +623,7 @@ class HistoryLimits(Base):
         server.db.execute("INSERT INTO enforced VALUES(?)", (KID,))
         server.db.commit()
         server.init_db()
-        self.assertEqual(server.S.enforced, {KID})
-        self.assertEqual(server.S.enforced_mac, {KID: ""})
+        self.assertEqual(server.sql("SELECT ip, mac FROM enforced"), [(KID, None)])
 
     def test_at_most_64_addresses_are_kept_per_name(self):
         for i in range(80):
