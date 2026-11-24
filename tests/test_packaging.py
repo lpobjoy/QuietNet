@@ -261,6 +261,129 @@ class AdvertList(unittest.TestCase):
             self.assertEqual(server.base_of(d), d, "%r can never match: activity is grouped as %r" % (d, server.base_of(d)))
 
 
+class NeededNames(unittest.TestCase):
+    """The short list of names a device's own system depends on (server.NEEDED). It decides a label
+    and a question, so it must stay short, sure and keyed the way the activity list groups names."""
+
+    def test_needed_names_are_keyed_by_addresses_the_grouping_can_produce(self):
+        for d in server.NEEDED:
+            self.assertEqual(server.base_of(d), d, "%r can never match: activity is grouped as %r" % (d, server.base_of(d)))
+
+    def test_needed_names_are_well_formed_lower_case_addresses(self):
+        for d in server.NEEDED:
+            self.assertTrue(server.VALID_NAME.fullmatch(d), repr(d))
+
+    def test_both_of_samsungs_tv_names_are_needed(self):
+        self.assertEqual((server.NEEDED["samsungcloudsolution.com"], server.NEEDED["samsungcloudsolution.net"]),
+                         ("Samsung TVs", "Samsung TVs"))
+
+    def test_the_list_stays_short_enough_to_be_believed(self):
+        # A long list would put the question in front of people so often that they stop reading it.
+        self.assertTrue(20 <= len(server.NEEDED) <= 40, len(server.NEEDED))
+
+    def test_no_needed_name_is_on_the_built_in_advert_list(self):
+        junk = {l.strip() for l in read("junk_domains.txt").splitlines() if l.strip() and not l.startswith("#")}
+        self.assertEqual([d for d in server.NEEDED if d in junk], [])
+
+    def test_who_needs_each_name_is_a_short_plain_phrase(self):
+        for d, who in server.NEEDED.items():
+            self.assertTrue(re.fullmatch(r"[A-Z][A-Za-z ]{3,40}", who), (d, who))
+
+    def test_samsungs_second_tv_name_has_an_owner_label(self):
+        self.assertEqual(server.OWNERS["samsungcloudsolution.net"], "Samsung TV")
+
+
+class DashboardNeededNames(unittest.TestCase):
+    """The dashboard's parts for names a device's own system depends on: the "Needed by" note in
+    place of "Possibly junk", the question before blocking one, and the note beside a block that
+    already exists. Reads the page's script only; nothing is run in a browser."""
+
+    @classmethod
+    def setUpClass(cls):
+        page = read("static", "index.html")
+        cls.helpers = page[page.index("function neededQuestion("):page.index("function statusBadges(")]
+        cls.block_address = page[page.index("async function blockAddress("):page.index("function statusBadges(")]
+        cls.badges = page[page.index("function statusBadges("):page.index("function blockedByYouNote(")]
+        cls.button = page[page.index("function blockBtn("):page.index("function activityList(")]
+        cls.activity = page[page.index("function activityList("):page.index("function viewDevice(")]
+        cls.rules = page[page.index("function viewRules("):page.index("/* ---------- Set up a device")]
+        cls.api = page[page.index("async function api("):page.index("function ago(")]
+        cls.page = page
+
+    def test_a_needed_name_shows_who_needs_it(self):
+        self.assertIn("Needed by ${esc(x.needed)}", self.badges)
+
+    def test_a_needed_name_is_never_called_possibly_junk(self):
+        # "Possibly junk" is the 'else' of the needed check, so the two can never show together.
+        needed = self.badges.index("if(x.needed) out +=")
+        junk = self.badges.index('<span class="badge warn">Possibly junk</span>')
+        self.assertLess(needed, junk)
+        self.assertIn("else if(x.v === 'suspect') out +=", self.badges[needed:junk])
+        self.assertEqual(self.page.count("Possibly junk</span>"), 1)
+
+    def test_a_name_on_the_advert_list_keeps_its_advert_label(self):
+        self.assertIn("if(x.v === 'junk') out += '<span class=\"badge danger\">Advert / tracker</span>';", self.badges)
+
+    def test_the_block_button_on_a_needed_name_is_not_the_highlighted_one(self):
+        self.assertIn("x.v === 'ok' || x.needed ? '' : 'primary'", self.button)
+
+    def test_the_question_says_who_needs_the_address_and_what_may_happen(self):
+        self.assertIn("${who} need this address for their own system to work. Blocking it may stop apps opening, "
+                      "signing in or updates on them. Block it anyway?", self.helpers)
+
+    def test_the_question_promises_nothing(self):
+        self.assertNotIn("will stop", self.helpers)
+
+    def test_the_question_is_asked_only_when_the_server_says_the_name_is_needed(self):
+        self.assertIn("if(e.status !== 409 || !a.needed) throw e;", self.block_address)
+
+    def test_the_question_goes_through_the_pop_up_that_escapes_its_text(self):
+        self.assertIn("ask({title:`Block ${a.domain || domain}?`, ok:'Block it anyway', danger:true, text:neededQuestion(a.needed)})",
+                      self.block_address)
+
+    def test_saying_no_blocks_nothing(self):
+        self.assertIn("if(!yes) return false;", self.block_address)
+
+    def test_saying_yes_sends_the_block_again_marked_sure(self):
+        asked, sure = self.block_address.index("await ask("), self.block_address.index("{domain:domain, sure:true}")
+        self.assertLess(asked, sure)
+
+    def test_every_way_of_blocking_an_address_goes_through_the_question(self):
+        # The Block button on a device page and the box on the Blocked list page. Nothing else on
+        # the page may call the block address directly.
+        self.assertEqual(self.page.count("'/api/block'"), self.block_address.count("'/api/block'"))
+        self.assertIn("await blockAddress(d.d).catch(oops)", self.page)
+        self.assertIn("if(await blockAddress(v))", self.page)
+
+    def test_a_refusal_carries_its_status_and_answer_to_the_caller(self):
+        self.assertIn("e.status = r.status; e.answer = j;", self.api)
+
+    def test_the_note_beside_an_existing_block_says_who_needs_it_and_what_to_do(self):
+        self.assertIn("${esc(who)} need this address. If apps have stopped opening on one, or it can't sign in or "
+                      "update, unblock it.", self.helpers)
+
+    def test_the_blocked_list_page_carries_the_note(self):
+        self.assertIn("${blocks ? neededBlockedNote(x.needed) : ''}", self.rules)
+        self.assertIn("rows(r.blocked, 'Unblock', true)", self.rules)
+
+    def test_the_always_allowed_list_does_not_carry_the_note(self):
+        self.assertIn("rows(r.allowed, 'Remove', false)", self.rules)
+
+    def test_a_blocked_by_you_row_on_a_device_page_carries_the_note(self):
+        self.assertIn("function blockedByYouNote(x){ return x.b && x.why === 'you' ? neededBlockedNote(x.needed) : ''; }", self.page)
+        self.assertIn("${blockedByYouNote(g)}", self.activity)
+        self.assertIn("${blockedByYouNote(h)}", self.activity)
+
+    def test_who_needs_a_name_is_escaped_wherever_it_is_shown(self):
+        for part in (self.helpers, self.badges, self.button, self.activity, self.rules):
+            self.assertNotIn("${x.needed}", part)
+        # The one unescaped use builds the question's text, which ask() escapes when it shows it.
+        self.assertEqual(self.helpers.count("${who}"), 1)
+        self.assertIn("return `${who} need this address for their own system to work.", self.helpers)
+        self.assertIn('data-needed="${esc(x.needed || \'\')}"', self.button)
+        self.assertIn("Needed by ${esc(x.needed)}", self.rules)
+
+
 class DashboardContract(unittest.TestCase):
     """The dashboard page is served twice: by the Pi directly, and by the relay, which
     edits it on the way through. These checks protect the things each side relies on."""

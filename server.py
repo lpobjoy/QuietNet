@@ -161,6 +161,7 @@ OWNERS = {
     "bbc.co.uk": "BBC", "bbci.co.uk": "BBC", "bbc.com": "BBC", "itv.com": "ITV", "channel4.com": "Channel 4",
     "sky.com": "Sky", "disneyplus.com": "Disney+", "disney-plus.net": "Disney+", "bamgrid.com": "Disney+",
     "roku.com": "Roku", "samsung.com": "Samsung", "samsungcloud.com": "Samsung", "samsungcloudsolution.com": "Samsung TV",
+    "samsungcloudsolution.net": "Samsung TV",
     "lgtvsdp.com": "LG TV", "lge.com": "LG", "sonos.com": "Sonos", "ring.com": "Ring", "nest.com": "Google Nest",
     "playstation.com": "PlayStation", "playstation.net": "PlayStation", "nintendo.net": "Nintendo",
     "nintendo.com": "Nintendo", "steampowered.com": "Steam", "epicgames.com": "Epic Games", "roblox.com": "Roblox",
@@ -176,6 +177,49 @@ OWNERS = {
     "adnxs.com": "Advert network (Xandr)", "criteo.com": "Advert network (Criteo)",
     "taboola.com": "Advert network (Taboola)", "outbrain.com": "Advert network (Outbrain)",
     "amazon-adsystem.com": "Amazon adverts", "scorecardresearch.com": "Tracking (Comscore)",
+}
+
+# Names that a device's own system depends on: its sign-in, app shop, "am I online?" check, clock
+# or updates. Blocking the WHOLE name is known to break those, so the dashboard never labels such a
+# name "Possibly junk", says who needs it instead, and the block call asks first (see needed_by and
+# Web.handle_post). Each value is who needs the name, as a plural that fits "... need this address".
+#
+# Keep this list short and sure. A wrong entry costs only a needless question, but a long or sloppy
+# list teaches people to ignore the question. Rules for an entry:
+#  - a whole owner name, exactly as the activity list groups it (see base_of), never a sub-name;
+#  - a common household device needs it for its own system, not for one app or one streaming service;
+#  - not a name that is mainly adverts or tracking. Those belong on the advert list.
+# This table changes labels and adds a question. It never changes what decision() blocks.
+NEEDED = {
+    # Samsung TVs: the app system ("Smart Hub") and its clock; Samsung account sign-in.
+    "samsungcloudsolution.com": "Samsung TVs", "samsungcloudsolution.net": "Samsung TVs",
+    "samsungosp.com": "Samsung TVs and phones",
+    # LG TVs: the TV's service platform and clock; the app shop ("Content Store").
+    "lgtvsdp.com": "LG TVs", "lgappstv.com": "LG TVs",
+    # Apple: sign-in, the online check, clock, activation and updates; iCloud sign-in;
+    # the App Store's pages; update downloads.
+    "apple.com": "Apple devices", "icloud.com": "Apple devices", "mzstatic.com": "Apple devices",
+    "cdn-apple.com": "Apple devices",
+    # Android, Chromecast and Google TV: sign-in, the Play shop and the online check; a second
+    # online check; sign-in and Play services; the clock; app and update downloads.
+    "google.com": "Android and Google devices", "gstatic.com": "Android and Google devices",
+    "googleapis.com": "Android and Google devices", "android.com": "Android and Google devices",
+    "gvt1.com": "Android and Google devices",
+    # Amazon: sign-in, registration and updates for Fire TV and Echo; the Fire online check.
+    "amazon.com": "Amazon Fire TVs and Echo speakers", "fireoscaptiveportal.com": "Amazon Fire TVs and tablets",
+    # Roku: sign-in, the channel shop and updates all sit under this one name.
+    "roku.com": "Roku players and TVs",
+    # Windows: the two online checks; updates; the clock; updates and the Store; Microsoft sign-in.
+    "msftconnecttest.com": "Windows computers", "msftncsi.com": "Windows computers",
+    "windowsupdate.com": "Windows computers", "windows.com": "Windows computers",
+    "microsoft.com": "Windows computers and Xbox consoles", "live.com": "Windows computers and Xbox consoles",
+    # PlayStation: sign-in, the online check and updates; the PlayStation Store; account sign-in.
+    "playstation.net": "PlayStation consoles", "playstation.com": "PlayStation consoles",
+    "sonyentertainmentnetwork.com": "PlayStation consoles",
+    # Xbox: sign-in and the console's own services.
+    "xboxlive.com": "Xbox consoles",
+    # Nintendo Switch: the online check, the eShop and updates; Nintendo Account sign-in.
+    "nintendo.net": "Nintendo Switch consoles", "nintendo.com": "Nintendo Switch consoles",
 }
 
 SECOND_LEVEL = {"co", "com", "org", "net", "gov", "ac", "edu", "ltd", "plc", "me", "sch", "nhs"}
@@ -719,6 +763,23 @@ def verdict(domain):
     if SUSPECT.search(domain.rsplit(".", 1)[0]):
         return "suspect"
     return "ok"
+
+
+def needed_by(domain):
+    """Who needs this name for their own system to work, as a short phrase such as 'Samsung TVs',
+    or '' when nobody is known to (see NEEDED). Only the whole name counts: a sub-name beneath a
+    needed name gives '', because blocking one sub-name is the right, narrow way to block a tracker.
+    Used for labels and for the question asked before a block; decision() never reads it."""
+    return NEEDED.get(domain, "")
+
+
+def needed_refusal(who):
+    """The sentence sent with the 409 when a needed name is blocked without the person's say-so.
+    The dashboard asks its own question from the phrase alone; this is for anything else that
+    shows the 'error' text, such as a dashboard page loaded before this question existed."""
+    return ("%s need this address for their own system to work. Blocking it may stop apps opening, "
+            "signing in or updates on them. It has not been blocked. Reload this page and try again "
+            "to be asked first." % who)
 
 
 def base_of(domain):
@@ -2951,7 +3012,8 @@ def activity_groups(ip, since):
     """The activity list for one device since a time: see api_activity. A name of another DNS
     service (see OTHER_DNS_SERVICES) is shown as blocked with why 'other_dns' when this device is
     kept away from them (other_dns_blocked_for), since every lookup of it then is, and its group is
-    marked "other_dns" too."""
+    marked "other_dns" too. Every name and group also carries "needed": who needs that whole name
+    for their own system (see needed_by), or '' for most."""
     rows = read_sql("""SELECT domain, COUNT(*), MAX(ts), SUM(blocked) FROM queries
                   WHERE client=? AND ts>? GROUP BY domain""", (ip, since))
     guarded = other_dns_blocked_for(ip)
@@ -2966,7 +3028,7 @@ def activity_groups(ip, since):
         g = groups.setdefault(base, {"base": base, "owner": OWNERS.get(base, ""), "n": 0, "nb": 0, "last": 0, "hosts": []})
         b, why, svc = (True, "other_dns", "") if kept_off(domain) else decision(domain, ip)
         g["hosts"].append({"d": domain, "n": n, "nb": nb, "last": last, "v": verdict(domain),
-                           "b": b, "why": why, "svc": svc})
+                           "b": b, "why": why, "svc": svc, "needed": needed_by(domain)})
         g["n"] += n
         g["nb"] += nb
         g["last"] = max(g["last"], last)
@@ -2980,14 +3042,19 @@ def activity_groups(ip, since):
             g["b"], g["why"], g["svc"] = decision(g["base"], ip)
         g["some_blocked"] = any(h["b"] for h in g["hosts"])
         g["other_dns"] = any(h["why"] == "other_dns" for h in g["hosts"])
+        # Who needs this whole name, if anyone (see NEEDED). The dashboard then shows "Needed by ..."
+        # where it would have shown "Possibly junk", whatever the sub-names beneath it look like.
+        g["needed"] = needed_by(g["base"])
     return sorted(groups.values(), key=lambda g: -g["n"])
 
 
 def api_rules():
-    """GET /api/rules: your own blocked and allowed addresses, newest first."""
+    """GET /api/rules: your own blocked and allowed addresses, newest first. Each carries
+    "needed": who needs that name for their own system (see needed_by), or ''. The Blocked list
+    page uses it to say, beside a block, which devices it may have broken."""
     def rows(table):
         """One of the two lists. `table` is only ever the fixed text 'blocked' or 'allowed'."""
-        return [{"d": d, "ts": ts, "owner": OWNERS.get(base_of(d), "")} for d, ts in
+        return [{"d": d, "ts": ts, "owner": OWNERS.get(base_of(d), ""), "needed": needed_by(d)} for d, ts in
                 sql("SELECT domain, ts FROM %s ORDER BY ts DESC" % table)]
     return {"blocked": rows("blocked"), "allowed": rows("allowed")}
 
@@ -3278,6 +3345,12 @@ class Web(BaseHTTPRequestHandler):
             domain = clean_domain(body.get("domain"))
             if not domain:
                 return self.send_json({"error": "That doesn't look like a web address."}, 400)
+            # A name a device's own system depends on is not blocked until the person has been
+            # asked: the request must say "sure": true (exactly that). The check is here, not in
+            # the page, so it covers the Block button, a typed name and the relayed dashboard alike.
+            who = needed_by(domain) if path == "/api/block" else ""
+            if who and body.get("sure") is not True:
+                return self.send_json({"error": needed_refusal(who), "needed": who, "domain": domain}, 409)
             {"/api/block": block, "/api/unblock": unblock, "/api/forget": forget}[path](domain)
             return self.send_json({"ok": True, "domain": domain})
         if path == "/api/device-name":

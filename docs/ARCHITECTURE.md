@@ -109,6 +109,20 @@ Points that follow from this order:
 - **Unblocking an advert-list name creates an allow.** `unblock()` removes your block; if the advert list would still block the name, it adds the name to the allowed list so the unblock sticks.
 - **Blocking a name removes allows beneath it.** `block("example.com")` deletes allows for `example.com` and anything under it.
 
+### Names a device's own system needs
+
+Some names look like junk and are not. A Samsung TV's app system lives under `samsungcloudsolution.net`; one of its sub-names has "log" in it, which the "possibly junk" word list (`SUSPECT`) matches, so the whole group used to read "Possibly junk" with a Block button beside it. Blocking the group stops the TV's apps opening.
+
+`NEEDED` in `server.py` is a short table of such names: whole owner names, as the activity list groups them (`base_of()`), that a common household device (Samsung and LG TVs, Apple, Android and Google devices, Amazon Fire TV and Echo, Roku, Windows, PlayStation, Xbox, Nintendo Switch) needs for its own sign-in, app shop, "am I online?" check, clock or updates. Each maps to who needs it, as a short phrase. `needed_by(name)` returns the phrase, or `''`; only the whole name counts, never a sub-name.
+
+The table is outside the order above and does not touch it. `decision()` never reads it: a needed name that is blocked is blocked like any other, and one that is not is decided like any other. It does three things:
+
+1. **The label.** `/api/activity` and `/api/rules` carry the phrase as `needed`. The dashboard shows "Needed by Samsung TVs" where it would have shown "Possibly junk"; a name the advert list really blocks keeps "Advert / tracker"; sub-names keep their own labels when the group is opened.
+2. **A question before a new block.** `POST /api/block` refuses a needed name with `409` unless the request carries `"sure": true` (`Web.handle_post`). The dashboard asks ("Samsung TVs need this address for their own system to work. Blocking it may stop apps opening, signing in or updates on them. Block it anyway?") and sends the call again with `sure`. Because the check is the server's, it holds for the Block button on a device page, a name typed on the Blocked list page, and the same page served through the relay, which passes the `409` and its body back unchanged. Blocking one sub-name beneath a needed name does not ask.
+3. **A note beside a block that exists.** On the Blocked list page and on a "Blocked by you" row of a device page, a needed name says who needs it and to unblock it if apps have stopped opening.
+
+Keep the table short and sure (a test holds it between 20 and 40 names). A wrong entry costs only a needless question, but a long or sloppy list teaches people to ignore the question. An entry must be a whole owner name, needed by the device's own system and not by one app, and not mainly an advert or tracking name.
+
 ### Scopes
 
 A rule applies to one of three scopes, written as text:
@@ -494,6 +508,7 @@ Fixed values worth knowing, all near the top of their files:
 | Large answers held at once | One per account; `BIG_ANSWER_BUDGET` = 48 MB in all; `BIG_ANSWER_WAIT` = 10 s | `relay.py` |
 | QuietNets per account | `MAX_PIS_PER_ACCOUNT` = 10; successful pairings `PAIR_LIMIT_PER_ACCOUNT` = 20 a day | `relay.py` |
 | Largest request body | `MAX_BODY` = 64 KB | `server.py`, `relay.py` |
+| Names a device's own system needs, asked about before a block | `NEEDED` (about 30 names, each with who needs it) | `server.py` |
 
 ## Adding a blockable service
 

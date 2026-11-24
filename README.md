@@ -8,7 +8,7 @@ See what every device in your home is talking to, block the adverts and trackers
 
 - **Shows what each device contacts** — grouped by company, with plain labels such as "Advert / tracker" and "Possibly junk".
 - **Blocks adverts and trackers automatically**, using a built-in list plus an optional community list of over 70,000 addresses.
-- **One-click Block / Unblock** on anything a device talks to.
+- **One-click Block / Unblock** on anything a device talks to. An address that a TV, phone, computer or games console needs for its own system says so ("Needed by Samsung TVs"), and QuietNet asks before blocking it.
 - **Blocks whole apps and services** — Fortnite, Roblox, YouTube, Netflix, Disney+, TikTok, Snapchat, Discord and more.
 - **Rules for one device, a group, or the whole house** — make a "Kids" or "TVs" group and control them together.
 - **Internet on/off switch** for any device or group.

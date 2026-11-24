@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+Names a device's own system needs (24 November). Found in a real household: a Samsung TV stopped opening apps after `samsungcloudsolution.net`, labelled "Possibly junk", was blocked from its page. Known issue 95:
+- **Fixed: an address a TV depends on was called "Possibly junk".** A short table, `NEEDED` in `server.py`, lists about 30 whole names that common household devices need for their own sign-in, app shop, online check, clock or updates. Such a row shows "Needed by Samsung TVs" in place of "Possibly junk"; a name on the advert list keeps "Advert / tracker"; sub-names keep their own labels. New `needed` in `GET /api/activity` and `GET /api/rules`. `samsungcloudsolution.net` is now labelled "Samsung TV".
+- **New: blocking such a name asks first.** `POST /api/block` answers `409` with who needs the name unless the request carries `"sure": true`; the dashboard asks ("Samsung TVs need this address for their own system to work. Blocking it may stop apps opening, signing in or updates on them. Block it anyway?") and blocks only on a yes. This covers the Block button, a name typed on the Blocked list page, and the dashboard through the relay. Blocking a single sub-name does not ask. What is blocked once a block exists is unchanged.
+- **New: a note beside a block that already exists.** On the Blocked list page and on a "Blocked by you" row, a needed name says who needs it and to unblock it if apps have stopped opening.
+
 Licences on the relay, first phase (relay only; nothing changes on the Pi):
 - **New: one licence per account**, in new `licences` and `licence_log` tables. `licence_state()` works out the state (none, trial, active, cancelling, past due with 14 days' grace, expired, revoked; active counts as expired 3 days after its end date) and what it allows: remote access, updates, adding and pairing Pis.
 - **New: `QUIETNET_LICENCE_GATE`, off by default.** While off, nothing is refused; what would have been refused is logged (a log line and a `licence_log` row, at most once an hour per account and kind of refusal). With it on: the Pi's page becomes a "Remote access is paused" page and dashboard calls get `402`; adding a Pi needs a licence that allows it and a free seat; `POST /agent/pair` answers `403` with the reason and the licence state. Never `401` for a licence reason.

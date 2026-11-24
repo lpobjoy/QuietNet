@@ -219,6 +219,67 @@ class BlockingAddresses(Api):
                 self.assertEqual(self.post(path, {"domain": domain})[0], 400, (path, domain))
         self.assertEqual((server.S.blocked, server.S.allowed), (set(), set()))
 
+    # ----- names a device's own system depends on (server.NEEDED): the block call asks first
+
+    def test_blocking_a_needed_name_is_refused_until_the_person_has_said_yes(self):
+        status, out = self.post("/api/block", {"domain": "samsungcloudsolution.net"})
+        self.assertEqual(status, 409)
+        self.assertEqual(server.S.blocked, set())
+
+    def test_the_refusal_names_who_needs_the_address(self):
+        _, out = self.post("/api/block", {"domain": "samsungcloudsolution.net"})
+        self.assertEqual((out["needed"], out["domain"]), ("Samsung TVs", "samsungcloudsolution.net"))
+        self.assertTrue(out["error"].startswith("Samsung TVs need this address"), out["error"])
+
+    def test_the_refusal_says_what_may_happen_and_promises_nothing(self):
+        _, out = self.post("/api/block", {"domain": "samsungcloudsolution.net"})
+        self.assertIn("may stop", out["error"])
+        self.assertNotIn("will", out["error"])
+
+    def test_blocking_a_needed_name_goes_ahead_once_the_person_has_said_yes(self):
+        out = self.ok("/api/block", {"domain": "samsungcloudsolution.net", "sure": True})
+        self.assertEqual(out, {"ok": True, "domain": "samsungcloudsolution.net"})
+        self.assertTrue(is_blocked("lcprd1.samsungcloudsolution.net", KID))
+
+    def test_only_a_plain_yes_counts_as_being_sure(self):
+        for sure in ("yes", "true", 1, [True], None, False):
+            status, _ = self.post("/api/block", {"domain": "samsungcloudsolution.net", "sure": sure})
+            self.assertEqual(status, 409, repr(sure))
+        self.assertEqual(server.S.blocked, set())
+
+    def test_a_needed_name_typed_with_extras_is_asked_about_too(self):
+        status, out = self.post("/api/block", {"domain": "https://WWW.SamsungCloudSolution.net/apps"})
+        self.assertEqual((status, out["domain"]), (409, "samsungcloudsolution.net"))
+
+    def test_blocking_one_sub_name_beneath_a_needed_name_does_not_ask(self):
+        self.ok("/api/block", {"domain": "log-config.samsungcloudsolution.net"})
+        self.assertEqual(server.S.blocked, {"log-config.samsungcloudsolution.net"})
+
+    def test_an_ordinary_name_is_blocked_without_being_asked_about(self):
+        self.ok("/api/block", {"domain": "example.com"})
+        self.assertEqual(server.S.blocked, {"example.com"})
+
+    def test_unblocking_a_needed_name_never_asks(self):
+        self.ok("/api/block", {"domain": "samsungcloudsolution.net", "sure": True})
+        self.ok("/api/unblock", {"domain": "samsungcloudsolution.net"})
+        self.assertEqual(server.S.blocked, set())
+
+    def test_forgetting_a_needed_name_never_asks(self):
+        self.ok("/api/block", {"domain": "samsungcloudsolution.net", "sure": True})
+        self.ok("/api/forget", {"domain": "samsungcloudsolution.net"})
+        self.assertEqual(server.S.blocked, set())
+
+    def test_the_blocked_list_says_who_needs_a_blocked_name(self):
+        self.ok("/api/block", {"domain": "samsungcloudsolution.net", "sure": True})
+        _, rules = self.get("/api/rules")
+        self.assertEqual([(r["d"], r["owner"], r["needed"]) for r in rules["blocked"]],
+                         [("samsungcloudsolution.net", "Samsung TV", "Samsung TVs")])
+
+    def test_the_blocked_list_says_nothing_extra_about_an_ordinary_name(self):
+        self.ok("/api/block", {"domain": "tiktok.com"})
+        _, rules = self.get("/api/rules")
+        self.assertEqual(rules["blocked"][0]["needed"], "")
+
     def test_the_rules_page_lists_blocks_and_allows_with_owners(self):
         self.ok("/api/block", {"domain": "tiktok.com"})
         self.ok("/api/unblock", {"domain": "doubleclick.net"})         # on the advert list, so it becomes an allow
@@ -563,6 +624,40 @@ class Devices(Api):
         self.assertEqual([(h["d"], h["n"]) for h in bbc["hosts"]], [("www.bbc.co.uk", 2), ("news.bbc.co.uk", 1)])
         self.assertEqual((ads["owner"], ads["v"], ads["b"], ads["why"], ads["nb"]),
                          ("Google adverts", "junk", True, "list", 1))
+
+    # ----- names a device's own system depends on (server.NEEDED): what the activity list says
+
+    def test_a_needed_names_group_says_who_needs_it(self):
+        # What happened in a real household: one sub-name with "log" in it made the whole Samsung
+        # group read "Possibly junk", with a Block button beside it. The page now shows this instead.
+        self.log(KID, "log-config.samsungcloudsolution.net")
+        self.log(KID, "lcprd1.samsungcloudsolution.net")
+        g = self.get("/api/activity?ip=%s" % KID)[1][0]
+        self.assertEqual((g["base"], g["owner"], g["needed"]), ("samsungcloudsolution.net", "Samsung TV", "Samsung TVs"))
+
+    def test_sub_names_beneath_a_needed_name_keep_their_own_labels(self):
+        self.log(KID, "log-config.samsungcloudsolution.net")
+        self.log(KID, "lcprd1.samsungcloudsolution.net", ago=120)
+        g = self.get("/api/activity?ip=%s" % KID)[1][0]
+        self.assertEqual(sorted((h["d"], h["v"], h["needed"]) for h in g["hosts"]),
+                         [("lcprd1.samsungcloudsolution.net", "ok", ""),
+                          ("log-config.samsungcloudsolution.net", "suspect", "")])
+
+    def test_a_needed_name_looked_up_by_itself_says_who_needs_it(self):
+        self.log(KID, "samsungcloudsolution.net")
+        g = self.get("/api/activity?ip=%s" % KID)[1][0]
+        self.assertEqual(g["hosts"][0]["needed"], "Samsung TVs")
+
+    def test_an_ordinary_group_is_needed_by_nobody(self):
+        self.log(KID, "telemetry.example.com")
+        g = self.get("/api/activity?ip=%s" % KID)[1][0]
+        self.assertEqual((g["v"], g["needed"], g["hosts"][0]["needed"]), ("suspect", "", ""))
+
+    def test_a_needed_name_the_person_blocked_shows_as_blocked_by_them_with_who_needs_it(self):
+        self.log(KID, "lcprd1.samsungcloudsolution.net")
+        self.ok("/api/block", {"domain": "samsungcloudsolution.net", "sure": True})
+        g = self.get("/api/activity?ip=%s" % KID)[1][0]
+        self.assertEqual((g["b"], g["why"], g["needed"]), (True, "you", "Samsung TVs"))
 
     def test_activity_shows_why_something_is_blocked_for_this_device(self):
         self.log(KID, "www.youtube.com")

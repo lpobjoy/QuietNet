@@ -27,7 +27,7 @@ A **scope** is `all`, `group:<id>` or `device:<ip>`.
 | `GET /api/status` | See below |
 | `GET /api/devices` | List of devices, most recently active first |
 | `GET /api/activity?ip=<ip>&hours=<n>&since=<marker>` | What one device contacted, grouped by company. `hours` defaults to 24, limited to 0.1–720. `since` is optional: see below |
-| `GET /api/rules` | `{"blocked": [...], "allowed": [...]}`, each item `{"d", "ts", "owner"}` |
+| `GET /api/rules` | `{"blocked": [...], "allowed": [...]}`, each item `{"d", "ts", "owner", "needed"}`. `needed` is who needs that name for their own system, such as `"Samsung TVs"`, or `""` (see "Names a device's own system needs" below) |
 | `GET /api/services` | The service catalogue: `[{"id", "name", "cat"}]` |
 | `GET /api/groups` | `[{"id", "name", "off", "members", "services"}]` |
 | `GET /api/schedules` | All schedules, each with `"active"` (in force right now) |
@@ -85,8 +85,8 @@ A **scope** is `all`, `group:<id>` or `device:<ip>`.
 
 ```json
 {"base": "bbc.co.uk", "owner": "BBC", "n": 3, "nb": 0, "last": 1795000000.0,
- "v": "ok", "b": false, "why": null, "svc": "", "some_blocked": false, "other_dns": false,
- "hosts": [{"d": "www.bbc.co.uk", "n": 2, "nb": 0, "last": 1795000000.0, "v": "ok", "b": false, "why": null, "svc": ""}]}
+ "v": "ok", "b": false, "why": null, "svc": "", "some_blocked": false, "other_dns": false, "needed": "",
+ "hosts": [{"d": "www.bbc.co.uk", "n": 2, "nb": 0, "last": 1795000000.0, "v": "ok", "b": false, "why": null, "svc": "", "needed": ""}]}
 ```
 
 **The `since` marker.** Without `since`, the answer is the plain list of items above, as it always was. With `since` (send it empty, `since=`, the first time), the answer is an object:
@@ -101,6 +101,19 @@ For QuietNet's own computer, `kill`, `off` and `schedule` never appear: it is ex
 
 `v` is the label: `ok`, `suspect` (possibly junk, shown for a person to judge, never blocked on its own) or `junk` (on the advert list). `b` is whether it is blocked for this device now, `why` is the reason code (`kill`, `off`, `schedule`, `you`, `allowed`, `service`, `list`, or `other_dns` for another DNS service, which is blocked whatever the rules say for a device the owner controls: one with "cut live connections", a group, or rules of its own, or every device when `other_dns_all` is on), and `svc` names the service or schedule responsible. A group's `other_dns` is `true` when any of its names is another DNS service.
 
+**Names a device's own system needs.** `server.py` keeps a short table, `NEEDED`, of whole names that a common household device needs for its own sign-in, app shop, "am I online?" check, clock or updates, each with who needs it (`samsungcloudsolution.net` is needed by "Samsung TVs"). It changes three things, and never what is blocked once a block exists:
+
+- **`needed` in `/api/activity` and `/api/rules`.** A group or name that is itself in the table carries who needs it; everything else carries `""`. A sub-name beneath a needed name carries `""` and keeps its own `v`. `v` itself is unchanged: the dashboard shows "Needed by Samsung TVs" where it would have shown "Possibly junk", and keeps "Advert / tracker" for a name on the advert list.
+- **`POST /api/block` asks first.** Blocking a name that is itself in the table, without `"sure": true`, changes nothing and answers `409`:
+
+  ```json
+  {"error": "Samsung TVs need this address for their own system to work. Blocking it may stop apps opening, signing in or updates on them. It has not been blocked. Reload this page and try again to be asked first.",
+   "needed": "Samsung TVs", "domain": "samsungcloudsolution.net"}
+  ```
+
+  The dashboard asks the person, from `needed`, and on a yes sends the same call again with `"sure": true`, which blocks the name and answers `{"ok", "domain"}` as usual. Only the JSON value `true` counts. Blocking a single sub-name beneath a needed name (`log-config.samsungcloudsolution.net`) never asks: that is the narrow way to block a tracker. `POST /api/unblock` and `POST /api/forget` never ask. Through the relay the `409` and its body come back unchanged.
+- **A note beside an existing block.** The dashboard uses `needed` on a blocked name to say which devices may have stopped working because of it.
+
 `/api/controls`:
 
 ```json
@@ -114,7 +127,7 @@ For QuietNet's own computer, `kill`, `off` and `schedule` never appear: it is ex
 
 | Request | Body | Notes |
 | --- | --- | --- |
-| `POST /api/block` | `{"domain"}` | The text is tidied first (scheme, path, port and `www.` removed). Returns `{"ok", "domain"}` |
+| `POST /api/block` | `{"domain", "sure"?}` | The text is tidied first (scheme, path, port and `www.` removed). Returns `{"ok", "domain"}`. A name a device's own system needs is refused with `409` unless `sure` is `true`: see "Names a device's own system needs" below |
 | `POST /api/unblock` | `{"domain"}` | Adds an allow if the advert list would still block it |
 | `POST /api/forget` | `{"domain"}` | Removes both the block and the allow |
 | `POST /api/service-block` | `{"scope", "service", "on"}` | `400` for an unknown service or scope |

@@ -369,6 +369,20 @@ class Helpers(Base):
         self.assertEqual(server.verdict("telemetry.example.com"), "suspect")
         self.assertFalse(server.decision("telemetry.example.com", KID)[0])
 
+    def test_a_name_a_devices_own_system_depends_on_says_who_needs_it(self):
+        self.assertEqual(server.needed_by("samsungcloudsolution.net"), "Samsung TVs")
+        self.assertEqual(server.needed_by("samsungcloudsolution.com"), "Samsung TVs")
+
+    def test_a_sub_name_beneath_a_needed_name_is_not_itself_needed(self):
+        self.assertEqual(server.needed_by("log-config.samsungcloudsolution.net"), "")
+
+    def test_an_ordinary_name_is_needed_by_nobody(self):
+        for name in ("example.com", "bbc.co.uk", "doubleclick.net"):
+            self.assertEqual(server.needed_by(name), "", name)
+
+    def test_a_sub_name_beneath_a_needed_name_keeps_its_own_label(self):
+        self.assertEqual(server.verdict("log-config.samsungcloudsolution.net"), "suspect")
+
     def test_which_rule_sets_apply_to_a_device(self):
         self.assertEqual(server.scopes_for(None), ["all"])
         self.assertEqual(server.scopes_for(KID), ["all", "device:" + KID])
