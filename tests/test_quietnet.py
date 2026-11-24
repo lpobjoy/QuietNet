@@ -138,6 +138,16 @@ class Rules(Base):
         self.assertTrue(is_blocked("a.b.example.com", KID))
         self.assertFalse(is_blocked("notexample.com", KID))
 
+    def test_a_blocked_needed_name_is_blocked_like_any_other(self):
+        # The list of names devices need only adds a question before a block is made (see
+        # server.NEEDED). Once the block exists it is decided exactly as any other.
+        server.block("samsungcloudsolution.net")
+        self.assertEqual(server.decision("samsungcloudsolution.net", KID), (True, "you", ""))
+        self.assertEqual(server.decision("lcprd1.samsungcloudsolution.net", KID), (True, "you", ""))
+
+    def test_a_needed_name_nobody_blocked_is_allowed_like_any_other(self):
+        self.assertEqual(server.decision("lcprd1.samsungcloudsolution.net", KID), (False, None, ""))
+
     def test_unblocking_a_listed_advert_makes_an_exception(self):
         server.unblock("doubleclick.net")
         self.assertFalse(is_blocked("ads.doubleclick.net", KID))

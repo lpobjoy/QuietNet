@@ -465,7 +465,7 @@ class RangeExtenders(Base, Setup):
 
     def test_a_number_behind_an_extender_is_not_steered_on_a_stale_entry(self):
         # One hardware address answers for several devices there, so a stale entry says nothing
-        # about which device has the number (known issue 98).
+        # about which device has the number (known issue 99).
         self.become_an_extender({OLD: fresh(EXTENDER), NEW: fresh(EXTENDER)})
         server.set_live_cut(server.S.addr_only[NEW], True)
         self.assertEqual(sorted(self.plan({OLD: fresh(EXTENDER), NEW: fresh(EXTENDER)})), [NEW])
@@ -1914,6 +1914,18 @@ class TheApiByDevice(Api, Setup):
         for ask in ("device=%d" % self.phone, "ip=%s&device=%d" % (NEW, self.phone)):
             _, groups = self.get("/api/activity?hours=24&" + ask)
             self.assertEqual([(g["base"], g["b"]) for g in groups], [("youtube.com", True)], ask)
+
+    def test_the_activity_list_says_who_needs_a_name_the_person_blocked_at_whatever_address(self):
+        # The page shows its note beside a blocked name a device's own system needs from these
+        # three fields. They must come with the list worked out for the device, not only by address.
+        server.sql("INSERT INTO queries(ts,client,domain,blocked,device) VALUES(?,?,?,0,?)",
+                   (self.now, OLD, "lcprd1.samsungcloudsolution.net", self.phone), commit=True)
+        self.ok("/api/block", {"domain": "samsungcloudsolution.net", "sure": True})
+        self.look({NEW: PHONE}, later=60)
+        for ask in ("device=%d" % self.phone, "ip=%s&device=%d" % (NEW, self.phone)):
+            _, groups = self.get("/api/activity?hours=24&" + ask)
+            self.assertEqual([(g["base"], g["b"], g["why"], g["needed"]) for g in groups],
+                             [("samsungcloudsolution.net", True, "you", "Samsung TVs")], ask)
 
     def test_the_devices_page_reads_its_switches_by_the_device(self):
         self.ok("/api/internet", {"scope": "dev:%d" % self.phone, "off": True})

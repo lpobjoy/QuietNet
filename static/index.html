@@ -761,11 +761,13 @@ async function api(path, body){
   const r = await fetch(BASE + path, opts);
   const j = await r.json().catch(() => ({}));
   if(!r.ok){
-    // The status goes with the error: 404 means the Pi has no such call (an older QuietNet reached
-    // through the relay), 409 that a preview is out of date.
-    const err = new Error(j.error || 'Something went wrong. Is QuietNet still running?');
-    err.status = r.status;
-    throw err;
+    // The status and the answer go with the error, for a caller that acts on one kind of refusal:
+    // 404 means the Pi has no such call (an older QuietNet reached through the relay), 409 that a
+    // preview is out of date or that a name is needed and the person has not yet said they are sure
+    // (see blockAddress). Everything else shows e.message as before.
+    const e = new Error(j.error || 'Something went wrong. Is QuietNet still running?');
+    e.status = r.status; e.answer = j;
+    throw e;
   }
   return j;
 }
@@ -833,8 +835,11 @@ function suggestionLines(d, inCard){
     + (d.hint_detail ? `<span class="meta sugg">${esc(d.hint_detail)}</span>` : '');
 }
 
-/* ---------- pop-up questions ---------- */
-function ask({title, text, input, ok='OK', danger=false, cancel='Cancel'}){
+/* ---------- pop-up questions ----------
+   Enter answers yes, and the yes button has the keyboard, unless the question is `careful`: then
+   Cancel has the keyboard and Enter presses only the button it is on, so that pressing Enter twice
+   (once to send a typed name, once more by habit) says no. A held-down Enter never answers at all. */
+function ask({title, text, input, ok='OK', danger=false, cancel='Cancel', careful=false}){
   return new Promise(resolve => {
     const m = $('modal');
     m.innerHTML = `<div class="card" role="dialog" aria-modal="true" aria-label="${esc(title)}">
@@ -846,8 +851,13 @@ function ask({title, text, input, ok='OK', danger=false, cancel='Cancel'}){
     const done = v => { m.hidden = true; m.innerHTML = ''; resolve(v); };
     $('mYes').onclick = () => done(input !== undefined ? $('mInput').value : true);
     if(cancel) $('mNo').onclick = () => done(null);
-    m.onkeydown = e => { if(e.key === 'Escape') done(null); if(e.key === 'Enter') $('mYes').click(); };
-    (input !== undefined ? $('mInput') : $('mYes')).focus();
+    m.onkeydown = e => {
+      // The Enter that opened the question may still be held down: its repeats answer nothing.
+      if(e.key === 'Enter' && e.repeat){ e.preventDefault(); return; }
+      if(e.key === 'Escape') done(null);
+      if(e.key === 'Enter' && !careful) $('mYes').click();
+    };
+    (input !== undefined ? $('mInput') : careful && cancel ? $('mNo') : $('mYes')).focus();
   });
 }
 const oops = e => ask({title:'That didn\'t work', text:e.message, cancel:''});
@@ -1300,9 +1310,39 @@ function enforceCard(d){
     <label class="switch"><input type="checkbox" id="enforceSwitch" ${d.enforced ? 'checked' : ''} aria-label="Cut live connections for this device"><span></span></label></div></div>`;
 }
 
+/* ---------- names a device's own system needs ----------
+   The server keeps a short list of names that a kind of device needs for its sign-in, app shop,
+   online check, clock or updates, and sends who needs each as `needed` ("Samsung TVs") with
+   activity rows and blocked-list rows. Such a row is never called "Possibly junk"; it says who needs it.
+   Blocking one is refused by the server (409, carrying `needed`) until the person has said yes:
+   blockAddress() asks and sends the block again with "sure": true. The check is the server's so
+   that it holds for every way of blocking, here and through the relay. */
+function neededQuestion(who){
+  return `${who} need this address for their own system to work. Blocking it may stop them opening apps, signing in or updating. Block it anyway?`;
+}
+// The line under a block that already exists on a needed name: the likely cause when a device plays up.
+function neededBlockedNote(who){
+  return who ? `<div class="meta">${esc(who)} need this address. If apps have stopped opening on one, or it can't sign in or update, unblock it.</div>` : '';
+}
+// Block an address; true if it was blocked, false if the person said no to the question.
+async function blockAddress(domain){
+  try{
+    await api('/api/block', {domain:domain});
+    return true;
+  }catch(e){
+    const a = e.answer || {};
+    if(e.status !== 409 || !a.needed) throw e;
+    const yes = await ask({title:`Block ${a.domain || domain}?`, ok:'Block it anyway', danger:true, careful:true, text:neededQuestion(a.needed)});
+    if(!yes) return false;
+    await api('/api/block', {domain:domain, sure:true});
+    return true;
+  }
+}
 function statusBadges(x){
   let out = '';
   if(x.v === 'junk') out += '<span class="badge danger">Advert / tracker</span>';
+  // A needed name is never called "Possibly junk". The note is plain, and amber once the person has blocked the name.
+  if(x.needed) out += `<span class="badge${x.b && x.why === 'you' ? ' warn' : ''}">Needed by ${esc(x.needed)}</span>`;
   else if(x.v === 'suspect') out += '<span class="badge warn">Possibly junk</span>';
   if(x.b && x.why === 'other_dns') out += '<span class="badge warn">Tried to use another DNS service</span>';
   else if(x.b) out += `<span class="badge accent">${x.why === 'you' ? 'Blocked by you' : x.why === 'service' || x.why === 'schedule' ? 'Blocked · ' + esc(x.svc)
@@ -1311,12 +1351,14 @@ function statusBadges(x){
   else if(x.why === 'allowed') out += '<span class="badge">Allowed by you</span>';
   return out;
 }
+// On a device page: the note for a row the person has blocked themselves, when devices need that name.
+function blockedByYouNote(x){ return x.b && x.why === 'you' ? neededBlockedNote(x.needed) : ''; }
 function blockBtn(x, domain){
   if(['service', 'off', 'schedule', 'kill'].includes(x.why)) return '';   // managed with the switches at the top of the page
   if(x.why === 'other_dns') return '';                                   // always blocked: see otherDnsNotice
   return x.b
     ? `<button class="btn" data-act="unblock" data-d="${esc(domain)}">Unblock</button>`
-    : `<button class="btn ${x.v === 'ok' ? '' : 'primary'}" data-act="block" data-d="${esc(domain)}" data-v="${esc(x.v)}">Block</button>`;
+    : `<button class="btn ${x.v === 'ok' || x.needed ? '' : 'primary'}" data-act="block" data-d="${esc(domain)}" data-v="${esc(x.v)}" data-needed="${esc(x.needed || '')}">Block</button>`;
 }
 function activityList(){
   const q = S.search.trim().toLowerCase();
@@ -1333,10 +1375,10 @@ function activityList(){
     const open = S.open.has(g.base), many = g.hosts.length > 1 || g.hosts[0].d !== g.base;
     const hosts = open ? `<div class="hosts">${g.hosts.map(h => `
       <div class="item"><div class="top"><div class="info"><span class="title">${esc(h.d)}</span>${statusBadges(h)}
-        <div class="meta">${h.n === 1 ? 'once' : num(h.n) + ' times'} · last ${esc(ago(h.last))}</div></div>${blockBtn(h, h.d)}</div></div>`).join('')}</div>` : '';
+        <div class="meta">${h.n === 1 ? 'once' : num(h.n) + ' times'} · last ${esc(ago(h.last))}</div>${blockedByYouNote(h)}</div>${blockBtn(h, h.d)}</div></div>`).join('')}</div>` : '';
     return `<div class="item"><div class="top">
       <div class="info"><span class="title">${esc(g.owner || g.base)}</span>${statusBadges(g)}
-        <div class="meta">${g.owner ? esc(g.base) + ' · ' : ''}contacted ${g.n === 1 ? 'once' : num(g.n) + ' times'}${g.nb ? ' (' + num(g.nb) + ' blocked)' : ''} · last ${esc(ago(g.last))}</div>
+        <div class="meta">${g.owner ? esc(g.base) + ' · ' : ''}contacted ${g.n === 1 ? 'once' : num(g.n) + ' times'}${g.nb ? ' (' + num(g.nb) + ' blocked)' : ''} · last ${esc(ago(g.last))}</div>${blockedByYouNote(g)}
         ${many ? `<button class="expand" data-act="expand" data-b="${esc(g.base)}" aria-expanded="${open}">${open ? 'Hide' : 'Show'} ${num(g.hosts.length)} address${g.hosts.length > 1 ? 'es' : ''}</button>` : ''}
       </div>${blockBtn(g, g.base)}</div>${hosts}</div>`;
   }).join('');
@@ -1574,9 +1616,10 @@ function overnightHint(e){
 /* ---------- Blocked list ---------- */
 function viewRules(){
   const r = S.rules || {blocked:[], allowed:[]}, c = (S.status || {}).community || {};
-  const rows = (list, label) => list.length ? `<div class="list rows">${list.map(x => `
-    <div class="item"><div class="top"><div class="info"><span class="title mono">${esc(x.d)}</span>
-      <div class="meta">${x.owner ? esc(x.owner) + ' · ' : ''}added ${esc(ago(x.ts))}</div></div>
+  // `blocks` is true for the "Blocked by you" list: only there does a needed name carry its note.
+  const rows = (list, label, blocks) => list.length ? `<div class="list rows">${list.map(x => `
+    <div class="item"><div class="top"><div class="info"><span class="title mono">${esc(x.d)}</span>${blocks && x.needed ? `<span class="badge warn">Needed by ${esc(x.needed)}</span>` : ''}
+      <div class="meta">${x.owner ? esc(x.owner) + ' · ' : ''}added ${esc(ago(x.ts))}</div>${blocks ? neededBlockedNote(x.needed) : ''}</div>
       <button class="btn" data-act="forget" data-d="${esc(x.d)}">${label}</button></div></div>`).join('')}</div>`
     : '<div class="empty">Nothing here yet.</div>';
   let listInfo = c.installed
@@ -1590,9 +1633,9 @@ function viewRules(){
     <p class="meta">Type a website or address, for example <i>ads.example.com</i>. Everything under it is blocked too.</p>
     <div class="row"><input type="text" id="addBox" class="grow" placeholder="example.com" aria-label="Address to block">
       <button class="btn primary" data-act="add">Block</button></div></div>
-  <div class="card"><h2>Blocked by you</h2>${rows(r.blocked, 'Unblock')}</div>
+  <div class="card"><h2>Blocked by you</h2>${rows(r.blocked, 'Unblock', true)}</div>
   <div class="card"><h2>Always allowed</h2>
-    <p class="meta">Addresses you unblocked even though they're on the junk list.</p>${rows(r.allowed, 'Remove')}</div>
+    <p class="meta">Addresses you unblocked even though they're on the junk list.</p>${rows(r.allowed, 'Remove', false)}</div>
   <div class="card"><h2>The full junk list</h2>
     <p class="meta">A free list of well over 100,000 known advert and tracker addresses, kept up to date by volunteers
       (the StevenBlack list). Downloading it makes automatic blocking far more thorough.</p>
@@ -1984,19 +2027,20 @@ const actions = {
   filter(d){ S.filter = d.f; render(); },
   expand(d){ S.open.has(d.b) ? S.open.delete(d.b) : S.open.add(d.b); drawList(); },
   async block(d){
-    if(d.v === 'ok'){
+    // A needed name skips this general question: the server asks a fuller one (see blockAddress).
+    if(d.v === 'ok' && !d.needed){
       const yes = await ask({title:`Block ${d.d}?`, ok:'Block it', danger:true,
         text:'This doesn\'t look like an advert or tracker. Blocking it might stop an app or website from working. You can unblock it again at any time.'});
       if(!yes) return;
     }
-    await api('/api/block', {domain:d.d}).catch(oops); refresh();
+    await blockAddress(d.d).catch(oops); refresh();
   },
   async unblock(d){ await api('/api/unblock', {domain:d.d}).catch(oops); refresh(); },
   async forget(d){ await api('/api/forget', {domain:d.d}).catch(oops); refresh(true); },
   async add(){
     const v = $('addBox').value;
     if(!v.trim()) return;
-    try{ await api('/api/block', {domain:v}); $('addBox').value = ''; refresh(true); }catch(e){ oops(e); }
+    try{ if(await blockAddress(v)){ $('addBox').value = ''; refresh(true); } }catch(e){ oops(e); }
   },
   // The open device, or (from a group's "Name it" button) the device the button names.
   async rename(d){
@@ -2066,7 +2110,8 @@ document.addEventListener('input', e => {
   }
   if(e.target.id === 'search'){ S.search = e.target.value; drawList(); }
 });
-document.addEventListener('keydown', e => { if(e.key === 'Enter' && e.target.id === 'addBox') actions.add(); });
+// A held-down Enter sends the typed name once, not once for every repeat of the key.
+document.addEventListener('keydown', e => { if(e.key === 'Enter' && !e.repeat && e.target.id === 'addBox') actions.add(); });
 
 // Safari before 14.1 ignores 'gap' on flex rows. A one-pixel gap between two empty boxes stacked
 // in a column makes the column one pixel tall only where it works; elsewhere add 'nogap' so the
