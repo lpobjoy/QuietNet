@@ -110,6 +110,12 @@ class Containers(unittest.TestCase):
     def test_the_relay_container_includes_the_relay_and_the_dashboard(self):
         self.assertLessEqual({"cloud/relay.py", "static"}, copied_into(os.path.join("cloud", "Dockerfile")))
 
+    def test_the_relay_container_writes_its_log_out_unbuffered(self):
+        # The host reads the relay's output through a pipe; without this a start-up line such as
+        # "Licence gate: on" could sit in Python's buffer, or be lost when the relay is stopped.
+        lines = [l.split() for l in read("cloud", "Dockerfile").splitlines() if l.strip().upper().startswith("ENV")]
+        self.assertIn(["ENV", "PYTHONUNBUFFERED=1"], lines)
+
     def test_the_relay_container_declares_no_volume(self):
         # Railway refuses to build an image with a VOLUME line (see CHANGELOG 0.5).
         lines = [l for l in read("cloud", "Dockerfile").splitlines() if l.strip().upper().startswith("VOLUME")]

@@ -182,14 +182,15 @@ A network address is the last entry of `X-Forwarded-For` (added by the host's pr
 | `POST /login` | Form fields `email`, `password`. `503` "The relay is busy" if four passwords are already being checked and none finishes within 5 seconds |
 | `GET /logout` | A "Sign out?" page with a button. Changes nothing. Redirects to `/login` if not signed in |
 | `POST /logout` | Form field `token`, the sign-out token in the page's sign-out button (made from the session cookie and the relay's secret). With the right token, signs the account out everywhere (every session cookie made for it so far, in any browser, stops working), clears both cookies and redirects to `/login`. Without it, changes nothing and redirects to `/` (or to `/login` if not signed in) |
-| `GET /` | Your QuietNets, with pairing codes for those not yet paired. A code older than 15 minutes is replaced when this page is opened. Each waiting QuietNet also shows the one-line install command with this relay's address and the code (the address from `QUIETNET_RELAY_URL`, `RAILWAY_PUBLIC_DOMAIN` or the `Host` header, used only if it is a plain address; otherwise a placeholder to replace) |
-| `POST /pis/new` | Form field `name`. Creates a QuietNet and a pairing code. `403` with a page saying so when the account already has 10 QuietNets, paired or waiting |
+| `GET /` | Your QuietNets, with pairing codes for those not yet paired. A code older than 15 minutes is replaced when this page is opened. Each waiting QuietNet also shows the one-line install command with this relay's address and the code (the address from `QUIETNET_RELAY_URL`, `RAILWAY_PUBLIC_DOMAIN` or the `Host` header, used only if it is a plain address; otherwise a placeholder to replace). A **Licence** card gives one sentence for the licence's state (see "Licences" below), in the licence's last 7 days a warning ("Your QuietNet licence ends on 4 January 2027. Filtering at home carries on; remote access and updates stop unless it's renewed."; not for plans that renew by themselves), and "Pis: N of M" (paired Pis of the licence's seats; just "Pis: N" for an account with no licence), followed by "(1 waiting to be paired)" when Pis waiting with a code still in date hold seats too. With the licence gate on: a paired Pi whose account may not use remote access shows "Remote access paused" instead of Online or Offline (it still opens `/pi/<id>/`, which is then the paused page); when a new Pi isn't allowed the Add a QuietNet form is replaced by "Adding a Pi needs a current licence.", or, when every seat is taken, "Your licence covers 2 Pis and both are in use. Remove one to add another." (paired Pis fill the seats) or "Your licence covers 2 Pis: 1 is paired and 1 is waiting to be paired. Remove one to add another." (waiting Pis make up the rest); and when pairing isn't allowed (no current licence, or paired Pis fill the seats) a waiting QuietNet shows "Adding a Pi needs a current licence." or "Your licence covers 1 Pi and it is in use. Remove one to pair this one." in place of its code and install command, and its code is not renewed. This page refuses nothing and logs nothing itself; the gates behind it do |
+| `POST /pis/new` | Form field `name`. Creates a QuietNet and a pairing code. `403` with a page saying so when the account already has 10 QuietNets, paired or waiting. With the licence gate on, also `403` with "Adding a Pi needs a current licence." when the licence doesn't allow pairing, or the same seats sentence as the home page when paired Pis plus Pis waiting with a code still in date already fill the seats. With the gate off these are let through and logged |
 | `POST /pis/<id>/delete` | Removes one of your QuietNets. Its Pi is locked out at once |
 | `POST /theme` | Form field `theme`: `calm`, `household` or `control` (anything else saves `calm`). Sets the `qn_theme` cookie (below) and redirects (`303`) to `/`, always. Redirects to `/login`, setting nothing, if not signed in. Offered by the Appearance card on `/` |
-| `GET /pi/<id>/` | The dashboard page, set to call this Pi, with a bar across the top naming the Pi, saying whether it is online, and offering a way back and a sign-out button |
-| `GET` or `POST /pi/<id>/api/…` | Passed to the Pi. Needs the header `X-QuietNet: 1` |
+| `GET /pi/<id>/` | The dashboard page, set to call this Pi, with a bar across the top naming the Pi, saying whether it is online, and offering a way back and a sign-out button. With the licence gate on and remote access not allowed: the **paused page** instead (below) |
+| `GET` or `POST /pi/<id>/api/…` | Passed to the Pi. Needs the header `X-QuietNet: 1`. With the licence gate on and remote access not allowed: `402` with `{"error"}` (below), and nothing is passed to the Pi |
+| `POST /pi/<id>/rescue` | Form field `what`: `internet-on` or `pause-hour`. Sends one fixed call to the Pi, in every licence state and whether the gate is on or off (below). Redirects to `/login` if not signed in; `404` if the Pi isn't yours; `400` with a page for any other `what`, and nothing is sent; `429` with a page, nothing sent and nothing logged, after 20 rescues by the account in the last hour |
 
-**Forms from another website.** `POST /login`, `/signup`, `/logout`, `/pis/new`, `/theme` and `/pis/<id>/delete` are refused with `403` when the request's `Sec-Fetch-Site` header is `cross-site` or `same-site`, with the message "That form was sent from another website, so it was refused. Open this relay's own page and try again." (on the sign-in form for `/login` and `/signup`, on a short "Refused" page for the others). Requests without the header are handled as usual. This does not apply to `/pi/…` or `/agent/…`.
+**Forms from another website.** `POST /login`, `/signup`, `/logout`, `/pis/new`, `/theme`, `/pis/<id>/delete` and `/pi/<id>/rescue` are refused with `403` when the request's `Sec-Fetch-Site` header is `cross-site` or `same-site`, with the message "That form was sent from another website, so it was refused. Open this relay's own page and try again." (on the sign-in form for `/login` and `/signup`, on a short "Refused" page for the others). Requests without the header are handled as usual. This does not apply to `/agent/…`, or to `/pi/…` other than the rescue form.
 
 The session cookie is `qn_session`, valid for 14 days, `HttpOnly` and `SameSite=Lax`, and `Secure` when the request arrived over HTTPS. Its value is `user.number.expiry.signature`; a cookie from before session numbers (three parts) counts as signed out.
 
@@ -199,6 +200,7 @@ Relayed calls can fail in these ways:
 
 | Status | Meaning |
 | --- | --- |
+| `402` | Remote access is paused for this account's licence (gate on only). `{"error": "..."}`, for example "Remote access is paused because the licence ended on 4 January 2027. Your Pi is still blocking at home." This is checked after "is it your Pi", so another account's Pi is still `404` |
 | `403` | The `X-QuietNet: 1` header is missing |
 | `404` | Not signed in, not your Pi, or not an `/api/` path |
 | `503` | The Pi is not paired, or has not been heard from for 40 seconds; or its answer was too large for the relay to pass on right now (`{"error": "Your QuietNet's answer was too large for the relay to pass on right now. Please try again in a moment."}`) |
@@ -212,8 +214,70 @@ Any other status and body are the Pi's own.
 
 | Request | Body or header | Returns |
 | --- | --- | --- |
-| `POST /agent/pair` | `{"code"}` | `{"ok", "id", "token"}` (the only time the token is sent; the relay keeps only its hash), or `400` with `{"error"}` if the code is wrong, used or expired. A code works once and for 15 minutes. `429` after too many wrong codes (from this network address or overall), or when the account has paired too many QuietNets today; the code is not used up |
-| `GET /agent/poll` | Header `X-QuietNet-Token` | Waits up to 25 seconds. `{}` if nothing to do, or `{"id", "method", "path", "body"?}`. A Pi has one poll waiting at a time: a new one ends the older one, which returns `{}`. `401` if the token is not recognised. `503` with `{"error"}` when 150 Pis are already waiting |
+| `POST /agent/pair` | `{"code", "install"?}` | `{"ok", "id", "token"}` (the only time the token is sent; the relay keeps only its hash), or `400` with `{"error"}` if the code is wrong, used or expired. A code works once and for 15 minutes. `429` after too many wrong codes (from this network address or overall), or when the account has paired too many QuietNets today; the code is not used up. `install` is the Pi's install id, exactly 32 lower-case hex characters; anything else is ignored (older Pis send none). It is stored on the Pi's entry. `403` cases, none of which use up the code: (1) another paired Pi of the same account has the same install id and is online: `{"error": "Another Pi with the same identity is online. This usually means the SD card was copied. On this Pi, run the installer with --new-identity, then pair again."}` (if that other entry is offline, it is this Pi paired again, and the old entry is removed and its token stops working); (2) with the licence gate on, the licence doesn't allow pairing: `{"error": "Remote access needs a QuietNet licence. Your Pi is still filtering at home. Visit q3n.net to renew.", "licence": "<state>"}`; (3) with the gate on, paired Pis (not counting one being replaced) already fill the seats: `{"error": "Your licence covers 2 Pis and both are in use. Remove one at q3n.net, then pair again.", "licence": "<state>"}`. The seat count and the pairing happen together, so codes sent at the same moment can't pair more Pis than the seats, and a code sent twice at once pairs once (the other gets the `400`). Never `401` for a licence reason |
+| `GET /agent/poll` | Header `X-QuietNet-Token`; optional `X-QuietNet-Agent: 2` | Waits up to 25 seconds. `{"licence": {...}}` (no `id`) if nothing to do, or `{"id", "method", "path", "body"?, "licence": {...}}`, plus `"latest"` in both when set (below). A Pi has one poll waiting at a time: a new one ends the older one, which returns with no `id`. `401` if the token is not recognised. `503` with `{"error"}` when 150 Pis are already waiting. Always `200` for a licence reason, and the wait and poll slots are the same whatever the licence. `X-QuietNet-Agent: 2` (from 0.6) is recorded on the Pi's entry; anything else counts as 1 and picks the older rescue call |
 | `POST /agent/respond` | Headers `X-QuietNet-Token` and `X-QuietNet-Call` (the call id); `{"id", "status", "body"}`, up to 16 MB | `{"ok": true}`, or `413` if too big. An answer to a call that was sent to a different Pi is ignored, as is a second answer to the same call. An answer over 64 KB needs room: one at a time per account (across all its Pis) and 48 MB across every account. If none comes within 10 seconds, the answer is `503` and the waiting browser gets `503` at once |
 
 `body` in both directions is the JSON text as a string, passed through unchanged.
+
+**The `licence` object in poll answers** (version 1):
+
+```json
+{"licence": {"v": 1, "state": "past_due", "remote": true, "updates": true,
+             "until": 1798934400, "grace_until": 1800144000,
+             "seats": 2, "used": 1, "now": 1798000000},
+ "latest": "0.6"}
+```
+
+| Key | Meaning |
+| --- | --- |
+| `v` | Format version, `1` |
+| `state` | `none`, `trial`, `active`, `cancelling`, `past_due`, `expired` or `revoked`: the real state, gate on or off |
+| `remote`, `updates` | What the relay will actually allow. **With the gate off both are `true` whatever the state**, because nothing is refused then; with it on they follow the state |
+| `until` | End of the paid period (Unix seconds), `0` for no end |
+| `grace_until` | Only for `past_due`: when it becomes `expired` |
+| `seats` | Pis the licence covers. Left out for `none`: an account with no licence has none |
+| `used` | Paired Pis |
+| `now` | The relay's clock, so a Pi with a wrong clock can still count days |
+
+`latest` is added only when `QUIETNET_LATEST` holds a version number such as `0.6` or `0.6.1`. Pis before 0.6 ignore both keys: they hand on only an answer with an `id`, and use only its `id`, `method`, `path` and `body`.
+
+### Licences (relay)
+
+Each account has at most one licence. The relay works out its state from what is stored (the time-based steps are applied as it is read):
+
+| State | Remote access | Updates | Add or pair Pis |
+| --- | --- | --- | --- |
+| `none` (no licence) | No | No | No |
+| `trial` | Yes | Yes | Yes, within seats |
+| `active` | Yes | Yes | Yes, within seats |
+| `cancelling` (active, set to end at the period end) | Yes, until the end date | Yes | Yes |
+| `past_due` (until `grace_until`, or 14 days after the end date if that is not set; with neither set, no end) | Yes | Yes | No |
+| `expired` (also: `active` or `trial` 3 days past the end date; `cancelling` from the end date; `past_due` once its grace ends) | No | No | No |
+| `revoked` | No | No | No |
+
+**The gate.** `QUIETNET_LICENCE_GATE=on` enforces the table. Off (the default, and any other value), every request is let through and what would have been refused is logged instead: one log line and one `licence_log` row, at most once an hour for each account and kind of refusal (remote access, adding a Pi, adding beyond the seats, pairing, pairing beyond the seats). Refusals with the gate on are logged the same way. `licence_log` keeps the newest 1000 of these lines (and rescues) per account; the owner's own lines (grants and changes from the command line, and the legacy grant) are always kept.
+
+**The paused page** (`GET /pi/<id>/`, gate on, remote access not allowed) says why ("Your QuietNet licence ended on 4 January 2027. Your Pi is still filtering and blocking at home as normal." for an expired licence; other words for `revoked` and `none`), then two buttons, each a form posting to `/pi/<id>/rescue`: **Turn the internet back on for every device** (`what=internet-on`) and **Pause blocking for an hour** (`what=pause-hour`), and how to reach the dashboard at home or stop using QuietNet.
+
+**Rescue calls.** The relay builds the call itself from fixed text; nothing from the browser goes into its path or body:
+
+| Button | Pi from 0.6 (`X-QuietNet-Agent: 2`) | Older Pi |
+| --- | --- | --- |
+| `internet-on` | `POST /api/rescue {"what": "internet-on"}` | `POST /api/kill {"on": false}` (kill switch only) |
+| `pause-hour` | `POST /api/pause {"minutes": 60}` | the same |
+
+It goes through the bridge like any relayed call. The result page says "Done. Every device's internet switch is back on. It can take a minute or two for devices to notice." (older Pi: "Done. The household kill switch is off. ..."), or "Done. Blocking is paused for an hour."; `503` with "Your Pi isn't connected to q3n.net right now, so this couldn't be sent. Is it switched on?" when the Pi is not paired or not heard from for 40 seconds; `504` when it doesn't answer in 30 seconds; `502` when it answers with an error. Every rescue is written to `licence_log`. An account may press 20 times an hour; after that the answer is `429` ("That's a lot of rescue presses in the last hour, so this one wasn't sent. Please wait a few minutes and try again."), nothing is sent and nothing is logged.
+
+**Owner's command line** (run inside the relay's container, for example with `railway ssh`). It gives up root first, as the server does, then opens `relay.db`:
+
+```
+python relay.py licence show <email>
+python relay.py licence list
+python relay.py licence grant <email> --plan owner|gift|legacy [--days N] [--seats N]
+python relay.py licence revoke <email> --reason "..."
+python relay.py licence restore <email>
+python relay.py licence seats <email> N
+```
+
+`--days` left out or `0` means no end date; `--seats` 1 to 10, left out keeps the licence's seats (2 for a new one). `grant` sets `active` and clears any reason; `revoke` sets `revoked` with the reason and keeps the plan and dates; `restore` sets `active` again, keeping the end date. The account is found by its current email. Each change writes a `licence_log` row. `list` prints every account, one line each (email, account number, licence id, state now, plan, end date, and "Pis: N of M", or "no licence" and "Pis: N"), then the number of accounts, or "No accounts on this relay yet."; it changes nothing. Exit status 0 when done, 1 for an unknown email or a licence that isn't there, 2 for a wrong command (a missing or blank `--reason` included); the reason is printed in plain words.

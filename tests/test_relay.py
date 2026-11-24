@@ -84,6 +84,12 @@ class RelayCase(unittest.TestCase):
     def setUp(self):
         relay.sql("DELETE FROM users", commit=True)
         relay.sql("DELETE FROM pis", commit=True)
+        relay.sql("DELETE FROM licences", commit=True)
+        relay.sql("DELETE FROM licence_log", commit=True)
+        with relay._gate_lock:
+            relay._gate_noted.clear()
+        self.said = []
+        self.limit("say", self.said.append)         # the relay's log lines, kept out of the test output
         with relay.bridge.lock:
             relay.bridge.queues.clear()
             relay.bridge.waiting.clear()
@@ -92,6 +98,8 @@ class RelayCase(unittest.TestCase):
         relay.sql("DELETE FROM throttle", commit=True)
         self.limit("big_answers", relay.BigAnswers(relay.BIG_ANSWER_BUDGET))
         self.limit("SIGNUP", "open")        # most tests make several accounts; SignupSwitch tests the others
+        self.limit("LICENCE_GATE", "off")   # the gate's own tests switch it on; a developer's QUIETNET_LICENCE_GATE must not leak in
+        self.limit("LATEST", "")            # likewise QUIETNET_LATEST, so poll answers carry only the licence
 
     def limit(self, name, value):
         """Change one of the relay's limits for the length of a test."""
@@ -656,7 +664,10 @@ class AgentSide(RelayCase):
             status, text, _ = Browser(self.port).get("/agent/poll", headers={"X-QuietNet-Token": token})
         finally:
             relay.POLL_TIMEOUT = real
-        self.assertEqual((status, json.loads(text)), (200, {}))
+        answer = json.loads(text)
+        self.assertEqual(status, 200)
+        self.assertNotIn("id", answer)                  # no id: nothing to do
+        self.assertEqual(set(answer), {"licence"})      # only the licence, which every answer carries
         self.assertGreater(relay.sql("SELECT last_seen FROM pis WHERE id=?", (pid,), one=True)[0], time.time() - 60)
 
 
@@ -861,13 +872,18 @@ class Looks(RelayCase):
 
     def relay_pages(self):
         """The text of every kind of relay page: signed out, signed in with a paired and a waiting
-        Pi, sign-out, refused, and an error page."""
+        Pi, sign-out, refused, an error page, and (with the licence gate on and no licence) the home
+        page, the paused page and a rescue's result."""
         b = self.signed_in()
-        self.paired_pi(b)
+        pid, _ = self.paired_pi(b)
         b.post("/pis/new", form={"name": "Gran's"})
         pages = [Browser(self.port).get("/login")[1], Browser(self.port).get("/signup")[1],
                  b.get("/")[1], b.get("/logout")[1], Browser(self.port).get("/nope")[1],
                  b.post("/pis/new", form={"name": "x"}, headers={"Sec-Fetch-Site": "cross-site"})[1]]
+        self.limit("LICENCE_GATE", "on")
+        relay.sql("UPDATE pis SET last_seen=0 WHERE id=?", (pid,), commit=True)
+        pages += [b.get("/")[1], b.get("/pi/%s/" % pid)[1],
+                  b.post("/pi/%s/rescue" % pid, form={"what": "pause-hour"})[1]]
         return pages
 
     def test_the_relay_pages_load_nothing_from_other_websites(self):
