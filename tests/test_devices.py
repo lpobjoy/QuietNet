@@ -1202,6 +1202,16 @@ class DeviceList(Api):
         self.assertEqual([(g["base"], g["needed"], g["hosts"][0]["needed"]) for g in groups],
                          [("samsungcloudsolution.net", "Samsung TVs", "")])
 
+    def test_activity_says_who_needs_a_name_a_device_asked_for_from_its_link_local_address(self):
+        # The announcement trial names this computer's link-local address, so a device that takes it
+        # up asks from its own link-local address. Its card's list must still say who needs the name.
+        self.look({OLD_SPOT: fresh(TV)})
+        server.note_ipv6_addresses({LL_A: fresh(TV)}, now=self.now)
+        self.lookup(LL_A + "%wlan0", "lcprd1.samsungcloudsolution.net")
+        _, groups = self.get("/api/activity?ip=%s&device=%s&hours=24" % (OLD_SPOT, server.S.hw_device[TV]))
+        self.assertEqual([(g["base"], g["needed"], g["hosts"][0]["needed"]) for g in groups],
+                         [("samsungcloudsolution.net", "Samsung TVs", "")])
+
     def test_activity_by_address_alone_is_what_was_recorded_under_that_address(self):
         self.tv_moves()
         _, groups = self.get("/api/activity?ip=%s&hours=24" % NEW_SPOT)
