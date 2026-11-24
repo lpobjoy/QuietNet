@@ -653,7 +653,7 @@ class AThirdDeviceStillBeingAskedAbout(Api, Setup):
         self.assertTrue(blocked_for(OLD))
 
     def test_the_question_ends_when_the_merged_device_is_seen_beside_the_newcomer(self):
-        # As for any device seen on the network beside the newcomer (known issue 99: with a merged
+        # As for any device seen on the network beside the newcomer (known issue 100: with a merged
         # device this is the laptop's other network card, which proves less than it used to).
         self.merge(self.laptop, self.phone)
         self.look({OLD: PRIVATE, OTHER: LAPTOP}, later=120)
@@ -1413,7 +1413,7 @@ class TheDashboardPage(unittest.TestCase):
         flow = self.page[self.page.index("async function mergeFlow("):self.page.index("const actions = {")]
         self.assertIn("for(;;){", flow)
         self.assertIn("catch(e){ if(e.status !== 409) return e; await oops(e); }", flow)
-        self.assertIn("err.status = r.status;", self.page)
+        self.assertIn("e.status = r.status;", self.page)
 
     def test_the_merge_preview_shows_each_hardware_address_and_marks_what_is_new_or_stops(self):
         blocks = self.part("mergeBlocks")

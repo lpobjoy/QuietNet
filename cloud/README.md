@@ -21,6 +21,10 @@ It uses only the Python standard library.
    the Pi's own QuietNet page under **Remote access**. The code works once and for 15 minutes;
    reload the page for a new one. One account can hold up to 10 QuietNets and pair up to 20 a day.
 
+## Keeping the relay in step with the Pi
+
+The dashboard you see through the relay is the relay's own copy of the page (`static/index.html`, built into its image), not the Pi's. When QuietNet on the Pi is updated, redeploy the relay as well, so the page away from home matches what the Pi can do. A relay left behind still works, but shows the older page: for example, it will not ask before blocking an address that a TV or console needs for its own system, and the Pi then refuses that block until it is made from QuietNet's own page at home.
+
 ## Licences
 
 Each account has a licence, which decides whether it can reach its Pis through the relay and add or pair Pis. Blocking at home never depends on it: a Pi whose licence has lapsed stays paired, keeps filtering, and its paused page keeps two buttons to turn the internet back on for every device or pause blocking for an hour.
