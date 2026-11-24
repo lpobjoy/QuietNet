@@ -31,7 +31,7 @@ A home network filter. Devices point their DNS at it; it records what they look 
 python3 -m unittest discover tests
 ```
 
-It takes about 75 seconds and needs nothing installed. It must end in `OK`. Run it as an ordinary user if you can: as an admin user on Linux, two shutdown tests are skipped.
+It takes about 70 to 90 seconds and needs nothing installed. It must end in `OK`. Run it as an ordinary user if you can: as an admin user on Linux, two shutdown tests are skipped.
 
 ## Rules
 
