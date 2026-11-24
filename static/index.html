@@ -1508,9 +1508,10 @@ async function refresh(hard, tick){
       jobs.push(api('/api/schedules').then(x => S.schedules = x));
     if(S.tab === 'setup') jobs.push(api('/api/cloud').then(x => S.cloud = x).catch(() => {}));
     if(S.tab === 'home' || S.tab === 'groups' || S.tab === 'schedules')
-      // The Pi lists by device now. Every card here is still known by its address (d.ip), so a
+      // The Pi lists by device now. Every card here is still known by its address (d.ip). A
       // device with no address of its own (it has left, and its address went to another device)
-      // is not shown yet; its history is kept on the Pi under its number (d.id).
+      // is only sent when asked for with ?all=1, and could not be shown here yet; its history is
+      // kept on the Pi under its number (d.id). The filter is a second guard on that.
       jobs.push(api('/api/devices').then(x => S.devices = x.filter(d => d.ip)), api('/api/groups').then(x => S.groups = x));
     if(S.tab === 'home' && S.device) jobs.push(ctl('device:' + S.device));
     if(S.tab === 'groups' && S.group) jobs.push(ctl('group:' + S.group));

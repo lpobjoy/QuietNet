@@ -25,7 +25,7 @@ A **scope** is `all`, `group:<id>` or `device:<ip>`.
 | --- | --- |
 | `GET /` | The dashboard page |
 | `GET /api/status` | See below |
-| `GET /api/devices` | List of devices, one entry per device, most recently active first |
+| `GET /api/devices` | List of devices, one entry per device, most recently active first. With `?all=1` it also lists devices that have no address of their own now (`"ip": ""`: see below) |
 | `GET /api/activity?ip=<ip>&device=<number>&hours=<n>&since=<marker>` | What one device contacted, grouped by company. `device` is the device's number (`id` in `/api/devices`): the list is then the device's own history at every address it has had. Without it, or with a number QuietNet doesn't know, the list is what was recorded under the address `ip`, as before. `hours` defaults to 24, limited to 0.1–720. `since` is optional: see below |
 | `GET /api/rules` | `{"blocked": [...], "allowed": [...]}`, each item `{"d", "ts", "owner"}` |
 | `GET /api/services` | The service catalogue: `[{"id", "name", "cat"}]` |
@@ -94,7 +94,7 @@ A **scope** is `all`, `group:<id>` or `device:<ip>`.
 - `kind` is `"hw"` (known by its hardware address), `"addr"` (known only by a network address: no hardware address is known for it, or it is behind a Wi-Fi range extender that shows several devices under one hardware address), `"pi"` (this computer) or `"hub"` (the home router).
 - `macs` is the device's hardware addresses; `mac` is the first, as before.
 - `addresses` is the addresses it has now or was confirmed at in the last day, IPv4 first, 32 at most. `first` and `last` are when it was first and last confirmed there (`null` where that isn't recorded) and `now` is whether it is there at this moment. A phone usually shows one IPv4 address and several IPv6 ones.
-- `ip` is the one address the entry is shown and controlled under: the IPv4 address the device has now; else the last one it had that no other device has been seen at since; else an IPv6 address. **It is `""` for a device that has left and whose address has since gone to another device.** Such a device keeps its history under its `id`; the dashboard page does not show it yet.
+- `ip` is the one address the entry is shown and controlled under: the IPv4 address the device has now; else the last one it had that no other device has been seen at since; else an IPv6 address. **It is `""` for a device that has left and whose address has since gone to another device.** Such a device keeps its history under its `id`, and is listed only with `?all=1`: a page from before the device tables (which an older relay may still serve) knows each card by its address and could not show or open it. The dashboard page does not show such devices yet.
 
 **Names, groups and rules are still kept under addresses**, so `name`, `group`, `off`, `enforced`, `paused` and `warning` are read from `ip`, and the calls that change them still take an address. An address that carries a name or rules of its own but is not the address its device is listed under (a TV's old address whose rules could not be moved, say) keeps an entry of its own, with `id` `null` and `kind` `"addr"`, so those rules can still be seen and removed. So does an address no device is known for. No two entries share an `ip`.
 

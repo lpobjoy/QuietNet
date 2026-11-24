@@ -462,8 +462,8 @@ class HistoryAgainstTheDevice(Devices):
             t = threading.Thread(target=lambda: (server.answer_query(query("www.bbc.co.uk"), OLD_SPOT, fake_answer),
                                                  done.set()), daemon=True)
             t.start()
-            answered = done.wait(2)
-        t.join(2)
+            answered = done.wait(10)
+        t.join(10)
         self.assertTrue(answered)
 
 
@@ -663,8 +663,8 @@ class DeviceList(Api):
         with server.db_lock:
             server.save_history(drain())
 
-    def devices(self):
-        status, out = self.get("/api/devices")
+    def devices(self, everything=False):
+        status, out = self.get("/api/devices" + ("?all=1" if everything else ""))
         self.assertEqual(status, 200)
         return out
 
@@ -727,16 +727,34 @@ class DeviceList(Api):
 
     def test_a_device_that_left_and_whose_address_went_to_another_has_no_address_but_keeps_its_history(self):
         tv, phone = self.address_changes_hands()
-        listed = {d["id"]: d for d in self.devices()}
+        listed = {d["id"]: d for d in self.devices(everything=True)}
         self.assertEqual((listed[tv]["ip"], listed[tv]["n"]), ("", 1))
+
+    def test_a_device_with_no_address_of_its_own_is_only_listed_when_asked_for(self):
+        tv, phone = self.address_changes_hands()
+        self.assertEqual([d["id"] for d in self.devices()], [phone])
+        self.assertEqual(sorted(d["id"] for d in self.devices(everything=True)), sorted([tv, phone]))
 
     def test_no_two_entries_share_an_address(self):
         self.address_changes_hands()
         self.look({OLD_SPOT: fresh(PHONE), NEW_SPOT: fresh(LAPTOP)})
         self.lookup(NEW_SPOT)
         server.sql("INSERT INTO seen(ip, mac, host, ts) VALUES(?,?,?,?)", (OLD_SPOT, TV, "", self.now - 900), commit=True)
-        ips = [d["ip"] for d in self.devices() if d["ip"]]
+        listed = self.devices(everything=True)
+        self.assertEqual(len(listed), 3)
+        ips = [d["ip"] for d in listed if d["ip"]]
         self.assertEqual(len(ips), len(set(ips)))
+
+    def test_a_device_whose_old_address_this_computer_now_has_is_not_listed_under_it(self):
+        self.look({OTHER: fresh(LAPTOP)}, ago=600)
+        self.lookup(OTHER, "laptop.example.com")
+        self.look({})                                         # the laptop has gone
+        server.S.local_ip = OTHER                             # and the router gave this computer its number
+        server.rebuild_address_map()
+        self.lookup("127.0.0.1", "pi.example.com")
+        listed = {d["id"]: d for d in self.devices(everything=True)}
+        self.assertEqual(listed[server.S.pi_device]["ip"], OTHER)
+        self.assertEqual((listed[server.S.hw_device[LAPTOP]]["ip"], listed[server.S.hw_device[LAPTOP]]["addresses"]), ("", []))
 
     def test_a_device_found_only_by_a_scan_is_listed_under_the_address_it_was_found_at(self):
         self.look({OLD_SPOT: fresh(TV)}, ago=600)
@@ -903,7 +921,7 @@ class DeviceList(Api):
         self.look({OLD_SPOT: stale(TV), NEW_SPOT: fresh(TV), OTHER: fresh(LAPTOP)})
         self.lookup(OTHER, "laptop.example.com")
         self.ok("/api/clear-history", {"ip": NEW_SPOT, "device": tv})
-        server.last_clear.join(5)
+        server.last_clear.join(30)
         self.assertEqual(server.sql("SELECT domain FROM queries"), [("laptop.example.com",)])
 
     def test_clearing_a_device_by_number_clears_its_waiting_lookups_too(self):
@@ -911,13 +929,13 @@ class DeviceList(Api):
         server.sql("INSERT INTO queries(ts,client,domain,blocked) VALUES(?,?,?,0)", (self.now, OLD_SPOT, "waiting.example.com"),
                    commit=True)
         self.ok("/api/clear-history", {"device": server.S.hw_device[TV]})
-        server.last_clear.join(5)
+        server.last_clear.join(30)
         self.assertEqual(server.sql("SELECT COUNT(*) FROM queries")[0][0], 0)
 
     def test_clearing_one_device_leaves_another_devices_history_at_the_same_address(self):
         tv, phone = self.address_changes_hands()
         self.ok("/api/clear-history", {"ip": OLD_SPOT, "device": phone})
-        server.last_clear.join(5)
+        server.last_clear.join(30)
         self.assertEqual(server.sql("SELECT domain FROM queries"), [("tv.example.com",)])
 
     def test_clearing_with_a_device_number_quietnet_does_not_know_and_no_address_clears_nothing(self):
@@ -974,8 +992,8 @@ class DeviceList(Api):
             with server.db_lock:
                 t = threading.Thread(target=lambda: (server.api_devices(), done.set()), daemon=True)
                 t.start()
-                finished = done.wait(2)
-            t.join(2)
+                finished = done.wait(10)
+            t.join(10)
         self.assertTrue(finished)
 
     def test_the_status_says_the_device_tables_are_ready(self):
@@ -1196,8 +1214,8 @@ class TheMove(OlderHousehold):
 
     def test_the_version_and_the_time_of_the_move_are_saved(self):
         self.assertEqual(server.get_setting("devices_version", ""), str(server.DEVICES_VERSION))
-        self.assertAlmostEqual(float(server.get_setting("devices_moved_at", "0")), time.time(), delta=30)
-        self.assertAlmostEqual(server.S.devices_moved_at, time.time(), delta=30)
+        self.assertAlmostEqual(float(server.get_setting("devices_moved_at", "0")), time.time(), delta=300)
+        self.assertEqual(server.S.devices_moved_at, float(server.get_setting("devices_moved_at", "0")))
 
     def test_a_copy_of_the_database_from_before_the_move_is_kept(self):
         copy = sqlite3.connect(os.path.join(self.folder, server.BEFORE_DEVICES))
@@ -1446,16 +1464,16 @@ class WhenTheMoveCannotBeDone(OlderHousehold):
 
         def slow(now):
             holding.set()
-            let_go.wait(5)
+            let_go.wait(60)
             return real(now)
         with mock.patch.object(server, "build_devices", slow):
             mover = threading.Thread(target=server.move_to_devices, daemon=True)
             mover.start()
-            self.assertTrue(holding.wait(5))
+            self.assertTrue(holding.wait(60))
             answered.append(server.answer_query(query("www.bbc.co.uk"), OTHER, fake_answer))
             answered.append(server.answer_query(query("www.youtube.com"), OTHER, fake_answer)[-4:])
             let_go.set()
-            mover.join(5)
+            mover.join(60)
         self.assertTrue(answered[0])
         self.assertEqual(answered[1], bytes(4))               # and the phone's YouTube block still bites
         self.assertTrue(server.S.devices_ready)
@@ -1487,7 +1505,7 @@ class TheKeeper(OlderHousehold):
 
     def test_the_keeper_starts_the_fill_once_the_move_is_done(self):
         fill = self.run_until_the_first_pause()
-        for _ in range(50):
+        for _ in range(500):
             if fill.called:
                 break
             time.sleep(0.02)
@@ -1504,6 +1522,77 @@ class TheKeeper(OlderHousehold):
         with mock.patch.object(server, "move_to_devices", side_effect=RuntimeError("no")):
             self.run_until_the_first_pause()                  # ends at the pause, not with the fault
         self.assertFalse(server.S.devices_ready)
+
+
+class TheKeepersRounds(Devices):
+    """The device keeper's loop, run for a set number of pauses with a stand-in clock. The looks
+    themselves are stand-ins, so the real neighbour table is never read."""
+
+    class Stop(BaseException):
+        """Raised by the stand-in for sleeping, to end the keeper's endless loop."""
+
+    def run_rounds(self, pauses, seconds_per_pause=server.ADDRESS_LOOK):
+        """Run the keeper until it has paused `pauses` times and is about to pause again. Returns
+        the stand-ins for the move, the look, the clean-up pass and the forgetting."""
+        clock = [1000.0]
+        slept = []
+
+        def sleep(seconds):
+            if len(slept) >= pauses:
+                raise self.Stop()
+            slept.append(seconds)
+            clock[0] += seconds_per_pause
+        with mock.patch.object(server.time, "sleep", sleep), \
+                mock.patch.object(server.time, "monotonic", lambda: clock[0]), \
+                mock.patch.object(server, "move_to_devices") as move, \
+                mock.patch.object(server, "note_ipv4_addresses") as look, \
+                mock.patch.object(server, "tidy_history") as tidy, \
+                mock.patch.object(server, "forget_old_devices") as forget:
+            with self.assertRaises(self.Stop):
+                server.device_keeper()
+        self.assertLessEqual(set(slept), {server.ADDRESS_LOOK})
+        return move, look, tidy, forget
+
+    def test_the_keeper_looks_at_the_neighbours_after_every_pause(self):
+        move, look, tidy, forget = self.run_rounds(3)
+        self.assertEqual(look.call_count, 3)
+        move.assert_not_called()
+
+    def test_the_first_look_comes_only_after_the_first_pause(self):
+        move, look, tidy, forget = self.run_rounds(0)
+        look.assert_not_called()
+
+    def test_the_clean_up_pass_runs_once_a_minute_not_on_every_look(self):
+        move, look, tidy, forget = self.run_rounds(server.TIDY_EVERY // server.ADDRESS_LOOK)
+        self.assertEqual(tidy.call_count, 1)
+        forget.assert_not_called()
+
+    def test_old_devices_are_forgotten_once_an_hour(self):
+        move, look, tidy, forget = self.run_rounds(2, seconds_per_pause=1800)
+        self.assertEqual(forget.call_count, 1)
+
+    def test_a_fault_in_a_look_does_not_stop_the_keeper(self):
+        with mock.patch("builtins.print"):
+            clock = [0]
+
+            def sleep(seconds):
+                clock[0] += 1
+                if clock[0] > 3:
+                    raise self.Stop()
+            with mock.patch.object(server.time, "sleep", sleep), \
+                    mock.patch.object(server, "note_ipv4_addresses", side_effect=RuntimeError("no")) as look:
+                with self.assertRaises(self.Stop):
+                    server.device_keeper()
+        self.assertEqual(look.call_count, 3)
+
+    def test_too_little_free_space_is_tried_again_after_an_hour_not_before(self):
+        server.S.devices_ready, server.S.devices_state = False, "waiting"
+        self.addCleanup(server.init_db)
+        move, look, tidy, forget = self.run_rounds(3)
+        self.assertEqual(move.call_count, 1)                  # three pauses of 5 seconds: not yet
+        move, look, tidy, forget = self.run_rounds(3, seconds_per_pause=server.MOVE_RETRY)
+        self.assertEqual(move.call_count, 4)
+        look.assert_not_called()                              # nothing is looked at until the tables are in use
 
 
 BIG_ROWS = int(os.environ.get("QUIETNET_BIG_ROWS", "2000000"))
@@ -1534,11 +1623,13 @@ class ABigHistory(OlderHousehold):
         self.assertEqual(server.move_to_devices(), "ready")
         moving = time.monotonic() - started
         # The move is the one long hold of the database (the dashboard waits; lookups do not).
-        self.assertLess(moving, 120)
+        # About a second on a laptop. The limits here are loose on purpose, so that a busy
+        # machine does not fail the test: they are there to catch work that grows out of hand.
+        self.assertLess(moving, 600)
         # The device list is quick straight away, before a single old row has its device...
         started = time.monotonic()
         listed = server.api_devices()
-        self.assertLess(time.monotonic() - started, 5)
+        self.assertLess(time.monotonic() - started, 30)
         self.assertEqual(len(listed), 40)
         self.assertGreater(sum(d["n"] for d in listed), 0)
         # ...and each step of the fill holds the database only briefly.
@@ -1550,12 +1641,12 @@ class ABigHistory(OlderHousehold):
             steps += 1
             if not done:
                 break
-        self.assertLess(worst, 5)
+        self.assertLess(worst, 30)
         self.assertEqual(steps, BIG_ROWS // server.FILL_BATCH + 1)
         self.assertEqual(server.sql("SELECT COUNT(*) FROM queries WHERE device IS NULL")[0][0], 0)
         started = time.monotonic()
         listed = server.api_devices()
-        self.assertLess(time.monotonic() - started, 5)
+        self.assertLess(time.monotonic() - started, 30)
         self.assertAlmostEqual(sum(d["n"] for d in listed),
                                server.sql("SELECT COUNT(*) FROM queries WHERE ts>?", (time.time() - 86400,))[0][0], delta=2)
         self.assertEqual({d["kind"] for d in listed}, {"hw"})

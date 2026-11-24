@@ -1107,17 +1107,19 @@ def forget_old_devices(now=None):
 
 def device_addresses(number):
     """The addresses a device has now, or was the last device seen at: IPv4 first, the most
-    recently confirmed first, MAX_LISTED_ADDRESSES at most. This computer's are its own, and a
-    device known only by an address has that address unless another device has been seen there
-    since. Reads S only, without a lock."""
+    recently confirmed first, MAX_LISTED_ADDRESSES at most. This computer's are its own (and never
+    another device's, even one that had the address before), and a device known only by an
+    address has that address unless another device has been seen there since. Reads S only,
+    without a lock."""
     kind = S.device_kind.get(number)
     if kind == "pi":
         return [S.local_ip] + sorted(S.v6_own)[:MAX_LISTED_ADDRESSES - 1]
-    uses = dict(S.addr_use)
-    mine = [(":" in addr, -use[2], addr) for addr, use in uses.items() if use[0] == number]
+    uses, current = dict(S.addr_use), S.addr_device
+    mine = [(":" in addr, -use[2], addr) for addr, use in uses.items()
+            if use[0] == number and current.get(addr, number) == number]
     if kind == "addr":
         mine += [(":" in addr, 0, addr) for addr, n in list(S.addr_only.items())
-                 if n == number and addr not in uses and S.addr_device.get(addr, number) == number]
+                 if n == number and addr not in uses and current.get(addr, number) == number]
     return [addr for _, _, addr in sorted(mine)[:MAX_LISTED_ADDRESSES]]
 
 
@@ -4220,7 +4222,7 @@ NEWEST_BY_ADDRESS_SQL = """
     WHERE x IS NOT NULL"""
 
 
-def api_devices():
+def api_devices(everything=False):
     """GET /api/devices: one entry for each device, with its name, group, switches and today's
     counts, and when (if in the last 24 hours) it last tried to use another DNS service.
 
@@ -4236,7 +4238,10 @@ def api_devices():
       "ip"         the one address it is listed and controlled under: the IPv4 address it has now,
                    else the last it had that no other device has since been seen at, else an IPv6
                    address. Empty for a device that has left and whose address has gone to
-                   another device: its history is kept under its number all the same.
+                   another device: its history is kept under its number all the same. Such a
+                   device is only listed when `everything` is true (GET /api/devices?all=1),
+                   because a page written before the device tables, as an older relay may still
+                   serve, knows every card by its address and could not show or open it.
     Names, groups and rules are still kept under addresses, so those fields are read from "ip". An
     address that carries a name or rules of its own, but is not the address its device is listed
     under, keeps an entry of its own ("id" null, "kind" "addr"), or its rules could not be seen or
@@ -4289,7 +4294,7 @@ def api_devices():
         """The one address a device is listed and controlled under ("ip"), or '' if it has none
         of its own now. See the docstring above for the order."""
         if number not in homes:
-            mine = held.get(number, [])
+            mine = [use for use in held.get(number, []) if holder(use[0]) == number]
             v4 = [(last, addr) for addr, _, last in mine if ":" not in addr]
             pools = ([x for x in v4 if current.get(x[1]) == number], v4,
                      [x for x in scanned_at.get(number, []) if ":" not in x[1] and holder(x[1]) == number],
@@ -4376,7 +4381,8 @@ def api_devices():
                               for a in [S.local_ip] + sorted(S.v6_own)[:MAX_LISTED_ADDRESSES - 1]]
         else:
             mine = [(":" in addr, -last, addr, first) for addr, first, last in held.get(number, [])
-                    if current.get(addr) == number or last >= now - ADDRESS_RECENT or addr == d["ip"]]
+                    if holder(addr) == number
+                    and (current.get(addr) == number or last >= now - ADDRESS_RECENT or addr == d["ip"])]
             d["addresses"] = [{"address": addr, "first": first, "last": -last, "now": current.get(addr) == number}
                               for _, last, addr, first in sorted(mine)[:MAX_LISTED_ADDRESSES]]
             if d["ip"] and all(a["address"] != d["ip"] for a in d["addresses"]):
@@ -4394,7 +4400,8 @@ def api_devices():
         if d["id"] is None and ":" in d["ip"]:
             d["same_as"] = at.get(eui64_mac(d["ip"]), "")
     # Devices using QuietNet first (most recent at the top), then the rest in address order.
-    return sorted(out.values(), key=lambda d: (-d["last"], [int(x) if x.isdigit() else 0 for x in d["ip"].split(".")]))
+    listed = [d for d in out.values() if d["ip"] or everything]
+    return sorted(listed, key=lambda d: (-d["last"], [int(x) if x.isdigit() else 0 for x in d["ip"].split(".")]))
 
 
 def api_devices_by_address():
@@ -4810,7 +4817,8 @@ class Web(BaseHTTPRequestHandler):
         elif url.path == "/api/status":
             self.send_json(api_status())
         elif url.path == "/api/devices":
-            self.send_json(api_devices())
+            # all=1 also lists devices with no address of their own now (see api_devices).
+            self.send_json(api_devices(qs.get("all", [""])[0] == "1"))
         elif url.path == "/api/activity":
             try:
                 hours = min(max(float(qs.get("hours", ["24"])[0]), 0.1), KEEP_DAYS * 24)
