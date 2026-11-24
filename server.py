@@ -144,6 +144,10 @@ IFCONFIG = next((p for p in ("/sbin/ifconfig", "/usr/sbin/ifconfig") if os.path.
 SCOPE = re.compile(r"all|device:[0-9a-f.:]{3,45}|group:\d+")
 # One device is one hardware address (see the "devices" part of this file). These say how the
 # record of which device has which address is kept, and how history is filed against the device.
+# Nothing compares the saved version or the time of the move on a later start yet: the warning and
+# the offer to move the data again that the design asks for when an older QuietNet has been run on
+# a moved database (4.7 step 7) belong with the move of rules to the device, and are listed as
+# open in KNOWN_ISSUES 96.
 DEVICES_VERSION = 1            # the shape of the device tables, saved with the data when it is moved over
 BEFORE_DEVICES = "quietnet.db.before-devices"   # the copy of the database kept from just before that move
 NO_DEVICE = 0                  # filed against no device at all (no real device ever has this number)
@@ -156,6 +160,9 @@ TIDY_EVERY = 60                # seconds between passes that file waiting lookup
 TIDY_BATCH = 500               # lookups filed per step of that pass
 FILL_BATCH = 2000              # rows of older history given their device per step, after the move
 FILL_PAUSE = 0.05              # seconds between those steps, so everything else gets a turn at the database
+FILL_SETTLE = 10               # seconds after the move before that work may call itself finished: the history
+                               # writer holds each lookup for a second before saving it, so one made just
+                               # before the move is saved just after it, and must still be given its device
 ADDRESS_RECENT = 86400         # seconds: an address a device used this recently is listed with it
 MAX_DEVICES = 5000             # the most devices remembered; the longest unseen are forgotten first
 MAX_ADDRESS_USE = 20000        # the most "who used which address" rows kept
@@ -287,6 +294,8 @@ class State:
     devices_state = "old"   # "ready", "moving", "waiting" (too little free space), "failed", or "old" (not tried yet)
     devices_notice = ""     # what to tell the owner about that move ('' = nothing)
     devices_moved_at = 0.0  # when (time.time()) the device tables were made: older history gets its device from the move
+    moved_steady = None     # when (time.monotonic()) this run of QuietNet finished the move; None if it did not
+    copy_unwanted = False   # was everyone's history forgotten while the move was making its copy? (forget_old_copy)
     history_fill = False    # is older history still being given its device (fill_old_history)?
     history_filed = 0       # goes up whenever waiting or older history is filed against devices (see activity_marker)
     addr_device = {}        # address, IPv4 or IPv6 -> device number, for addresses confirmed at the last look
@@ -490,6 +499,7 @@ def init_db():
         db.execute("INSERT OR REPLACE INTO settings(key, value) VALUES('devices_version', ?)", (str(DEVICES_VERSION),))
         db.commit()
     S.devices_state, S.devices_notice = "old", ""
+    S.moved_steady, S.copy_unwanted = None, False
     load_devices()
     open_read_db()                  # after the tables exist, so it never sees a half-made database
     rules_changed()
@@ -608,7 +618,10 @@ def clear_history(ip=None, device=None):
     filed (the dashboard shows those as its own). `ip` alone deletes what was recorded under that
     address, as it always did.
 
-    Everyone's is one statement, which the database does quickly by emptying the table. One
+    Everyone's is one statement, which the database does quickly by emptying the table. The copy
+    of the database kept from before the move to the device tables holds the household's history
+    from that time, so it is deleted with it (forget_old_copy). One device's history does not
+    touch that copy: its older lookups stay in the copy until the copy is KEEP_DAYS old. One
     device's is deleted PRUNE_BATCH rows at a time, letting go of db_lock between steps as
     prune_history does, so clearing a busy device's month of history does not hold up the history
     writer or other dashboard calls. Only rows already there when the clear began are deleted.
@@ -619,6 +632,7 @@ def clear_history(ip=None, device=None):
         steps = [(CLEAR_DEVICE_SQL, str(ip))]
     else:
         sql("DELETE FROM queries", commit=True)
+        forget_old_copy(at_once=True)
         return
     top = sql("SELECT MAX(id) FROM queries")[0][0] or 0
     for statement, whose in steps:
@@ -1130,14 +1144,17 @@ def device_number(value):
         return None
     try:
         number = int(value)
-    except (TypeError, ValueError):
-        return None
+    except (TypeError, ValueError, OverflowError):
+        return None                         # OverflowError: a number too large to be a whole number (1e999 in JSON)
     return number if number in S.device_kind else None
 
 
 # ----- moving an older household's data into the device tables
 
 MOVE_RETRY = 3600              # seconds before the move is tried again after too little free space
+MOVE_ADDRESS_WAIT = 120        # seconds the move waits for this computer to learn its own address on the home
+                               # network (a Pi can start before its Wi-Fi is connected). The move decides once
+                               # which old history is this computer's and which the router's.
 # Every address in the old history, found by hopping through the q_client_ts index from one address
 # to the next (as LAST_SEEN_SQL does), not by reading every row.
 OLD_CLIENTS_SQL = """
@@ -1193,6 +1210,48 @@ def copy_database(dest):
         pass                                # some systems can't do this for a folder; the copy is still there
 
 
+def forget_old_copy(now=None, at_once=False):
+    """Delete the copy of the database kept from just before the move to the device tables
+    (BEFORE_DEVICES in the data folder), once it is KEEP_DAYS old, or straight away when `at_once`
+    is true. Returns True if the copy is gone or was never there.
+
+    The copy holds every lookup the household made before the move. History is promised to be
+    kept for KEEP_DAYS and no longer, and "forget everyone's history" is promised to forget it, so
+    the copy must not outlive either: device_keeper calls this each hour, and clear_history calls
+    it with `at_once` when everyone's history is cleared. After KEEP_DAYS the copy is no use as a
+    way back in any case: every history row in it would have been trimmed by then, and its rules
+    are a month out of date.
+
+    Its age is counted from the time of the move when the move finished, otherwise (a copy left
+    by a move that failed) from when the file was written. A part-written copy left by an
+    interrupted move goes the same way. While a move is under way its files are left alone, and a
+    request to delete at once is remembered (S.copy_unwanted) and carried out when the move ends.
+    Only these fixed names in the data folder are ever touched. A missing file is not an error,
+    and nothing here raises: a file that can't be deleted is reported and tried again later."""
+    now = time.time() if now is None else now
+    if S.devices_state == "moving":
+        if at_once:
+            S.copy_unwanted = True
+        return False
+    path = os.path.join(DATA, BEFORE_DEVICES)
+    gone = True
+    for name in (path, path + ".part", path + ".part-wal", path + ".part-shm", path + ".part-journal"):
+        try:
+            if not os.path.exists(name):
+                continue
+            moved = name == path and S.devices_ready and S.devices_moved_at
+            made = S.devices_moved_at if moved else os.path.getmtime(name)
+            if at_once or now - made >= KEEP_DAYS * 86400:
+                os.remove(name)
+                continue
+        except OSError as e:
+            print("Could not delete the copy of the data kept from before the device tables (%s):" % name, e,
+                  flush=True)
+        if name == path:
+            gone = False                        # still there: not old enough yet, or it could not be deleted
+    return gone
+
+
 def build_devices(now):
     """The data part of the move, inside move_to_devices' one transaction: make a device for every
     hardware address the old tables know, and decide which device each address in the old history
@@ -1210,7 +1269,8 @@ def build_devices(now):
          history, becomes a device known only by that address (kind "addr"): MAX_DEVICES of them
          at most. A history holding more such addresses than that was filled by something making
          addresses up, and the rest are filed against no device (NO_DEVICE).
-      7. The version of the tables and the time of the move are saved with the settings.
+      7. The version of the tables and the time of the move are saved with the settings. (Nothing
+         compares them on a later start yet: see the note above DEVICES_VERSION.)
     Old history rows are given their device afterwards, in small steps (fill_old_history): the old
     tables do not say when an address changed hands, so every row goes to the address's device as
     decided here, and a few rows from before a change will sit with the wrong device until they
@@ -1291,7 +1351,9 @@ def build_devices(now):
     for key, value in (("devices_version", DEVICES_VERSION), ("devices_moved_at", repr(now)), ("devices_fill", "pending")):
         db.execute("INSERT OR REPLACE INTO settings(key, value) VALUES(?,?)", (key, str(value)))
     add_event("", "QuietNet now keeps each device's history with the device itself, whatever address it has. "
-                  "A copy of your data from just before this change is kept beside it as %s." % BEFORE_DEVICES, now)
+                  "A copy of your data from just before this change, with the history up to then, is kept beside "
+                  "it as %s for %d days and then deleted. Forgetting everyone's history deletes it too."
+                  % (BEFORE_DEVICES, KEEP_DAYS), now)
     return {"devices": sum(1 for key in numbers if key.startswith("hw:")), "addresses": len(addresses),
             "uncertain": uncertain}
 
@@ -1304,13 +1366,15 @@ def move_to_devices():
       - Too little free space (space_for_move): nothing is touched, the owner is told, and it is
         tried again later ("waiting").
       - A copy of the database is kept first, as BEFORE_DEVICES in the data folder (copy_database).
+        It is deleted when it is KEEP_DAYS old, or when everyone's history is forgotten
+        (forget_old_copy), because it holds the household's history from before the move.
       - Everything else is ONE transaction: the new tables, the history's new column and index,
         the devices (build_devices). Any error rolls all of it back, so the database is exactly as
         it was, QuietNet carries on with the old tables as before, and the owner is told
         ("failed"). It is tried again at the next start.
       - db_lock is held for that transaction, so the dashboard and the history writer wait while
         the index is built (some seconds on a big history). Lookups are still answered: they never
-        take that lock.
+        take that lock, and neither does the look that matches a new IPv6 address to its device.
     Going back to an older QuietNet afterwards means putting the kept copy back in place of
     quietnet.db, which loses what was recorded after the move (see docs/ARCHITECTURE.md)."""
     if S.devices_ready:
@@ -1338,6 +1402,7 @@ def move_to_devices():
             except BaseException:
                 db.rollback()
                 raise
+            S.moved_steady = time.monotonic()   # the fill waits FILL_SETTLE from here before it may finish
             load_devices()
         print("Moved the household's data to the device tables in %.1f seconds: %d devices, %d addresses "
               "(%d matched on a best guess)." % (time.monotonic() - started, report["devices"], report["addresses"],
@@ -1349,18 +1414,26 @@ def move_to_devices():
                             "changed and everything works as before. It will try again the next time it starts."
                             % (str(e) or type(e).__name__))
         print("Could not move the household's data to the device tables:", e, flush=True)
+    if S.copy_unwanted:
+        # Everyone's history was forgotten while the copy was being made: the copy may hold it.
+        S.copy_unwanted = False
+        forget_old_copy(at_once=True)
     return S.devices_state
 
 
-def fill_step(moved, now=None):
+def fill_step(moved, now=None, finish=True):
     """Give one batch of older history rows (from before the move) their device: each row goes to
     the device its address was given to in the move (`moved`, from moved_address). An address the
     move did not see gets a device of its own, known by that address. Returns how many rows it
-    did; 0 means the fill is finished, which is then saved so it is not started again."""
+    did. 0 means no row is waiting; with `finish` true the fill is then finished, which is saved
+    so it is not started again. With `finish` false nothing is marked: more rows may still arrive
+    (see fill_old_history)."""
     now = time.time() if now is None else now
     with db_lock:
         rows = db.execute(FILL_SQL, (S.devices_moved_at, FILL_BATCH)).fetchall()
         if not rows:
+            if not finish:
+                return 0
             S.history_fill = False
             db.execute("INSERT OR REPLACE INTO settings(key, value) VALUES('devices_fill', 'done')")
             db.commit()
@@ -1385,13 +1458,25 @@ def fill_old_history():
     it has finished): give every older history row its device, FILL_BATCH rows at a time, newest
     first, letting go of db_lock and pausing between steps so lookups, the history writer and the
     dashboard are not held up. Until a row is done the dashboard shows it under the device that
-    has its address now."""
+    has its address now.
+
+    The fill does not call itself finished until FILL_SETTLE seconds after the move. The history
+    writer holds each lookup for a second before saving it, so lookups made in the last moments
+    before the move (or while it held the database) are saved just after it, with a time from
+    before it and no device. Only the fill handles such rows, so on a small history, done in a
+    blink, it looks again each second until the writer has surely caught up. After a restart
+    there is nothing to wait for: the writer's queue starts empty. A restart during the wait is
+    safe too: the fill is still marked as to do, and runs once more."""
     moved = dict(sql("SELECT addr, device FROM moved_address"))
     while S.devices_ready and S.history_fill:
-        if not fill_step(moved):
+        settled = S.moved_steady is None or time.monotonic() - S.moved_steady >= FILL_SETTLE
+        if fill_step(moved, finish=settled):
+            time.sleep(FILL_PAUSE)
+        elif settled:
             print("Every older history row now has its device.", flush=True)
             return
-        time.sleep(FILL_PAUSE)
+        else:
+            time.sleep(1)                       # nothing waiting just now; the history writer may still bring some
 
 
 def device_keeper():
@@ -1400,13 +1485,27 @@ def device_keeper():
     too little free space it tries again every MOVE_RETRY seconds, after a failure not until the
     next start). Then, every ADDRESS_LOOK seconds, it looks at the neighbour table to keep
     S.addr_device right (note_ipv4_addresses); each minute it files waiting lookups against their
-    device (tidy_history); each hour it forgets devices long gone (forget_old_devices). The first
-    look comes ADDRESS_LOOK seconds after starting."""
+    device (tidy_history); each hour it forgets devices long gone (forget_old_devices) and the
+    copy of the data from before the move once that is old enough (forget_old_copy; this one also
+    while the move is still to do or has failed). The first look comes ADDRESS_LOOK seconds after
+    starting.
+
+    The move waits, up to MOVE_ADDRESS_WAIT seconds, until this computer knows its own address on
+    the home network. A Pi can start QuietNet before its Wi-Fi is connected (after a power cut,
+    say), and the move decides once and for all which old history is this computer's and which
+    the router's: done with no address, both would be filed under ordinary devices that are not
+    shown. It comes round every ADDRESS_LOOK seconds, so the move starts within moments of the
+    address being found (address_watcher looks for it every 10 seconds). After the wait it goes
+    ahead regardless: a computer with no network must still get its device tables. Just before
+    the move the router is looked for afresh, so that "no router", found while the network was
+    down and trusted for ROUTER_RECHECK seconds, is not what the move goes by."""
     retry_at, filling = 0.0, None
-    tidied = forgot = time.monotonic()
+    started = tidied = forgot = time.monotonic()
     while True:
         try:
-            if not S.devices_ready and S.devices_state != "failed" and time.monotonic() >= retry_at:
+            if (not S.devices_ready and S.devices_state != "failed" and time.monotonic() >= retry_at
+                    and (S.local_ip != "127.0.0.1" or time.monotonic() - started >= MOVE_ADDRESS_WAIT)):
+                S.router_checked = None             # look for the router again now (home_router)
                 move_to_devices()
                 retry_at = time.monotonic() + MOVE_RETRY
             if S.devices_ready and S.history_fill and (filling is None or not filling.is_alive()):
@@ -1421,9 +1520,10 @@ def device_keeper():
                 if time.monotonic() - tidied >= TIDY_EVERY:
                     tidied = time.monotonic()
                     tidy_history()
-                if time.monotonic() - forgot >= 3600:
-                    forgot = time.monotonic()
-                    forget_old_devices()
+            if time.monotonic() - forgot >= 3600:
+                forgot = time.monotonic()
+                forget_old_copy()                   # whether or not the move has been done
+                forget_old_devices()                # does nothing until the device tables are in use
         except Exception as e:
             print("Could not keep the record of which device has which address:", e, flush=True)
 
@@ -3682,6 +3782,10 @@ def refresh_ipv6_view():
     from beating a fresh one. If the IPv6 neighbour table can't be read, nothing is matched and
     S.v6_neighbours_ok says so for the dashboard.
 
+    The scan table is read on the read-only connection (read_sql), so a look never waits for the
+    database lock: a lookup from a new IPv6 address may be waiting on this very look, and the lock
+    can be held for some seconds while an older household's data is moved (move_to_devices).
+
     IPv6 addresses whose hardware address is a range extender's (S.shared_macs) are noted in
     S.v6_shared, so each keeps its own share of lookups (share_key).
 
@@ -3693,7 +3797,7 @@ def refresh_ipv6_view():
         announced = list(S.router_prefixes) if S.ra_listening else None
     own, ranges, for_devices = own_ipv6(announced)
     can_hear = can_hear_router()
-    scanned = sql("SELECT ip, mac FROM seen WHERE mac != '' ORDER BY ts") if db is not None else []
+    scanned = read_sql("SELECT ip, mac FROM seen WHERE mac != '' ORDER BY ts") if read_db is not None else []
     by_mac = ipv4_by_hardware_address(neighbour_table(), scanned)
     table6 = ipv6_neighbour_table()
     matched = {addr: by_mac[mac] for addr, (mac, _) in (table6 or {}).items() if mac in by_mac}
@@ -4245,10 +4349,16 @@ def api_devices(everything=False):
     Names, groups and rules are still kept under addresses, so those fields are read from "ip". An
     address that carries a name or rules of its own, but is not the address its device is listed
     under, keeps an entry of its own ("id" null, "kind" "addr"), or its rules could not be seen or
-    removed. So does an address no device is known for.
+    removed. So does an address no device is known for. No two entries share an "ip": when a
+    device is listed under an address, what that address carries shows on that device's entry
+    only, whichever device an old scan found there.
 
-    Listed are the devices with any history, those found by a scan, and those with rules that
-    follow them (S.dev_mac) or a notice. Lookups still waiting to be filed against a device count
+    Listed are the devices with any history, those found by a scan, those with rules that follow
+    them (S.dev_mac) or a notice, and every address that carries a name, a group or rules,
+    whoever has it now and whether or not it has any history: a rule put on the card of a device
+    that was away has no recorded owner, and must not drop out of sight when the device comes
+    back at another address. (An address whose name was cleared, and that carries nothing else,
+    is not listed for that alone.) Lookups still waiting to be filed against a device count
     towards the device that has their address now. On an older database not moved to the device
     tables yet, the list is by address, as it was (api_devices_by_address).
 
@@ -4258,7 +4368,9 @@ def api_devices(everything=False):
         return api_devices_by_address()
     now = time.time()
     since = now - 86400
-    given = dict(sql("SELECT ip, name FROM devices"))
+    # Only names that say something: clearing a name leaves a row with an empty one, and that must
+    # not count as the address carrying a name of its own (own_rules).
+    given = {ip: name for ip, name in sql("SELECT ip, name FROM devices") if name}
     scanned = sql("SELECT ip, mac, host, ts FROM seen")
     hints = S.hints
     v6 = ipv6_dns_view()
@@ -4334,12 +4446,20 @@ def api_devices(everything=False):
         """The entry that something known about an address belongs to: its device's (`number`
         when a hardware address already says which device, else whichever device has the address).
         But an address with a name or rules of its own that is not the one its device is listed
-        under keeps an entry of its own, and so does an address no device is known for."""
+        under keeps an entry of its own, and so does an address no device is known for.
+
+        When the last scan saw one device at an address but another device is listed under that
+        address now, what the address carries already shows on that other device's entry, and the
+        scan counts for the device it saw, wherever that is listed now. A scan row stays until the
+        next scan, and must never make a second entry for an address a device is listed under."""
+        here = holder(addr)
         if number is None:
-            number = holder(addr)
-        if number is None or (home(number) != addr and (own_rules(addr, given) or addr in S.dev_mac
-                                                        or addr in S.device_warnings)):
+            number = here
+        if number is None:
             return card(addr)
+        if home(number) != addr and (own_rules(addr, given) or addr in S.dev_mac or addr in S.device_warnings):
+            if here is None or home(here) != addr:
+                return card(addr)               # no device is listed under this address: an entry of its own
         return card(home(number), number)
 
     # Three small questions about the history, each answered from an index.
@@ -4370,6 +4490,17 @@ def api_devices(everything=False):
         d = card_at(ip)
         if d["id"] is None:
             d["mac"] = d["mac"] or mac
+    # Every address that carries a name, a group or rules is listed too, whoever has it now. A rule
+    # put on the card of a device that was away at the time has no recorded owner (S.dev_mac is
+    # only filled for an address whose device is there), and once the device is listed under
+    # another address the rule would otherwise drop out of sight, still in force and waiting for
+    # the next device given that address, with no card to see it on or switch it off from.
+    scopes = (list(S.off) + [scope for scope, services in list(S.svc_blocks.items()) if services]
+              + [x["scope"] for x in list(S.schedules)])
+    carrying = set(given) | set(S.dev_group) | set(S.enforced) | set(S.device_warnings)
+    carrying.update(scope[7:] for scope in scopes if scope.startswith("device:"))
+    for ip in sorted(carrying):
+        card_at(ip)
     at = {}
     for d in out.values():
         number = d["id"]

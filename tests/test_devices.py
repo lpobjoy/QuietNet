@@ -52,6 +52,31 @@ def drain():
             return out
 
 
+class WriterStop(BaseException):
+    """Raised by the stand-in for waiting on the queue, to end the history writer's endless loop.
+    Not an ordinary error, so the writer's own catch of database faults cannot swallow it."""
+
+
+def one_round_of_the_writer():
+    """Run the history writer (log_writer) on what is waiting, without its one-second pause, until
+    it goes back to wait for more. Returns the stand-in for prune_history."""
+    waiting = server.log_q.get
+
+    def get_or_stop():
+        """Hand over the next waiting lookup, or end the round when there is none."""
+        if server.log_q.empty():
+            raise WriterStop()
+        return waiting()
+    with mock.patch.object(server.time, "sleep", lambda seconds: None), \
+            mock.patch.object(server.log_q, "get", get_or_stop), \
+            mock.patch.object(server, "prune_history") as prune:
+        try:
+            server.log_writer()
+        except WriterStop:
+            pass
+    return prune
+
+
 class Devices(Base):
     """Shared steps: a home with this computer at PI and the router at ROUTER."""
 
@@ -195,6 +220,13 @@ class WhichDeviceHasWhichAddress(Devices):
         self.look({OLD_SPOT: fresh(TV), NEW_SPOT: fresh(TV)})
         self.assertEqual(self.device_at(OLD_SPOT), tv)
         self.assertIsNone(self.device_at(NEW_SPOT))
+
+    def test_one_hardware_address_live_at_two_addresses_it_had_before_keeps_the_one_confirmed_last(self):
+        self.look({OLD_SPOT: fresh(TV)}, ago=600)
+        tv = self.device_at(OLD_SPOT)
+        self.look({NEW_SPOT: fresh(TV)}, ago=300)
+        self.look({OLD_SPOT: fresh(TV), NEW_SPOT: fresh(TV)})
+        self.assertEqual((self.device_at(OLD_SPOT), self.device_at(NEW_SPOT)), (None, tv))
 
     def test_the_second_address_gets_the_device_once_the_first_is_no_longer_confirmed(self):
         self.look({OLD_SPOT: fresh(TV)}, ago=600)
@@ -370,6 +402,28 @@ class AddressesOverIPv6(Devices):
         self.lookup(V6_A)
         self.assertEqual(server.sql("SELECT client, device FROM queries"), [(OLD_SPOT, server.S.hw_device[PHONE])])
 
+    def test_the_address_a_lookup_came_from_decides_its_device_when_the_two_disagree(self):
+        self.look({OLD_SPOT: fresh(PHONE)})                  # the phone now holds this number
+        self.look6({V6_A: fresh(TV)})                         # the neighbour table says the address is the TV's
+        server.S.v6_devices = {V6_A: OLD_SPOT}                # a stale match still judges it under the phone's number
+        self.lookup(V6_A)
+        self.assertEqual(server.sql("SELECT client, device FROM queries"), [(OLD_SPOT, server.S.hw_device[TV])])
+
+    def test_an_ipv6_look_finishes_while_the_database_lock_is_held(self):
+        # As while an older household's data is being moved: a lookup may be waiting on this look.
+        server.sql("INSERT INTO seen(ip, mac, host, ts) VALUES(?,?,?,?)", (OLD_SPOT, PHONE, "", self.now), commit=True)
+        done = threading.Event()
+        with mock.patch.object(server, "own_ipv6", return_value=(set(), [], "")), \
+                mock.patch.object(server, "neighbour_table", return_value={}), \
+                mock.patch.object(server, "ipv6_neighbour_table", return_value={V6_A: fresh(PHONE)}):
+            with server.db_lock:
+                t = threading.Thread(target=lambda: (server.refresh_ipv6_view(), done.set()), daemon=True)
+                t.start()
+                finished = done.wait(10)
+            t.join(10)
+        self.assertTrue(finished)
+        self.assertEqual(server.S.v6_devices, {V6_A: OLD_SPOT})     # matched through the last scan, read without the lock
+
     def test_the_ipv6_look_keeps_the_table_it_read_for_the_device_record(self):
         table = {V6_A: fresh(PHONE)}
         with mock.patch.object(server, "own_ipv6", return_value=(set(), [], "")), \
@@ -416,6 +470,21 @@ class HistoryAgainstTheDevice(Devices):
         with server.db_lock:
             server.save_history(waiting)
         self.assertEqual(self.filed(), {"www.bbc.co.uk": server.S.hw_device[TV]})
+
+    def test_the_writer_asks_again_by_the_address_the_lookup_came_from(self):
+        self.look({OLD_SPOT: fresh(PHONE)})
+        waiting = [(self.now, OLD_SPOT, "www.bbc.co.uk", 0, None, V6_A)]   # no device when it was made; came from V6_A
+        self.look6({V6_A: fresh(TV)})                         # confirmed as the TV's before it is written
+        with server.db_lock:
+            server.save_history(waiting)
+        self.assertEqual(self.filed(), {"www.bbc.co.uk": server.S.hw_device[TV]})
+
+    def test_the_history_writer_saves_a_lookup_against_its_device(self):
+        self.look({OLD_SPOT: fresh(TV)})
+        server.answer_query(query("www.bbc.co.uk"), OLD_SPOT, fake_answer)
+        prune = one_round_of_the_writer()
+        self.assertEqual(self.filed(), {"www.bbc.co.uk": server.S.hw_device[TV]})
+        prune.assert_called_once_with()
 
     def test_a_blocked_lookup_is_filed_against_its_device_too(self):
         self.look({OLD_SPOT: fresh(TV)})
@@ -633,6 +702,30 @@ class ForgettingOldDevices(Devices):
         server.forget_old_devices(self.now)
         self.assertEqual(self.device_at(OTHER), server.S.hw_device[LAPTOP])
 
+    def test_a_device_first_seen_long_ago_and_seen_again_today_is_not_forgotten(self):
+        self.look({OLD_SPOT: fresh(TV)}, ago=31 * 86400)
+        number = server.S.hw_device[TV]
+        self.look({OLD_SPOT: fresh(TV)})
+        server.forget_old_devices(self.now)
+        self.assertEqual(server.S.hw_device.get(TV), number)
+        self.assertEqual(self.device_at(OLD_SPOT), number)
+
+    def test_a_device_seen_again_today_only_over_ipv6_is_not_forgotten(self):
+        self.look({OLD_SPOT: fresh(TV)}, ago=31 * 86400)
+        number = server.S.hw_device[TV]
+        self.look6({V6_A: fresh(TV)})
+        server.forget_old_devices(self.now)
+        self.assertEqual(server.S.hw_device.get(TV), number)
+        self.assertEqual(self.device_at(V6_A), number)
+
+    def test_beyond_the_limit_the_longest_unseen_address_records_go_first(self):
+        self.look({OLD_SPOT: fresh(TV)}, ago=3000)
+        self.look({OTHER: fresh(LAPTOP)}, ago=2000)
+        self.look({NEW_SPOT: fresh(PHONE)}, ago=1000)
+        with mock.patch.object(server, "MAX_ADDRESS_USE", 2):
+            server.forget_old_devices(self.now)
+        self.assertEqual({a for (a,) in server.sql("SELECT addr FROM address_use")}, {OTHER, NEW_SPOT})
+
     def test_beyond_the_limit_the_longest_unseen_devices_go_first(self):
         self.look({OLD_SPOT: fresh(TV)}, ago=3000)
         self.look({OTHER: fresh(LAPTOP)}, ago=2000)
@@ -715,6 +808,22 @@ class DeviceList(Api):
         self.assertEqual(d["ip"], OLD_SPOT)
         self.assertEqual([a["address"] for a in d["addresses"]], [OLD_SPOT, V6_A, V6_B])
 
+    def test_no_more_than_the_limit_of_addresses_are_listed_with_one_device(self):
+        self.look({OLD_SPOT: fresh(PHONE)})
+        many = ["2a00:23c8:1:2::%x" % n for n in range(1, 6)]
+        server.note_ipv6_addresses({addr: fresh(PHONE) for addr in many}, now=self.now)
+        self.lookup(OLD_SPOT)
+        with mock.patch.object(server, "MAX_LISTED_ADDRESSES", 3):
+            listed = [a["address"] for a in self.devices()[0]["addresses"]]
+        self.assertEqual(listed, [OLD_SPOT] + many[:2])
+
+    def test_a_device_never_seen_over_ipv4_is_listed_under_its_ipv6_address(self):
+        server.note_ipv6_addresses({V6_A: fresh(PHONE)}, now=self.now)
+        phone = server.S.hw_device[PHONE]
+        server.sql("INSERT INTO queries(ts,client,domain,blocked,device) VALUES(?,?,?,0,?)",
+                   (self.now - 5, V6_A, "sixer.example.com", phone), commit=True)
+        self.assertEqual([(d["id"], d["ip"], d["n"]) for d in self.devices()], [(phone, V6_A, 1)])
+
     def test_a_reused_address_shows_each_device_its_own_history(self):
         tv, phone = self.address_changes_hands()
         self.assertEqual(self.names_for(tv), ["tv.example.com"])
@@ -740,10 +849,34 @@ class DeviceList(Api):
         self.look({OLD_SPOT: fresh(PHONE), NEW_SPOT: fresh(LAPTOP)})
         self.lookup(NEW_SPOT)
         server.sql("INSERT INTO seen(ip, mac, host, ts) VALUES(?,?,?,?)", (OLD_SPOT, TV, "", self.now - 900), commit=True)
+        server.set_internet_off("device:" + OLD_SPOT, True)   # a rule on the address two devices have had
+        self.ok("/api/device-name", {"ip": NEW_SPOT, "name": "Laptop"})
         listed = self.devices(everything=True)
         self.assertEqual(len(listed), 3)
         ips = [d["ip"] for d in listed if d["ip"]]
         self.assertEqual(len(ips), len(set(ips)))
+
+    def test_a_named_address_the_last_scan_saw_another_device_at_is_listed_once(self):
+        self.look({OLD_SPOT: fresh(TV)}, ago=600)
+        server.sql("INSERT INTO seen(ip, mac, host, ts) VALUES(?,?,?,?)", (OLD_SPOT, TV, "", self.now - 600), commit=True)
+        self.look({NEW_SPOT: fresh(TV), OLD_SPOT: fresh(PHONE)})          # the TV moves, and a phone is given its number
+        self.lookup(OLD_SPOT)
+        self.lookup(NEW_SPOT)
+        self.ok("/api/device-name", {"ip": OLD_SPOT, "name": "Sam's phone"})
+        listed = self.devices(everything=True)
+        self.assertEqual(sorted(d["ip"] for d in listed), [OLD_SPOT, NEW_SPOT])
+        here = [d for d in listed if d["ip"] == OLD_SPOT][0]
+        self.assertEqual((here["kind"], here["macs"], here["name"], here["on_network"]), ("hw", [PHONE], "Sam's phone", 0))
+
+    def test_a_scan_of_another_device_at_an_address_with_a_warning_does_not_list_the_address_twice(self):
+        self.look({OLD_SPOT: fresh(TV)}, ago=600)
+        server.sql("INSERT INTO seen(ip, mac, host, ts) VALUES(?,?,?,?)", (OLD_SPOT, TV, "", self.now - 600), commit=True)
+        self.look({NEW_SPOT: fresh(TV), OLD_SPOT: fresh(PHONE)})
+        self.lookup(OLD_SPOT)
+        with mock.patch.object(server.S, "device_warnings", {OLD_SPOT: "A different device has this number now."}), \
+                mock.patch.object(server.S, "dev_mac", {OLD_SPOT: TV}):
+            listed = self.devices(everything=True)
+        self.assertEqual(sorted(d["ip"] for d in listed), [OLD_SPOT, NEW_SPOT])
 
     def test_a_device_whose_old_address_this_computer_now_has_is_not_listed_under_it(self):
         self.look({OTHER: fresh(LAPTOP)}, ago=600)
@@ -787,10 +920,73 @@ class DeviceList(Api):
     def test_an_old_address_that_still_carries_rules_keeps_an_entry_of_its_own(self):
         tv = self.tv_moves()
         server.set_service_block("device:" + OLD_SPOT, "youtube", True)
-        server.sql("INSERT INTO seen(ip, mac, host, ts) VALUES(?,?,?,?)", (OLD_SPOT, TV, "", self.now - 900), commit=True)
         listed = {d["ip"]: d for d in self.devices()}
         self.assertEqual((listed[OLD_SPOT]["id"], listed[OLD_SPOT]["kind"]), (None, "addr"))
         self.assertEqual(listed[NEW_SPOT]["id"], tv)
+
+    def old_address_alone(self):
+        """The entry for the TV's old address after it moved, with the TV itself still listed at
+        its new one and no owner recorded for the old address."""
+        self.assertEqual(server.S.dev_mac, {})
+        listed = self.devices()
+        self.assertEqual(sorted(d["ip"] for d in listed), [OLD_SPOT, NEW_SPOT])
+        by_address = {d["ip"]: d for d in listed}
+        self.assertEqual(by_address[NEW_SPOT]["id"], server.S.hw_device[TV])
+        self.assertEqual((by_address[OLD_SPOT]["id"], by_address[OLD_SPOT]["kind"]), (None, "addr"))
+        return by_address[OLD_SPOT]
+
+    def test_an_address_with_internet_off_and_no_recorded_owner_keeps_an_entry_of_its_own(self):
+        self.tv_moves()
+        server.set_internet_off("device:" + OLD_SPOT, True)
+        self.assertTrue(self.old_address_alone()["off"])
+
+    def test_an_address_with_only_a_name_and_no_recorded_owner_keeps_an_entry_of_its_own(self):
+        self.tv_moves()
+        self.ok("/api/device-name", {"ip": OLD_SPOT, "name": "Old telly"})
+        self.assertEqual(self.old_address_alone()["name"], "Old telly")
+
+    def test_an_address_with_only_a_group_and_no_recorded_owner_keeps_an_entry_of_its_own(self):
+        self.tv_moves()
+        gid = self.ok("/api/group", {"name": "Kids"})["id"]
+        self.ok("/api/device-group", {"ip": OLD_SPOT, "group": gid})
+        self.assertEqual(self.old_address_alone()["group"], gid)
+
+    def test_an_address_with_only_a_schedule_and_no_recorded_owner_keeps_an_entry_of_its_own(self):
+        self.tv_moves()
+        self.schedule(scope="device:" + OLD_SPOT)
+        self.old_address_alone()
+
+    def test_an_address_with_only_cut_live_connections_and_no_recorded_owner_keeps_an_entry_of_its_own(self):
+        self.tv_moves()
+        with mock.patch.object(server.S, "enforced", {OLD_SPOT}):
+            self.assertTrue(self.old_address_alone()["enforced"])
+
+    def test_a_rule_set_while_a_device_was_away_is_still_listed_when_it_returns_elsewhere(self):
+        self.look({OLD_SPOT: fresh(PHONE)}, ago=600)
+        self.lookup(OLD_SPOT)
+        self.look({})                                         # the phone leaves; its card stays, under its last address
+        self.assertEqual([d["ip"] for d in self.devices()], [OLD_SPOT])
+        self.ok("/api/internet", {"scope": "device:" + OLD_SPOT, "off": True})
+        self.ok("/api/device-name", {"ip": OLD_SPOT, "name": "Sam's phone"})
+        self.assertEqual(server.S.dev_mac, {})                # no owner is recorded for a device that is away
+        self.look({NEW_SPOT: fresh(PHONE)})                   # and it comes back at another address
+        listed = self.devices()
+        self.assertEqual(sorted(d["ip"] for d in listed), [OLD_SPOT, NEW_SPOT])
+        by_address = {d["ip"]: d for d in listed}
+        old = by_address[OLD_SPOT]
+        self.assertEqual((old["id"], old["kind"], old["off"], old["name"]), (None, "addr", True, "Sam's phone"))
+        self.assertEqual((by_address[NEW_SPOT]["id"], by_address[NEW_SPOT]["off"]), (server.S.hw_device[PHONE], False))
+
+    def test_an_address_whose_name_was_cleared_is_not_listed_on_its_own(self):
+        self.tv_moves()
+        self.ok("/api/device-name", {"ip": OLD_SPOT, "name": "Old telly"})
+        self.ok("/api/device-name", {"ip": OLD_SPOT, "name": ""})
+        self.assertEqual(server.sql("SELECT ip, name FROM devices"), [(OLD_SPOT, "")])     # the empty row is still there
+        self.assertEqual([d["ip"] for d in self.devices(everything=True)], [NEW_SPOT])
+
+    def test_an_address_with_a_name_and_no_history_at_all_is_listed(self):
+        self.ok("/api/device-name", {"ip": OTHER, "name": "Spare tablet"})
+        self.assertEqual([(d["ip"], d["id"], d["name"]) for d in self.devices()], [(OTHER, None, "Spare tablet")])
 
     def test_an_address_whose_rules_follow_a_device_is_listed_even_with_no_history(self):
         server.S.dev_mac = {OTHER: LAPTOP}
@@ -855,7 +1051,7 @@ class DeviceList(Api):
     def test_a_device_number_must_be_a_whole_number_of_a_known_device(self):
         tv = self.tv_moves()
         self.assertEqual((server.device_number(tv), server.device_number(str(tv))), (tv, tv))
-        for wrong in (True, None, "", "x", "1.5", [tv], 10 ** 9):
+        for wrong in (True, None, "", "x", "1.5", [tv], 10 ** 9, float("inf"), float("-inf"), float("nan"), "1e999"):
             self.assertIsNone(server.device_number(wrong), wrong)
 
     def test_activity_by_device_number_covers_every_address_the_device_had(self):
@@ -925,12 +1121,20 @@ class DeviceList(Api):
         self.assertEqual(server.sql("SELECT domain FROM queries"), [("laptop.example.com",)])
 
     def test_clearing_a_device_by_number_clears_its_waiting_lookups_too(self):
-        self.look({OLD_SPOT: fresh(TV)})
-        server.sql("INSERT INTO queries(ts,client,domain,blocked) VALUES(?,?,?,0)", (self.now, OLD_SPOT, "waiting.example.com"),
-                   commit=True)
+        self.look({OLD_SPOT: fresh(TV), OTHER: fresh(LAPTOP)})
+        for address, name in ((OLD_SPOT, "waiting.example.com"), (OTHER, "laptop-waiting.example.com")):
+            server.sql("INSERT INTO queries(ts,client,domain,blocked) VALUES(?,?,?,0)", (self.now, address, name), commit=True)
         self.ok("/api/clear-history", {"device": server.S.hw_device[TV]})
         server.last_clear.join(30)
-        self.assertEqual(server.sql("SELECT COUNT(*) FROM queries")[0][0], 0)
+        self.assertEqual(server.sql("SELECT domain FROM queries"), [("laptop-waiting.example.com",)])
+
+    def test_clearing_by_number_alone_leaves_other_devices_history(self):
+        self.look({OLD_SPOT: fresh(TV), OTHER: fresh(LAPTOP)})
+        self.lookup(OLD_SPOT, "tv.example.com")
+        self.lookup(OTHER, "laptop.example.com")
+        self.ok("/api/clear-history", {"device": server.S.hw_device[TV]})
+        server.last_clear.join(30)
+        self.assertEqual(server.sql("SELECT domain FROM queries"), [("laptop.example.com",)])
 
     def test_clearing_one_device_leaves_another_devices_history_at_the_same_address(self):
         tv, phone = self.address_changes_hands()
@@ -940,10 +1144,17 @@ class DeviceList(Api):
 
     def test_clearing_with_a_device_number_quietnet_does_not_know_and_no_address_clears_nothing(self):
         self.tv_moves()
-        for unknown in (99999, "abc", None, True, [1]):
+        # An infinite number is sent as "Infinity", which the server's reading of JSON accepts.
+        for unknown in (99999, "abc", None, True, [1], float("inf")):
             status, out = self.post("/api/clear-history", {"device": unknown})
             self.assertEqual(status, 400, unknown)
         self.assertEqual(server.sql("SELECT COUNT(*) FROM queries")[0][0], 2)
+
+    def test_clearing_with_a_device_number_too_large_to_be_one_falls_back_to_the_address(self):
+        self.tv_moves()
+        self.ok("/api/clear-history", {"device": float("inf"), "ip": NEW_SPOT})
+        server.last_clear.join(30)
+        self.assertEqual(server.sql("SELECT domain FROM queries"), [("old.example.com",)])
 
     def test_clearing_a_devices_history_in_steps_lets_go_of_the_lock_between_them(self):
         self.look({OLD_SPOT: fresh(TV)})
@@ -1108,6 +1319,10 @@ class OlderHousehold(Base):
         server.init_db()
         shutil.rmtree(self.folder, ignore_errors=True)
 
+    def copy(self):
+        """Where the copy of the database from before the move is kept, in the throwaway folder."""
+        return os.path.join(self.folder, server.BEFORE_DEVICES)
+
     def tables(self):
         return {name for (name,) in server.sql("SELECT name FROM sqlite_master WHERE type='table'")}
 
@@ -1148,6 +1363,11 @@ class BeforeTheMove(OlderHousehold):
         self.assertTrue(server.answer_query(query("www.bbc.co.uk"), OTHER, fake_answer))
         with server.db_lock:
             server.save_history(drain())
+        self.assertEqual(server.sql("SELECT client FROM queries WHERE domain='www.bbc.co.uk'"), [(OTHER,)])
+
+    def test_the_history_writer_saves_a_lookup_on_an_older_database(self):
+        server.answer_query(query("www.bbc.co.uk"), OTHER, fake_answer)
+        one_round_of_the_writer()
         self.assertEqual(server.sql("SELECT client FROM queries WHERE domain='www.bbc.co.uk'"), [(OTHER,)])
 
     def test_the_device_list_is_by_address_as_before(self):
@@ -1242,10 +1462,66 @@ class TheMove(OlderHousehold):
         self.assertEqual(len(notes), 1)
         self.assertIn(server.BEFORE_DEVICES, notes[0])
 
+    def test_the_owner_is_told_how_long_the_copy_is_kept(self):
+        note = server.sql("SELECT text FROM events")[0][0]
+        self.assertIn("for %d days and then deleted" % server.KEEP_DAYS, note)
+        self.assertIn("Forgetting everyone's history deletes it too", note)
+
+    def test_the_copy_kept_before_the_move_is_deleted_once_it_is_thirty_days_old(self):
+        self.assertEqual(server.KEEP_DAYS, 30)
+        self.assertTrue(server.forget_old_copy(now=server.S.devices_moved_at + 30 * 86400))
+        self.assertFalse(os.path.exists(self.copy()))
+
+    def test_the_copy_kept_before_the_move_stays_while_it_is_younger_than_thirty_days(self):
+        self.assertFalse(server.forget_old_copy(now=server.S.devices_moved_at + 30 * 86400 - 60))
+        self.assertTrue(os.path.exists(self.copy()))
+
+    def test_the_age_of_the_copy_is_counted_from_the_move_not_from_the_file(self):
+        long_ago = self.now - 90 * 86400
+        os.utime(self.copy(), (long_ago, long_ago))           # as after the file was copied about or restored
+        self.assertFalse(server.forget_old_copy(now=server.S.devices_moved_at + 86400))
+        self.assertTrue(os.path.exists(self.copy()))
+
+    def test_forgetting_everyones_history_deletes_the_copy_kept_before_the_move(self):
+        server.clear_history()
+        self.assertFalse(os.path.exists(self.copy()))
+        self.assertEqual(server.sql("SELECT COUNT(*) FROM queries")[0][0], 0)
+
+    def test_forgetting_one_devices_history_leaves_the_copy_kept_before_the_move(self):
+        self.fill()
+        server.clear_history(ip=OTHER)
+        server.clear_history(ip=NEW_SPOT, device=server.S.hw_device[TV])
+        self.assertTrue(os.path.exists(self.copy()))
+        self.assertEqual(server.sql("SELECT COUNT(*) FROM queries WHERE client IN (?,?,?)", (OTHER, NEW_SPOT, OLD_SPOT))[0][0], 0)
+
+    def test_a_missing_copy_is_not_an_error(self):
+        os.remove(self.copy())
+        self.assertTrue(server.forget_old_copy())
+        self.assertTrue(server.forget_old_copy(at_once=True))
+        server.clear_history()                                # and forgetting everyone's history still works
+
+    def test_a_copy_that_cannot_be_deleted_is_reported_and_tried_again_later(self):
+        with mock.patch.object(server.os, "remove", side_effect=OSError("read-only")):
+            self.assertFalse(server.forget_old_copy(at_once=True))      # no fault reaches the caller
+        self.assertTrue(os.path.exists(self.copy()))
+        self.assertTrue(server.forget_old_copy(at_once=True))
+        self.assertFalse(os.path.exists(self.copy()))
+
+    def test_only_the_copy_is_deleted_never_the_database_beside_it(self):
+        server.forget_old_copy(at_once=True)
+        left = sorted(f for f in os.listdir(self.folder) if not f.endswith(("-wal", "-shm")))
+        self.assertEqual(left, ["quietnet.db"])
+
     def test_old_history_waits_for_its_device_until_the_fill(self):
         self.assertEqual(server.sql("SELECT COUNT(*) FROM queries WHERE device IS NOT NULL")[0][0], 0)
         self.assertTrue(server.S.history_fill)
         self.assertEqual(server.api_status()["devices"], {"state": "ready", "notice": "", "filling": True})
+
+    def test_the_clean_up_pass_leaves_older_history_for_the_fill(self):
+        self.assertEqual(server.tidy_history(), 0)
+        self.assertEqual(server.sql("SELECT COUNT(*) FROM queries WHERE device IS NOT NULL")[0][0], 0)
+        self.fill()
+        self.assertEqual(self.filed()["old.example.com"], ("hw", "hw:" + TV))
 
     def test_the_fill_gives_every_old_row_the_device_its_address_was_given_to(self):
         self.fill()
@@ -1262,6 +1538,7 @@ class TheMove(OlderHousehold):
 
     def test_the_fill_lets_go_of_the_lock_between_steps(self):
         pauses = []
+        server.S.moved_steady -= server.FILL_SETTLE           # the history writer has long caught up
         with mock.patch.object(server, "FILL_BATCH", 3), \
                 mock.patch.object(server.time, "sleep", lambda s: pauses.append(server.db.in_transaction)):
             server.fill_old_history()
@@ -1271,6 +1548,41 @@ class TheMove(OlderHousehold):
     def test_the_fill_is_marked_done_when_it_finishes(self):
         self.fill()
         self.assertFalse(server.S.history_fill)
+        self.assertEqual(server.get_setting("devices_fill", ""), "done")
+
+    def test_each_step_of_the_fill_changes_the_activity_marker_for_a_device(self):
+        phone = server.sql("SELECT device FROM moved_address WHERE addr=?", (OTHER,))[0][0]
+        before = server.activity_marker(OTHER, 24, self.now - 86400, device=phone)
+        with mock.patch.object(server, "FILL_BATCH", 3):                  # three rows, none of them the phone's
+            server.fill_step(dict(server.sql("SELECT addr, device FROM moved_address")))
+        self.assertNotEqual(server.activity_marker(OTHER, 24, self.now - 86400, device=phone), before)
+
+    def test_the_fill_is_not_called_finished_until_the_writer_has_caught_up(self):
+        moved = dict(server.sql("SELECT addr, device FROM moved_address"))
+        self.assertEqual(server.fill_step(moved, finish=False), 7)
+        self.assertEqual(server.fill_step(moved, finish=False), 0)        # nothing waiting, but more may arrive
+        self.assertTrue(server.S.history_fill)
+        self.assertEqual(server.get_setting("devices_fill", ""), "pending")
+
+    def test_just_after_the_move_the_fill_looks_again_each_second_before_it_finishes(self):
+        waits = []
+
+        def sleep(seconds):
+            """Note the wait, and let the settling time pass at the third look for more."""
+            waits.append(seconds)
+            if waits.count(1) == 3:
+                server.S.moved_steady -= server.FILL_SETTLE
+        with mock.patch.object(server.time, "sleep", sleep):
+            server.fill_old_history()
+        self.assertEqual(waits, [server.FILL_PAUSE, 1, 1, 1])
+        self.assertEqual(server.get_setting("devices_fill", ""), "done")
+
+    def test_after_a_restart_the_fill_finishes_without_waiting(self):
+        server.init_db()                                      # nothing is waiting to be written after a restart
+        waits = []
+        with mock.patch.object(server.time, "sleep", waits.append):
+            server.fill_old_history()
+        self.assertEqual(waits, [server.FILL_PAUSE])
         self.assertEqual(server.get_setting("devices_fill", ""), "done")
 
     def test_a_fill_cut_short_by_a_restart_carries_on_afterwards(self):
@@ -1334,6 +1646,9 @@ class TheMoveWithTrickyHouseholds(OlderHousehold):
         old.execute("INSERT INTO device_mac(ip, mac, paused) VALUES(?,?,1)", (OLD_SPOT, TV))     # the TV's rules, paused
         old.execute("INSERT INTO seen VALUES(?,?,?,?)", (NEW_SPOT, EXTENDER, "", now))
         old.execute("INSERT INTO seen VALUES(?,?,?,?)", (OTHER, "", "", now))
+        old.execute("INSERT INTO devices VALUES(?,?)", ("192.168.1.81", "Spare tablet"))        # a name, no history
+        old.execute("INSERT INTO device_group VALUES(?,?)", ("192.168.1.82", 1))               # a group, no history
+        old.execute("INSERT INTO enforced VALUES(?,?)", ("192.168.1.83", ""))                   # a live cut, no history
         old.executemany("INSERT INTO queries(ts,client,domain,blocked) VALUES(?,?,?,?)", [
             (now - 100, OLD_SPOT, "now.example.com", 0), (now - 90, NEW_SPOT, "behind.example.com", 0),
             (now - 80, None, "nobody.example.com", 0)])
@@ -1357,6 +1672,10 @@ class TheMoveWithTrickyHouseholds(OlderHousehold):
 
     def test_a_scanned_address_with_no_hardware_address_becomes_a_device_known_by_that_address(self):
         self.assertEqual(self.device_of(OTHER), ("addr", "addr:" + OTHER, 1))
+
+    def test_an_address_with_only_a_name_a_group_or_a_live_cut_is_given_a_device_in_the_move(self):
+        for addr in ("192.168.1.81", "192.168.1.82", "192.168.1.83"):
+            self.assertEqual(self.device_of(addr), ("addr", "addr:" + addr, 1))
 
     def test_an_old_row_with_no_address_is_filed_against_no_device(self):
         self.fill()
@@ -1427,6 +1746,65 @@ class WhenTheMoveCannotBeDone(OlderHousehold):
             self.assertEqual(server.move_to_devices(), "failed")
         self.assertEqual(self.before(), before)
 
+    def test_a_copy_that_fails_part_way_leaves_no_file_under_the_copys_name(self):
+        with mock.patch.object(server.os, "fsync", side_effect=OSError("the disk is full")):
+            self.assertEqual(server.move_to_devices(), "failed")
+        self.assertFalse(os.path.exists(self.copy()))
+
+    def test_a_part_written_copy_from_an_earlier_try_does_not_spoil_the_next_copy(self):
+        part = self.copy() + ".part"
+        for name in (part, part + "-journal"):
+            with open(name, "wb") as f:
+                f.write(b"half a copy " * 500)
+        self.assertEqual(server.move_to_devices(), "ready")
+        copy = sqlite3.connect(self.copy())
+        try:
+            rows = copy.execute("SELECT COUNT(*) FROM queries").fetchone()[0]
+            sound = copy.execute("PRAGMA integrity_check").fetchone()[0]
+        finally:
+            copy.close()
+        self.assertEqual((rows, sound), (7, "ok"))
+        self.assertEqual([f for f in os.listdir(self.folder) if ".part" in f], [])
+
+    def test_a_copy_left_by_a_failed_move_is_deleted_once_the_file_is_thirty_days_old(self):
+        self.fail_part_way()
+        self.assertTrue(os.path.exists(self.copy()))
+        self.assertFalse(server.forget_old_copy())            # written a moment ago: it stays
+        self.assertTrue(os.path.exists(self.copy()))
+        long_ago = time.time() - 31 * 86400
+        os.utime(self.copy(), (long_ago, long_ago))
+        self.assertTrue(server.forget_old_copy())
+        self.assertFalse(os.path.exists(self.copy()))
+
+    def test_a_part_written_copy_left_behind_is_deleted_once_it_is_thirty_days_old(self):
+        part = self.copy() + ".part"
+        with open(part, "wb") as f:
+            f.write(b"half a copy")
+        server.forget_old_copy()
+        self.assertTrue(os.path.exists(part))
+        long_ago = time.time() - 31 * 86400
+        os.utime(part, (long_ago, long_ago))
+        server.forget_old_copy()
+        self.assertFalse(os.path.exists(part))
+
+    def test_forgetting_everyones_history_deletes_the_copy_left_by_a_failed_move(self):
+        self.fail_part_way()
+        server.clear_history()
+        self.assertFalse(os.path.exists(self.copy()))
+
+    def test_forgetting_everyones_history_while_the_copy_is_being_made_deletes_it_when_the_move_ends(self):
+        real = server.copy_database
+
+        def copy_then_forget(dest):
+            """Make the copy, and have the owner forget everyone's history before the move is over."""
+            real(dest)
+            server.clear_history()
+            self.assertTrue(os.path.exists(dest))             # left alone while the move is under way
+        with mock.patch.object(server, "copy_database", copy_then_forget):
+            self.assertEqual(server.move_to_devices(), "ready")
+        self.assertFalse(os.path.exists(self.copy()))
+        self.assertFalse(server.S.copy_unwanted)
+
     def test_a_failed_move_is_tried_again_at_the_next_start_and_can_then_succeed(self):
         self.fail_part_way()
         server.init_db()
@@ -1494,7 +1872,9 @@ class TheKeeper(OlderHousehold):
     def run_until_the_first_pause(self):
         def stop(seconds):
             raise self.Stop()
-        with mock.patch.object(server.time, "sleep", stop), mock.patch.object(server, "fill_old_history") as fill:
+        # The keeper looks for the router afresh before the move: hand it a stand-in routing table.
+        with mock.patch.object(server.time, "sleep", stop), mock.patch.object(server, "fill_old_history") as fill, \
+                mock.patch.object(server.enforcer, "interface_and_gateway", lambda: ("wlan0", ROUTER)):
             with self.assertRaises(self.Stop):
                 server.device_keeper()
         return fill
@@ -1524,6 +1904,130 @@ class TheKeeper(OlderHousehold):
         self.assertFalse(server.S.devices_ready)
 
 
+class TheMoveWaitsForThisComputersAddress(OlderHousehold):
+    """A Pi can start QuietNet before its Wi-Fi is connected (after a power cut, say). The move
+    decides once which old history is this computer's and which the router's, so the keeper holds
+    it back until this computer knows its own address. Run on a stand-in clock, with a stand-in
+    for the routing table."""
+
+    class Stop(BaseException):
+        """Raised by the stand-in for sleeping, to end the keeper's endless loop."""
+
+    def setUp(self):
+        super().setUp()
+        self.gateway = None                                   # what the stand-in routing table says the router is
+        server.S.local_ip, server.S.router, server.S.router_checked = "127.0.0.1", "", None
+        self.addCleanup(setattr, server.S, "router_checked", float("inf"))
+
+    def run_keeper(self, pauses, network_up_after=None, move=True):
+        """Run the keeper for `pauses` pauses of ADDRESS_LOOK seconds. After `network_up_after` of
+        them this computer finds its address and its router. With `move` false the move itself
+        is a stand-in. Returns that stand-in."""
+        clock, slept = [5000.0], []
+
+        def sleep(seconds):
+            """One pause on the stand-in clock."""
+            if len(slept) >= pauses:
+                raise self.Stop()
+            slept.append(seconds)
+            clock[0] += server.ADDRESS_LOOK
+            if len(slept) == network_up_after:
+                server.S.local_ip, self.gateway = PI, ROUTER
+
+        def routes():
+            """The stand-in routing table: the network card and the router, once there is one."""
+            return ("wlan0", self.gateway) if self.gateway else (None, None)
+        with mock.patch.object(server.time, "sleep", sleep), \
+                mock.patch.object(server.time, "monotonic", lambda: clock[0]), \
+                mock.patch.object(server.enforcer, "interface_and_gateway", routes), \
+                mock.patch.object(server, "move_to_devices", wraps=server.move_to_devices) as moving, \
+                mock.patch.object(server, "fill_old_history"), \
+                mock.patch.object(server, "note_ipv4_addresses"), \
+                mock.patch.object(server, "tidy_history"):
+            if not move:
+                moving.side_effect = lambda: "ready"
+            with self.assertRaises(self.Stop):
+                server.device_keeper()
+        return moving
+
+    def test_the_move_waits_while_this_computer_does_not_know_its_address(self):
+        moving = self.run_keeper(5, move=False)
+        moving.assert_not_called()
+        self.assertFalse(server.S.devices_ready)
+
+    def test_lookups_are_still_answered_and_blocked_while_the_move_waits(self):
+        self.run_keeper(5, move=False)
+        self.assertTrue(server.answer_query(query("www.bbc.co.uk"), OTHER, fake_answer))
+        self.assertEqual(server.answer_query(query("www.youtube.com"), OTHER, fake_answer)[-4:], bytes(4))
+
+    def test_the_move_goes_ahead_as_soon_as_the_address_is_known(self):
+        moving = self.run_keeper(2, network_up_after=2, move=False)
+        self.assertEqual(moving.call_count, 1)
+
+    def test_the_move_goes_ahead_after_the_wait_even_with_no_address(self):
+        rounds = server.MOVE_ADDRESS_WAIT // server.ADDRESS_LOOK
+        self.run_keeper(rounds - 1, move=False).assert_not_called()
+        self.assertEqual(self.run_keeper(rounds, move=False).call_count, 1)
+
+    def test_a_computer_that_knows_its_address_is_moved_at_once(self):
+        server.S.local_ip = PI
+        self.assertEqual(self.run_keeper(0, move=False).call_count, 1)
+
+    def test_the_move_looks_for_the_router_afresh_and_does_not_trust_an_earlier_empty_answer(self):
+        server.S.local_ip, self.gateway = PI, ROUTER
+        server.S.router, server.S.router_checked = "", 5000.0             # "no router", found a moment ago
+        self.run_keeper(0)
+        self.assertEqual(self.device_of(ROUTER)[:2], ("hub", "hub"))
+
+    def test_after_a_start_with_no_network_this_computers_and_the_routers_old_history_go_to_the_fixed_devices(self):
+        self.run_keeper(3, network_up_after=2)                # the network comes up ten seconds after the start
+        self.assertTrue(server.S.devices_ready)
+        self.fill()
+        filed = self.filed()
+        self.assertEqual((filed["pi.example.com"], filed["hub.example.com"]), (("pi", "pi"), ("hub", "hub")))
+        self.assertEqual(server.sql("SELECT d.kind FROM device_hw h JOIN device d ON d.id=h.device WHERE h.mac=?",
+                                    (ROUTER_MAC,)), [("hub",)])
+
+
+class LookupsMadeJustBeforeTheMove(OlderHousehold):
+    """The history writer holds each lookup for a second before saving it, so one made just before
+    the move is saved just after it: with a time from before the move, and no device."""
+
+    def test_a_lookup_made_just_before_the_move_and_saved_after_it_still_gets_its_device(self):
+        server.answer_query(query("late.example.com"), OTHER, fake_answer)
+        waiting = drain()                                     # the writer is still holding it
+        self.assertEqual(server.move_to_devices(), "ready")
+
+        def sleep(seconds):
+            """The fill's waits. At its first one-second wait the writer saves what it held, and
+            the settling time then passes."""
+            if seconds == 1 and waiting:
+                with server.db_lock:
+                    server.save_history(waiting)
+                del waiting[:]
+                self.assertEqual(server.sql("SELECT device FROM queries WHERE domain='late.example.com'"), [(None,)])
+                server.S.moved_steady -= server.FILL_SETTLE
+        with mock.patch.object(server.time, "sleep", sleep):
+            server.fill_old_history()
+        self.assertEqual(waiting, [])
+        self.assertEqual(server.sql("SELECT COUNT(*) FROM queries WHERE device IS NULL")[0][0], 0)
+        self.assertEqual(self.filed()["late.example.com"], ("hw", "hw:" + PHONE))
+        self.assertEqual(server.get_setting("devices_fill", ""), "done")
+
+    def test_the_real_writer_and_the_fill_together_leave_no_lookup_without_a_device(self):
+        server.answer_query(query("late.example.com"), OTHER, fake_answer)   # made just before the move
+        self.assertEqual(server.move_to_devices(), "ready")
+        moved = dict(server.sql("SELECT addr, device FROM moved_address"))
+        while server.fill_step(moved, finish=False):          # the fill reaches the end of a small history at once
+            pass
+        one_round_of_the_writer()                             # and only then does the writer save the lookup
+        server.S.moved_steady -= server.FILL_SETTLE
+        with mock.patch.object(server.time, "sleep", lambda seconds: None):
+            server.fill_old_history()
+        self.assertEqual(server.sql("SELECT COUNT(*) FROM queries WHERE device IS NULL")[0][0], 0)
+        self.assertFalse(server.S.history_fill)
+
+
 class TheKeepersRounds(Devices):
     """The device keeper's loop, run for a set number of pauses with a stand-in clock. The looks
     themselves are stand-ins, so the real neighbour table is never read."""
@@ -1547,7 +2051,9 @@ class TheKeepersRounds(Devices):
                 mock.patch.object(server, "move_to_devices") as move, \
                 mock.patch.object(server, "note_ipv4_addresses") as look, \
                 mock.patch.object(server, "tidy_history") as tidy, \
-                mock.patch.object(server, "forget_old_devices") as forget:
+                mock.patch.object(server, "forget_old_devices") as forget, \
+                mock.patch.object(server, "forget_old_copy") as self.forget_copy, \
+                mock.patch.object(server.enforcer, "interface_and_gateway", lambda: ("wlan0", ROUTER)):
             with self.assertRaises(self.Stop):
                 server.device_keeper()
         self.assertLessEqual(set(slept), {server.ADDRESS_LOOK})
@@ -1571,6 +2077,17 @@ class TheKeepersRounds(Devices):
         move, look, tidy, forget = self.run_rounds(2, seconds_per_pause=1800)
         self.assertEqual(forget.call_count, 1)
 
+    def test_the_copy_from_before_the_move_is_checked_for_its_age_once_an_hour(self):
+        self.run_rounds(2, seconds_per_pause=1800)
+        self.forget_copy.assert_called_once_with()
+
+    def test_the_copy_is_checked_for_its_age_even_when_the_move_has_failed(self):
+        server.S.devices_ready, server.S.devices_state = False, "failed"
+        self.addCleanup(server.init_db)
+        move, look, tidy, forget = self.run_rounds(2, seconds_per_pause=1800)
+        self.forget_copy.assert_called_once_with()
+        move.assert_not_called()
+
     def test_a_fault_in_a_look_does_not_stop_the_keeper(self):
         with mock.patch("builtins.print"):
             clock = [0]
@@ -1593,6 +2110,86 @@ class TheKeepersRounds(Devices):
         move, look, tidy, forget = self.run_rounds(3, seconds_per_pause=server.MOVE_RETRY)
         self.assertEqual(move.call_count, 4)
         look.assert_not_called()                              # nothing is looked at until the tables are in use
+
+
+class StartUp(unittest.TestCase):
+    """main() itself, with a stand-in for every part it starts: no database, socket, thread,
+    firewall tool or web server is touched, only the order of the starts is noted."""
+
+    def start_up(self):
+        """Run main() to the end with stand-ins. Returns (what was started, in order; the stand-in
+        for move_to_devices, to see whether start-up itself ran the move)."""
+        order = []
+
+        class Thread:
+            """Stands in for threading.Thread: notes the function, never runs it."""
+
+            def __init__(self, target=None, daemon=None):
+                self.target = target
+
+            def start(self):
+                """Note which background job was started."""
+                order.append(self.target.__name__)
+
+        class Part:
+            """Stands in for the enforcer, the cloud link and the dashboard's web server."""
+            reason = "this is a test"
+
+            def __init__(self, name):
+                self.name = name
+
+            def start(self):
+                """Note that this part was started."""
+                order.append(self.name)
+
+            def serve_forever(self):
+                """Note that the dashboard was reached, and come straight back."""
+                order.append(self.name)
+
+            def available(self):
+                """The enforcer is never ready in this test."""
+                return False
+
+            def stop(self):
+                """Nothing to stop."""
+
+        threads = mock.Mock(wraps=threading)
+        threads.Thread = Thread
+        swaps = [
+            mock.patch.object(sys, "argv", ["server.py", "--no-browser", "--no-device-names"]),
+            mock.patch.object(server, "init_db", lambda: order.append("init_db")),
+            mock.patch.object(server, "load_lists", lambda: None),
+            mock.patch.object(server, "find_local_ip", lambda: PI),
+            mock.patch.object(server, "start_dns", lambda port: order.append("start_dns")),
+            mock.patch.object(server, "threading", threads),
+            mock.patch.object(server.enforcer, "Enforcer", lambda *a, **k: Part("enforcer")),
+            mock.patch.object(server.cloud_agent, "CloudAgent", lambda *a, **k: Part("cloud link")),
+            mock.patch.object(server, "ThreadingHTTPServer", lambda *a, **k: Part("dashboard")),
+            mock.patch.object(server.signal, "signal", lambda *a: None),
+            mock.patch.object(server, "ENF", None), mock.patch.object(server, "CA", None),
+            mock.patch.object(server.S, "local_ip", PI),
+            mock.patch("builtins.print"),
+        ]
+        for swap in swaps:
+            swap.start()
+            self.addCleanup(swap.stop)
+        with mock.patch.object(server, "move_to_devices") as move:
+            server.main()
+        return order, move
+
+    def test_the_device_keeper_is_started_only_after_the_filter_and_the_enforcer(self):
+        order, _ = self.start_up()
+        self.assertEqual(order.count("device_keeper"), 1)
+        self.assertGreater(order.index("device_keeper"), order.index("start_dns"))
+        self.assertGreater(order.index("device_keeper"), order.index("enforcer"))
+
+    def test_start_up_leaves_the_move_to_the_device_keeper(self):
+        _, move = self.start_up()
+        move.assert_not_called()
+
+    def test_the_history_writer_is_started_at_start_up(self):
+        order, _ = self.start_up()
+        self.assertEqual(order.count("log_writer"), 1)
 
 
 BIG_ROWS = int(os.environ.get("QUIETNET_BIG_ROWS", "2000000"))
