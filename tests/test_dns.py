@@ -2578,13 +2578,20 @@ class Limits(unittest.TestCase):
 
     def taken_over_udp(self, senders, shares, family=socket.AF_INET):
         """Run a UDP listener over one lookup from each sender, with a pool that never answers;
-        returns the senders whose lookups were taken."""
+        returns the senders whose lookups were taken.
+
+        The stand-in socket hands lookups over through recvfrom only. On Linux an IPv4 listener
+        would otherwise ask which address each lookup was sent to and read with recvmsg (see
+        server.ask_for_reply_address), which the stand-in does not answer, so that option is
+        switched off here. These tests are about shares, the same on every system; ReplyAddress
+        covers the option itself."""
         sock = mock.Mock(family=family)
         sock.recvfrom.side_effect = [(query("www.bbc.co.uk"), (host, 5000 + i, 0, 0)) for i, host in enumerate(senders)] \
             + [KeyboardInterrupt()]
         taken = []
         pool = mock.Mock(submit=lambda fn, data, addr, source: taken.append(addr[0]))
         with mock.patch.object(server, "MAX_DNS_PER_DEVICE", 2), \
+                mock.patch.object(server, "IP_PKTINFO", None), \
                 mock.patch.object(server, "ThreadPoolExecutor", lambda max_workers: pool):
             with self.assertRaises(KeyboardInterrupt):
                 server.udp_server(sock, shares)

@@ -253,6 +253,8 @@ A check of the first part of the IPv6 design, before release, found these faults
 | **The steady-timer guard on the confirmation was only tested with the timer set by hand** | A test notes a real announcement and checks the confirmation stays off however far the clock then jumps |
 | **Manual step 17 (then numbered 16) told the tester to expect "Still checking" where the page says "IPv6 is on in your home"**; `docs/TESTING.md` and `AGENTS.md` gave the run time as 45 seconds; and one description and one test name said the live-cut card does not mention IPv4 only, when it now does | Step 17 says what the page shows at each point; the run time is given as about 75 seconds; the description and the test (now `test_the_enforcer_card_says_ipv4_only_just_once_and_only_when_the_network_has_ipv6`) say what the card does |
 
+The pull request's automatic run on Linux then found one more fault, in the tests alone: four tests of a device's share of lookups in `tests/test_dns.py` (class `Limits`) stopped with "cannot unpack non-iterable Mock object". On Linux an IPv4 listener asks which address each lookup was sent to and reads with `recvmsg` (see `ask_for_reply_address()`), and the stand-in socket those tests share hands lookups over through `recvfrom` only. Their helper now switches that option off for the stand-in, since shares are counted the same on every system; the option itself keeps its own tests (class `ReplyAddress`). The filter was not at fault, and nothing in it changed.
+
 ### Found while designing IPv6 and device identity (24 November)
 
 The design for IPv6, DNS and telling devices apart found these smaller faults on the way. All were fixed with its first part; what that part leaves open is issue 96.
