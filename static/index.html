@@ -1143,6 +1143,36 @@ function ipv6SteerSwitch(st){
   return `<div class="row"><div class="grow"><h2>Take IPv6 away from steered devices</h2>${meta}${note}</div>
     <label class="switch"><input type="checkbox" id="ipv6SteerSwitch" ${st.ipv6_steer ? 'checked' : ''} aria-label="Take IPv6 away from steered devices"><span></span></label></div>`;
 }
+// The trial "Announce QuietNet as an IPv6 DNS server" (st.dns_announce, from the Pi's announcer.py).
+// Off unless the owner turns it on, and labelled a trial wherever it shows: it cannot stop a device
+// using the router's own IPv6 DNS server, so it must never read as "protected". a.on is the owner's
+// choice; a.state is "off", "starting", "announcing", "held" (on, but not announcing: a.reason says
+// why, in the Pi's words), "stopping" or "unavailable". Through the relay the Pi may be an older
+// QuietNet without the trial (no st.dns_announce): then it is not offered.
+function dnsAnnounceState(a){
+  if(a.state === 'unavailable' || a.available === false) return `<p class="small">${esc(a.reason || 'The trial can\'t run on this computer.')}</p>`;
+  if(a.state === 'announcing') return `<p class="small"><b>Announcing now.</b> Devices are being told they can use
+    <b>${esc(a.address)}</b> for IPv6 DNS${a.sent ? ', last ' + esc(ago(a.sent)) : ''}. That does not mean they do.</p>`;
+  if(a.state === 'held') return `<div class="notice warn"><b>Switched on, but not announcing.</b> ${esc(a.reason)}
+    Nothing is announced until that is put right, and QuietNet keeps checking.</div>`;
+  if(a.state === 'starting') return '<p class="small">Starting…</p>';
+  if(a.state === 'stopping') return '<p class="small">Telling devices to stop using this computer for IPv6 DNS…</p>';
+  return '';
+}
+function dnsAnnounceSwitch(st){
+  const a = st.dns_announce;
+  if(a == null) return '';
+  const mins = num(Math.round((a.lifetime || 600) / 60));
+  return `<div class="row"><div class="grow"><h2>Announce QuietNet as an IPv6 DNS server <span class="badge warn">Trial</span></h2>
+    <p class="meta">A trial, off unless you turn it on. <b>It does not stop any device getting round QuietNet.</b> While it is
+      on, this computer tells every device in your home, every few minutes, that it can be used for IPv6 DNS as well. Your
+      router carries on naming its own IPv6 DNS server, each device chooses between the two, and devices marked "Can bypass
+      over IPv6" still can. QuietNet never offers itself as a router, hands out no addresses and changes nothing on your
+      router. If this computer loses power without warning, devices that chose it may be slow to look names up for up to
+      ${mins} minutes. Turning this off, or stopping QuietNet in the ordinary way, tells devices to stop at once.</p>
+    ${dnsAnnounceState(a)}</div>
+    <label class="switch"><input type="checkbox" id="dnsAnnounceSwitch" ${a.on ? 'checked' : ''} ${a.available === false && !a.on ? 'disabled' : ''} aria-label="Trial: announce QuietNet as an IPv6 DNS server"><span></span></label></div>`;
+}
 // What QuietNet knows about IPv6 on the home network, for "Set up a device". v6.hub_off is true only
 // after the Pi has listened for a full hour while able to hear the router, heard no router announce
 // IPv6, holds no public IPv6 address itself, and nothing in the home names an IPv6 DNS server other
@@ -1674,7 +1704,8 @@ function viewSetup(){
       'This narrows the gap but does not close it: the hub still gives devices its own IPv6 DNS server, and devices marked "Can bypass over IPv6" still can. The switch below helps a little more.',
       'To undo it, turn <b>ULA Enabled</b> off again.'])}
     ${noIpv6Switch(S.status || {})}
-    ${ipv6SteerSwitch(S.status || {})}</div>`;
+    ${ipv6SteerSwitch(S.status || {})}
+    ${dnsAnnounceSwitch(S.status || {})}</div>`;
   return `
   ${v6Warning(false)}
   ${cloudCard()}
@@ -2045,6 +2076,7 @@ document.addEventListener('change', async e => {
   if(e.target.id === 'otherDnsSwitch'){ await api('/api/other-dns-switch', {on:e.target.checked}).catch(oops); refresh(); }
   if(e.target.id === 'noIpv6Switch'){ await api('/api/no-ipv6-switch', {on:e.target.checked}).catch(oops); refresh(); }
   if(e.target.id === 'ipv6SteerSwitch'){ await api('/api/ipv6-steer-switch', {on:e.target.checked}).catch(oops); refresh(); }
+  if(e.target.id === 'dnsAnnounceSwitch'){ await api('/api/dns-announce-switch', {on:e.target.checked}).catch(oops); refresh(); }
   if(e.target.id === 'enforceSwitch'){ await api('/api/enforce', Object.assign(byDevice(S.device), {on:e.target.checked})).catch(oops); refresh(true); }
   if(e.target.id === 'netSwitch'){ await api('/api/internet', {scope:e.target.dataset.scope, off:!e.target.checked}).catch(oops); refresh(true); }
   if(e.target.id === 'newGroupSel'){ await api('/api/new-device-group', {group:e.target.value ? +e.target.value : null}).catch(oops); e.target.blur(); refresh(true); }

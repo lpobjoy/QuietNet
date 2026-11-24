@@ -35,6 +35,7 @@ from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
+import announcer
 import enforcer
 import cloud_agent
 import names
@@ -361,6 +362,7 @@ class State:
 S = State()
 ENF = None
 CA = None
+AN = None               # the trial announcer (announcer.py), made in main(); see make_announcer
 db = None
 db_lock = threading.RLock()
 # A second, read-only connection for the dashboard's questions about the history, with its own
@@ -6146,6 +6148,19 @@ def ipv6_dns_view(now=None, mono=None):
             "router_dns_not_ours": not_ours}
 
 
+def ipv6_dns_listening():
+    """Is the filter taking lookups over IPv6 on the usual DNS port (53)? The trial announcer
+    asks this before every announcement: an announcement can name an address but not a port, so
+    on any other port, or with the IPv6 listener not open, it must say nothing."""
+    return bool(S.dns_ipv6) and S.dns_port == announcer.DNS_PORT
+
+
+def make_announcer():
+    """The trial that announces this computer as an IPv6 DNS server (announcer.py), switched on
+    only if the owner has saved it so ("dns_announce" in the settings table; off otherwise)."""
+    return announcer.Announcer(ipv6_dns_listening, on=get_setting("dns_announce", "0") == "1")
+
+
 def hint_refresher():
     """Background thread: every two minutes (or soon after a network scan), look for a name for
     each device this computer knows about, so the dashboard can suggest one. The asking is done by
@@ -6313,6 +6328,7 @@ def api_status():
         "enforcer": dict(ENF.status() if ENF else {"available": False, "reason": "", "active": False},
                          shared=dict(S.shared_left)),
         "ipv6": ipv6_dns_view(now),
+        "dns_announce": AN.status() if AN else None,
         "new_device_group": S.new_device_group,
         "device_notices": list(S.device_notices),
         "device_events": recent_device_events(),
@@ -7345,6 +7361,12 @@ class Web(BaseHTTPRequestHandler):
             if ENF is not None:
                 ENF.poke()                        # hand the devices back (or start) at once, not in 2 seconds
             return self.send_json({"ok": True})
+        if path == "/api/dns-announce-switch":  # the trial: announce this computer as an IPv6 DNS server
+            if AN is None:
+                return self.send_json({"error": "The announcement trial is not running here."}, 400)
+            set_setting("dns_announce", "1" if body.get("on") is True else "0")
+            AN.switch(body.get("on") is True)
+            return self.send_json(dict(AN.status(), ok=True))
         if path == "/api/junk-switch":
             S.junk_on = bool(body.get("on"))
             set_setting("junk_on", "1" if S.junk_on else "0")
@@ -7422,6 +7444,9 @@ def main():
         threading.Thread(target=hint_refresher, daemon=True).start()
     start_dns(args.dns_port)
     threading.Thread(target=router_advert_listener, daemon=True).start()
+    global AN
+    AN = make_announcer()               # sends nothing unless the owner switched the trial on
+    AN.start()
 
     global ENF
     ENF = enforcer.Enforcer(S.local_ip, enforcement_plan, plan_neighbours, data_dir=DATA,
@@ -7455,10 +7480,14 @@ def main():
         pass
     finally:
         signal.signal(signal.SIGTERM, signal.SIG_IGN)     # a second request must not interrupt the clean-up
+        if AN:
+            AN.ask_to_stop()                              # its goodbyes go out while the enforcer restores the network
         if ENF:
             ENF.stop()                                    # waits until the network is restored
         if CA:
             CA.stop()
+        if AN:
+            AN.stop()                                     # waits until the goodbyes have gone
         print("\nQuietNet stopped.", flush=True)
 
 

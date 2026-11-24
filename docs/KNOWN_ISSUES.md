@@ -138,6 +138,7 @@ On 23 November the DNS half was fixed: the filter now also listens on IPv6 (`::`
 - On the Pi, matching needs the `ip` tool (`iproute2`, now in the image). Without it nothing is matched, so while any device is treated differently every IPv6 lookup from a real IPv6 address is refused. Since 24 November the home page says so ("QuietNet can't tell which device a lookup over IPv6 came from") rather than refusing with no explanation.
 - **A device known by two addresses is one device (24 November).** Its history, and since the third part of the design its name, group and rules, are held against the device, by hardware address, whatever IPv4 or IPv6 address it has, and `GET /api/devices` lists one entry per device (the TV at `.65` and `.67` is one). See issues 96 and 97 for what is left open.
 - **Switching IPv6 off on the router is the only fix for every device** (design, 24 November). "Set up a device" now has the steps for a BT Smart Hub (Allocation Mode off, or ULA on where there is no off switch) with what to do afterwards, and confirms "IPv6 is off on your hub" only after a full hour of listening with nothing heard. Whether a given hub offers the off switch is reported both ways by BT users; see issue 95.
+- **A trial lets the Pi announce itself as an IPv6 DNS server beside the hub (24 November).** Off unless switched on. It cannot replace the hub's own announcement, so it does not close this; see issue 96.
 
 ### 93. Ways a device can still get round QuietNet
 
@@ -253,6 +254,22 @@ The IPv6 steering of the design (option c2) is built, off by default behind the 
 - **A device's IPv6 steering problem is shown under the number it has now.** `ipv6_steering.problems` is keyed by IPv4 address, like the enforcer's other problems; for a merged device at two numbers at once the page shows only the one for the number on its card.
 - **Recovery after a restart.** The hub's link-local and hardware addresses are saved with the steered devices, so the first tick after a restart hands each saved device back with a correction before the hub is heard again (so a steered device has its IPv6 back within a few seconds of a restart); a device still chosen is claimed again only once the hub next announces, which can be minutes. On a clean stop or setting-off the correction goes within the stop grace period. If neither the live nor the saved hub address is known, or the Pi is killed, the device is relied on to right itself once the Pi stops answering its checks; how long that takes is not measured.
 - **The IPv6 reply-from-the-asked-address path** is live for every home on Linux, setting on or off, and is unproven on a real Pi until step 66 is run.
+
+### 101. The IPv6 DNS announcement trial: what it cannot do, and what is untried
+
+The trial on "Set up a device" (`announcer.py`, off unless switched on) makes the Pi announce itself to every device as an IPv6 DNS server. It was built from the standards and checked byte for byte, but has never run on a real network. What it cannot do, and what is not known:
+
+- **It does not stop a device getting round QuietNet.** The hub goes on announcing its own IPv6 DNS server and can't be told not to. Each device then has two and chooses; Pi-hole users on this hub report that this does not stop the bypass. The dashboard labels are unchanged by the trial, on purpose.
+- **If the Pi loses power, or QuietNet is killed without warning, there is no goodbye.** Devices keep the Pi's address until its 10 minutes run out, and those that put it first may be slow to look names up, or fail, meanwhile. How slow, on each kind of device, is not measured (manual step 33). A shorter lifetime would make Android ignore the announcement.
+- **Whether the hub passes the announcements on is not known.** They go to every device through the hub's Wi-Fi. A hub that filters router announcements from ordinary devices would make the trial do nothing; the dashboard would still say "Announcing now", because the Pi can't tell (manual step 28).
+- **Whether devices accept it is not known.** A device written to the older standard may ignore a DNS server from an announcement whose router lifetime is 0. Which devices list the Pi, and whether before or after the hub, needs checking on each kind (manual step 29).
+- **It names the Pi's link-local address (`fe80::…`),** not the address "Set up a device" gives for typing in. That address is always there and the Pi always answers from it, and a BT hub names its own link-local address the same way, but a device that mishandles a link-local DNS server would ignore the Pi or fail to reach it.
+- **A lookup from a device's link-local address must still be matched to the device.** Until it is (its first seconds), and while any device is treated differently from the whole house, it is refused, as any unmatched IPv6 lookup is (issue 5), and the device tries its other server.
+- **The "is QuietNet answering?" check is made from the Pi itself,** to its own address. It proves the filter is listening and answering there, not that every device can reach it: a firewall on the Pi that lets the Pi's own traffic through but drops the home network's would not be noticed.
+- **A device that has just joined waits for the next announcement,** up to 200 seconds, because the Pi does not answer devices asking for a router. Until then it has only the hub's server.
+- **With the hub's IPv6 switched off the trial still announces.** Devices then have no other IPv6 DNS server, so one that uses IPv6 DNS without an IPv6 internet address would send its lookups to the Pi. That is not known to cause harm, and is not tried (manual step 29).
+- **A second announcer on the same Pi** (the system's own `radvd`, say) naming the same address would have its announcements called off whenever the trial sends a goodbye.
+- **On a Mac, or without the right to send raw frames, it does nothing** and the page says so.
 
 ### 18. The local dashboard has no password
 
