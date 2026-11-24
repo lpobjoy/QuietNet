@@ -31,7 +31,7 @@ flowchart LR
 
 | File | Lines | Job |
 | --- | --- | --- |
-| `server.py` | ~5,300 | DNS filter, rules engine, the device tables, network scan, dashboard web server, start-up |
+| `server.py` | ~5,400 | DNS filter, rules engine, the device tables, network scan, dashboard web server, start-up |
 | `names.py` | ~1,080 | Finds names for the devices on the home network (see [Device names](#device-names)) |
 | `enforcer.py` | ~980 | Steers a chosen device's traffic through the Pi and drops what is blocked |
 | `cloud_agent.py` | ~370 | Holds an outbound connection to the relay and runs relayed requests locally |

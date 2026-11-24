@@ -1058,6 +1058,16 @@ class DeviceList(Api):
         tv = self.tv_moves()
         self.assertEqual(self.names_for(tv, NEW_SPOT), ["new.example.com", "old.example.com"])
 
+    def test_activity_by_device_number_says_who_needs_a_name(self):
+        # A name looked up at the address the TV had before it moved is on no list kept by address;
+        # the device's own list must still say who needs it, so the page can ask before blocking.
+        self.look({OLD_SPOT: fresh(TV)}, ago=600)
+        self.lookup(OLD_SPOT, "lcprd1.samsungcloudsolution.net")
+        self.look({NEW_SPOT: fresh(TV)})
+        _, groups = self.get("/api/activity?ip=%s&device=%s&hours=24" % (NEW_SPOT, server.S.hw_device[TV]))
+        self.assertEqual([(g["base"], g["needed"], g["hosts"][0]["needed"]) for g in groups],
+                         [("samsungcloudsolution.net", "Samsung TVs", "")])
+
     def test_activity_by_address_alone_is_what_was_recorded_under_that_address(self):
         self.tv_moves()
         _, groups = self.get("/api/activity?ip=%s&hours=24" % NEW_SPOT)
