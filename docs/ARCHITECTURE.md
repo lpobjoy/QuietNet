@@ -36,7 +36,7 @@ flowchart LR
 | `enforcer.py` | ~1,770 | Steers a chosen device's traffic through the Pi and drops what is blocked; can also take IPv6 away from steered devices |
 | `announcer.py` | ~680 | A trial, off unless switched on: announces the Pi as an IPv6 DNS server beside the router's own (see [The IPv6 DNS announcement trial](#the-ipv6-dns-announcement-trial)) |
 | `cloud_agent.py` | ~370 | Holds an outbound connection to the relay and runs relayed requests locally |
-| `cloud/relay.py` | ~1,960 | The relay: accounts, pairing codes (and the install command shown with them), and the bridge between browser and Pi |
+| `cloud/relay.py` | ~2,950 | The relay: accounts, pairing codes (and the install command shown with them), and the bridge between browser and Pi |
 | `static/index.html` | ~2,180 | The dashboard: one page, no build step, no outside scripts; its three looks are in its one style sheet |
 | `services.json` | | The apps and services that can be blocked, and the addresses each uses |
 | `junk_domains.txt` | | The built-in advert and tracker list |
