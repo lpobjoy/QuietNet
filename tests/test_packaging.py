@@ -7,10 +7,12 @@ Run with:  python3 -m unittest discover tests
 These read files only. Nothing is built, started or sent anywhere.
 """
 import ast
+import atexit
 import collections
 import json
 import os
 import re
+import shutil
 import sys
 import tempfile
 import unittest
@@ -21,6 +23,7 @@ import unittest
 # whatever folder the person running the tests has in QUIETNET_DATA).
 if "server" not in sys.modules:
     os.environ["QUIETNET_DATA"] = tempfile.mkdtemp(prefix="quietnet-test-")
+    atexit.register(shutil.rmtree, os.environ["QUIETNET_DATA"], True)   # removed when the run is over
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 import server  # noqa: E402
@@ -333,6 +336,51 @@ class TestDataFolder(unittest.TestCase):
 
     def test_the_data_folder_these_tests_use_is_not_the_checkouts_own(self):
         self.assertNotEqual(os.path.realpath(server.DATA), os.path.realpath(os.path.join(ROOT, "data")))
+
+
+def kept_for_ever(source):
+    """The line numbers in `source` (the text of a Python file) where a temporary file or folder
+    is made with `tempfile` and no removal is named on that line or the four after it. A removal
+    is `rmtree`, `os.remove`, a `.cleanup`, or making it in a `with` statement, which removes it
+    at the end of the block."""
+    lines = source.splitlines()
+    kept = []
+    for node in ast.walk(ast.parse(source)):
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name) and node.func.value.id == "tempfile"
+                and node.func.attr in ("mkdtemp", "mkstemp", "mktemp", "TemporaryDirectory", "NamedTemporaryFile")):
+            continue
+        nearby = lines[node.lineno - 1:node.lineno + 4]
+        if nearby[0].lstrip().startswith("with "):
+            continue
+        if not any(word in line for line in nearby for word in ("rmtree", "os.remove", ".cleanup")):
+            kept.append(node.lineno)
+    return sorted(kept)
+
+
+class NothingLeftBehind(unittest.TestCase):
+    """A run of the tests removes every temporary file and folder it makes. A whole run used to
+    leave about a hundred small folders behind, and runs in a loop once filled a computer's
+    temporary folder with a hundred thousand of them."""
+
+    def test_every_temporary_folder_a_test_makes_has_its_removal_named_beside_it(self):
+        here = os.path.join(ROOT, "tests")
+        kept = ["%s:%d" % (name, line) for name in sorted(os.listdir(here)) if name.endswith(".py")
+                for line in kept_for_ever(read("tests", name))]
+        self.assertEqual(kept, [])
+
+    def test_a_temporary_folder_made_and_never_removed_is_noticed(self):
+        made = "import tempfile\n\n\ndef setUp(self):\n    self.folder = tempfile.mkdtemp()\n    self.other = 1\n"
+        self.assertEqual(kept_for_ever(made), [5])
+
+    def test_a_temporary_folder_removed_by_a_clean_up_on_the_next_line_is_passed(self):
+        made = ("import tempfile\n\n\ndef setUp(self):\n    self.folder = tempfile.mkdtemp()\n"
+                "    self.addCleanup(shutil.rmtree, self.folder, True)\n")
+        self.assertEqual(kept_for_ever(made), [])
+
+    def test_a_temporary_folder_made_in_a_with_statement_is_passed(self):
+        made = "import tempfile\n\nwith tempfile.TemporaryDirectory() as folder:\n    pass\n"
+        self.assertEqual(kept_for_ever(made), [])
 
 
 class DashboardNeededNames(unittest.TestCase):

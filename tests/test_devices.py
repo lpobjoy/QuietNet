@@ -1362,6 +1362,7 @@ class OlderHousehold(Base):
         super().setUp()
         self.now = time.time()
         self.usual, self.folder = server.DATA, tempfile.mkdtemp(prefix="quietnet-older-")
+        # The folder is removed (shutil.rmtree) by back_to_the_usual_database, once its database is closed.
         saved = server.S.local_ip
         self.addCleanup(setattr, server.S, "local_ip", saved)
         self.addCleanup(setattr, server.S, "router", "")

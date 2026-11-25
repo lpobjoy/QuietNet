@@ -8,6 +8,7 @@ spare ports on this computer; nothing leaves this machine.
 import http.client
 import json
 import os
+import shutil
 import ssl
 import sys
 import tempfile
@@ -117,6 +118,7 @@ class AgentCase(unittest.TestCase):
         PretendRelay.poll_status = 200
         PretendDashboard.requests = []
         self.data = tempfile.mkdtemp(prefix="quietnet-agent-test-")
+        self.addCleanup(shutil.rmtree, self.data, True)
         self.log = []
         env = mock.patch.dict(os.environ)
         env.start()
