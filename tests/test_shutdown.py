@@ -4,7 +4,8 @@ Run with:  python3 -m unittest discover tests
 
 These are the tests that start the whole of QuietNet, as a separate program on spare ports
 with a throwaway data folder, and then stop it the way `docker stop` or Ctrl-C does: once it
-is serving, while it is still starting up, and while its dashboard is busy taking connections.
+is serving, while it is still starting up, while its dashboard is busy taking connections, and
+while it has lookups in hand that the internet is not answering.
 They are skipped where the live-connection enforcer could really start (Linux, admin rights
 and a firewall tool), so that a test run never touches the real network settings.
 
@@ -15,6 +16,7 @@ import http.client
 import os
 import random
 import select
+import shutil
 import signal
 import socket
 import subprocess
@@ -23,6 +25,8 @@ import tempfile
 import threading
 import time
 import unittest
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
@@ -42,6 +46,14 @@ BUSY_CLIENTS = 3
 BUSY_ANSWERS = 30
 
 
+# Starts the program just as `python server.py` does, but with the internet's DNS servers
+# replaced by a stand-in on this computer, tried 24 times over. Each try waits two and a half
+# seconds for an answer, so a lookup the stand-in never answers stays in hand for a minute.
+# Run with: the repository's folder, the stand-in's port, then the program's own arguments.
+WITH_A_STAND_IN_INTERNET = ("import sys; sys.path.insert(0, sys.argv.pop(1)); import server; "
+                            "server.UPSTREAMS = [('127.0.0.1', int(sys.argv.pop(1)))] * 24; server.main()")
+
+
 def spare_port(kind=socket.SOCK_STREAM):
     """A port number that nothing is using at the moment."""
     with socket.socket(socket.AF_INET, kind) as s:
@@ -49,13 +61,53 @@ def spare_port(kind=socket.SOCK_STREAM):
         return s.getsockname()[1]
 
 
+def question(name):
+    """A DNS question for the IPv4 address of `name`, as a device would send it."""
+    labels = b"".join(bytes([len(part)]) + part.encode() for part in name.split("."))
+    return b"\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00" + labels + b"\x00\x00\x01\x00\x01"
+
+
+class SomethingElse(BaseHTTPRequestHandler):
+    """Another program's web server, for the test of a port that is taken: it answers every
+    request "not found"."""
+
+    def do_GET(self):
+        """Answer "not found"."""
+        self.send_error(404)
+
+    def log_message(self, *args):
+        """Keep the test output free of request lines."""
+
+
+class PortTaken(AssertionError):
+    """The program could not start because a port found free for it a moment earlier was in
+    use by the time it came to open it. Nothing is wrong with the program: see start()."""
+
+
 @unittest.skipIf(os.name == "nt", "signals work differently on Windows")
 @unittest.skipIf(enforcer.Enforcer("127.0.0.1", dict, dict, log=lambda m: None).available(),
                  "the enforcer could start for real here; not touching the network from a test")
 class Shutdown(unittest.TestCase):
-    def start(self, ready="answered"):
+    def setUp(self):
+        """See ctrl_c_not_ignored()."""
+        self.ctrl_c_not_ignored()
+
+    def ctrl_c_not_ignored(self):
+        """Make sure the program is started as it would be from a terminal, able to hear Ctrl-C.
+
+        A program inherits "ignore Ctrl-C's signal" from the one that starts it, and QuietNet,
+        like Python itself, leaves the signal ignored if it starts that way. A test run has it
+        ignored when a script or a shell without a terminal starts it in the background (with
+        "&"); the Ctrl-C tests then failed with "QuietNet ignored the request to stop", which
+        was true and no fault. A signal that this test program handles itself is not inherited
+        as ignored, so for the length of a test it is given Python's usual handler."""
+        if signal.getsignal(signal.SIGINT) == signal.SIG_IGN:
+            signal.signal(signal.SIGINT, signal.default_int_handler)
+            self.addCleanup(signal.signal, signal.SIGINT, signal.SIG_IGN)
+
+    def start(self, ready="answered", internet=None):
         """Start the real program on spare ports with a throwaway data folder, and return it at
-        the moment named by `ready`:
+        the moment named by `ready` (see launch() for `internet`):
 
         "answered"    its dashboard has answered a request in full, so it is up and serving
         "port open"   its dashboard's port takes a connection, which it does a few lines before
@@ -65,27 +117,53 @@ class Shutdown(unittest.TestCase):
                       saying it is off, so this is the middle of start-up: after the point where
                       a real enforcer would have started, before the dashboard's port is open
 
-        What the program printed while this waited is kept in self.printed_so_far."""
-        env = dict(os.environ, QUIETNET_DATA=tempfile.mkdtemp(prefix="quietnet-shutdown-test-"), PYTHONUNBUFFERED="1")
+        What the program printed while this waited is kept in self.printed_so_far.
+
+        A spare port is found by opening one and closing it again, and the program opens it a
+        moment later. Now and then something else on the computer has taken it in between
+        (seen on a Mac that was short of spare ports, with several test runs going at once),
+        and the program stops with "Address already in use". Such a start is tried once more,
+        on fresh ports."""
+        for another_try in (True, False):
+            proc = self.launch(internet)
+            try:
+                if ready == "first line":
+                    self.wait_until_the_first_line_is_printed(proc)
+                elif ready == "port open":
+                    self.wait_until_the_port_is_open(proc)
+                else:
+                    self.wait_until_the_dashboard_answers(proc)
+                return proc
+            except PortTaken:
+                if not another_try:
+                    raise
+
+    def launch(self, internet=None):
+        """Start the real program on spare ports with a throwaway data folder, which is removed
+        again when the test is over, and return it without waiting for anything.
+
+        `internet` is the port of a stand-in, on this computer, for the internet's DNS servers.
+        Without it the program is started exactly as it is by hand; these tests then send it
+        no lookups, so it never asks the real ones."""
+        self.data_folder = tempfile.mkdtemp(prefix="quietnet-shutdown-test-")
+        self.addCleanup(shutil.rmtree, self.data_folder, True)      # runs after the program has been ended
+        env = dict(os.environ, QUIETNET_DATA=self.data_folder, PYTHONUNBUFFERED="1")
         env.pop("QUIETNET_CLOUD", None)
         env.pop("QUIETNET_PAIR", None)
-        self.web_port = spare_port()
+        self.web_port, self.dns_port = spare_port(), spare_port(socket.SOCK_DGRAM)
         self.printed_so_far = b""
+        program = [sys.executable, os.path.join(ROOT, "server.py")]
+        if internet:
+            program = [sys.executable, "-c", WITH_A_STAND_IN_INTERNET, ROOT, str(internet)]
         proc = subprocess.Popen(
             # --no-device-names: the program must not send name questions onto the real network.
-            [sys.executable, os.path.join(ROOT, "server.py"), "--no-browser", "--no-device-names",
-             "--dns-port", str(spare_port(socket.SOCK_DGRAM)), "--web-port", str(self.web_port)],
+            program + ["--no-browser", "--no-device-names",
+                       "--dns-port", str(self.dns_port), "--web-port", str(self.web_port)],
             # bufsize=0: what this test reads itself and what communicate() reads later then
             # come straight from the one pipe, and nothing is left behind in a buffer between.
             env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=0)
         self.addCleanup(lambda: proc.poll() is None and proc.kill())
         self.addCleanup(proc.stdout.close)
-        if ready == "first line":
-            self.wait_until_the_first_line_is_printed(proc)
-        elif ready == "port open":
-            self.wait_until_the_port_is_open(proc)
-        else:
-            self.wait_until_the_dashboard_answers(proc)
         return proc
 
     def wait_until_the_first_line_is_printed(self, proc):
@@ -163,29 +241,34 @@ class Shutdown(unittest.TestCase):
 
         A program that has just died may not look ended yet, so it is given a few seconds to
         finish; then the failure says it stopped during start-up. One still running after that
-        is ended here, so that all it printed can be read, and the failure says `why`."""
+        is ended here, so that all it printed can be read, and the failure says `why`.
+
+        A program that stopped because a port was in use fails with PortTaken, which start()
+        answers with one more try."""
         try:
             out, _ = proc.communicate(timeout=5)
         except subprocess.TimeoutExpired:
             proc.kill()
             out, _ = proc.communicate()
             self.fail("%s. It was still running, and was ended. What it had printed:\n%s" % (why, self.all_printed(out)))
-        self.fail("QuietNet stopped during start-up (exit code %s):\n%s" % (proc.returncode, self.all_printed(out)))
+        printed = self.all_printed(out)
+        kind = PortTaken if "Address already in use" in printed else self.failureException
+        raise kind("QuietNet stopped during start-up (exit code %s):\n%s" % (proc.returncode, printed))
 
     def all_printed(self, rest):
         """Everything the program printed, as text: what a wait read, then the rest."""
         return (self.printed_so_far + rest).decode("utf-8", "replace")
 
-    def ended(self, proc):
+    def ended(self, proc, complaint="QuietNet ignored the request to stop"):
         """Wait for a program that has been asked to stop, and return its exit code and all it
-        printed. Fail if it is still running 20 seconds later."""
+        printed. Fail with the `complaint` if it is still running 20 seconds later."""
         try:
             out, _ = proc.communicate(timeout=20)
         except subprocess.TimeoutExpired:
             # End the program so that what it printed can be shown.
             proc.kill()
             out, _ = proc.communicate()
-            self.fail("QuietNet ignored the request to stop: still running 20 seconds later, "
+            self.fail(complaint + ": still running 20 seconds later, "
                       "and ended by this test. What it had printed:\n" + self.all_printed(out))
         return proc.returncode, self.all_printed(out)
 
@@ -227,9 +310,83 @@ class Shutdown(unittest.TestCase):
         self.assert_clean(code, out)
 
     def test_a_stop_request_the_moment_the_port_opens_ends_the_program_cleanly(self):
-        """The last lines of start-up: the port is open and the program is not yet serving."""
+        """The last lines of start-up: the port is open and the program is about to serve, or
+        has just begun to.
+
+        A plain check that a stop at this moment is clean, and no more. It cannot be relied on
+        to land before the serving begins, and it did not show the fault that was fixed: the
+        program as it was failed it once in 1,080 runs. The test that pins the moment down is
+        in tests/test_start_stop.py (a stop request just as the dashboard's port opens)."""
         code, out = self.stopped_with(signal.SIGTERM, ready="port open")
         self.assert_clean(code, out)
+
+    def test_ctrl_c_ends_the_program_when_the_test_run_itself_has_ctrl_c_ignored(self):
+        """As when a script starts the tests in the background: see ctrl_c_not_ignored()."""
+        self.addCleanup(signal.signal, signal.SIGINT, signal.getsignal(signal.SIGINT))
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        self.ctrl_c_not_ignored()
+        code, out = self.stopped_with(signal.SIGINT)
+        self.assert_clean(code, out)
+
+    def test_the_throwaway_data_folder_is_removed_when_the_test_is_over(self):
+        """Each start makes a folder of about a quarter of a megabyte, and these tests make
+        thirty starts a run. They used to be left behind in the computer's temporary folder."""
+        code, out = self.stopped_with(signal.SIGTERM)
+        self.assertTrue(os.path.isdir(self.data_folder))
+        self.doCleanups()
+        self.assertFalse(os.path.exists(self.data_folder))
+
+    def test_a_start_that_finds_its_port_taken_is_tried_once_more_on_fresh_ports(self):
+        """See start(). The first port found for the dashboard is taken here by another web
+        server, run by this test, before the program can open it."""
+        other = HTTPServer(("127.0.0.1", 0), SomethingElse)
+        self.addCleanup(other.server_close)
+        threading.Thread(target=other.serve_forever, daemon=True).start()
+        self.addCleanup(other.shutdown)
+        taken = [other.server_address[1]]
+        asked_for = []
+
+        def taken_the_first_time(kind=socket.SOCK_STREAM):
+            """The held port for the first dashboard, and truly spare ports after that."""
+            asked_for.append(kind)
+            return taken.pop() if taken and kind == socket.SOCK_STREAM else really_spare(kind)
+        really_spare = spare_port
+        with mock.patch.object(sys.modules[__name__], "spare_port", taken_the_first_time):
+            proc = self.start()
+        proc.send_signal(signal.SIGTERM)
+        code, out = self.ended(proc)
+        self.assert_clean(code, out)
+        self.assertEqual(len(asked_for), 4)                 # two ports for each of two starts
+        self.assertNotEqual(self.web_port, other.server_address[1])
+
+    def test_lookups_still_in_hand_do_not_hold_up_the_end_of_the_program(self):
+        """With the internet down, a lookup waits in the program for an answer that is not
+        coming. Python used to wait, as the program ended, for every such lookup to give up:
+        up to 20 seconds after "QuietNet stopped." had been printed, which is as long as Docker
+        waits before it kills a program, and with a traceback if another lookup arrived
+        meanwhile.
+
+        Here the internet is a stand-in that never answers, and each lookup would wait a minute
+        for it. Three are sent, and once the stand-in has been asked all three, so that each
+        is in hand, the program is asked to stop. It must end within the usual 20 seconds,
+        with nothing printed after its last line."""
+        internet = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.addCleanup(internet.close)
+        internet.bind(("127.0.0.1", 0))
+        internet.settimeout(30)
+        proc = self.start(internet=internet.getsockname()[1])
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as device:
+            for n in range(3):
+                device.sendto(question("lookup-%d.quietnet-test.example.com" % n), ("127.0.0.1", self.dns_port))
+            for n in range(3):
+                try:
+                    internet.recvfrom(512)
+                except socket.timeout:
+                    self.give_up(proc, "QuietNet passed only %d of 3 lookups on within 30 seconds" % n)
+            proc.send_signal(signal.SIGTERM)
+            code, out = self.ended(proc, "QuietNet did not end while it had lookups in hand")
+        self.assert_clean(code, out)
+        self.assertTrue(out.endswith("QuietNet stopped.\n"), out)
 
     def keep_asking(self, done, answers):
         """One client of the busy dashboard: open a connection, ask, read the answer, note it
