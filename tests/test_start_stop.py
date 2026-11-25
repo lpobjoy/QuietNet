@@ -1,0 +1,1221 @@
+"""Checks for how server.py starts and stops: the handling of a stop request (StopRequest), and
+the order of start_up(), serving and clean_up() in run().
+
+Run with:  python3 -m unittest discover tests
+
+Everything here runs inside the test program, with stand-ins for the enforcer, the cloud link,
+the device keeper, the trial announcer and the listeners, so nothing touches the network or its
+settings. (Where a test of the clean-up uses the real enforcer or the real announcer, everything
+it would touch has a stand-in: see CleanUp.enforcer_steering_a_phone and trial_announcer.) A stop
+request is sent the
+way `docker stop` and Ctrl-C send one, as a signal, but to the test program itself and only
+while QuietNet's own handling is in place; the handling that was there before is put back
+after every test. tests/test_shutdown.py does the same from outside, with the whole program.
+"""
+import contextlib
+import http.client
+import inspect
+import io
+import os
+import shutil
+import signal
+import socket
+import sys
+import tempfile
+import threading
+import time
+import unittest
+from http.server import ThreadingHTTPServer
+from unittest import mock
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from test_quietnet import Base, server
+
+STOP_SIGNALS = (signal.SIGTERM, signal.SIGINT)
+# A made-up home network for the test of the clean-up with the real enforcer: the router, this
+# computer and one phone, each with its hardware address, and the router's and the phone's own
+# IPv6 addresses on the home network (the "link-local" ones, which is what IPv6 steering claims).
+HUB, HUB_V6, HUB_MAC = "192.168.1.254", "fe80::1", "98:99:99:99:99:99"
+PI, PI_MAC = "192.168.1.60", "aa:aa:aa:aa:aa:aa"
+PHONE, PHONE_V6, PHONE_MAC = "192.168.1.23", "fe80::23", "10:22:33:44:55:66"
+# For the tests with the real trial announcer: this computer's home network card and its own
+# IPv6 address on the home network, which is the address the trial announces.
+CARD, PI_V6 = "wlan0", "fe80::60"
+
+
+def nothing(*args, **kwargs):
+    """Stands in for a part of start-up that these tests have no use for."""
+
+
+def ask_to_stop(signum=signal.SIGTERM):
+    """Send this test program the signal and return once Python has run QuietNet's handler for it.
+
+    Refuses unless QuietNet's handler is the one in place: with Python's own handling, SIGTERM
+    would end the whole test run and Ctrl-C's signal would raise KeyboardInterrupt in it."""
+    handler = signal.getsignal(signum)
+    if getattr(handler, "__func__", None) is not server.StopRequest.note:
+        raise AssertionError("QuietNet is not listening for %s: %r is in place" % (signum.name, handler))
+    try:
+        signal.raise_signal(signum)
+        # Python runs the handler at the main thread's next pause between instructions, which is
+        # almost always before the line above returns. Wait for the thing itself all the same.
+        deadline = time.monotonic() + 10
+        while not handler.__self__.asked and time.monotonic() < deadline:
+            time.sleep(0.001)
+    except BaseException as e:          # KeyboardInterrupt too: it would end the whole test run
+        raise AssertionError("the handler raised %r" % (e,))
+    if not handler.__self__.asked:
+        raise AssertionError("the handler did not run within 10 seconds")
+
+
+def wait_until(happened, what):
+    """Wait until happened() is true: 30 seconds at most, ending the moment it is. Fails the test,
+    naming `what`, if it never is."""
+    deadline = time.monotonic() + 30
+    while not happened() and time.monotonic() < deadline:
+        time.sleep(0.001)
+    if not happened():
+        raise AssertionError("%s within 30 seconds" % what)
+
+
+class NotedSender:
+    """Stands in for the socket the trial announcer sends through: each frame it is given goes
+    into a list and nowhere else."""
+
+    def __init__(self, sent):
+        """Keep the list the frames go into."""
+        self.sent = sent
+
+    def sendto(self, frame, where):
+        """Note the frame in place of sending it."""
+        self.sent.append(bytes(frame))
+
+    def close(self):
+        """Nothing was opened, so there is nothing to close."""
+
+
+def trial_announcer(sent, on=True, pause=nothing, asked=None):
+    """The real trial announcer (announcer.py), with the trial switched on unless `on` says
+    otherwise, and a stand-in for everything it would touch: the facts about this computer's
+    card are made up, its test question is always answered, the frames it would send go into the
+    list `sent`, and `pause` stands in for its wait between goodbyes. `asked`, if given, is a
+    list that notes each thing it asks for ("facts", "answers", "socket"), so that a test can
+    see it asked for nothing at all. Nothing is sent, opened or read."""
+    asked = [] if asked is None else asked
+
+    def facts():
+        """The card, its hardware address and the address to announce, with no reason not to."""
+        asked.append("facts")
+        return CARD, PI_MAC, PI_V6, ""
+
+    def answers(address, card):
+        """QuietNet always answers the announcer's test question here."""
+        asked.append("answers")
+        return True
+
+    def open_sender(card):
+        """The socket's stand-in."""
+        asked.append("socket")
+        return NotedSender(sent)
+
+    return server.announcer.Announcer(lambda: True, on=on, log=nothing, facts=facts, answers=answers,
+                                      open_sender=open_sender, pause=pause, unavailable="")
+
+
+def announcement():
+    """The frame trial_announcer() sends to offer this computer for IPv6 DNS."""
+    return server.announcer.build_dns_announcement(PI_MAC, PI_V6, server.announcer.DNS_LIFETIME)
+
+
+def goodbye():
+    """The frame trial_announcer() sends to tell devices to stop using this computer for IPv6
+    DNS: the same announcement with a lifetime of 0. It is sent GOODBYES times."""
+    return server.announcer.build_dns_announcement(PI_MAC, PI_V6, 0)
+
+
+class ClosingLine(io.StringIO):
+    """Takes what the clean-up prints, and calls `note` at the moment its closing line,
+    "QuietNet stopped.", is printed: so a test can keep what had been done by then."""
+
+    def __init__(self, note):
+        """Keep what is to be called."""
+        super().__init__()
+        self.note = note
+
+    def write(self, text):
+        """Keep the text, and say when the closing line came."""
+        if "QuietNet stopped." in text:
+            self.note()
+        return super().write(text)
+
+
+class SignalsPutBack(unittest.TestCase):
+    """Shared steps for tests that let QuietNet set its handling of stop requests in the test
+    program: start from Python's ordinary handling, and put back what was there afterwards."""
+
+    def setUp(self):
+        """Remember how both signals are handled now, and give Ctrl-C Python's usual handler, so
+        the tests behave the same when the run was started in the background (where a shell has
+        Ctrl-C's signal ignored)."""
+        super().setUp()
+        for signum in STOP_SIGNALS:
+            self.addCleanup(signal.signal, signum, signal.getsignal(signum))
+        signal.signal(signal.SIGINT, signal.default_int_handler)
+
+
+class Handler(SignalsPutBack):
+    """StopRequest alone: what its handler does, and how serving ends."""
+
+    def setUp(self):
+        """A StopRequest whose pipe is closed again after the test."""
+        super().setUp()
+        self.stop = server.StopRequest()
+        self.addCleanup(self.close_pipe)
+
+    def close_pipe(self):
+        """Close both ends of the StopRequest's pipe. A test may have closed one already."""
+        for end in (self.stop._read, self.stop._write):
+            try:
+                os.close(end)
+            except OSError:
+                pass
+
+    def note(self):
+        """Call the handler as Python would for a signal. Anything it raises fails the test
+        here: left alone, a KeyboardInterrupt from it would end the whole test run."""
+        try:
+            return self.stop.note(signal.SIGTERM, None)
+        except BaseException as e:
+            self.fail("the handler raised %r" % (e,))
+
+    def web_server(self):
+        """A real web server on a spare port that answers every GET with 200, not yet serving."""
+        class Hello(server.BaseHTTPRequestHandler):
+            """Answers "hello" to anything."""
+
+            def do_GET(self):
+                """Send the one answer."""
+                self.send_response(200)
+                self.send_header("Content-Length", "5")
+                self.end_headers()
+                self.wfile.write(b"hello")
+
+            def log_message(self, *args):
+                """Keep the test output free of request lines."""
+
+        web = ThreadingHTTPServer(("127.0.0.1", 0), Hello)
+        web.daemon_threads = True
+        self.addCleanup(web.server_close)
+        return web
+
+    def serve_with_a_time_limit(self, web):
+        """Run stop.serve(web) in this thread. Should it still be serving 30 seconds later, end
+        it from outside and fail, so that a fault here cannot hang the whole test run."""
+        gave_up = []
+
+        def give_up():
+            """End the serving loop and note that it had to be done."""
+            gave_up.append(True)
+            web.shutdown()
+        limit = threading.Timer(30, give_up)
+        limit.daemon = True
+        limit.start()
+        try:
+            self.stop.serve(web)
+        finally:
+            limit.cancel()
+        self.assertFalse(gave_up, "serving did not end within 30 seconds of the stop request")
+
+    def test_nothing_is_asked_until_a_request_arrives(self):
+        self.assertFalse(self.stop.asked)
+
+    def test_a_stop_request_is_remembered_and_the_handler_raises_nothing(self):
+        self.assertIsNone(self.note())
+        self.assertTrue(self.stop.asked)
+
+    def test_the_handler_raises_nothing_when_its_pipe_cannot_be_written(self):
+        os.close(self.stop._write)
+        self.assertIsNone(self.note())
+        self.assertTrue(self.stop.asked)
+
+    def test_the_handler_calls_nothing_but_one_write_to_its_pipe(self):
+        """The handler runs in the main thread, in between two steps of whatever that thread was
+        doing. A call to almost anything else (print, a log, threading.Event.set) can take a
+        lock the main thread is already holding, and then wait for ever. So: every call made
+        while the handler runs is recorded, and there must be the one write and nothing more."""
+        calls = []
+
+        def record(frame, event, arg):
+            """Note each Python function entered and each built-in function called."""
+            if event == "call":
+                calls.append(frame.f_code.co_name)
+            elif event == "c_call":
+                calls.append(arg.__name__)
+        sys.setprofile(record)
+        try:
+            self.stop.note(signal.SIGTERM, None)
+        except BaseException as e:
+            self.fail("the handler raised %r" % (e,))
+        finally:
+            sys.setprofile(None)
+        self.assertEqual([c for c in calls if c != "setprofile"], ["note", "write"])
+
+    def test_the_handler_refers_to_nothing_that_could_take_a_lock(self):
+        """The same guard from the other side, for what a recording of calls can miss (a "with"
+        on a lock is not a call): the names the handler's code uses are these and no others."""
+        self.assertEqual(set(server.StopRequest.note.__code__.co_names), {"asked", "os", "write", "_write", "OSError"})
+
+    def test_a_request_made_again_writes_no_second_byte(self):
+        """So the pipe can never fill up, however many times someone asks."""
+        for _ in range(3):
+            self.note()
+        os.set_blocking(self.stop._read, False)
+        self.assertEqual(os.read(self.stop._read, 10), b"!")
+
+    def test_listening_notes_the_signal_docker_stop_sends(self):
+        self.stop.listen()
+        ask_to_stop(signal.SIGTERM)
+        self.assertTrue(self.stop.asked)
+
+    def test_listening_notes_ctrl_c(self):
+        self.stop.listen()
+        ask_to_stop(signal.SIGINT)
+        self.assertTrue(self.stop.asked)
+
+    def test_ctrl_c_stays_ignored_if_it_was_ignored_when_the_program_started(self):
+        """A shell has Ctrl-C's signal ignored in a program it puts in the background."""
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        self.stop.listen()
+        self.assertEqual(signal.getsignal(signal.SIGINT), signal.SIG_IGN)
+        self.assertEqual(signal.getsignal(signal.SIGTERM), self.stop.note)
+
+    def test_ignoring_turns_both_signals_off(self):
+        self.stop.listen()
+        self.stop.ignore()
+        for signum in STOP_SIGNALS:
+            self.assertEqual(signal.getsignal(signum), signal.SIG_IGN, signum.name)
+
+    def test_serving_ends_when_a_stop_is_asked_for(self):
+        web = self.web_server()
+        answers = []
+
+        def ask_then_stop():
+            """Wait for the dashboard's answer, which shows it is serving, then ask it to stop."""
+            conn = http.client.HTTPConnection("127.0.0.1", web.server_address[1], timeout=30)
+            conn.request("GET", "/")
+            answers.append(conn.getresponse().read())
+            conn.close()
+            self.note()
+        client = threading.Thread(target=ask_then_stop, daemon=True)
+        client.start()
+        self.serve_with_a_time_limit(web)
+        client.join(30)
+        self.assertEqual(answers, [b"hello"])
+
+    def test_there_is_no_serving_at_all_when_the_stop_was_asked_for_before_it_began(self):
+        """Once the serving loop has begun it can take a moment to notice that it should finish,
+        so a request already noted must mean that it never begins."""
+        web = mock.Mock()
+        self.note()
+        self.stop.serve(web)
+        web.serve_forever.assert_not_called()
+
+    def test_serving_still_ends_when_the_request_comes_before_the_loop_has_begun(self):
+        """The instant between serve() finding nothing asked and the serving loop starting: the
+        request's byte waits in the pipe for the helper thread, which ends the loop."""
+        web = self.web_server()
+        begin = web.serve_forever
+
+        def asked_just_before_the_loop_begins(**how):
+            """Note a stop request, as the handler would, then start the real serving loop."""
+            self.note()
+            begin(**how)
+        web.serve_forever = asked_just_before_the_loop_begins
+        self.serve_with_a_time_limit(web)
+
+    def test_an_idle_dashboard_looks_for_the_request_to_finish_at_least_ten_times_a_second(self):
+        """Python's serving loop notices that it has been told to finish only when it next looks,
+        and left alone it looks twice a second: a stop with nobody using the dashboard then took
+        up to half a second, where before the fix it had taken a hundredth."""
+        web = mock.Mock()
+        self.stop.serve(web)
+        web.serve_forever.assert_called_once()
+        self.assertLessEqual(web.serve_forever.call_args[1]["poll_interval"], 0.1)
+        # Let the helper thread go before the pipe it is reading is closed.
+        self.note()
+        deadline = time.monotonic() + 30
+        while not web.shutdown.called and time.monotonic() < deadline:
+            time.sleep(0.001)
+        web.shutdown.assert_called_once_with()
+
+
+class StandIn:
+    """A stand-in for the enforcer or the cloud link: writes down, in a list shared with the
+    test, that it was made, started and stopped, and runs anything the test gave it to do at
+    each of those moments (`during`, keyed by "start" or "stop")."""
+
+    def __init__(self, name, diary, during):
+        """Note the making."""
+        self.name, self.diary, self.during = name, diary, during
+        self.reason = "a stand-in"
+        diary.append(name + " made")
+
+    def available(self):
+        """The enforcer is asked this for the start-up lines; say no, as on a Mac."""
+        return False
+
+    def start(self):
+        """Do what the test asked for at this moment, then note the start."""
+        self.during.get("start", lambda: None)()
+        self.diary.append(self.name + " started")
+
+    def stop(self):
+        """Do what the test asked for at this moment, then note the stop."""
+        self.during.get("stop", lambda: None)()
+        self.diary.append(self.name + " stopped")
+
+
+class AnnouncerStandIn:
+    """A stand-in for the trial announcer (announcer.py): it announces nothing, and writes in
+    the diary that it was made, started, asked to stop and waited for. It runs anything the test
+    gave it to do at each of the last three moments (`during`, keyed by "start", "ask" or
+    "wait")."""
+
+    def __init__(self, diary, during):
+        """Note the making."""
+        self.diary, self.during = diary, during
+        diary.append("announcer made")
+
+    def start(self):
+        """Do what the test asked for at this moment, then note the start."""
+        self.during.get("start", lambda: None)()
+        self.diary.append("announcer started")
+
+    def ask_to_stop(self):
+        """Do what the test asked for at this moment, then note that it was asked to stop: the
+        real one begins its goodbyes here and does not wait for them."""
+        self.during.get("ask", lambda: None)()
+        self.diary.append("announcer asked to stop")
+
+    def stop(self):
+        """Do what the test asked for at this moment, then note that it was waited for: the real
+        one comes back from here when its goodbyes have gone."""
+        self.during.get("wait", lambda: None)()
+        self.diary.append("announcer waited for")
+
+
+class BrowserTimer:
+    """A stand-in for the timer that opens the dashboard in a browser half a second after
+    start-up: it opens nothing, and writes in the diary that it was set and that it was called
+    off."""
+
+    def __init__(self, url, diary):
+        """Note that the timer was set, and for which address."""
+        self.diary = diary
+        diary.append("browser set to open " + url)
+
+    def cancel(self):
+        """Note that the timer was called off."""
+        self.diary.append("browser called off")
+
+
+class Dashboard(ThreadingHTTPServer):
+    """The real dashboard web server, on a spare port, that writes in the diary when its
+    serving loop begins."""
+    daemon_threads = True
+
+    def serve_forever(self, poll_interval=0.5):
+        """Note that serving has begun, then serve as usual."""
+        self.diary.append("dashboard serving")
+        super().serve_forever(poll_interval)
+
+
+class Threads:
+    """Stands in for the `threading` module as server.py sees it: Python's own in everything
+    but the Thread class, which is the one given."""
+
+    def __init__(self, thread_class):
+        """Keep the class that server.py is to make its threads from."""
+        self.Thread = thread_class
+
+    def __getattr__(self, name):
+        """Anything else (locks, events, timers) is Python's own."""
+        return getattr(threading, name)
+
+
+# The names start_up() and clean_up() use that start nothing by themselves: the program's
+# settings and what it holds in memory, the modules whose classes have stand-ins, and the methods
+# called on the stand-ins. Every other name those two functions use must have a stand-in in
+# WholeLife.setUp (see the test near the end of WholeLife).
+STARTS_NOTHING = {
+    "S", "local_ip", "dns_error", "dns_port", "DATA", "enforcement_plan", "plan_neighbours", "learn_enforced_mac",
+    "plan6",                # handed to the enforcer, never called here: the enforcer asks it each tick
+    "web_port", "no_browser", "no_device_names", "asked", "print", "Web",
+    "threading", "Thread", "enforcer", "cloud_agent",
+    "start", "stop", "cancel", "available", "reason", "start_listeners",
+    "ask_to_stop",          # called on the trial announcer, which has a stand-in
+}
+
+
+class WholeLife(SignalsPutBack, Base):
+    """run() with the real start_up() and clean_up(), and stand-ins for everything they start.
+
+    `self.diary` lists what happened, in order. A test says what should happen while a stand-in
+    starts or stops, or as the dashboard's port is opened, such as a stop request arriving, by
+    filling `self.enforcer_does`, `self.cloud_does`, `self.listeners_do`, `self.keeper_does`,
+    `self.announcer_does` or `self.dashboard_does`.
+
+    Whatever start_up() starts needs a stand-in here, or these tests start the real thing
+    inside the test program. `self.stood_in` holds the names replaced; a test checks them
+    against the names start_up() and clean_up() use."""
+
+    def setUp(self):
+        """Put the stand-ins in place for the length of the test."""
+        super().setUp()
+        self.diary, self.enforcer_does, self.cloud_does, self.listeners_do = [], {}, {}, {}
+        self.dashboard_does, self.keeper_does, self.keeper_threads = {}, {}, []
+        self.announcer_does = {}
+        self.real_enforcer, self.enforcer_given = server.enforcer.Enforcer, []
+        self.webs, self.answers, self.stood_in = [], [], set()
+        self.printed = io.StringIO()
+        for name in ("init_db", "load_lists", "log_writer", "router_advert_listener", "address_watcher",
+                     "hint_refresher"):
+            self.patch(server, name, nothing)
+        self.patch(server, "device_keeper", self.device_keeper)
+        self.patch(server, "threading", Threads(self.noting_thread()))
+        self.addCleanup(self.keeper_threads_ended)
+        self.patch(server, "NAMER", mock.Mock())
+        self.patch(server, "find_local_ip", lambda: "192.168.1.2")
+        self.patch(server, "start_dns", lambda port: self.listeners_do.get("start", nothing)())
+        self.patch(server.enforcer, "Enforcer", self.make_enforcer)
+        self.patch(server.cloud_agent, "CloudAgent", lambda *a, **k: StandIn("cloud link", self.diary, self.cloud_does))
+        # The real announcer would read the owner's choice from the database, and once started
+        # and switched on would send onto the home network.
+        self.patch(server, "make_announcer", lambda: AnnouncerStandIn(self.diary, self.announcer_does))
+        self.patch(server, "ThreadingHTTPServer", self.make_web_server)
+        self.patch(server, "open_browser_soon", lambda url: BrowserTimer(url, self.diary))
+        # What start_up() keeps for clean_up(): put back after each test, so that no test stops
+        # something an earlier test left behind.
+        for name in ("ENF", "CA", "BROWSER", "AN"):
+            self.patch(server, name, None)
+
+    def patch(self, where, name, stand_in):
+        """Replace where.name with the stand-in until the test is over."""
+        patcher = mock.patch.object(where, name, stand_in)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.stood_in.add(name)
+
+    def make_enforcer(self, *args, **kwargs):
+        """Stands in for the enforcer's class: keeps what start_up() handed over, under the names
+        the real enforcer knows each thing by, and gives back a stand-in that starts nothing."""
+        self.enforcer_given.append(inspect.signature(self.real_enforcer).bind(*args, **kwargs).arguments)
+        return StandIn("enforcer", self.diary, self.enforcer_does)
+
+    def device_keeper(self):
+        """Stands in for the device keeper, the background job that moves an older household's
+        data to the device tables and then keeps track of which device has which address. Run
+        in a thread of its own by start_up(), it does what the test asked for and comes back."""
+        self.keeper_does.get("run", nothing)()
+
+    def noting_thread(self):
+        """Python's Thread class with one thing added: when the thread that is to run the device
+        keeper's stand-in is started, the diary says so, there and then, and what the test asked
+        for at that moment is done (`self.keeper_does["start"]`, such as a stop request).
+
+        The stand-in itself could not write that line: it runs in the new thread, a moment
+        later, by when start_up() may be several steps further on. The start is noted in the
+        thread that starts it, which is the one start_up() runs in, so the diary's order is the
+        order of start_up()'s own lines. Every other thread is started exactly as usual. Only
+        server.py is given this class (see Threads): Python's own library must keep its own."""
+        test = self
+
+        class NotingThread(threading.Thread):
+            """threading.Thread, noting the start of the device keeper's thread in the diary."""
+
+            def __init__(self, *args, **kwargs):
+                """Remember what the thread is to run, however it was handed over."""
+                self.runs = kwargs.get("target", args[1] if len(args) > 1 else None)
+                super().__init__(*args, **kwargs)
+
+            def start(self):
+                """Note the device keeper's start, do what the test asked for, then start."""
+                if self.runs == test.device_keeper:
+                    test.diary.append("device keeper started")
+                    test.keeper_threads.append(self)
+                    test.keeper_does.get("start", nothing)()
+                super().start()
+        return NotingThread
+
+    def keeper_threads_ended(self):
+        """After each test: the threads that ran the device keeper's stand-in have ended."""
+        for thread in self.keeper_threads:
+            thread.join(30)
+            self.assertFalse(thread.is_alive(), "the device keeper's stand-in was still going 30 seconds on")
+
+    def make_web_server(self, address, handler):
+        """A real dashboard web server on a spare port, noted in the diary and kept in
+        self.webs, so that a test can reach it and the time limit can end it."""
+        web = Dashboard(("127.0.0.1", 0), handler)
+        web.diary = self.diary
+        self.addCleanup(web.server_close)
+        self.webs.append(web)
+        self.diary.append("dashboard port opened")
+        self.dashboard_does.get("opened", nothing)()
+        return web
+
+    def run_it(self, stop_once_serving=None, browser=False, listening_already=None):
+        """Run the whole life in this thread, and return the error that ended it, if one did.
+
+        `stop_once_serving` is a signal to send once the dashboard has answered a request (the
+        diary then says "dashboard answered"). `browser` says whether the program is to open
+        the dashboard in a browser, as it does when started by hand. `listening_already` is a
+        StopRequest to hand to run(), as the program does with the one it makes at the top of
+        its file. Should run() still be
+        going 30 seconds on, the dashboard is ended from outside and the test fails, so that a
+        fault here cannot hang the whole test run."""
+        gave_up, helpers, over = [], [], threading.Event()
+
+        def give_up():
+            """End the serving loop from outside and note that it had to be done."""
+            gave_up.append(True)
+            for web in self.webs:
+                web.shutdown()
+
+        def ask_then_stop():
+            """Wait for the dashboard's answer, which shows it is serving, then send the signal
+            to this program. Python runs the handler in the main thread, which is serving.
+
+            If start-up never gets as far as a dashboard, give up as soon as run() is over, or
+            after 30 seconds, and send nothing. And send nothing unless QuietNet is listening
+            for the signal: left to Python, it would end the whole test run. The dashboard is
+            then ended from here, and the diary says why."""
+            deadline = time.monotonic() + 30
+            while not self.webs:
+                if over.is_set() or time.monotonic() > deadline:
+                    return
+                time.sleep(0.001)
+            conn = http.client.HTTPConnection("127.0.0.1", self.webs[0].server_address[1], timeout=30)
+            conn.request("GET", "/api/services", headers={"Host": "localhost"})
+            self.answers.append(conn.getresponse().status)
+            conn.close()
+            self.diary.append("dashboard answered")
+            handler = signal.getsignal(stop_once_serving)
+            if getattr(handler, "__func__", None) is server.StopRequest.note:
+                signal.raise_signal(stop_once_serving)
+            else:
+                self.diary.append("QuietNet was not listening for %s: %r was in place" % (stop_once_serving.name, handler))
+                self.webs[0].shutdown()
+        limit = threading.Timer(30, give_up)
+        limit.daemon = True
+        limit.start()
+        if stop_once_serving:
+            helpers.append(threading.Thread(target=ask_then_stop, daemon=True))
+            helpers[0].start()
+        args = mock.Mock(dns_port=0, web_port=0, no_browser=not browser, no_device_names=True)
+        error = None
+        try:
+            with contextlib.redirect_stdout(self.printed):
+                server.run(args, listening_already)
+        except BaseException as e:      # KeyboardInterrupt too: it must not end the test run
+            error = e
+        finally:
+            limit.cancel()
+            over.set()
+        for helper in helpers:
+            helper.join(30)
+            self.assertFalse(helper.is_alive(), "the tests' own helper thread was still going 30 seconds on")
+        self.assertFalse(gave_up, "QuietNet was still running 30 seconds on. The diary: %r" % self.diary)
+        return error
+
+    def test_an_ordinary_life_starts_everything_serves_and_stops_everything(self):
+        self.assertIsNone(self.run_it(stop_once_serving=signal.SIGTERM))
+        self.assertEqual(self.diary, ["announcer made", "enforcer made", "enforcer started", "device keeper started",
+                                      "cloud link made", "cloud link started",
+                                      "dashboard port opened", "announcer started",
+                                      "dashboard serving", "dashboard answered",
+                                      "announcer asked to stop", "enforcer stopped", "cloud link stopped",
+                                      "announcer waited for"])
+        self.assertEqual(self.answers, [200])
+        self.assertIn("QuietNet is running.", self.printed.getvalue())
+        self.assertTrue(self.printed.getvalue().endswith("QuietNet stopped.\n"))
+
+    def test_ctrl_c_while_serving_stops_everything_too(self):
+        self.assertIsNone(self.run_it(stop_once_serving=signal.SIGINT))
+        self.assertEqual(self.diary[-5:], ["dashboard answered", "announcer asked to stop", "enforcer stopped",
+                                           "cloud link stopped", "announcer waited for"])
+        self.assertTrue(self.printed.getvalue().endswith("QuietNet stopped.\n"))
+
+    def test_a_stop_request_noted_while_the_program_was_still_loading_means_nothing_is_started(self):
+        """Run as the program, server.py listens from its first lines, before its imports, and
+        hands that StopRequest to run(). A request noted by then must not be forgotten.
+
+        The trial announcer is made all the same, since making it starts nothing, and the
+        clean-up has its two lines for one that was never started (see CleanUp for the real one)."""
+        early = server.StopRequest()
+        self.addCleanup(os.close, early._read)
+        self.addCleanup(os.close, early._write)
+        early.listen()
+        ask_to_stop()
+        self.assertIsNone(self.run_it(listening_already=early))
+        self.assertEqual(self.diary, ["announcer made", "announcer asked to stop", "announcer waited for"])
+        self.assertTrue(self.printed.getvalue().endswith("QuietNet stopped.\n"))
+
+    def test_nothing_is_listened_for_just_because_the_file_was_imported(self):
+        """Only the program itself listens from the top of the file. Imported, as it is here,
+        it must leave the handling of signals alone until run() is called."""
+        self.assertIsNone(server.STOP_FROM_THE_TOP)
+
+    def test_a_stop_request_before_the_enforcer_starts_means_nothing_more_is_started(self):
+        self.listeners_do["start"] = ask_to_stop
+        self.assertIsNone(self.run_it())
+        self.assertEqual(self.diary, ["announcer made", "announcer asked to stop", "announcer waited for"])
+        self.assertTrue(self.printed.getvalue().endswith("QuietNet stopped.\n"))
+
+    def test_a_stop_request_while_the_enforcer_starts_still_stops_the_enforcer(self):
+        """The start-up gap of known issue 12: the enforcer may already be steering devices, so
+        the clean-up must run for it. The cloud link and the dashboard are never started."""
+        self.enforcer_does["start"] = ask_to_stop
+        self.assertIsNone(self.run_it())
+        self.assertEqual(self.diary, ["announcer made", "enforcer made", "enforcer started",
+                                      "announcer asked to stop", "enforcer stopped", "announcer waited for"])
+        self.assertTrue(self.printed.getvalue().endswith("QuietNet stopped.\n"))
+
+    def test_ctrl_c_while_the_enforcer_starts_still_stops_the_enforcer(self):
+        self.enforcer_does["start"] = lambda: ask_to_stop(signal.SIGINT)
+        self.assertIsNone(self.run_it())
+        self.assertEqual(self.diary, ["announcer made", "enforcer made", "enforcer started",
+                                      "announcer asked to stop", "enforcer stopped", "announcer waited for"])
+
+    def test_the_enforcer_is_given_the_neighbour_table_its_plan_has_just_read(self):
+        """Every two seconds the enforcer asks for its plan and then for the neighbour table. The
+        plan is made from a reading of that table (which device is at which address just now), so
+        the enforcer is handed plan_neighbours, which gives it that same reading while it is
+        fresh: the table is read once a tick, not twice. Handed the plain reader, `neighbours`,
+        the enforcer would run the system's tool a second time every tick."""
+        self.enforcer_does["start"] = ask_to_stop
+        self.assertIsNone(self.run_it())
+        self.assertEqual(len(self.enforcer_given), 1)
+        self.assertIs(self.enforcer_given[0]["neighbours"], server.plan_neighbours)
+
+    def test_the_enforcer_is_given_the_plan_for_taking_ipv6_away_from_steered_devices(self):
+        """The enforcer takes IPv6 away from the devices it steers only when it is handed plan6,
+        which it asks each tick what that steering should do (nothing, while the household has
+        the setting off) and once more as it stops, to hand those devices back. Made without
+        it, the enforcer leaves IPv6 steering out altogether: the setting on the dashboard would
+        then do nothing, and nothing would say so."""
+        self.enforcer_does["start"] = ask_to_stop
+        self.assertIsNone(self.run_it())
+        self.assertEqual(len(self.enforcer_given), 1)
+        self.assertIs(self.enforcer_given[0].get("plan6"), server.plan6)
+
+    def test_a_stop_request_while_the_cloud_link_starts_means_the_dashboard_is_never_served(self):
+        """Too late for start-up to be cut short, so the request has to be remembered: the rest
+        of start-up is finished, there is no serving, and everything is stopped."""
+        self.cloud_does["start"] = ask_to_stop
+        self.assertIsNone(self.run_it())
+        self.assertEqual(self.diary, ["announcer made", "enforcer made", "enforcer started", "device keeper started",
+                                      "cloud link made", "cloud link started",
+                                      "dashboard port opened",
+                                      "announcer asked to stop", "enforcer stopped", "cloud link stopped",
+                                      "announcer waited for"])
+        self.assertTrue(self.printed.getvalue().endswith("QuietNet stopped.\n"))
+
+    def test_the_device_keeper_is_started_once_the_enforcer_has_started_and_before_the_cloud_link(self):
+        """The keeper moves an older household's data to the device tables, which must wait until
+        the filter is answering and the enforcer steering (tests/test_devices.py checks the
+        filter's place in the order)."""
+        self.assertIsNone(self.run_it(stop_once_serving=signal.SIGTERM))
+        self.assertEqual(self.diary[:5], ["announcer made", "enforcer made", "enforcer started",
+                                          "device keeper started", "cloud link made"])
+
+    def test_a_stop_request_while_the_enforcer_starts_means_the_device_keeper_is_not_started(self):
+        """A move begun on the way out would be cut off moments later, and while it lasted it
+        would hold the database lock that the enforcer's last tick needs before it can hand the
+        network back."""
+        self.enforcer_does["start"] = ask_to_stop
+        self.assertIsNone(self.run_it())
+        self.assertNotIn("device keeper started", self.diary)
+        self.assertEqual(self.keeper_threads, [])
+
+    def test_a_stop_request_as_the_device_keeper_is_started_means_the_cloud_link_is_not(self):
+        """The request arrives after start-up's look for the device keeper and before its look
+        for the cloud link, whose first pairing try can take 20 seconds."""
+        self.keeper_does["start"] = ask_to_stop
+        self.assertIsNone(self.run_it())
+        self.assertEqual(self.diary, ["announcer made", "enforcer made", "enforcer started", "device keeper started",
+                                      "announcer asked to stop", "enforcer stopped", "announcer waited for"])
+        self.assertTrue(self.printed.getvalue().endswith("QuietNet stopped.\n"))
+
+    def test_the_device_keeper_runs_in_a_daemon_thread(self):
+        """Python waits, as the program ends, for every thread that is not a daemon thread, and
+        the device keeper never ends by itself."""
+        self.assertIsNone(self.run_it(stop_once_serving=signal.SIGTERM))
+        self.assertEqual([thread.daemon for thread in self.keeper_threads], [True])
+
+    def test_the_program_stops_without_waiting_for_a_device_keeper_that_is_still_at_work(self):
+        """The clean-up has no line for the device keeper: it has nothing to put back, and a move
+        to the device tables cut short is undone by the database. Here it is still at work, as
+        the real one always is, when the stop is asked for and when the clean-up has finished."""
+        at_work, enough = threading.Event(), threading.Event()
+        self.addCleanup(enough.set)
+
+        def work():
+            """Say that the work has begun, then keep at it until the test is over."""
+            at_work.set()
+            enough.wait(30)
+        self.keeper_does["run"] = work
+        self.assertIsNone(self.run_it(stop_once_serving=signal.SIGTERM))
+        self.assertTrue(at_work.wait(30))
+        self.assertTrue(self.keeper_threads[0].is_alive())
+        self.assertEqual(self.diary[-5:], ["dashboard answered", "announcer asked to stop", "enforcer stopped",
+                                           "cloud link stopped", "announcer waited for"])
+        self.assertTrue(self.printed.getvalue().endswith("QuietNet stopped.\n"))
+
+    def test_a_stop_request_just_as_the_dashboards_port_opens_means_it_is_never_served(self):
+        """The last lines of start-up, after its last look at the request: the port is open
+        and the program is not yet serving. Before the fix, the request ended the program on
+        the spot here, with no clean-up."""
+        self.dashboard_does["opened"] = ask_to_stop
+        self.assertIsNone(self.run_it())
+        self.assertEqual(self.diary[-5:], ["dashboard port opened", "announcer asked to stop", "enforcer stopped",
+                                           "cloud link stopped", "announcer waited for"])
+        self.assertTrue(self.printed.getvalue().endswith("QuietNet stopped.\n"))
+
+    def test_a_program_started_by_hand_sets_its_browser_to_open_and_the_clean_up_calls_it_off(self):
+        """The browser opens half a second after start-up. Calling it off does nothing once it
+        has opened; if the stop request came first, it stops a browser opening on a dashboard
+        that has gone."""
+        self.assertIsNone(self.run_it(stop_once_serving=signal.SIGTERM, browser=True))
+        self.assertEqual(self.diary[6:], ["dashboard port opened", "browser set to open http://localhost:0",
+                                          "announcer started", "dashboard serving", "dashboard answered",
+                                          "browser called off", "announcer asked to stop", "enforcer stopped",
+                                          "cloud link stopped", "announcer waited for"])
+
+    def test_no_browser_is_set_to_open_when_the_program_was_told_not_to(self):
+        self.assertIsNone(self.run_it(stop_once_serving=signal.SIGTERM))
+        self.assertEqual([line for line in self.diary if "browser" in line], [])
+
+    def test_a_stop_request_while_the_cloud_link_starts_means_no_browser_is_opened(self):
+        """Before this was fixed the browser opened after "QuietNet stopped." had been printed."""
+        self.cloud_does["start"] = ask_to_stop
+        self.assertIsNone(self.run_it(browser=True))
+        self.assertEqual([line for line in self.diary if "browser" in line], [])
+        self.assertEqual(self.diary[-5:], ["dashboard port opened", "announcer asked to stop", "enforcer stopped",
+                                           "cloud link stopped", "announcer waited for"])
+
+    def test_a_start_up_that_fails_still_stops_what_it_had_started(self):
+        """The dashboard's port being in use is the usual cause. The error still ends the
+        program, but not before the enforcer has handed the network back.
+
+        The tests' helper that waits for the dashboard is set going here as well, to show that
+        it gives up when there is never to be a dashboard: run_it() checks that it has ended."""
+        def port_in_use(address, handler):
+            """What Python's web server does when something else has the port."""
+            raise OSError(48, "Address already in use")
+        self.patch(server, "ThreadingHTTPServer", port_in_use)
+        error = self.run_it(stop_once_serving=signal.SIGTERM)
+        self.assertIsInstance(error, OSError)
+        self.assertEqual(self.diary[-4:], ["announcer asked to stop", "enforcer stopped", "cloud link stopped",
+                                           "announcer waited for"])
+        self.assertTrue(self.printed.getvalue().endswith("QuietNet stopped.\n"))
+
+    def test_a_second_stop_request_during_the_clean_up_does_not_interrupt_it(self):
+        """The enforcer's stop() is where the network is handed back, and it takes a few seconds
+        on a Pi. Both signals arrive again while it runs; it must finish, and so must the rest."""
+        seen = []
+        self.enforcer_does["stop"] = lambda: self.ask_again(seen)
+        self.assertIsNone(self.run_it(stop_once_serving=signal.SIGTERM))
+        self.assertEqual(seen, [signal.SIG_IGN, signal.SIG_IGN])
+        self.assertEqual(self.diary[-4:], ["announcer asked to stop", "enforcer stopped", "cloud link stopped",
+                                           "announcer waited for"])
+        self.assertTrue(self.printed.getvalue().endswith("QuietNet stopped.\n"))
+
+    def ask_again(self, seen):
+        """Note in `seen` how each signal is handled at this moment, then send it to this program
+        if that is safe: one that is neither ignored nor noted would end the test run."""
+        for signum in STOP_SIGNALS:
+            handler = signal.getsignal(signum)
+            seen.append(handler)
+            if handler == signal.SIG_IGN or getattr(handler, "__func__", None) is server.StopRequest.note:
+                signal.raise_signal(signum)
+
+    def test_a_second_stop_request_while_the_goodbyes_are_waited_for_does_not_interrupt_the_wait(self):
+        """The clean-up's last wait is for the trial announcer's goodbyes. Both signals arrive
+        again during it: they are ignored outright, so the wait goes on to its end and the
+        closing line follows."""
+        seen = []
+        self.announcer_does["wait"] = lambda: self.ask_again(seen)
+        self.assertIsNone(self.run_it(stop_once_serving=signal.SIGTERM))
+        self.assertEqual(seen, [signal.SIG_IGN, signal.SIG_IGN])
+        self.assertEqual(self.diary[-1], "announcer waited for")
+        self.assertTrue(self.printed.getvalue().endswith("QuietNet stopped.\n"))
+
+    def test_the_trial_announcer_is_made_before_the_enforcer(self):
+        """As before the stop-request fix: made early, so that the dashboard can show the trial
+        from its first answer. Making it starts nothing (CleanUp checks the real one)."""
+        self.assertIsNone(self.run_it(stop_once_serving=signal.SIGTERM))
+        self.assertLess(self.diary.index("announcer made"), self.diary.index("enforcer made"))
+        self.assertEqual(self.diary.count("announcer made"), 1)
+
+    def test_the_trial_announcer_is_started_last_of_all_once_the_dashboards_port_is_open(self):
+        """Nothing is announced until the dashboard's port (the trial's off switch) is open and
+        nothing is left in start-up that can fail: the browser's timer is set first, and serving
+        is the very next thing."""
+        self.assertIsNone(self.run_it(stop_once_serving=signal.SIGTERM, browser=True))
+        started = self.diary.index("announcer started")
+        self.assertEqual(self.diary[started - 2:started + 2],
+                         ["dashboard port opened", "browser set to open http://localhost:0",
+                          "announcer started", "dashboard serving"])
+        self.assertEqual(self.diary.count("announcer started"), 1)
+
+    def test_a_stop_request_just_as_the_dashboards_port_opens_means_the_trial_announcer_is_not_started(self):
+        """Devices must not be told to use a computer that is on its way out. The request comes
+        before start-up's last look, the one just before the announcer's start."""
+        self.dashboard_does["opened"] = ask_to_stop
+        self.assertIsNone(self.run_it())
+        self.assertNotIn("announcer started", self.diary)
+
+    def test_a_start_up_that_fails_as_the_dashboards_port_is_opened_has_not_started_the_trial_announcer(self):
+        """The port being in use is the usual cause. Had the announcer been started any earlier,
+        devices could have been told to use this computer by a program that then failed to start."""
+        def port_in_use(address, handler):
+            """What Python's web server does when something else has the port."""
+            raise OSError(48, "Address already in use")
+        self.patch(server, "ThreadingHTTPServer", port_in_use)
+        self.assertIsInstance(self.run_it(), OSError)
+        self.assertNotIn("announcer started", self.diary)
+        self.assertEqual(self.diary[-1], "announcer waited for")
+
+    def test_a_start_up_that_fails_while_making_the_enforcer_has_not_started_the_trial_announcer(self):
+        """The announcer has been made by then, and the clean-up's two lines for it must cope
+        with one that was never started."""
+        def broken(*args, **kwargs):
+            """An enforcer that cannot even be made."""
+            raise RuntimeError("broken")
+        self.patch(server.enforcer, "Enforcer", broken)
+        self.assertIsInstance(self.run_it(), RuntimeError)
+        self.assertEqual(self.diary, ["announcer made", "announcer asked to stop", "announcer waited for"])
+        self.assertTrue(self.printed.getvalue().endswith("QuietNet stopped.\n"))
+
+    def test_a_stop_request_in_the_instant_before_the_trial_announcer_starts_means_it_is_started_and_then_stopped(self):
+        """The request arrives after start-up's last look and before the announcer's thread is
+        started, which is too late to leave it unstarted. Nothing is lost by that: there is no
+        serving, and the clean-up, which always runs, asks the announcer to stop and waits for it."""
+        self.announcer_does["start"] = ask_to_stop
+        self.assertIsNone(self.run_it())
+        self.assertEqual(self.diary[-6:], ["dashboard port opened", "announcer started",
+                                           "announcer asked to stop", "enforcer stopped", "cloud link stopped",
+                                           "announcer waited for"])
+        self.assertTrue(self.printed.getvalue().endswith("QuietNet stopped.\n"))
+
+    def test_a_stop_request_in_the_instant_before_the_trial_announcer_starts_still_ends_in_the_goodbye(self):
+        """The same instant with the real announcer, the trial switched on, and the harder of the
+        two ways it can go: the announcer's thread gets its first announcement out before the
+        clean-up reaches it. (If it does not, nothing was announced and no goodbye is owed.)
+        Devices that heard it must be told to stop before the program says it has stopped."""
+        sent, by_the_closing_line = [], []
+        announcer = trial_announcer(sent)
+        self.addCleanup(announcer.stop)
+        begin = announcer.start
+
+        def asked_just_before_it_starts():
+            """A stop request, then the real start, then wait for the first announcement."""
+            ask_to_stop()
+            begin()
+            wait_until(lambda: sent, "the announcer did not send its first announcement")
+        announcer.start = asked_just_before_it_starts
+        self.patch(server, "make_announcer", lambda: announcer)
+        self.printed = ClosingLine(lambda: by_the_closing_line.extend(sent))
+        self.assertIsNone(self.run_it())
+        self.assertNotIn("dashboard serving", self.diary)
+        self.assertEqual(by_the_closing_line, [announcement()] + [goodbye()] * server.announcer.GOODBYES)
+        self.assertFalse(announcer._thread.is_alive())
+        self.assertTrue(self.printed.getvalue().endswith("QuietNet stopped.\n"))
+
+    def test_a_signal_is_not_sent_to_the_test_program_unless_quietnet_is_listening_for_it(self):
+        """A guard on these tests themselves. Should run() ever stop listening, the test must
+        fail with a reason; a signal sent regardless would end the whole test run on the spot,
+        with no report at all."""
+        self.patch(server.StopRequest, "listen", nothing)
+        self.assertIsNone(self.run_it(stop_once_serving=signal.SIGTERM))
+        self.assertIn("QuietNet was not listening for SIGTERM", " ".join(self.diary))
+
+    def test_everything_start_up_and_clean_up_use_has_a_stand_in_here_or_starts_nothing(self):
+        """These tests run the real start_up() and clean_up() inside the test program. So the
+        next thing added to them (a thread, a listener, something that sends onto the home
+        network) would be started for real by every test above, with nothing to show for it,
+        unless it is given a stand-in in setUp. This fails until it has one, or until its name
+        is added to STARTS_NOTHING because it truly starts nothing."""
+        used = set(server.start_up.__code__.co_names) | set(server.clean_up.__code__.co_names)
+        self.assertEqual(used - self.stood_in - STARTS_NOTHING, set(),
+                         "start_up() or clean_up() in server.py uses these names, which WholeLife.setUp in "
+                         "tests/test_start_stop.py does not replace with a stand-in")
+
+
+class CleanUp(Base):
+    """clean_up() alone, for the states start-up can be left in."""
+
+    def cleaned_up(self, enforcer, cloud, browser=None, announcer=None, printed=None):
+        """Run clean_up() with these in place of the real ones; return what it printed.
+        `printed`, if given, is what takes the printing (a ClosingLine, say)."""
+        printed = printed or io.StringIO()
+        with mock.patch.object(server, "ENF", enforcer), mock.patch.object(server, "CA", cloud), \
+                mock.patch.object(server, "BROWSER", browser), mock.patch.object(server, "AN", announcer), \
+                contextlib.redirect_stdout(printed):
+            server.clean_up()
+        return printed.getvalue()
+
+    def patched(self, where, name, stand_in):
+        """Replace where.name with the stand-in until the test is over, and return the stand-in."""
+        patcher = mock.patch.object(where, name, stand_in)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return stand_in
+
+    def test_with_nothing_started_it_only_says_that_quietnet_has_stopped(self):
+        self.assertEqual(self.cleaned_up(None, None), "\nQuietNet stopped.\n")
+
+    def test_with_only_the_enforcer_started_it_stops_the_enforcer(self):
+        enforcer = mock.Mock()
+        self.assertIn("QuietNet stopped.", self.cleaned_up(enforcer, None))
+        enforcer.stop.assert_called_once_with()
+
+    def test_an_enforcer_that_was_made_but_never_started_can_be_stopped(self):
+        """A stop request can land between the making and the starting. The real class is used
+        here; it never runs a command or opens a socket unless it is started."""
+        enforcer = server.enforcer.Enforcer("127.0.0.1", dict, dict, log=lambda m: None)
+        self.assertIn("QuietNet stopped.", self.cleaned_up(enforcer, None))
+
+    def test_an_enforcer_made_to_steer_ipv6_too_but_never_started_is_stopped_without_asking_for_a_plan(self):
+        """The same moment, for the enforcer as start_up() makes it, with a plan for IPv6
+        steering: stopping one that never started must ask for no plan (the real one takes
+        the database lock) and send nothing."""
+        plan6 = mock.Mock(return_value={})
+        enforcer = server.enforcer.Enforcer("127.0.0.1", dict, dict, log=lambda m: None, plan6=plan6)
+        enforcer._v6.send = mock.Mock()
+        self.assertIn("QuietNet stopped.", self.cleaned_up(enforcer, None))
+        plan6.assert_not_called()
+        enforcer._v6.send.assert_not_called()
+
+    def enforcer_steering_a_phone(self):
+        """The real enforcer, started, steering one phone over IPv4 and holding its IPv6 as well
+        (the optional setting on), with a stand-in for everything it would touch: the commands
+        it would run are only noted, kernel settings are neither read nor changed, its listeners
+        open nothing, and the frames it would send go into a list. Returns the enforcer, the
+        list of frames and the list of what it logged."""
+        made, frames, log = server.enforcer, [], []
+        self.patched(made.subprocess, "run", lambda args, **kw: mock.Mock(returncode=0, stdout="", stderr=""))
+        self.patched(made, "shutil", mock.Mock(which=lambda tool: "/sbin/nft" if tool == "nft" else None))
+        self.patched(made, "interface_and_gateway", lambda: ("wlan0", HUB))
+        self.patched(made, "local_subnet", lambda card: made.ipaddress.IPv4Network("192.168.1.0/24"))
+        self.patched(made, "mac_of_interface", lambda card: PI_MAC)
+        self.patched(made, "sysctl_get", lambda key: "1" if "forward" in key and "ipv6" not in key else "0")
+        self.patched(made, "sysctl_set", lambda key, value: True)
+        folder = tempfile.mkdtemp(prefix="quietnet-test-")
+        self.addCleanup(shutil.rmtree, folder, True)
+        plan6 = {"enabled": True, "hub": {"v6": HUB_V6, "mac": HUB_MAC}, "our_v6": "fd00::9", "port": 53,
+                 "servers": [HUB_V6], "shared": [], "devices": {PHONE: {"mac": PHONE_MAC, "ll": PHONE_V6}}}
+        enforcer = made.Enforcer(PI, lambda: {PHONE: {"off": True, "ips": set(), "mac": PHONE_MAC}},
+                                 lambda: {PHONE: PHONE_MAC, HUB: HUB_MAC}, log=log.append, data_dir=folder,
+                                 dns_port=53, plan6=lambda: plan6)
+        enforcer.reason = ""                        # as on a Pi: away from Linux it would say it cannot run
+        wire = mock.Mock()
+        wire.send.side_effect = frames.append
+        wire.recv.side_effect = OSError("nothing is heard on a stand-in")
+        enforcer._open_socket = lambda: wire
+        enforcer._v6.listen = lambda stop: None
+        enforcer.start()
+        self.addCleanup(enforcer.stop)
+        # IPv4 steering takes the phone on one tick and the IPv6 claim follows on the next; a
+        # poke runs a tick at once. Up to 30 seconds, ending the moment the phone is held.
+        deadline = time.monotonic() + 30
+        while not enforcer._v6.active() and time.monotonic() < deadline:
+            enforcer.poke()
+            time.sleep(0.01)
+        self.assertTrue(enforcer._v6.active(), "the enforcer did not take the phone's IPv6 within 30 seconds")
+        return enforcer, frames, log
+
+    def test_the_clean_up_says_quietnet_has_stopped_only_after_a_steered_devices_ipv6_is_handed_back(self):
+        """With "Take IPv6 away from steered devices" on, stopping the enforcer does one thing
+        more than handing the device back over IPv4: it tells the device the router's real
+        hardware address for the router's IPv6 address as well. The clean-up waits for both,
+        because the program ends right after its last line."""
+        enforcer, frames, log = self.enforcer_steering_a_phone()
+        ipv6_back = server.enforcer.neighbour_advertisement(HUB_V6, HUB_MAC, PHONE_V6, PHONE_MAC, eth_src=PI_MAC,
+                                                            solicited=False, override=True)
+        ipv4_back = server.enforcer.build_arp_reply(HUB, HUB_MAC, PHONE, PHONE_MAC, eth_src=PI_MAC)
+        self.assertNotIn(ipv6_back, frames)
+        self.assertNotIn(ipv4_back, frames)
+        seen = {}
+
+        class Noting(io.StringIO):
+            """Notes which frames had gone out by the time the clean-up's last line was printed."""
+
+            def write(self, text):
+                """Keep the text, and what had been sent when "QuietNet stopped." came."""
+                if "QuietNet stopped." in text:
+                    seen["frames"], seen["log"] = list(frames), list(log)
+                return super().write(text)
+
+        with mock.patch.object(server, "ENF", enforcer), mock.patch.object(server, "CA", None), \
+                mock.patch.object(server, "BROWSER", None), mock.patch.object(server, "AN", None), \
+                contextlib.redirect_stdout(Noting()):
+            server.clean_up()
+        self.assertIn(ipv6_back, seen["frames"])
+        self.assertIn(ipv4_back, seen["frames"])
+        self.assertLess(seen["frames"].index(ipv6_back), seen["frames"].index(ipv4_back))
+        self.assertEqual(seen["log"][-1], "Enforcer stopped; network restored.")
+        self.assertFalse(enforcer._v6.active())
+
+    def test_a_cloud_link_that_was_made_but_never_started_can_be_stopped(self):
+        """The real class again: made with a throwaway folder, it contacts nothing until started."""
+        cloud = server.cloud_agent.CloudAgent(0, server.DATA, log=lambda m: None)
+        self.assertIn("QuietNet stopped.", self.cleaned_up(None, cloud))
+
+    def test_a_browser_that_has_not_opened_yet_is_called_off(self):
+        browser = mock.Mock()
+        self.assertIn("QuietNet stopped.", self.cleaned_up(None, None, browser))
+        browser.cancel.assert_called_once_with()
+
+    def test_the_real_browser_timer_can_be_called_off_and_never_holds_up_the_end_of_the_program(self):
+        """The real timer, with a stand-in for the opening itself and an hour to run in place of
+        half a second, so that this test cannot be too slow for it: it is set for the address
+        given, is a daemon thread (which Python does not wait for at exit), and once called off
+        it ends without opening anything."""
+        opened = []
+        with mock.patch.object(server.webbrowser, "open", opened.append):
+            timer = server.open_browser_soon("http://localhost:1", after=3600)
+            self.assertEqual(self.cleaned_up(None, None, timer), "\nQuietNet stopped.\n")
+            timer.join(30)
+        self.assertFalse(timer.is_alive())
+        self.assertTrue(timer.daemon)
+        self.assertEqual(timer.args, ("http://localhost:1",))
+        self.assertEqual(opened, [])
+
+    def test_the_enforcer_is_stopped_before_the_cloud_link(self):
+        order = []
+        enforcer, cloud = mock.Mock(), mock.Mock()
+        enforcer.stop.side_effect = lambda: order.append("enforcer")
+        cloud.stop.side_effect = lambda: order.append("cloud link")
+        self.cleaned_up(enforcer, cloud)
+        self.assertEqual(order, ["enforcer", "cloud link"])
+
+    # -- the trial announcer ---------------------------------------------------
+
+    def test_with_only_the_trial_announcer_made_it_is_asked_to_stop_and_then_waited_for(self):
+        announcer = mock.Mock()
+        self.assertIn("QuietNet stopped.", self.cleaned_up(None, None, announcer=announcer))
+        self.assertEqual(announcer.mock_calls, [mock.call.ask_to_stop(), mock.call.stop()])
+
+    def test_the_trial_announcer_is_asked_to_stop_before_the_enforcer_and_waited_for_after_the_cloud_link(self):
+        """Asked first, so that its goodbyes leave while the enforcer hands the network back;
+        waited for last, so that the program does not end before they have gone; and only then
+        the closing line, after which the program ends."""
+        order = []
+        enforcer, cloud, announcer = mock.Mock(), mock.Mock(), mock.Mock()
+        announcer.ask_to_stop.side_effect = lambda: order.append("announcer asked to stop")
+        enforcer.stop.side_effect = lambda: order.append("enforcer")
+        cloud.stop.side_effect = lambda: order.append("cloud link")
+        announcer.stop.side_effect = lambda: order.append("announcer waited for")
+        self.cleaned_up(enforcer, cloud, announcer=announcer,
+                        printed=ClosingLine(lambda: order.append("QuietNet stopped.")))
+        self.assertEqual(order, ["announcer asked to stop", "enforcer", "cloud link", "announcer waited for",
+                                 "QuietNet stopped."])
+
+    def test_a_trial_announcer_that_was_made_but_never_started_sends_no_goodbye_and_is_not_waited_for(self):
+        """A stop request or a failure can end start-up between the making and the starting. The
+        real class, with the trial switched on: it has announced nothing, so there is nothing to
+        call off, and it has no thread to wait for. It asks for nothing, opens nothing, sends
+        nothing and pauses for nothing."""
+        sent, asked, pauses = [], [], []
+        announcer = trial_announcer(sent, pause=pauses.append, asked=asked)
+        self.assertEqual(self.cleaned_up(None, None, announcer=announcer), "\nQuietNet stopped.\n")
+        self.assertIsNone(announcer._thread)
+        self.assertEqual((sent, asked, pauses), ([], [], []))
+
+    def test_the_trial_announcer_as_start_up_makes_it_touches_nothing_until_it_is_started(self):
+        """make_announcer() itself, as start_up() calls it, with the owner's choice saved as
+        "on": neither the making nor the clean-up's two lines open a socket of any kind, ask a
+        test question, read the facts about this computer's card or start a thread."""
+        server.set_setting("dns_announce", "1")
+        self.addCleanup(server.sql, "DELETE FROM settings WHERE key='dns_announce'", commit=True)
+        touched = mock.Mock(side_effect=AssertionError("an announcer that was never started touched the network"))
+        sockets = mock.Mock(wraps=socket)
+        sockets.socket = touched                # every socket announcer.py opens is made with this
+        self.patched(server.announcer, "socket", sockets)
+        announcer = server.make_announcer()
+        self.assertIs(announcer.on, True)
+        announcer._facts = announcer._answers = touched
+        self.assertEqual(self.cleaned_up(None, None, announcer=announcer), "\nQuietNet stopped.\n")
+        self.assertIsNone(announcer._thread)
+        self.assertIsNone(announcer._sock)
+        touched.assert_not_called()
+
+    def test_a_started_trial_announcer_with_the_trial_off_says_no_goodbye_and_its_thread_ends(self):
+        """What every household that has not switched the trial on gets at a stop: the thread
+        that was only waiting ends, having asked for nothing and sent nothing."""
+        sent, asked = [], []
+        announcer = trial_announcer(sent, on=False, asked=asked)
+        announcer.start()
+        self.addCleanup(announcer.stop)
+        self.assertEqual(self.cleaned_up(None, None, announcer=announcer), "\nQuietNet stopped.\n")
+        self.assertFalse(announcer._thread.is_alive())
+        self.assertEqual((sent, asked), ([], []))
+
+    def announcing(self, pause=nothing):
+        """The real announcer, started, with the trial on and its first announcement sent.
+        Returns it and the list of frames it has sent."""
+        sent = []
+        announcer = trial_announcer(sent, pause=pause)
+        announcer.start()
+        self.addCleanup(announcer.stop)
+        wait_until(lambda: sent, "the announcer did not send its first announcement")
+        self.assertEqual(sent, [announcement()])
+        return announcer, sent
+
+    def test_the_clean_up_says_quietnet_has_stopped_only_after_the_goodbyes_have_gone(self):
+        """The announcer's thread is a daemon thread and the program ends right after the closing
+        line, so the clean-up must wait for the goodbyes. To show that it is the wait that does
+        it, the announcer is held at its pause after the first goodbye until the clean-up has
+        reached its wait: a clean-up that did not wait, or said "stopped" first, would print its
+        closing line with one goodbye sent, or none."""
+        waiting = threading.Event()
+        self.addCleanup(waiting.set)
+        announcer, sent = self.announcing(pause=lambda seconds: waiting.wait(30))
+        wait_for_it = announcer.stop
+
+        def reached_the_wait(*args):
+            """Let the announcer go on, then wait for it as the program does."""
+            waiting.set()
+            wait_for_it(*args)
+        announcer.stop = reached_the_wait
+        by_the_closing_line = []
+        self.cleaned_up(None, None, announcer=announcer, printed=ClosingLine(lambda: by_the_closing_line.extend(sent)))
+        self.assertEqual(by_the_closing_line, [announcement()] + [goodbye()] * server.announcer.GOODBYES)
+        self.assertFalse(announcer._thread.is_alive())
+
+    def test_the_goodbyes_go_out_while_the_enforcer_is_still_handing_the_network_back(self):
+        """Asking the announcer to stop does not wait, and comes before the enforcer's stop(),
+        which can take seconds on a Pi: neither the devices being handed back nor the devices
+        being told to stop using this computer for IPv6 DNS should wait for the other. Here the
+        enforcer's stand-in does not come back from stop() until the goodbyes have gone (or, if
+        they never come, 10 seconds on)."""
+        announcer, sent = self.announcing()
+        everything = [announcement()] + [goodbye()] * server.announcer.GOODBYES
+        by_the_enforcers_end = []
+
+        def hand_back():
+            """The enforcer's stop(): wait for the goodbyes, and note what had gone by the end."""
+            deadline = time.monotonic() + 10
+            while sent != everything and time.monotonic() < deadline:
+                time.sleep(0.001)
+            by_the_enforcers_end.extend(sent)
+        enforcer = mock.Mock()
+        enforcer.stop.side_effect = hand_back
+        self.cleaned_up(enforcer, None, announcer=announcer)
+        self.assertEqual(by_the_enforcers_end, everything)
+
+
+if __name__ == "__main__":
+    unittest.main()

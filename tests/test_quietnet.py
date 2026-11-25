@@ -3,9 +3,12 @@
 Uses only Python's standard library, and a throwaway data folder - it never
 touches your real history or rules, and never sends anything to the network.
 """
+import atexit
 import calendar
 import os
+import shutil
 import socket
+import sqlite3
 import struct
 import sys
 import tempfile
@@ -15,11 +18,13 @@ import unittest
 from unittest import mock
 
 os.environ["QUIETNET_DATA"] = tempfile.mkdtemp(prefix="quietnet-test-")
+atexit.register(shutil.rmtree, os.environ["QUIETNET_DATA"], True)       # removed when the run is over
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import server  # noqa: E402
 import enforcer  # noqa: E402
 
 KID, ADULT = "192.168.1.23", "192.168.1.40"
+KID_MAC = "aa:bb:cc:00:00:23"       # the hardware address the tests see at KID when it matters
 
 
 def at(day, hhmm):
@@ -27,6 +32,38 @@ def at(day, hhmm):
     base = time.mktime((2026, 11, 16, 0, 0, 0, 0, 0, -1))      # 16 Nov 2026 is a Monday
     assert time.localtime(base).tm_wday == 0
     return base + day * 86400 + int(hhmm[:2]) * 3600 + int(hhmm[3:]) * 60
+
+
+def in_force_now(**more):
+    """What to give a schedule so that it is in force at this moment, at any time on any day.
+
+    Returns the "days", "start" and "end" of a window that opened at the start of the present hour
+    (by this computer's clock) and closes two hours after that, on every day of the week, with
+    anything in `more` added. Use it wherever a test needs a schedule that is on right now:
+
+        self.schedule(**in_force_now())
+        self.schedule(**in_force_now(scope="all", off=False, services=["tiktok"]))
+
+    Never write a fixed window such as "00:00" to "23:59" for this. A schedule's end is not inside
+    it, so that one is off for the last minute of every day, and a test relying on it fails when
+    it happens to run then. This window stays open for at least an hour after it is made: a
+    window that runs past midnight belongs to the evening it started, and every day is chosen, so
+    it holds late in the evening and across the turn of the day and of the week too."""
+    hour = time.localtime().tm_hour
+    window = {"days": [0, 1, 2, 3, 4, 5, 6], "start": "%02d:00" % hour, "end": "%02d:00" % ((hour + 2) % 24)}
+    window.update(more)
+    return window
+
+
+def not_in_force_now(**more):
+    """The opposite of in_force_now(): a window, on every day, that is closed at this moment.
+
+    It opens two hours after the start of the present hour and closes an hour after that, so it
+    stays closed for at least an hour after it is made, whatever the time of day."""
+    hour = time.localtime().tm_hour
+    window = {"days": [0, 1, 2, 3, 4, 5, 6], "start": "%02d:00" % ((hour + 2) % 24), "end": "%02d:00" % ((hour + 3) % 24)}
+    window.update(more)
+    return window
 
 
 def query(name, qtype=1):
@@ -45,6 +82,33 @@ def is_blocked(name, client):
     return resp[-4:] == bytes(4)
 
 
+_open_the_database = server.init_db
+
+
+def init_db_closing_the_old_connection():
+    """server.init_db(), followed by closing the database connection it replaced.
+
+    QuietNet opens its database once, at start-up. The tests open it again and again: Base.setUp
+    does before every test, and so does every test that mimics a restart. Each time, the
+    connection in use until then was simply dropped. From Python 3.13 on, a connection dropped
+    without being closed draws a "ResourceWarning: unclosed database" line when Python tidies it
+    away, and a run printed hundreds of them, each quoting whatever line of code happened to be
+    running at that moment (which is how lines such as "raise AttributeError(name)", from
+    unittest/mock.py, came to appear in the output of a run that passed).
+
+    The old connection is closed while holding db_lock, so no other thread is part-way through
+    using it. Only a real connection is closed: a test may have put a stand-in in its place."""
+    old = server.db
+    _open_the_database()
+    if isinstance(old, sqlite3.Connection) and old is not server.db:
+        with server.db_lock:
+            old.close()
+
+
+# Every test file calls server.init_db() by that name, so replacing it here covers them all.
+server.init_db = init_db_closing_the_old_connection
+
+
 class Base(unittest.TestCase):
     def setUp(self):
         if server.db is None:
@@ -52,9 +116,11 @@ class Base(unittest.TestCase):
             server.load_lists()
         for table in ("blocked", "allowed", "groups", "device_group", "service_blocks",
                       "internet_off", "schedules", "queries", "enforced", "device_mac", "known_macs", "events",
-                      "shared_macs"):
+                      "shared_macs", "device", "device_hw", "address_use", "moved_address", "devices",
+                      "group_member", "live_cut", "device_follow", "rule_conflict"):
             server.sql("DELETE FROM %s" % table, commit=True)
-        server.sql("DELETE FROM settings WHERE key='other_dns_all'", commit=True)
+        server.sql("DELETE FROM settings WHERE key IN ('macs_seeded', 'rules_move_report')", commit=True)
+        server.sql("DELETE FROM settings WHERE key IN ('other_dns_all', 'no_ipv6_all', 'ipv6_steer')", commit=True)
         server.init_db()
         server.S.junk_on, server.S.paused_until = True, 0
         server.S.enforced, server.S.resolved = set(), {}
@@ -62,9 +128,31 @@ class Base(unittest.TestCase):
         server.S.router, server.S.router_checked = "", float("inf")
         # No IPv6 view of the real machine: nothing matched, no home range, no own addresses.
         server.S.v6_own, server.S.v6_prefixes, server.S.v6_devices = set(), [], {}
+        server.S.v6_shared = frozenset()
+        server.S.v6_table = {}
         # Nothing heard from the router about IPv6, and no IPv6 address to give devices.
         server.S.v6_dns, server.S.router_v6_dns, server.S.ra_heard = "", {}, None
+        server.S.v6_by_mac = {}
+        server.S.v6_unclear = frozenset()
+        server.S.plan_table = (0.0, None)   # no neighbour table left over from another test's plan
         server.S.router_prefixes = {}
+        # The announcement listener and the IPv6 watcher are not running, and have never looked.
+        server.S.ra_listening, server.S.ra_since, server.S.ra_heard_at, server.S.routers_v6 = False, None, None, {}
+        server.S.v6_watching, server.S.v6_looking, server.S.v6_checked, server.S.v6_looked_at = False, False, None, None
+        server.S.v6_neighbours_ok = None
+        # Nor is it known whether this computer could hear the router over IPv6, and a look at the
+        # IPv6 view never reads the real machine's network cards to find out.
+        server.S.v6_can_hear, server.S.v6_hear_since = None, None
+        hearing = mock.patch.object(server, "can_hear_router", return_value=None)
+        hearing.start()
+        self.addCleanup(hearing.stop)
+        # Nor is this computer's real neighbour table ever read: giving a rule to an address no
+        # device is known for looks there for a hardware address (device_for_address).
+        nobody = mock.patch.object(server, "neighbours", return_value={})
+        nobody.start()
+        self.addCleanup(nobody.stop)
+        server.v6_askers.clear()
+        server.v6_wanted.clear()
         server.S.other_dns = {}
         server.S.shared_left, server.S.plan_cache = {}, {}
 
@@ -74,6 +162,33 @@ class Base(unittest.TestCase):
         body.update(kw)
         self.assertIsNone(server.save_schedule(body))
         return server.S.schedules[-1]
+
+    def device(self, ip):
+        """The number of the device listed under this address, made if no device is known there."""
+        return server.device_for_address(ip, make=True)
+
+    def match_ipv6(self, v6, ip):
+        """Have this IPv6 address matched to the device listed under the IPv4 address `ip`, as a
+        look at the IPv6 neighbours would: its lookups get that device's rules, and are filed
+        under the IPv4 address. Returns the device's number."""
+        number = self.device(ip)
+        server.S.v6_devices = dict(server.S.v6_devices, **{v6: ip})
+        with server.rule_map_lock:
+            server.S.rules6 = dict(server.S.rules6, **{v6: number})
+        server.rebuild_rule_map()
+        return number
+
+    def live_cut(self, ip=KID, mac=KID_MAC):
+        """Switch "cut live connections" on for the device at this address, which the (stand-in)
+        neighbour table shows there, confirmed just now. Returns the device's number."""
+        table = {ip: (mac, "fresh")}
+        server.note_ipv4_addresses(table)
+        seen = mock.patch.object(server, "neighbour_table", return_value=table)
+        seen.start()
+        self.addCleanup(seen.stop)
+        number = server.S.addr_device[ip]
+        server.set_live_cut(number, True)
+        return number
 
 
 class Rules(Base):
@@ -86,6 +201,16 @@ class Rules(Base):
         self.assertTrue(is_blocked("example.com", KID))
         self.assertTrue(is_blocked("a.b.example.com", KID))
         self.assertFalse(is_blocked("notexample.com", KID))
+
+    def test_a_blocked_needed_name_is_blocked_like_any_other(self):
+        # The list of names devices need only adds a question before a block is made (see
+        # server.NEEDED). Once the block exists it is decided exactly as any other.
+        server.block("samsungcloudsolution.net")
+        self.assertEqual(server.decision("samsungcloudsolution.net", KID), (True, "you", ""))
+        self.assertEqual(server.decision("lcprd1.samsungcloudsolution.net", KID), (True, "you", ""))
+
+    def test_a_needed_name_nobody_blocked_is_allowed_like_any_other(self):
+        self.assertEqual(server.decision("lcprd1.samsungcloudsolution.net", KID), (False, None, ""))
 
     def test_unblocking_a_listed_advert_makes_an_exception(self):
         server.unblock("doubleclick.net")
@@ -102,9 +227,9 @@ class Rules(Base):
     def test_group_rules_reach_members_only(self):
         with server.db_lock:
             gid = server.db.execute("INSERT INTO groups(name) VALUES('Kids')").lastrowid
-            server.db.execute("INSERT INTO device_group VALUES(?,?)", (KID, gid))
             server.db.commit()
         server.init_db()
+        server.set_device_group(self.device(KID), gid)
         server.set_service_block("group:%d" % gid, "fortnite", True)
         self.assertTrue(is_blocked("launcher.epicgames.com", KID))
         self.assertFalse(is_blocked("launcher.epicgames.com", ADULT))
@@ -142,7 +267,7 @@ class KillSwitch(Base):
     def test_a_whole_house_bedtime_does_not_stop_this_computers_own_lookups(self):
         self.addCleanup(setattr, server.S, "local_ip", server.S.local_ip)
         server.S.local_ip = "192.168.1.60"
-        self.schedule(scope="all", start="00:00", end="23:59")
+        self.schedule(**in_force_now(scope="all"))
         self.assertTrue(is_blocked("www.bbc.co.uk", KID))
         self.assertFalse(is_blocked("www.bbc.co.uk", "127.0.0.1"))
 
@@ -199,33 +324,30 @@ class Schedules(Base):
         self.assertFalse(server.schedule_in_force(x, at(1, "00:30")))
 
     def test_bedtime_turns_internet_off_for_that_device_only(self):
-        self.schedule(start="00:00", end="23:59")                           # in force now
+        self.schedule(**in_force_now())
         self.assertTrue(is_blocked("www.bbc.co.uk", KID))
         self.assertFalse(is_blocked("www.bbc.co.uk", ADULT))
         self.assertEqual(server.decision("www.bbc.co.uk", KID)[1:], ("schedule", "Bedtime"))
         self.assertTrue(server.internet_off_for(KID))
 
     def test_service_schedule_blocks_only_those_services(self):
-        self.schedule(name="Homework", start="00:00", end="23:59", off=False, services=["youtube", "fortnite"])
+        self.schedule(**in_force_now(name="Homework", off=False, services=["youtube", "fortnite"]))
         self.assertTrue(is_blocked("www.youtube.com", KID))
         self.assertTrue(is_blocked("fortnite.com", KID))
         self.assertFalse(is_blocked("www.bbc.co.uk", KID))
         self.assertFalse(is_blocked("www.youtube.com", ADULT))
 
     def test_schedule_outside_its_hours_or_switched_off_does_nothing(self):
-        now = time.localtime()
-        later = "%02d:00" % ((now.tm_hour + 2) % 24)
-        later_end = "%02d:00" % ((now.tm_hour + 3) % 24)
-        self.schedule(start=later, end=later_end)
+        self.schedule(**not_in_force_now())
         self.assertFalse(is_blocked("www.bbc.co.uk", KID))
-        x = self.schedule(name="Always", start="00:00", end="23:59")
+        x = self.schedule(**in_force_now(name="Always"))
         self.assertTrue(is_blocked("www.bbc.co.uk", KID))
         server.sql("UPDATE schedules SET enabled=0 WHERE id=?", (x["id"],), commit=True)
         server.load_schedules()
         self.assertFalse(is_blocked("www.bbc.co.uk", KID))
 
     def test_whole_house_schedule_and_pause(self):
-        self.schedule(scope="all", start="00:00", end="23:59", off=False, services=["tiktok"])
+        self.schedule(**in_force_now(scope="all", off=False, services=["tiktok"]))
         server.S.paused_until = time.time() + 600
         self.assertTrue(is_blocked("www.tiktok.com", ADULT))
 
@@ -246,7 +368,7 @@ class Schedules(Base):
         self.assertEqual(server.S.schedules, [])
 
     def test_unblocking_during_a_bedtime_schedule_adds_no_permanent_allow(self):
-        self.schedule(scope="all", start="00:00", end="23:59", off=True)   # whole house off, in force now
+        self.schedule(**in_force_now(scope="all", off=True))               # whole house off
         server.block("news.example.com")
         server.unblock("news.example.com")
         self.assertEqual(server.S.allowed, set())                          # no stray whitelist left behind
@@ -343,7 +465,7 @@ class EnforcementPlan(Base):
         server.record_resolved("www.disneyplus.com", self._answer("www.disneyplus.com", "203.0.113.5"))
         server.record_resolved("www.bbc.co.uk", self._answer("www.bbc.co.uk", "151.101.0.81"))
         server.set_service_block("device:" + KID, "disneyplus", True)
-        server.S.enforced = {KID}
+        self.live_cut()
         plan = server.enforcement_plan()
         self.assertIn(KID, plan)
         self.assertFalse(plan[KID]["off"])
@@ -353,44 +475,43 @@ class EnforcementPlan(Base):
     def test_plan_is_full_cut_when_device_internet_is_off(self):
         server.record_resolved("www.bbc.co.uk", self._answer("www.bbc.co.uk", "151.101.0.81"))
         server.set_internet_off("device:" + KID, True)
-        server.S.enforced = {KID}
+        self.live_cut()
         self.assertTrue(server.enforcement_plan()[KID]["off"])
 
     def test_no_enforced_devices_means_empty_plan(self):
-        server.S.enforced = set()
+        self.assertEqual(server.S.enforced, set())
         self.assertEqual(server.enforcement_plan(), {})
 
     def test_advert_list_addresses_are_not_cut_by_address(self):
         # Advert names often share addresses with ordinary sites, so they stay a DNS-only block.
         server.record_resolved("ads.doubleclick.net", self._answer("ads.doubleclick.net", "142.250.1.1"))
         self.assertTrue(server.decision("ads.doubleclick.net", KID)[0])
-        server.S.enforced = {KID}
+        self.live_cut()
         self.assertNotIn("142.250.1.1", server.enforcement_plan()[KID]["ips"])
 
     def test_an_all_internet_schedule_is_a_full_cut(self):
-        body = {"name": "Bedtime", "scope": "device:" + KID, "days": [0, 1, 2, 3, 4, 5, 6],
-                "start": "00:00", "end": "23:59", "off": True, "services": []}
+        body = in_force_now(name="Bedtime", scope="device:" + KID, off=True, services=[])
         self.assertIsNone(server.save_schedule(body))
         server.S.sched_cache = (0.0, [])
-        server.S.enforced = {KID}
+        self.live_cut()
         self.assertTrue(server.enforcement_plan()[KID]["off"])
 
     def test_pausing_also_pauses_your_own_blocks_in_the_plan(self):
         server.block("example.org")
         server.record_resolved("example.org", self._answer("example.org", "198.51.100.7"))
-        server.S.enforced = {KID}
+        self.live_cut()
         self.assertIn("198.51.100.7", server.enforcement_plan()[KID]["ips"])
         server.S.paused_until = time.time() + 600
         self.assertNotIn("198.51.100.7", server.enforcement_plan()[KID]["ips"])
 
     def test_the_plan_says_which_device_it_means(self):
-        server.S.enforced, server.S.enforced_mac = {KID}, {KID: "aa:bb:cc:dd:ee:ff"}
+        self.live_cut(KID, "aa:bb:cc:dd:ee:ff")
         self.assertEqual(server.enforcement_plan()[KID]["mac"], "aa:bb:cc:dd:ee:ff")
 
     def test_the_plan_does_not_ask_again_about_names_it_has_already_worked_out(self):
         # It runs every two seconds; re-checking thousands of unchanged names each time wastes the Pi.
         server.record_resolved("www.bbc.co.uk", self._answer("www.bbc.co.uk", "151.101.0.81"))
-        server.S.enforced = {KID}
+        self.live_cut()
         server.enforcement_plan()
         with mock.patch.object(server, "decision", wraps=server.decision) as asked:
             server.enforcement_plan()
@@ -398,7 +519,7 @@ class EnforcementPlan(Base):
 
     def test_a_rule_change_is_seen_by_the_next_plan(self):
         server.record_resolved("example.org", self._answer("example.org", "198.51.100.7"))
-        server.S.enforced = {KID}
+        self.live_cut()
         self.assertNotIn("198.51.100.7", server.enforcement_plan()[KID]["ips"])
         server.block("example.org")
         self.assertIn("198.51.100.7", server.enforcement_plan()[KID]["ips"])
@@ -406,14 +527,14 @@ class EnforcementPlan(Base):
     def test_a_new_address_for_a_blocked_name_is_added_to_the_next_plan(self):
         server.block("example.org")
         server.record_resolved("example.org", self._answer("example.org", "198.51.100.7"))
-        server.S.enforced = {KID}
+        self.live_cut()
         server.enforcement_plan()
         server.record_resolved("example.org", self._answer("example.org", "198.51.100.8"))
         self.assertIn("198.51.100.8", server.enforcement_plan()[KID]["ips"])
 
     def test_a_name_seen_after_the_last_plan_is_added_to_the_next_one(self):
         server.block("example.org")
-        server.S.enforced = {KID}
+        self.live_cut()
         server.enforcement_plan()
         server.record_resolved("example.org", self._answer("example.org", "198.51.100.7"))
         self.assertIn("198.51.100.7", server.enforcement_plan()[KID]["ips"])
@@ -424,7 +545,7 @@ class EnforcementPlan(Base):
         server.record_resolved("www.google.com", self._answer("www.google.com", "142.250.1.10"))
         server.record_resolved("rr1.googlevideo.com", self._answer("rr1.googlevideo.com", "173.194.0.5"))
         server.set_service_block("device:" + KID, "youtube", True)
-        server.S.enforced = {KID}
+        self.live_cut()
 
     def test_an_address_shared_with_an_allowed_name_is_not_dropped(self):
         self._youtube_blocked_for_the_kid()
@@ -579,8 +700,7 @@ class HistoryLimits(Base):
         server.db.execute("INSERT INTO enforced VALUES(?)", (KID,))
         server.db.commit()
         server.init_db()
-        self.assertEqual(server.S.enforced, {KID})
-        self.assertEqual(server.S.enforced_mac, {KID: ""})
+        self.assertEqual(server.sql("SELECT ip, mac FROM enforced"), [(KID, None)])
 
     def test_at_most_64_addresses_are_kept_per_name(self):
         for i in range(80):

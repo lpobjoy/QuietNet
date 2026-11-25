@@ -13,6 +13,7 @@ import calendar
 import io
 import json
 import os
+import shutil
 import sqlite3
 import sys
 import tempfile
@@ -142,6 +143,7 @@ class FirstStart(unittest.TestCase):
 
     def setUp(self):
         self.folder = tempfile.mkdtemp(prefix="quietnet-relay-licence-")
+        self.addCleanup(shutil.rmtree, self.folder, True)       # runs last, once its database is closed
         keep = (relay.db, relay.SECRET, relay.DATA)
 
         def put_back():
@@ -685,7 +687,8 @@ class PairingGate(LicenceCase):
         status, text, _ = Browser(self.port).post("/agent/pair", data={"code": code})
         self.assertEqual(status, 403)
         self.assertEqual(json.loads(text), {"error": "Remote access needs a QuietNet licence. Your Pi is still "
-                                                     "filtering at home. Visit q3n.net to renew.", "licence": "none"})
+                                                     "filtering at home. Visit quiet-net-relay.q3n.net to renew.",
+                                            "licence": "none"})
 
     def test_pairing_beyond_the_seats_is_refused_with_403(self):
         b = self.signed_in()
@@ -697,7 +700,8 @@ class PairingGate(LicenceCase):
         status, text, _ = Browser(self.port).post("/agent/pair", data={"code": code})
         self.assertEqual(status, 403)
         self.assertEqual(json.loads(text), {"error": "Your licence covers 1 Pi and it is in use. Remove one at "
-                                                     "q3n.net, then pair again.", "licence": "active"})
+                                                     "quiet-net-relay.q3n.net, then pair again.",
+                                            "licence": "active"})
 
     def live_codes(self, n):
         """Add `n` Pis waiting to be paired, each with a code still in date, straight to the database
@@ -743,8 +747,23 @@ class PairingGate(LicenceCase):
         self.assertEqual(self.pair_at_once([code, code]), [200, 400])
 
     def test_two_seats_are_described_as_both_in_use(self):
-        self.assertEqual(relay.seats_full(2, "Remove one at q3n.net, then pair again."),
-                         "Your licence covers 2 Pis and both are in use. Remove one at q3n.net, then pair again.")
+        self.assertEqual(relay.seats_full(2, "Remove one at quiet-net-relay.q3n.net, then pair again."),
+                         "Your licence covers 2 Pis and both are in use. Remove one at quiet-net-relay.q3n.net, "
+                         "then pair again.")
+
+    def test_the_sentences_send_people_to_the_name_the_relay_is_reached_at(self):
+        self.assertEqual(relay.RELAY_NAME, "quiet-net-relay.q3n.net")
+        told = [relay.PAIR_NEEDS_LICENCE, relay.RESCUE_OFFLINE,
+                relay.paused_lead({"state": "revoked"})]
+        for sentence in told:
+            self.assertIn(" quiet-net-relay.q3n.net", sentence)
+
+    def test_the_relays_name_is_written_in_one_place_only(self):
+        # A sentence with the name typed into it would go on naming the old place after a move, as
+        # seven did when the relay moved off q3n.net itself.
+        with open(relay.__file__, encoding="utf-8") as f:
+            lines = [line for line in f if "q3n.net" in line]
+        self.assertEqual([line.strip() for line in lines], ['RELAY_NAME = "quiet-net-relay.q3n.net"'])
 
     def test_a_refused_pairing_leaves_the_code_to_work_once_the_licence_is_sorted(self):
         b = self.signed_in()
@@ -1039,7 +1058,7 @@ class Rescue(LicenceCase):
         with self.bridge_unused() as call:
             status, text, _ = self.b.post("/pi/%s/rescue" % self.pid, form={"what": "internet-on"})
         self.assertEqual(status, 503)
-        self.assertIn("Your Pi isn&#x27;t connected to q3n.net right now, so this couldn&#x27;t be sent. "
+        self.assertIn("Your Pi isn&#x27;t connected to quiet-net-relay.q3n.net right now, so this couldn&#x27;t be sent. "
                       "Is it switched on?", text)
         call.assert_not_called()
 
@@ -1102,6 +1121,7 @@ class CommandLine(unittest.TestCase):
 
     def setUp(self):
         self.folder = tempfile.mkdtemp(prefix="quietnet-relay-cli-")
+        self.addCleanup(shutil.rmtree, self.folder, True)       # runs last, once its database is closed
         keep = (relay.db, relay.SECRET, relay.DATA)
         self.shared = keep[0]
 
