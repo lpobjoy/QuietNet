@@ -45,7 +45,8 @@ import names
 #   helpers              this computer's address, the neighbour table, device names (the work is in
 #                        names.py), the network scan, and the api_...() functions that build each
 #                        dashboard answer
-#   dashboard web server the Web class (every HTTP call) and main()
+#   dashboard web server the Web class (every HTTP call); then starting and stopping: StopRequest,
+#                        start_up(), clean_up(), run() and main()
 #
 # HOW A CHANGE TO A RULE WORKS: the rule sets live in S for speed and in the database so they
 # survive a restart. Every function that changes one updates both while holding db_lock.
@@ -3542,23 +3543,100 @@ class Web(BaseHTTPRequestHandler):
         self.send_error(404)
 
 
-def _stop_requested(signum, frame):
-    """`docker stop` and a system shutdown ask politely with SIGTERM. Treat it like Ctrl-C,
-    so the enforcer gets to restore the network before the program exits."""
-    raise KeyboardInterrupt
+class StopRequest:
+    """Remembers that the program has been asked to stop, and ends the dashboard's serving loop
+    when it has.
+
+    `docker stop` and a system shutdown ask with the signal SIGTERM; Ctrl-C sends SIGINT. Python
+    runs the handler for a signal in the main thread, in between two steps of whatever that
+    thread was doing at the time. That rules out the two obvious ways of handling one:
+
+    - Raising an exception, which is what Python does for Ctrl-C if left alone. It comes up at
+      whatever line the main thread had reached. Inside Python's web server, in the instant it
+      takes a new connection, the exception is swallowed and the request to stop is lost; during
+      start-up it flies past the clean-up. Both used to happen (known issue 12).
+    - Setting a threading.Event. That takes a lock, and the main thread may have been stopped
+      while it held that very lock, in which case the handler would wait for it for ever.
+
+    So the handler, note(), raises nothing and takes no lock. It sets a plain flag, `asked`,
+    which start_up() reads between its steps, and writes one byte into a pipe. A helper thread
+    started by serve() waits for that byte and then stops the web server in the proper way, with
+    its shutdown(), which has to be called from a thread other than the one that is serving.
+
+    The byte stays in the pipe until it is read. So a request that arrives before serving has
+    begun, when there is no helper thread yet, is not lost: serving ends as soon as it starts.
+
+    A pipe written by the handler was chosen over Python's signal.set_wakeup_fd() because it
+    keeps the whole of this in one class: set_wakeup_fd is a single setting for the whole
+    process, reports every signal and not just these two, and still needs a handler."""
+
+    def __init__(self):
+        """Not yet asked. Nothing is listened for until listen() is called."""
+        self.asked = False
+        self._read, self._write = os.pipe()
+
+    def listen(self):
+        """From now on, note SIGTERM and Ctrl-C with note(). Call it from the main thread (Python
+        lets nothing else set a handler) before starting anything that needs cleaning up.
+
+        If Ctrl-C's signal was already being ignored when the program started, it is left
+        ignored: that is how a shell protects a program it has put in the background from a
+        Ctrl-C meant for something else."""
+        signal.signal(signal.SIGTERM, self.note)
+        if signal.getsignal(signal.SIGINT) != signal.SIG_IGN:
+            signal.signal(signal.SIGINT, self.note)
+
+    def note(self, signum=None, frame=None):
+        """The handler itself: note that a stop has been asked for. See the class for why it
+        must raise nothing and take no lock. It does nothing but set the flag and write a byte:
+        no print, no log, no call into anything else. Only the first request writes, so the
+        pipe can never fill up and make a later write wait."""
+        if not self.asked:
+            self.asked = True
+            try:
+                os.write(self._write, b"!")
+            except OSError:
+                pass                    # nothing useful can be done about it here; the flag is set
+
+    def serve(self, web):
+        """Run the web server in this thread until a stop is asked for, then return. If one has
+        been asked for already, return as soon as the server has started."""
+        threading.Thread(target=self._shut_when_asked, args=(web,), daemon=True).start()
+        web.serve_forever()
+
+    def _shut_when_asked(self, web):
+        """The helper thread: wait for the byte that note() writes, then tell the web server to
+        finish. Being an ordinary thread, it may take the locks that shutdown() needs. The
+        serving loop looks for that request twice a second, and at once after each connection."""
+        os.read(self._read, 1)
+        web.shutdown()
+
+    def ignore(self):
+        """From now on, ignore SIGTERM and Ctrl-C altogether. Called as the clean-up begins:
+        someone asking twice must not cut short the enforcer's handing back of the network.
+
+        The signals are ignored outright, and not just left to note(), because a Ctrl-C in a
+        terminal goes to every program started from it, and a program started while a signal is
+        ignored ignores it too. So the commands the enforcer runs to put the firewall and the
+        network settings back are not ended by a second Ctrl-C either."""
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
 
 
-def main():
-    """Start everything: database, lists, DNS filter, enforcer, cloud link, then the dashboard,
-    which runs until Ctrl-C or a stop request and then shuts the others down cleanly."""
-    ap = argparse.ArgumentParser(description="QuietNet home advert and tracker blocker")
-    ap.add_argument("--dns-port", type=int, default=53)
-    ap.add_argument("--web-port", type=int, default=8377)
-    ap.add_argument("--no-browser", action="store_true")
-    ap.add_argument("--no-device-names", action="store_true",
-                    help="don't ask the home network for device names (the tests use this)")
-    args = ap.parse_args()
+def start_up(args, stop):
+    """Start everything, in order: database, lists, DNS filter, enforcer, cloud link. Then open
+    the dashboard's port and return its web server, ready to serve.
 
+    `stop` is the StopRequest, which is already listening. It is looked at before the enforcer
+    and before the cloud link, the two things that need cleaning up or can take a while to start
+    (the cloud link's first pairing try can take 20 seconds): once a stop has been asked for,
+    nothing more is started and None is returned in place of the web server. A request that
+    arrives later than that is acted on as soon as serving begins. Either way run() goes on to
+    clean_up(), which stops whatever was started.
+
+    To start one more thing: start it here, look at `stop.asked` first if it is slow to start or
+    would be wrong to start on the way out, and give it its line in clean_up()."""
+    global ENF, CA
     init_db()
     load_lists()
     S.local_ip = find_local_ip()
@@ -3569,12 +3647,14 @@ def main():
     start_dns(args.dns_port)
     threading.Thread(target=router_advert_listener, daemon=True).start()
 
-    global ENF
+    if stop.asked:
+        return None
     ENF = enforcer.Enforcer(S.local_ip, enforcement_plan, neighbours, data_dir=DATA, learn_mac=learn_enforced_mac,
                             dns_port=None if S.dns_error else S.dns_port)
     ENF.start()
     threading.Thread(target=address_watcher, daemon=True).start()
-    global CA
+    if stop.asked:
+        return None
     CA = cloud_agent.CloudAgent(args.web_port, DATA)
     CA.start()
     if not ENF.available():
@@ -3590,18 +3670,53 @@ def main():
     print("\nLeave this window open. Close it to stop QuietNet.\n")
     if not args.no_browser:
         threading.Timer(0.5, webbrowser.open, (url,)).start()
-    signal.signal(signal.SIGTERM, _stop_requested)
+    return web
+
+
+def clean_up():
+    """Stop what start_up() started, and say that QuietNet has stopped.
+
+    To have one more thing stopped, add its line here. Each line must be safe whether its thing
+    was started, only made, or never reached (still None), because a stop request or an error
+    can end start-up at any point."""
+    if ENF:
+        ENF.stop()                      # waits until the network is restored
+    if CA:
+        CA.stop()
+    print("\nQuietNet stopped.", flush=True)
+
+
+def run(args):
+    """The whole life of the program: listen for a stop request, start up, serve the dashboard
+    until asked to stop, clean up.
+
+    The listening is set up first, so that from then on no stop request can end the program
+    without its clean-up: the enforcer may already be steering devices' traffic through this
+    computer, and must hand them back to the router. The clean-up runs however the rest ends:
+    a stop request during start-up (start_up() then gives no web server to serve), one while
+    serving, or an error such as the dashboard's port being in use. Further stop requests are
+    ignored while it runs."""
+    stop = StopRequest()
+    stop.listen()
     try:
-        web.serve_forever()
-    except KeyboardInterrupt:
-        pass
+        web = start_up(args, stop)
+        if web is not None:
+            stop.serve(web)
     finally:
-        signal.signal(signal.SIGTERM, signal.SIG_IGN)     # a second request must not interrupt the clean-up
-        if ENF:
-            ENF.stop()                                    # waits until the network is restored
-        if CA:
-            CA.stop()
-        print("\nQuietNet stopped.", flush=True)
+        stop.ignore()                   # a second request must not interrupt the clean-up
+        clean_up()
+
+
+def main():
+    """Read the command line, then run until Ctrl-C or a stop request. See run() for the order
+    of things."""
+    ap = argparse.ArgumentParser(description="QuietNet home advert and tracker blocker")
+    ap.add_argument("--dns-port", type=int, default=53)
+    ap.add_argument("--web-port", type=int, default=8377)
+    ap.add_argument("--no-browser", action="store_true")
+    ap.add_argument("--no-device-names", action="store_true",
+                    help="don't ask the home network for device names (the tests use this)")
+    run(ap.parse_args())
 
 
 if __name__ == "__main__":
