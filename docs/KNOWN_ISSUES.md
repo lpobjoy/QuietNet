@@ -111,7 +111,7 @@ When Docker is missing (and the person agrees), the installer downloads `https:/
 
 The relay now keeps a licence per account and can enforce it (`QUIETNET_LICENCE_GATE`, off by default). Gaps left on purpose, or found while building it:
 
-- **No way to pay or renew yet.** The paused page has no Renew button and the Licence card no billing buttons; licences come only from the owner's command line until payments are added. The wording still says "Renew at q3n.net", as the design asks.
+- **No way to pay or renew yet.** The paused page has no Renew button and the Licence card no billing buttons; licences come only from the owner's command line until payments are added. The wording still says "Renew at quiet-net-relay.q3n.net" (the relay's own name, `RELAY_NAME` in `cloud/relay.py`; the design said q3n.net, which the relay left on 25 November), though nothing there takes a payment yet.
 - **"Blocking is paused for an hour", not "until 14:35".** The relay doesn't know the Pi's time zone, so the result page after the second rescue button gives no clock time.
 - **Downloads don't take seats yet.** Seats in use are only the account's paired Pis. Installs that downloaded but never paired, and the 60-day expiry of seats, come with downloads.
 - **The gate's "once an hour" is kept in memory.** After a restart the same would-be refusal can be logged again straight away. `licence_log` keeps the newest 1000 lines per account that the account itself caused (gate notes, at most one an hour for each kind of refusal, and rescues, at most 20 an hour); the owner's own lines are always kept, so the oldest gate notes and rescues of a busy account are dropped.
