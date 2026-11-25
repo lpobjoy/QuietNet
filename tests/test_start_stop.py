@@ -367,12 +367,14 @@ class WholeLife(SignalsPutBack, Base):
         self.dashboard_does.get("opened", nothing)()
         return web
 
-    def run_it(self, stop_once_serving=None, browser=False):
+    def run_it(self, stop_once_serving=None, browser=False, listening_already=None):
         """Run the whole life in this thread, and return the error that ended it, if one did.
 
         `stop_once_serving` is a signal to send once the dashboard has answered a request (the
         diary then says "dashboard answered"). `browser` says whether the program is to open
-        the dashboard in a browser, as it does when started by hand. Should run() still be
+        the dashboard in a browser, as it does when started by hand. `listening_already` is a
+        StopRequest to hand to run(), as the program does with the one it makes at the top of
+        its file. Should run() still be
         going 30 seconds on, the dashboard is ended from outside and the test fails, so that a
         fault here cannot hang the whole test run."""
         gave_up, helpers = [], []
@@ -417,7 +419,7 @@ class WholeLife(SignalsPutBack, Base):
         error = None
         try:
             with contextlib.redirect_stdout(self.printed):
-                server.run(args)
+                server.run(args, listening_already)
         except BaseException as e:      # KeyboardInterrupt too: it must not end the test run
             error = e
         finally:
@@ -440,6 +442,23 @@ class WholeLife(SignalsPutBack, Base):
         self.assertIsNone(self.run_it(stop_once_serving=signal.SIGINT))
         self.assertEqual(self.diary[-3:], ["dashboard answered", "enforcer stopped", "cloud link stopped"])
         self.assertTrue(self.printed.getvalue().endswith("QuietNet stopped.\n"))
+
+    def test_a_stop_request_noted_while_the_program_was_still_loading_means_nothing_is_started(self):
+        """Run as the program, server.py listens from its first lines, before its imports, and
+        hands that StopRequest to run(). A request noted by then must not be forgotten."""
+        early = server.StopRequest()
+        self.addCleanup(os.close, early._read)
+        self.addCleanup(os.close, early._write)
+        early.listen()
+        ask_to_stop()
+        self.assertIsNone(self.run_it(listening_already=early))
+        self.assertEqual(self.diary, [])
+        self.assertTrue(self.printed.getvalue().endswith("QuietNet stopped.\n"))
+
+    def test_nothing_is_listened_for_just_because_the_file_was_imported(self):
+        """Only the program itself listens from the top of the file. Imported, as it is here,
+        it must leave the handling of signals alone until run() is called."""
+        self.assertIsNone(server.STOP_FROM_THE_TOP)
 
     def test_a_stop_request_before_the_enforcer_starts_means_nothing_more_is_started(self):
         self.listeners_do["start"] = ask_to_stop

@@ -15,6 +15,7 @@ tests/test_start_stop.py.
 import http.client
 import os
 import random
+import re
 import select
 import shutil
 import signal
@@ -112,6 +113,12 @@ class Shutdown(unittest.TestCase):
         "answered"    its dashboard has answered a request in full, so it is up and serving
         "port open"   its dashboard's port takes a connection, which it does a few lines before
                       the program starts serving
+        "loading"     Python is part of the way through loading the program: it has finished
+                      loading `argparse`, the first of the many parts of Python that server.py
+                      asks for after the lines at its top that begin the listening. Python is
+                      told to print a line as it loads each part (-X importtime), which is how
+                      the moment is seen from outside. The program has run none of its own
+                      start-up yet
         "first line"  it has printed its first line. Everything the program prints comes from
                       its start-up, and where these tests run the first line is the enforcer
                       saying it is off, so this is the middle of start-up: after the point where
@@ -125,9 +132,11 @@ class Shutdown(unittest.TestCase):
         and the program stops with "Address already in use". Such a start is tried once more,
         on fresh ports."""
         for another_try in (True, False):
-            proc = self.launch(internet)
+            proc = self.launch(internet, python_options=["-X", "importtime"] if ready == "loading" else [])
             try:
-                if ready == "first line":
+                if ready == "loading":
+                    self.wait_until_it_has_printed(proc, rb"\| +argparse\n")
+                elif ready == "first line":
                     self.wait_until_the_first_line_is_printed(proc)
                 elif ready == "port open":
                     self.wait_until_the_port_is_open(proc)
@@ -138,13 +147,14 @@ class Shutdown(unittest.TestCase):
                 if not another_try:
                     raise
 
-    def launch(self, internet=None):
+    def launch(self, internet=None, python_options=()):
         """Start the real program on spare ports with a throwaway data folder, which is removed
         again when the test is over, and return it without waiting for anything.
 
         `internet` is the port of a stand-in, on this computer, for the internet's DNS servers.
         Without it the program is started exactly as it is by hand; these tests then send it
-        no lookups, so it never asks the real ones."""
+        no lookups, so it never asks the real ones. `python_options` are extra options for
+        Python itself."""
         self.data_folder = tempfile.mkdtemp(prefix="quietnet-shutdown-test-")
         self.addCleanup(shutil.rmtree, self.data_folder, True)      # runs after the program has been ended
         env = dict(os.environ, QUIETNET_DATA=self.data_folder, PYTHONUNBUFFERED="1")
@@ -152,7 +162,7 @@ class Shutdown(unittest.TestCase):
         env.pop("QUIETNET_PAIR", None)
         self.web_port, self.dns_port = spare_port(), spare_port(socket.SOCK_DGRAM)
         self.printed_so_far = b""
-        program = [sys.executable, os.path.join(ROOT, "server.py")]
+        program = [sys.executable] + list(python_options) + [os.path.join(ROOT, "server.py")]
         if internet:
             program = [sys.executable, "-c", WITH_A_STAND_IN_INTERNET, ROOT, str(internet)]
         proc = subprocess.Popen(
@@ -168,14 +178,19 @@ class Shutdown(unittest.TestCase):
 
     def wait_until_the_first_line_is_printed(self, proc):
         """Wait until the program has printed one whole line, and keep it in self.printed_so_far."""
+        self.wait_until_it_has_printed(proc, rb"\n")
+
+    def wait_until_it_has_printed(self, proc, pattern):
+        """Wait until what the program has printed holds a match for `pattern`, keeping all of
+        it in self.printed_so_far."""
         deadline = time.time() + 30
-        while b"\n" not in self.printed_so_far:
+        while not re.search(pattern, self.printed_so_far):
             readable, _, _ = select.select([proc.stdout], [], [], max(deadline - time.time(), 0))
             if not readable:
-                self.give_up(proc, "QuietNet printed nothing within 30 seconds")
+                self.give_up(proc, "QuietNet had not printed %r within 30 seconds" % pattern)
             more = os.read(proc.stdout.fileno(), 4096)
             if not more:
-                self.give_up(proc, "QuietNet closed its output before printing a line")
+                self.give_up(proc, "QuietNet closed its output before printing %r" % pattern)
             self.printed_so_far += more
 
     def wait_until_the_port_is_open(self, proc):
@@ -307,6 +322,25 @@ class Shutdown(unittest.TestCase):
 
     def test_ctrl_c_during_start_up_ends_the_program_cleanly(self):
         code, out = self.stopped_with(signal.SIGINT, ready="first line")
+        self.assert_clean(code, out)
+
+    def test_docker_stop_while_the_program_is_still_loading_ends_it_cleanly(self):
+        """The program listens from the top of its file, before it loads the parts of Python it
+        uses, which takes most of the time before its own start-up begins. Until it did, a
+        request in that time ended it on the spot; in its container, where it is the first
+        process, Linux dropped the request altogether and Docker killed it 20 seconds later.
+
+        The request is sent part of the way through the loading. Should this test be held up
+        for a tenth of a second at that moment the request arrives during start-up instead,
+        which must be just as clean; so that is all that is asked here."""
+        code, out = self.stopped_with(signal.SIGTERM, ready="loading")
+        self.assert_clean(code, out)
+
+    def test_ctrl_c_while_the_program_is_still_loading_ends_it_cleanly(self):
+        """Left to Python, Ctrl-C at this moment is raised as an exception inside whatever was
+        being loaded: a traceback, or with Python 3.9 sometimes nothing at all, the request
+        swallowed by Python's own library and the program carrying on."""
+        code, out = self.stopped_with(signal.SIGINT, ready="loading")
         self.assert_clean(code, out)
 
     def test_a_stop_request_the_moment_the_port_opens_ends_the_program_cleanly(self):
