@@ -2935,6 +2935,50 @@ class Limits(unittest.TestCase):
                 server.udp_server(sock)
         self.assertEqual(len(submitted), 4)
 
+    def house_of_one_slot(self, submit, lookups=4, **stand_ins):
+        """Run udp_server with one slot for the whole house and a lookup from each of `lookups`
+        different devices, one after another, handing each to `submit` in place of the worker
+        team. No device comes near its own share, so a later lookup is taken up only if the
+        house's slot, held by the one before, was given back. `stand_ins` replace names in server."""
+        sock = mock.Mock()
+        incoming = [(query("n%d.example.com" % i), ("192.168.1.%d" % (23 + i), 5000)) for i in range(lookups)]
+        sock.recvfrom.side_effect = incoming + [KeyboardInterrupt()]
+        pool = mock.Mock(submit=submit)
+        with mock.patch.multiple(server, MAX_DNS_WAITING=1, Workers=lambda most: pool, **stand_ins), \
+                mock.patch("builtins.print"):
+            with self.assertRaises(KeyboardInterrupt):
+                server.udp_server(sock)
+
+    def test_the_house_gets_its_slot_back_once_a_lookup_is_answered(self):
+        taken_up = []
+
+        def run_now(fn, data, addr, source):
+            """Answer each lookup straight away, as if the team had a free worker."""
+            taken_up.append(addr[0])
+            fn(data, addr, source)
+        self.house_of_one_slot(run_now, answer_query=mock.Mock(return_value=None))
+        self.assertEqual(taken_up, ["192.168.1.23", "192.168.1.24", "192.168.1.25", "192.168.1.26"])
+
+    def test_the_house_gets_its_slot_back_when_answering_a_lookup_goes_wrong(self):
+        taken_up = []
+
+        def run_now(fn, data, addr, source):
+            """Try to answer each lookup straight away; the answering itself fails."""
+            taken_up.append(addr[0])
+            fn(data, addr, source)
+        self.house_of_one_slot(run_now, answer_query=mock.Mock(side_effect=ValueError("a broken question")))
+        self.assertEqual(len(taken_up), 4)
+
+    def test_the_house_gets_its_slot_back_when_a_lookup_cannot_be_given_a_thread(self):
+        tried = []
+
+        def refuse(fn, data, addr, source):
+            """Note the lookup, then refuse it as Python does when it will not start a thread."""
+            tried.append(addr[0])
+            raise RuntimeError("can't create new thread at interpreter shutdown")
+        self.house_of_one_slot(refuse)
+        self.assertEqual(len(tried), 4)
+
     def test_a_lookup_that_cannot_be_given_a_thread_is_dropped_quietly_and_the_listener_carries_on(self):
         """Python will not start a thread once the program is ending. A lookup that arrived at
         that moment used to end the listener with a traceback, printed after "QuietNet
