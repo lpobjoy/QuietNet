@@ -32,9 +32,14 @@ import enforcer  # noqa: E402
 # How many times the busy-dashboard test starts and stops the program, how many clients keep
 # opening connections to its dashboard while it does, and how many answers they must have had
 # between them, as the sign that the dashboard really is busy, before the stop request is sent.
+#
+# Three clients and the one more connection the test opens make four at once, which is fewer
+# than the five that Python's web server lets wait their turn. More than that and a Mac resets
+# some of the connections; the dashboard then prints a traceback for each ("Broken pipe"), stop
+# request or no stop request, and the test could not ask for an output free of tracebacks.
 BUSY_ROUNDS = 20
-BUSY_CLIENTS = 6
-BUSY_ANSWERS = 60
+BUSY_CLIENTS = 3
+BUSY_ANSWERS = 30
 
 
 def spare_port(kind=socket.SOCK_STREAM):
@@ -289,8 +294,8 @@ class Shutdown(unittest.TestCase):
 
         This is a guard, not a proof. The instant is a few millionths of a second long, and the
         program as it was before the fix lost the request, or stopped with a traceback, in
-        about one such round in 90 on a Mac and one in 500 in a Linux container; so these
-        rounds would have caught it only now and then. The fix was measured over thousands of
+        about one such round in 150 on a Mac and one in 400 in a Linux container; so these
+        rounds would have caught it only now and then (about one run of this test in ten). The fix was measured over thousands of
         rounds with the same steps (docs/KNOWN_ISSUES.md has the numbers)."""
         for n in range(BUSY_ROUNDS):
             signum = (signal.SIGTERM, signal.SIGINT)[n % 2]
