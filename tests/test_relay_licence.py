@@ -13,6 +13,7 @@ import calendar
 import io
 import json
 import os
+import shutil
 import sqlite3
 import sys
 import tempfile
@@ -142,6 +143,7 @@ class FirstStart(unittest.TestCase):
 
     def setUp(self):
         self.folder = tempfile.mkdtemp(prefix="quietnet-relay-licence-")
+        self.addCleanup(shutil.rmtree, self.folder, True)       # runs last, once its database is closed
         keep = (relay.db, relay.SECRET, relay.DATA)
 
         def put_back():
@@ -1119,6 +1121,7 @@ class CommandLine(unittest.TestCase):
 
     def setUp(self):
         self.folder = tempfile.mkdtemp(prefix="quietnet-relay-cli-")
+        self.addCleanup(shutil.rmtree, self.folder, True)       # runs last, once its database is closed
         keep = (relay.db, relay.SECRET, relay.DATA)
         self.shared = keep[0]
 

@@ -1066,7 +1066,7 @@ class Availability(unittest.TestCase):
         self.assertTrue(e.available())
         self.assertEqual(e.status(), {"available": True, "reason": "", "problem": "", "problems": {},
                                       "active": False, "backend": "nft", "gateway": GATEWAY, "dns_redirect": False,
-                                      "firewall": None})
+                                      "firewall": None, "ipv6_steering": {"offered": False}})
 
     def test_off_on_a_mac_with_a_plain_explanation(self):
         e = self.make(linux=False)

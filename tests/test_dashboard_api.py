@@ -16,7 +16,7 @@ from http.server import ThreadingHTTPServer
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from test_quietnet import ADULT, KID, Base, is_blocked, query, server
+from test_quietnet import ADULT, KID, Base, in_force_now, is_blocked, query, server
 
 
 class Api(Base):
@@ -422,7 +422,8 @@ class Groups(Api):
         self.ok("/api/device-group", {"ip": KID, "group": gid})
         self.ok("/api/group", {"id": gid, "name": "Children"})
         _, groups = self.get("/api/groups")
-        self.assertEqual(groups, [{"id": gid, "name": "Children", "off": False, "members": [KID], "services": 0}])
+        self.assertEqual(groups, [{"id": gid, "name": "Children", "off": False, "members": [KID],
+                                   "devices": [self.device(KID)], "services": 0}])
 
     def test_a_group_needs_a_name(self):
         status, out = self.post("/api/group", {"name": "   "})
@@ -438,7 +439,7 @@ class Groups(Api):
         tvs = self.ok("/api/group", {"name": "TVs"})["id"]
         self.ok("/api/device-group", {"ip": KID, "group": kids})
         self.ok("/api/device-group", {"ip": KID, "group": tvs})
-        self.assertEqual(server.S.dev_group, {KID: tvs})
+        self.assertEqual(server.S.dev_group, {self.device(KID): tvs})
 
     def test_choosing_no_group_takes_the_device_out(self):
         gid = self.ok("/api/group", {"name": "Kids"})["id"]
@@ -478,18 +479,18 @@ class ScheduleApi(Api):
         self.assertEqual(self.get("/api/schedules")[1], [])
 
     def test_a_saved_schedule_is_listed_with_whether_it_is_on_right_now(self):
-        every_day = dict(self.GOOD, days=[0, 1, 2, 3, 4, 5, 6])
-        self.ok("/api/schedule", every_day)
+        self.ok("/api/schedule", dict(self.GOOD, **in_force_now()))
         _, schedules = self.get("/api/schedules")
         self.assertEqual(len(schedules), 1)
         x = schedules[0]
         self.assertEqual((x["name"], x["scope"], x["services"], x["off"], x["enabled"]),
                          ("Homework", "all", ["youtube"], False, True))
-        self.assertEqual(x["active"], time.strftime("%H:%M") != "23:59")
+        self.assertTrue(x["active"])
 
     def test_switching_a_schedule_off_and_on(self):
-        self.ok("/api/schedule", dict(self.GOOD, days=[0, 1, 2, 3, 4, 5, 6], start="00:00", end="23:59"))
+        self.ok("/api/schedule", dict(self.GOOD, **in_force_now()))
         sid = self.get("/api/schedules")[1][0]["id"]
+        self.assertTrue(is_blocked("www.youtube.com", KID))
         self.ok("/api/schedule-enable", {"id": sid, "on": False})
         x = self.get("/api/schedules")[1][0]
         self.assertEqual((x["enabled"], x["active"]), (False, False))
@@ -557,6 +558,100 @@ class Devices(Api):
         self.assertTrue(server.S.other_dns_all)
         self.ok("/api/other-dns-switch", {"on": False})
         self.assertFalse(server.S.other_dns_all)
+
+    def test_the_no_ipv6_switch_is_off_until_the_owner_turns_it_on(self):
+        self.assertIs(self.get("/api/status")[1]["no_ipv6_all"], False)
+
+    def test_the_no_ipv6_switch_is_saved_and_shown_in_the_status(self):
+        self.ok("/api/no-ipv6-switch", {"on": True})
+        self.assertTrue(self.get("/api/status")[1]["no_ipv6_all"])
+        server.init_db()
+        self.assertTrue(server.S.no_ipv6_all)
+        self.ok("/api/no-ipv6-switch", {"on": False})
+        self.assertFalse(server.S.no_ipv6_all)
+        server.init_db()
+        self.assertFalse(server.S.no_ipv6_all)
+
+    def test_the_ipv6_steering_switch_is_off_until_the_owner_turns_it_on(self):
+        self.assertIs(self.get("/api/status")[1]["ipv6_steer"], False)
+        self.assertIs(server.plan6()["enabled"], False)
+
+    def test_the_ipv6_steering_switch_is_saved_and_shown_in_the_status(self):
+        self.ok("/api/ipv6-steer-switch", {"on": True})
+        self.assertTrue(self.get("/api/status")[1]["ipv6_steer"])
+        server.init_db()
+        self.assertTrue(server.S.ipv6_steer)
+        self.assertTrue(server.plan6()["enabled"])
+        self.ok("/api/ipv6-steer-switch", {"on": False})
+        self.assertFalse(server.S.ipv6_steer)
+        server.init_db()
+        self.assertFalse(server.S.ipv6_steer)
+        self.assertFalse(server.plan6()["enabled"])
+
+    def test_the_no_ipv6_switch_bites_on_the_very_next_lookup_and_lets_go_as_fast(self):
+        v6 = bytes.fromhex("2a001450400908000000000000000200")
+        internet = lambda d: d[:2] + b"\x81\x80\x00\x01\x00\x01\x00\x00\x00\x00" + d[12:] \
+            + b"\xc0\x0c\x00\x1c\x00\x01\x00\x00\x01\x2c\x00\x10" + v6
+        self.assertIn(v6, server.answer_query(query("www.bbc.co.uk", 28), KID, internet))
+        self.ok("/api/no-ipv6-switch", {"on": True})
+        self.assertNotIn(v6, server.answer_query(query("www.bbc.co.uk", 28), KID, internet))
+        self.ok("/api/no-ipv6-switch", {"on": False})
+        self.assertIn(v6, server.answer_query(query("www.bbc.co.uk", 28), KID, internet))
+
+    def test_every_device_is_marked_as_able_to_bypass_over_ipv6_while_the_network_has_ipv6(self):
+        self.log(KID, "www.bbc.co.uk")
+        self.log(ADULT, "www.bbc.co.uk")
+        server.S.ra_heard = time.time()
+        self.assertEqual([d["v6_bypass"] for d in self.get("/api/devices")[1]], [True, True])
+
+    def test_a_device_with_cut_live_connections_is_still_marked_as_able_to_bypass_over_ipv6(self):
+        self.log(KID, "www.bbc.co.uk")
+        server.set_live_cut(self.device(KID), True)
+        server.S.v6_prefixes = [server.ipaddress.IPv6Network("2001:db8:1:2::/64")]
+        d = self.get("/api/devices")[1][0]
+        self.assertEqual((d["enforced"], d["v6_bypass"]), (True, True))
+
+    def test_a_device_stays_marked_while_an_announcement_with_router_lifetime_0_names_another_ipv6_dns_server(self):
+        # A router with no IPv6 internet but a private range still names itself as IPv6 DNS server.
+        self.log(KID, "www.bbc.co.uk")
+        server.note_router_dns([("fd12:3456:789a::1", 1800)], time.time(), router_lifetime=0)
+        self.assertIs(self.get("/api/status")[1]["ipv6"]["in_use"], False)
+        self.assertIs(self.get("/api/devices")[1][0]["v6_bypass"], True)
+
+    def test_a_device_is_not_marked_when_the_only_ipv6_dns_server_named_is_quietnet(self):
+        self.log(KID, "www.bbc.co.uk")
+        server.S.v6_own = {"fd12:3456:789a::60"}
+        server.note_router_dns([("fd12:3456:789a::60", 1800)], time.time(), router_lifetime=0)
+        with mock.patch.object(server.S, "dns_ipv6", True):
+            self.assertIs(self.get("/api/devices")[1][0]["v6_bypass"], False)
+
+    def test_no_device_is_marked_as_able_to_bypass_over_ipv6_on_an_ipv4_only_network(self):
+        self.log(KID, "www.bbc.co.uk")
+        self.assertIs(self.get("/api/devices")[1][0]["v6_bypass"], False)
+
+    def test_quietnets_own_machine_is_never_marked_as_able_to_bypass_over_ipv6(self):
+        self.addCleanup(setattr, server.S, "local_ip", server.S.local_ip)
+        server.S.local_ip = ADULT
+        self.log(ADULT, "www.bbc.co.uk")
+        server.S.ra_heard = time.time()
+        self.assertIs(self.get("/api/devices")[1][0]["v6_bypass"], False)
+
+    def test_the_status_says_whether_the_filter_is_taking_lookups_over_ipv6(self):
+        with mock.patch.object(server.S, "dns_ipv6", True):
+            self.assertIs(self.get("/api/status")[1]["ipv6"]["taking_lookups"], True)
+        with mock.patch.object(server.S, "dns_ipv6", False):
+            self.assertIs(self.get("/api/status")[1]["ipv6"]["taking_lookups"], False)
+
+    def test_the_status_carries_the_ipv6_confirmation_and_what_it_rests_on(self):
+        ipv6 = self.get("/api/status")[1]["ipv6"]
+        self.assertEqual((ipv6["hub_off"], ipv6["listening_for"], ipv6["routers"], ipv6["neighbours_ok"]),
+                         (False, 0, [], None))
+
+    def test_the_status_says_whether_this_computer_could_hear_the_router_over_ipv6(self):
+        self.assertIsNone(self.get("/api/status")[1]["ipv6"]["can_hear"])
+        for known in (False, True):
+            server.S.v6_can_hear = known
+            self.assertIs(self.get("/api/status")[1]["ipv6"]["can_hear"], known)
 
     def test_ordinary_activity_is_not_flagged_as_another_dns_service(self):
         self.log(KID, "www.bbc.co.uk")
@@ -1013,12 +1108,24 @@ class Scanning(Api):
 class EnforceAndCloud(Api):
     def test_cut_live_connections_is_remembered_per_device(self):
         self.ok("/api/enforce", {"ip": KID, "on": True})
-        self.assertEqual(server.S.enforced, {KID})
+        kid = self.device(KID)
+        self.assertEqual(server.S.enforced, {kid})
         server.S.enforced = set()
         server.init_db()
-        self.assertEqual(server.S.enforced, {KID})                      # survives a restart
+        self.assertEqual(server.S.enforced, {kid})                      # survives a restart
         self.ok("/api/enforce", {"ip": KID, "on": False})
         self.assertEqual(server.S.enforced, set())
+
+    def test_cut_live_connections_can_be_switched_by_the_devices_number(self):
+        kid = self.device(KID)
+        self.ok("/api/enforce", {"device": kid, "on": True})
+        self.assertEqual(server.S.enforced, {kid})
+        self.ok("/api/enforce", {"device": kid, "on": False})
+        self.assertEqual(server.S.enforced, set())
+
+    def test_switching_cut_live_connections_off_for_an_address_nothing_is_known_at_makes_no_device(self):
+        self.ok("/api/enforce", {"ip": KID, "on": False})
+        self.assertEqual((server.S.enforced, server.S.addr_only), (set(), {}))
 
     def test_only_a_plain_ipv4_address_can_be_enforced(self):
         # This value ends up inside a firewall rule, so nothing else may get through.
@@ -1045,20 +1152,29 @@ class EnforceAndCloud(Api):
         self.assertEqual(server.S.enforced, set())
 
     def test_enforcing_remembers_which_device_it_is_from_the_live_table_first(self):
-        server.sql("INSERT INTO seen(ip,mac,host,ts) VALUES(?,?,?,?)", (KID, "aa:aa:aa:aa:aa:01", "", 0), commit=True)
-        self.neighbours_now = {KID: "bb:bb:bb:bb:bb:02"}                 # the old scan is out of date
+        server.sql("INSERT INTO seen(ip,mac,host,ts) VALUES(?,?,?,?)", (KID, "a4:aa:aa:aa:aa:01", "", 0), commit=True)
+        self.neighbours_now = {KID: "b8:27:eb:00:00:02"}                 # the old scan is out of date
         self.ok("/api/enforce", {"ip": KID, "on": True})
-        self.assertEqual(server.S.enforced_mac[KID], "bb:bb:bb:bb:bb:02")
+        there_now = server.S.hw_device["b8:27:eb:00:00:02"]
+        self.assertEqual(server.S.enforced, {there_now})                 # the device there now, not the scan's
+        self.assertNotIn("a4:aa:aa:aa:aa:01", server.S.hw_device)
         server.init_db()
-        self.assertEqual(server.S.enforced_mac[KID], "bb:bb:bb:bb:bb:02")    # kept across a restart
+        self.assertEqual(server.S.enforced, {there_now})                 # kept across a restart
+        self.assertEqual(self.device(KID), there_now)                    # and its card is that device's
 
     def test_an_unknown_hardware_address_is_filled_in_when_first_seen(self):
         self.ok("/api/enforce", {"ip": KID, "on": True})
-        self.assertEqual(server.S.enforced_mac[KID], "")
-        server.learn_enforced_mac(KID, "cc:cc:cc:cc:cc:03")
-        server.learn_enforced_mac(KID, "dd:dd:dd:dd:dd:04")                 # only the first is kept
+        kid = self.device(KID)
+        self.assertEqual(server.S.enforced_mac[kid], "")
+        extender = "cc:cc:cc:cc:cc:02"                                   # a range extender answers at that number
+        with mock.patch.object(server.S, "shared_macs", {extender}):
+            server.note_ipv4_addresses({KID: (extender, "fresh")})
+            with server.db_lock:
+                self.assertEqual(server.live_cut_devices({KID: (extender, "fresh")}), {KID: (extender, kid)})
+                # A different hardware address there later is not steered, and only the first is kept.
+                self.assertEqual(server.live_cut_devices({KID: ("dd:dd:dd:dd:dd:04", "fresh")}), {})
         server.init_db()
-        self.assertEqual(server.S.enforced_mac[KID], "cc:cc:cc:cc:cc:03")
+        self.assertEqual(server.S.enforced_mac[kid], extender)
 
     def test_remote_access_reports_off_when_the_link_is_not_running(self):
         real = server.CA
@@ -1103,6 +1219,66 @@ class EnforceAndCloud(Api):
             self.assertEqual(self.get("/api/enforcer")[1], {"available": False, "reason": "not started", "active": False, "shared": {}})
         finally:
             server.ENF = real
+
+
+HUB_LL, HUB_MAC = "fe80::1", "98:99:99:99:99:99"
+
+
+class Plan6(Base):
+    """plan6() names the hub as the real router heard most recently, gives no redirect while IPv6
+    DNS is down, and names no device while the setting is off. Which devices lose IPv6 is checked
+    with the device tables in test_device_moves.py (WhereIPv6IsTakenAway)."""
+
+    def setUp(self):
+        super().setUp()
+        server.S.routers_v6 = {HUB_LL: {"mac": HUB_MAC, "heard": time.time()}}
+        server.S.router_v6_dns = {}
+        server.S.shared_macs = set()
+        for name, value in (("dns_ipv6", True), ("v6_dns", "fd00::53"), ("v6_own", {"fd00::53"}),
+                            ("dns_port", 53), ("ipv6_steer", True)):
+            old = getattr(server.S, name)
+            setattr(server.S, name, value)
+            self.addCleanup(setattr, server.S, name, old)
+
+    def test_while_the_setting_is_off_no_device_is_named_and_the_neighbour_table_is_not_read(self):
+        server.S.ipv6_steer = False
+        self.neighbours_now = {KID: "10:22:33:44:55:66"}
+        with mock.patch.object(server, "neighbours", lambda: dict(self.neighbours_now)), \
+                mock.patch.object(server, "neighbour_table", return_value={KID: ("10:22:33:44:55:66", "fresh")}):
+            server.note_ipv4_addresses()
+            server.set_live_cut(server.S.hw_device["10:22:33:44:55:66"], True)
+        with mock.patch.object(server, "neighbour_table", side_effect=AssertionError("read")):
+            plan = server.plan6()
+        self.assertEqual((plan["enabled"], plan["devices"]), (False, {}))
+
+    def test_the_hub_is_the_real_router_heard_most_recently(self):
+        server.S.routers_v6 = {"fe80::1": {"mac": HUB_MAC, "heard": 10},
+                               "fe80::2": {"mac": "aa:bb:cc:dd:ee:ff", "heard": 20},
+                               "fe80::3": {"heard": 30}}            # no hardware address: not a candidate
+        self.assertEqual(server.plan6()["hub"], {"v6": "fe80::2", "mac": "aa:bb:cc:dd:ee:ff"})
+
+    def test_no_hub_is_named_until_a_router_is_heard_with_a_hardware_address(self):
+        server.S.routers_v6 = {"fe80::3": {"heard": 30}}
+        self.assertEqual(server.plan6()["hub"], {})
+
+    def test_no_port_or_address_of_our_own_while_ipv6_dns_is_down(self):
+        server.S.dns_ipv6 = False
+        plan = server.plan6()
+        self.assertIsNone(plan["port"])
+        self.assertEqual(plan["our_v6"], "")
+
+    def test_the_port_and_address_are_given_while_ipv6_dns_is_up(self):
+        plan = server.plan6()
+        self.assertEqual(plan["port"], 53)
+        self.assertEqual(plan["our_v6"], "fd00::53")
+
+    def test_our_own_address_is_not_listed_as_a_server_to_catch(self):
+        server.S.router_v6_dns = {"fd00::53": time.time() + 100}   # this computer's own: skip it
+        self.assertNotIn("fd00::53", server.plan6()["servers"])
+
+    def test_an_expired_router_dns_server_is_not_caught(self):
+        server.S.router_v6_dns = {"fe80::dead": time.time() - 100}
+        self.assertNotIn("fe80::dead", server.plan6()["servers"])
 
 
 if __name__ == "__main__":
