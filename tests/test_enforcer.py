@@ -6,9 +6,13 @@ Nothing here touches the real network. The raw socket, the firewall command and 
 kernel settings are all replaced with stand-ins that write down what they were asked
 to do, so these checks run safely on any computer, with or without admin rights.
 """
+import json
 import os
 import socket
 import sys
+import tempfile
+import threading
+import time
 import unittest
 from unittest import mock
 
@@ -19,6 +23,72 @@ US, GATEWAY = "192.168.1.60", "192.168.1.254"
 OUR_MAC, GATEWAY_MAC = "aa:aa:aa:aa:aa:aa", "99:99:99:99:99:99"
 KID, KID_MAC = "192.168.1.23", "11:22:33:44:55:66"
 TV, TV_MAC = "192.168.1.30", "77:77:77:77:77:77"
+
+
+# `nft list ruleset` as printed on a host running Docker (its iptables rules, seen through nft).
+DOCKER_RULESET = """table ip nat {
+	chain DOCKER {
+		iifname "docker0" counter packets 0 bytes 0 return
+	}
+}
+table ip filter {
+	chain DOCKER {
+	}
+	chain DOCKER-ISOLATION-STAGE-1 {
+		iifname "docker0" oifname != "docker0" counter packets 0 bytes 0 jump DOCKER-ISOLATION-STAGE-2
+		counter packets 0 bytes 0 return
+	}
+	chain DOCKER-ISOLATION-STAGE-2 {
+		oifname "docker0" counter packets 0 bytes 0 drop
+		counter packets 0 bytes 0 return
+	}
+	chain FORWARD {
+		type filter hook forward priority filter; policy drop;
+		counter packets 0 bytes 0 jump DOCKER-USER
+		counter packets 0 bytes 0 jump DOCKER-ISOLATION-STAGE-1
+		oifname "docker0" ct state related,established counter packets 0 bytes 0 accept
+		oifname "docker0" counter packets 0 bytes 0 jump DOCKER
+		iifname "docker0" oifname != "docker0" counter packets 0 bytes 0 accept
+		iifname "docker0" oifname "docker0" counter packets 0 bytes 0 accept
+	}
+	chain DOCKER-USER {
+		counter packets 0 bytes 0 return
+	}
+}
+"""
+# The same host after running our Docker advice.
+DOCKER_FIXED = DOCKER_RULESET.replace(
+    "\tchain DOCKER-USER {\n", '\tchain DOCKER-USER {\n\t\tiifname "eth0" oifname "eth0" counter packets 0 bytes 0 accept\n')
+
+# `nft list ruleset` for firewalld's own table, which ends its forward chain with a reject.
+FIREWALLD_RULESET = """table inet firewalld {
+	set allowed_nets {
+		type ipv4_addr
+		flags interval
+		elements = { 10.0.0.0/8,
+			     192.168.0.0/16 }
+	}
+	chain filter_FORWARD {
+		type filter hook forward priority filter + 10; policy accept;
+		ct state { established, related } accept
+		ct status dnat accept
+		iifname "lo" accept
+		ct state invalid drop
+		jump filter_FORWARD_POLICIES
+		reject with icmpx admin-prohibited
+	}
+	chain filter_FORWARD_POLICIES {
+		iifname "wlan0" oifname "wlan0" goto filter_FWD_trusted
+		return
+	}
+	chain filter_FWD_trusted {
+		accept
+	}
+}
+"""
+# firewalld's table after running our nft advice for it.
+FIREWALLD_FIXED = FIREWALLD_RULESET.replace(
+    "policy accept;\n", 'policy accept;\n\t\tiifname "eth0" oifname "eth0" accept\n')
 
 
 class FakeSocket:
@@ -51,16 +121,39 @@ class EnforcerCase(unittest.TestCase):
             "net.ipv4.ip_forward": "0", "net.ipv4.conf.all.send_redirects": "1",
             "net.ipv4.conf.eth0.send_redirects": "1"}
         self.nft_fails = False
+        chains = set()
 
         def run(args, **kw):
             self.commands.append((args, kw.get("input")))
-            return Result(1, "boom") if (self.nft_fails and args[0] == "nft") else Result()
+            if self.nft_fails and args[:2] == ["nft", "-f"]:
+                return Result(1, "boom")
+            if "-N" in args:                     # like the real command: making a chain that exists fails
+                if "QUIETNET" in chains:
+                    return Result(1, "Chain already exists.")
+                chains.add("QUIETNET")
+            return Result()
 
+        # This machine's network, as the enforcer would read it - never the real one, which on a
+        # Linux machine (a Pi, a CI runner) would not be 192.168.1.0/24.
+        for name, fake in (("interface_and_gateway", lambda: ("eth0", GATEWAY)),
+                           ("local_subnet", lambda iface: enforcer.ipaddress.IPv4Network("192.168.1.0/24")),
+                           ("mac_of_interface", lambda iface: OUR_MAC)):
+            p = mock.patch.object(enforcer, name, fake)
+            p.start()
+            self.addCleanup(p.stop)
         for name, fake in (("sysctl_get", lambda key: self.sysctl.get(key, "")),
                            ("sysctl_set", lambda key, value: self.sysctl.__setitem__(key, str(value)))):
             p = mock.patch.object(enforcer, name, fake)
             p.start()
             self.addCleanup(p.stop)
+        # Which firewall tools are installed, as the enforcer would find them - never the real
+        # machine's: a Linux CI runner has nft and iptables, a Mac has neither, and the commands
+        # the enforcer sends depend on it. Tests that need a tool present say so with self.tools.
+        self.tools = set()
+        p = mock.patch.object(enforcer.shutil, "which",
+                              lambda tool: "/usr/sbin/" + tool if tool in self.tools else None)
+        p.start()
+        self.addCleanup(p.stop)
         p = mock.patch.object(enforcer.subprocess, "run", run)
         p.start()
         self.addCleanup(p.stop)
@@ -117,7 +210,7 @@ class Ticking(EnforcerCase):
         self.e._tick()
         for text in self.loaded_rules():
             self.assertTrue(text.startswith("table inet quietnet\ndelete table inet quietnet\ntable inet quietnet {"), text)
-        self.assertNotIn("drop", self.loaded_rules()[-1])
+        self.assertNotIn("ip daddr != %s drop" % US, self.loaded_rules()[-1])
 
     def test_the_firewall_is_only_reloaded_when_the_plan_changes(self):
         self.plan = {KID: {"off": False, "ips": {"203.0.113.5"}}}
@@ -181,10 +274,712 @@ class Ticking(EnforcerCase):
         self.plan = {KID: {"off": False, "ips": {"203.0.113.5"}}, TV: {"off": True, "ips": set()}}
         self.e._tick()
         self.e._tick()
-        cmds = [args for args, _ in self.commands]
-        self.assertEqual(cmds, [["iptables", "-F", "QUIETNET"],
-                                ["iptables", "-A", "QUIETNET", "-s", KID, "-d", "203.0.113.5", "-j", "DROP"],
-                                ["iptables", "-A", "QUIETNET", "-s", TV, "!", "-d", US, "-j", "DROP"]])
+        # Each command waits for the firewall lock (-w 5), the chain and the jump to it are checked
+        # every tick, and the rules themselves are loaded once.
+        cmds = [args for args, _ in self.commands if "-S" not in args]
+        w = ["iptables", "-w", "5"]
+        self.assertEqual(cmds, [w + ["-N", "QUIETNET"], w + ["-C", "FORWARD", "-j", "QUIETNET"],
+                                w + ["-F", "QUIETNET"],
+                                w + ["-A", "QUIETNET", "-s", KID, "-p", "tcp", "--dport", "853", "-j", "DROP"],
+                                w + ["-A", "QUIETNET", "-s", KID, "-p", "udp", "--dport", "853", "-j", "DROP"],
+                                w + ["-A", "QUIETNET", "-s", KID, "-d", "203.0.113.5", "-j", "DROP"],
+                                w + ["-A", "QUIETNET", "-s", TV, "-p", "tcp", "--dport", "853", "-j", "DROP"],
+                                w + ["-A", "QUIETNET", "-s", TV, "-p", "udp", "--dport", "853", "-j", "DROP"],
+                                w + ["-A", "QUIETNET", "-s", TV, "!", "-d", US, "-j", "DROP"],
+                                w + ["-N", "QUIETNET"], w + ["-C", "FORWARD", "-j", "QUIETNET"]])
+
+    def test_iptables_rules_are_loaded_again_if_a_command_failed(self):
+        self.e.backend = "iptables"
+        self.plan = {KID: {"off": True, "ips": set()}}
+        failing = {"on": True}
+        run = enforcer.subprocess.run
+
+        def flaky(args, **kw):
+            if failing["on"] and "-A" in args:
+                self.commands.append((args, None))
+                return Result(1, "Another app is currently holding the xtables lock")
+            return run(args, **kw)
+        with mock.patch.object(enforcer.subprocess, "run", flaky):
+            self.e._tick()
+            failing["on"] = False
+            self.e._tick()
+        cuts = [args for args, _ in self.commands if "-A" in args and "!" in args]
+        self.assertEqual(len(cuts), 2)                           # tried again on the next tick
+        self.assertIn("iptables update failed; will try again.", self.log)
+
+    def test_the_iptables_jump_is_put_back_if_something_removed_it(self):
+        self.e.backend = "iptables"
+        self.plan = {KID: {"off": True, "ips": set()}}
+        run = enforcer.subprocess.run
+
+        def no_jump(args, **kw):
+            if "-C" in args:
+                self.commands.append((args, None))
+                return Result(1)
+            return run(args, **kw)
+        with mock.patch.object(enforcer.subprocess, "run", no_jump):
+            self.e._tick()
+        self.assertIn(["iptables", "-w", "5", "-I", "FORWARD", "-j", "QUIETNET"], [a for a, _ in self.commands])
+
+
+class Safety(EnforcerCase):
+    """The checks that stop the enforcer cutting a device off by mistake, and the hand-back paths."""
+
+    def steer_kid(self):
+        self.plan = {KID: {"off": False, "ips": set()}}
+        self.e._tick()
+        del self.sock.frames[:]
+
+    def test_a_device_leaving_the_plan_is_handed_back_at_once(self):
+        self.steer_kid()
+        self.plan = {}
+        self.e._tick()
+        self.assertEqual({claims(f) for f in self.sock.frames}, {(KID_MAC, GATEWAY, GATEWAY_MAC)})
+
+    def test_hand_back_messages_are_sent_from_our_own_hardware_address(self):
+        # Switches and Wi-Fi ignore or mis-learn frames that claim to come from another machine.
+        self.steer_kid()
+        self.plan = {}
+        self.e._tick()
+        self.assertTrue(self.sock.frames)
+        for f in self.sock.frames:
+            self.assertEqual(f[6:12], enforcer.mac_to_bytes(OUR_MAC))
+
+    def test_nothing_is_steered_when_this_machine_will_not_pass_traffic_on(self):
+        with mock.patch.object(enforcer, "sysctl_set", lambda key, value: False):
+            self.plan = {KID: {"off": False, "ips": set()}}
+            self.e._tick()
+        self.assertEqual(self.sock.frames, [])
+        self.assertIn("won't pass traffic on", self.e.status()["problem"])
+
+    def test_nothing_is_steered_when_another_firewall_drops_passed_on_traffic(self):
+        self.e._forward_blocker = lambda: "Another firewall on this machine (table 'filter') blocks passed-on traffic."
+        self.plan = {KID: {"off": False, "ips": set()}}
+        self.e._tick()
+        self.assertEqual(self.sock.frames, [])
+        self.assertIn("blocks passed-on traffic", self.e.status()["problem"])
+
+    def test_steered_devices_are_handed_back_if_it_becomes_unsafe(self):
+        self.steer_kid()
+        self.e._forward_blocker = lambda: "table 'filter'"
+        self.e._tick()
+        self.assertEqual({claims(f) for f in self.sock.frames}, {(KID_MAC, GATEWAY, GATEWAY_MAC)})
+
+    def test_the_router_and_addresses_off_the_home_network_are_never_steered(self):
+        self.e.subnet = enforcer.ipaddress.IPv4Network("192.168.1.0/24")
+        self.hosts["10.0.0.5"] = "cc:cc:cc:cc:cc:cc"
+        self.plan = {GATEWAY: {"off": True, "ips": set()}, "10.0.0.5": {"off": True, "ips": set()},
+                     "192.168.1.255": {"off": True, "ips": set()}}
+        self.e._tick()
+        self.assertEqual(self.sock.frames, [])
+
+    def test_a_device_that_now_has_someone_elses_address_is_left_alone_and_reported(self):
+        self.plan = {KID: {"off": True, "ips": set(), "mac": "bb:bb:bb:bb:bb:bb"}}
+        self.e._tick()
+        self.assertEqual(self.sock.frames, [])
+        self.assertIn("different device", self.e.status()["problems"][KID])
+
+    def test_one_devices_problem_is_not_reported_for_another(self):
+        self.plan = {KID: {"off": True, "ips": set(), "mac": "bb:bb:bb:bb:bb:bb"},
+                     TV: {"off": True, "ips": set(), "mac": TV_MAC}}
+        self.e._tick()
+        status = self.e.status()
+        self.assertEqual(set(status["problems"]), {KID})
+        self.assertEqual(status["problem"], "")                         # nothing stops steering in general
+        self.assertEqual([claims(f)[0] for f in self.sock.frames], [TV_MAC])
+
+    def test_a_chosen_devices_hardware_address_is_learned_the_first_time_it_is_seen(self):
+        learned = []
+        self.e.learn_mac = lambda ip, mac: learned.append((ip, mac))
+        self.plan = {KID: {"off": False, "ips": set(), "mac": ""}}
+        self.e._tick()
+        self.assertEqual(learned, [(KID, KID_MAC)])
+
+    def test_if_the_routers_address_is_unknown_devices_stay_listed_and_keep_their_internet(self):
+        self.steer_kid()
+        del self.hosts[GATEWAY]
+        self.plan = {}
+        self.e._tick()
+        self.assertIn(KID, self.e._spoofed)                              # still owed a hand-back
+        self.assertEqual(self.sysctl["net.ipv4.ip_forward"], "1")        # so it isn't cut off meanwhile
+        self.hosts[GATEWAY] = GATEWAY_MAC
+        self.e._tick()
+        self.assertEqual(self.e._spoofed, {})
+        self.assertEqual(self.sysctl["net.ipv4.ip_forward"], "0")
+
+    def test_a_late_answer_is_not_sent_to_a_device_already_handed_back(self):
+        self.steer_kid()
+        reply = enforcer.build_arp_reply(GATEWAY, OUR_MAC, KID, KID_MAC)
+        self.plan = {}
+        self.e._tick()
+        del self.sock.frames[:]
+        self.e._resteer(KID, KID_MAC, reply)
+        self.assertEqual(self.sock.frames, [])
+
+
+def router_question(asker_ip, asker_mac, about=GATEWAY):
+    """An ARP frame asking 'who has <about>?', as a device sends it."""
+    mac = enforcer.mac_to_bytes(asker_mac)
+    return (b"\xff" * 6 + mac + b"\x08\x06" + enforcer.struct.pack(">HHBBH", 1, 0x0800, 6, 4, 1)
+            + mac + socket.inet_aton(asker_ip) + bytes(6) + socket.inet_aton(about))
+
+
+class AnsweringQuestions(EnforcerCase):
+    """Answering a steered device's 'who is the router?' so it doesn't slip back to the real one."""
+
+    def test_a_steered_device_asking_for_the_router_gets_answers_planned(self):
+        self.e._spoofed = {KID: KID_MAC}
+        frames = [router_question(KID, KID_MAC), router_question(TV, TV_MAC)]   # TV isn't steered
+
+        def recv(n):
+            if frames:
+                return frames.pop(0)
+            raise OSError("closed")
+        self.sock.recv, self.sock.settimeout = recv, lambda t: None
+        with mock.patch.object(self.e, "_schedule_answers") as plan:
+            self.e._answer_questions()
+        plan.assert_called_once_with(KID, KID_MAC)
+
+    def test_the_router_asking_about_a_steered_device_gets_it_steered_again(self):
+        self.e._spoofed = {KID: KID_MAC}
+        frames = [router_question(GATEWAY, GATEWAY_MAC, about=KID), router_question(GATEWAY, GATEWAY_MAC, about=TV)]
+
+        def recv(n):
+            if frames:
+                return frames.pop(0)
+            raise OSError("closed")
+        self.sock.recv, self.sock.settimeout = recv, lambda t: None
+        with mock.patch.object(self.e, "_schedule_answers") as plan:
+            self.e._answer_questions()
+        plan.assert_called_once_with(KID, KID_MAC)                      # not the TV, which isn't steered
+
+    def test_a_flood_of_questions_costs_one_entry_and_one_thread(self):
+        self.e._spoofed = {KID: KID_MAC}
+        self.e._stop.set()                       # so the sending thread ends at once
+        before = threading.active_count()
+        for _ in range(3000):
+            self.e._schedule_answers(KID, KID_MAC)
+        self.assertEqual(list(self.e._pending), [KID])
+        self.assertLessEqual(threading.active_count() - before, 1)
+
+    def test_planned_answers_go_out_and_then_stop(self):
+        self.e._spoofed = {KID: KID_MAC}
+        clock = [100.0]
+        with mock.patch.object(enforcer.time, "monotonic", lambda: clock[0]):
+            self.e._pending = {KID: (KID_MAC, [100.0 + d for d in self.e.ANSWER_AT])}
+            real_sleep = []
+            with mock.patch.object(enforcer.time, "sleep", lambda s: clock.__setitem__(0, clock[0] + 0.5) or real_sleep.append(s)):
+                self.e._send_answers()
+        self.assertEqual(len(self.sock.frames), len(self.e.ANSWER_AT))
+        self.assertEqual({claims(f) for f in self.sock.frames}, {(KID_MAC, GATEWAY, OUR_MAC)})
+        self.assertEqual(self.e._pending, {})
+
+
+class FirewallCheckFailures(EnforcerCase):
+    """When the other firewalls can't be seen, it doesn't steer."""
+
+    def test_a_listing_that_fails_counts_as_a_blocker(self):
+        real = enforcer.subprocess.run
+
+        def run(args, **kw):
+            if args[:2] == ["nft", "list"]:
+                return Result(1, "Error: unknown expression")
+            return real(args, **kw)
+        with mock.patch.object(enforcer.subprocess, "run", run):
+            self.plan = {KID: {"off": False, "ips": set()}}
+            self.e._tick()
+        self.assertEqual(self.sock.frames, [])
+        self.assertIn("couldn't read this machine's firewall rules", self.e.status()["problem"])
+
+    def test_an_old_firewall_that_is_not_loaded_at_all_is_not_a_blocker(self):
+        real = enforcer.subprocess.run
+
+        def run(args, **kw):
+            if args[0] == "iptables-legacy":
+                return Result(3, "iptables v1.8: can't initialize iptables table `filter': Table does not exist")
+            return real(args, **kw)
+        with mock.patch.object(enforcer.subprocess, "run", run), \
+                mock.patch.object(enforcer.shutil, "which", lambda t: "/usr/sbin/" + t):
+            self.assertEqual(self.e._forward_blocker(), "")
+
+    def test_iptables_rules_are_loaded_again_after_something_flushed_them(self):
+        self.e.backend = "iptables"
+        self.plan = {KID: {"off": True, "ips": set()}}
+        self.e._tick()
+        real = enforcer.subprocess.run
+
+        def flushed(args, **kw):                 # the jump has gone: someone ran 'iptables -F'
+            if "-C" in args:
+                self.commands.append((args, None))
+                return Result(1)
+            return real(args, **kw)
+        with mock.patch.object(enforcer.subprocess, "run", flushed):
+            self.e._tick()
+        cuts = [a for a, _ in self.commands if "-A" in a and "!" in a]
+        self.assertEqual(len(cuts), 2)           # loaded once, then again after the flush
+
+
+class DnsRedirect(unittest.TestCase):
+    """A steered device's lookups sent to another DNS server are answered by QuietNet, and private
+    DNS (port 853) is dropped, so it falls back to ordinary DNS (known issue 8)."""
+
+    PLAN = {KID: {"off": False, "ips": set()}, TV: {"off": True, "ips": set()}}
+
+    def text(self, plan=None, port=53):
+        """The firewall text for the plan, with QuietNet answering on `port`."""
+        return enforcer.nft_ruleset(self.PLAN if plan is None else plan, US, port)
+
+    def test_ordinary_dns_from_steered_devices_is_sent_to_quietnet(self):
+        text = self.text()
+        for proto in ("udp", "tcp"):
+            self.assertIn("ip saddr { %s, %s } ip daddr != %s %s dport 53 dnat ip to %s:53" % (KID, TV, US, proto, US),
+                          text)
+
+    def test_the_redirect_goes_to_the_port_quietnet_answers_on(self):
+        self.assertIn("dnat ip to %s:5353" % US, self.text(port=5353))
+
+    def test_the_redirect_is_made_before_routing_in_a_nat_chain(self):
+        self.assertIn("type nat hook prerouting priority -100; policy accept;", self.text())
+
+    def test_private_dns_from_steered_devices_is_dropped(self):
+        text = self.text()
+        self.assertIn("ip saddr { %s, %s } tcp dport 853 drop" % (KID, TV), text)
+        self.assertIn("ip saddr { %s, %s } udp dport 853 drop" % (KID, TV), text)
+
+    def test_the_redirect_and_drops_name_only_steered_devices(self):
+        text = self.text({KID: {"off": False, "ips": set()}})
+        for line in text.splitlines():
+            if "dport 53 " in line or "dport 853 " in line:
+                self.assertIn("ip saddr { %s }" % KID, line)
+                self.assertNotIn("ip saddr { %s" % US, line)
+                self.assertNotIn(GATEWAY, line)
+
+    def test_nothing_is_redirected_or_dropped_when_nobody_is_steered(self):
+        text = self.text({})
+        self.assertNotIn("dnat", text)
+        self.assertNotIn("853", text)
+        self.assertNotIn("prerouting", text)
+
+    def test_the_whole_table_including_the_redirect_is_replaced_in_one_step(self):
+        self.assertTrue(self.text().startswith("table inet quietnet\ndelete table inet quietnet\ntable inet quietnet {"))
+
+    def test_without_a_dns_port_there_is_no_redirect_but_private_dns_is_still_dropped(self):
+        text = self.text(port=None)
+        self.assertNotIn("dnat", text)
+        self.assertIn("tcp dport 853 drop", text)
+
+    def test_no_redirect_while_this_machine_only_knows_itself_as_127_0_0_1(self):
+        self.assertNotIn("dnat", enforcer.nft_ruleset(self.PLAN, "127.0.0.1", 53))
+
+    def test_a_bad_device_address_is_refused(self):
+        for bad in ("192.168.1.23; flush ruleset", "192.168.1.256", "2001:db8::1", "kid"):
+            with self.assertRaises(ValueError, msg=bad):
+                enforcer.nft_ruleset({bad: {"off": True, "ips": set()}}, US, 53)
+
+    def test_a_bad_address_for_this_machine_is_refused(self):
+        with self.assertRaises(ValueError):
+            enforcer.nft_ruleset(self.PLAN, "192.168.1.60 } flush ruleset {", 53)
+
+    def test_a_bad_port_is_refused(self):
+        for bad in (0, 65536, -1, "53", True, 53.0):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                enforcer.nft_ruleset(self.PLAN, US, bad)
+
+    def test_the_older_iptables_tool_drops_private_dns_but_does_not_redirect(self):
+        cmds = enforcer.iptables_rules({KID: {"off": False, "ips": set()}}, US)
+        self.assertIn(["-A", "QUIETNET", "-s", KID, "-p", "tcp", "--dport", "853", "-j", "DROP"], cmds)
+        self.assertIn(["-A", "QUIETNET", "-s", KID, "-p", "udp", "--dport", "853", "-j", "DROP"], cmds)
+        self.assertFalse(any("DNAT" in c or "53" in c for c in cmds))
+
+    def test_the_older_iptables_tool_refuses_a_bad_device_address(self):
+        with self.assertRaises(ValueError):
+            enforcer.iptables_rules({"-j ACCEPT": {"off": True, "ips": set()}}, US)
+
+
+class DnsRedirectLoaded(EnforcerCase):
+    """The enforcer loads the DNS redirect with its other rules, and takes it away with them."""
+
+    def setUp(self):
+        super().setUp()
+        self.e.dns_port = 53
+
+    def test_the_loaded_rules_send_a_steered_devices_lookups_to_quietnet(self):
+        self.plan = {KID: {"off": False, "ips": set()}}
+        self.e._tick()
+        self.assertIn("udp dport 53 dnat ip to %s:53" % US, self.loaded_rules()[-1])
+
+    def test_the_redirect_goes_when_the_last_device_is_released(self):
+        self.plan = {KID: {"off": False, "ips": set()}}
+        self.e._tick()
+        self.plan = {}
+        self.e._tick()
+        self.assertNotIn("dnat", self.loaded_rules()[-1])
+
+    def test_stopping_deletes_the_whole_table_with_the_redirect_in_it(self):
+        self.plan = {KID: {"off": False, "ips": set()}}
+        self.e._tick()
+        self.commands.clear()
+        self.e._teardown()
+        self.assertIn((["nft", "delete", "table", "inet", "quietnet"], None), self.commands)
+
+    def test_a_start_after_a_crash_deletes_the_whole_table_with_the_redirect_in_it(self):
+        self.e._recover()
+        self.assertIn((["nft", "delete", "table", "inet", "quietnet"], None), self.commands)
+
+    def test_the_status_says_the_redirect_is_on_with_nft(self):
+        self.assertTrue(self.e.status()["dns_redirect"])
+
+    def test_the_status_says_the_redirect_is_off_with_the_older_iptables_tool(self):
+        self.e.backend = "iptables"
+        self.assertFalse(self.e.status()["dns_redirect"])
+
+
+class FirewallAdvice(EnforcerCase):
+    """The command shown on the device page matches the firewall that is actually in the way."""
+
+    def blocker(self, listings):
+        """Ask the enforcer about other firewalls, with each tool listing the given text."""
+        def run(args, **kw):
+            r = Result()
+            r.stdout = listings.get(args[0], "")
+            return r
+        self.tools = set(listings)
+        with mock.patch.object(enforcer.subprocess, "run", run):
+            return self.e._forward_blocker()
+
+    def test_dockers_drop_policy_gets_the_docker_user_command(self):
+        message = self.blocker({"nft": DOCKER_RULESET})
+        self.assertIn("Docker's table 'filter'", message)
+        self.assertTrue(message.endswith("run on the Pi: sudo iptables -I DOCKER-USER -i eth0 -o eth0 -j ACCEPT"))
+
+    def test_the_docker_advice_says_the_installer_makes_it_last_after_a_restart(self):
+        message = self.blocker({"nft": DOCKER_RULESET})
+        self.assertIn("lasts until the Pi restarts", message)
+        self.assertIn("running QuietNet's install command again", message)
+
+    def test_advice_for_other_firewalls_says_it_lasts_until_a_restart_without_mentioning_the_installer(self):
+        message = self.blocker({"nft": FIREWALLD_RULESET})
+        self.assertIn("lasts until the Pi restarts", message)
+        self.assertNotIn("install command", message)
+
+    def test_firewallds_reject_gets_an_nft_command_for_its_own_chain(self):
+        message = self.blocker({"nft": FIREWALLD_RULESET})
+        self.assertNotIn("DOCKER-USER", message)
+        self.assertTrue(message.endswith(
+            "run on the Pi: sudo nft insert rule inet firewalld filter_FORWARD iifname eth0 oifname eth0 accept"))
+
+    def test_following_the_nft_command_clears_the_blocker(self):
+        self.assertEqual(self.blocker({"nft": FIREWALLD_FIXED}), "")
+
+    def test_a_forward_drop_made_with_iptables_without_docker_gets_a_forward_chain_command(self):
+        ufw = "table ip filter {\n\tchain FORWARD {\n\t\ttype filter hook forward priority filter; policy drop;\n\t}\n}\n"
+        message = self.blocker({"nft": ufw})
+        self.assertTrue(message.endswith("run on the Pi: sudo iptables -I FORWARD -i eth0 -o eth0 -j ACCEPT"))
+
+    def test_the_older_tool_without_docker_gets_a_forward_chain_command(self):
+        self.e.backend = "iptables"
+        message = self.blocker({"iptables": "-P INPUT ACCEPT\n-P FORWARD DROP\n-P OUTPUT ACCEPT\n"})
+        self.assertTrue(message.endswith("run on the Pi: sudo iptables -I FORWARD -i eth0 -o eth0 -j ACCEPT"))
+
+    def test_the_older_tool_with_docker_gets_the_docker_user_command(self):
+        self.e.backend = "iptables"
+        message = self.blocker({"iptables": "-P FORWARD DROP\n-N DOCKER-USER\n-A FORWARD -j DOCKER-USER\n"})
+        self.assertTrue(message.endswith("run on the Pi: sudo iptables -I DOCKER-USER -i eth0 -o eth0 -j ACCEPT"))
+
+    def test_every_blocking_firewall_is_named_with_its_own_command(self):
+        message = self.blocker({"nft": DOCKER_RULESET + FIREWALLD_RULESET})
+        self.assertIn("(table 'firewalld', Docker's table 'filter')", message)
+        self.assertIn("sudo nft insert rule inet firewalld filter_FORWARD iifname eth0 oifname eth0 accept && "
+                      "sudo iptables -I DOCKER-USER -i eth0 -o eth0 -j ACCEPT", message)
+
+    def test_the_status_gives_dockers_blocker_and_its_command_for_the_home_page(self):
+        self.e.problem = self.blocker({"nft": DOCKER_RULESET})
+        self.assertEqual(self.e.status()["firewall"],
+                         {"blocked_by": ["Docker's table 'filter'"], "installer": True,
+                          "commands": ["sudo iptables -I DOCKER-USER -i eth0 -o eth0 -j ACCEPT"]})
+
+    def test_the_status_says_the_installer_cannot_fix_other_firewalls(self):
+        self.e.problem = self.blocker({"nft": FIREWALLD_RULESET})
+        self.assertFalse(self.e.status()["firewall"]["installer"])
+
+    def test_the_status_gives_no_firewall_blocker_once_it_is_fixed(self):
+        self.e.problem = self.blocker({"nft": DOCKER_RULESET})
+        self.e._fw_checked = 0.0
+        self.e.problem = self.blocker({"nft": FIREWALLD_FIXED})
+        self.assertIsNone(self.e.status()["firewall"])
+
+    def test_the_status_gives_no_firewall_blocker_when_another_problem_stops_steering(self):
+        self.blocker({"nft": DOCKER_RULESET})
+        self.e.problem = "This machine won't pass traffic on, so steering a device would cut it off."
+        self.assertIsNone(self.e.status()["firewall"])
+
+
+class QuietIptables(EnforcerCase):
+    """With only iptables, nothing is run every tick while no device is enforced."""
+
+    def setUp(self):
+        super().setUp()
+        self.e.backend = "iptables"
+
+    def iptables_calls(self):
+        """The firewall-changing iptables commands sent so far (not the read-only checks)."""
+        return [a for a, _ in self.commands if a[0] == "iptables" and "-S" not in a]
+
+    def test_with_nobody_chosen_iptables_is_not_run_at_all(self):
+        for _ in range(3):
+            self.e._tick()
+        self.assertEqual(self.iptables_calls(), [])
+
+    def test_when_the_last_device_is_released_its_rules_are_emptied_once(self):
+        self.plan = {KID: {"off": True, "ips": set()}}
+        self.e._tick()
+        self.plan = {}
+        self.e._tick()
+        after_release = len(self.iptables_calls())
+        self.assertIn(["iptables", "-w", "5", "-F", "QUIETNET"], self.iptables_calls()[-3:])
+        self.e._tick()
+        self.e._tick()
+        self.assertEqual(len(self.iptables_calls()), after_release)
+
+    def test_rules_left_by_a_failed_release_are_emptied_on_a_later_tick(self):
+        self.plan = {KID: {"off": True, "ips": set()}}
+        self.e._tick()
+        self.plan = {}
+        real = enforcer.subprocess.run
+
+        def locked(args, **kw):
+            if "-F" in args:
+                self.commands.append((args, None))
+                return Result(4, "Another app is currently holding the xtables lock")
+            return real(args, **kw)
+        with mock.patch.object(enforcer.subprocess, "run", locked):
+            self.e._tick()
+        self.e._tick()
+        flushes = [a for a in self.iptables_calls() if "-F" in a]
+        self.assertEqual(len(flushes), 3)        # loaded, failed to empty, emptied next tick
+
+    def test_a_chain_whose_removal_could_not_be_checked_is_still_emptied(self):
+        def locked(args, **kw):
+            self.commands.append((args, None))
+            return Result(4, "Another app is currently holding the xtables lock")
+        with mock.patch.object(enforcer.subprocess, "run", locked):
+            self.e._remove_firewall()
+        del self.commands[:]
+        self.e._tick()
+        self.assertIn(["iptables", "-w", "5", "-F", "QUIETNET"], self.iptables_calls())
+
+    def test_a_chain_that_is_definitely_gone_is_not_emptied_again(self):
+        def gone(args, **kw):
+            self.commands.append((args, None))
+            return Result(1, "No chain/target/match by that name.")
+        with mock.patch.object(enforcer.subprocess, "run", gone):
+            self.e._remove_firewall()
+        del self.commands[:]
+        self.e._tick()
+        self.assertEqual(self.iptables_calls(), [])
+
+    def test_a_chain_that_could_not_be_removed_at_start_up_is_still_emptied(self):
+        self.e._remove_firewall()                # the stand-in says the chain is still there afterwards
+        del self.commands[:]
+        self.e._tick()
+        self.assertIn(["iptables", "-w", "5", "-F", "QUIETNET"], self.iptables_calls())
+
+
+class StartingUnavailable(EnforcerCase):
+    """What happens when the enforcer can't run at start-up."""
+
+    def setUp(self):
+        super().setUp()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.e.state_path = os.path.join(self.tmp.name, "enforcer_state.json")
+
+    def notes(self, spoofed):
+        with open(self.e.state_path, "w") as f:
+            json.dump({"sysctls": {"net.ipv4.ip_forward": "0"}, "spoofed": spoofed}, f)
+        self.sysctl["net.ipv4.ip_forward"] = "1"
+
+    def test_a_crashed_runs_leftovers_are_tidied_even_when_it_cannot_start(self):
+        self.notes({})
+        self.e._recover_without_steering()
+        self.assertEqual(self.sysctl["net.ipv4.ip_forward"], "0")
+        self.assertFalse(os.path.exists(self.e.state_path))
+        self.assertIn((["nft", "delete", "table", "inet", "quietnet"], None), self.commands)
+
+    def test_forwarding_is_kept_on_if_steered_devices_cannot_be_handed_back(self):
+        self.notes({KID: KID_MAC})
+        self.e._recover_without_steering()
+        self.assertEqual(self.sysctl["net.ipv4.ip_forward"], "1")      # they keep their internet meanwhile
+        self.assertTrue(os.path.exists(self.e.state_path))             # and the next start can finish
+
+    def test_it_starts_by_itself_once_the_network_appears(self):
+        self.e.iface = self.e.gateway_ip = None
+        waits = iter([False, True])
+        started = []
+        with mock.patch.object(self.e._stop, "wait", lambda t: next(waits)), \
+                mock.patch.object(enforcer, "IS_LINUX", True), \
+                mock.patch.object(enforcer, "AF_PACKET", 17), \
+                mock.patch.object(enforcer.os, "geteuid", lambda: 0, create=True), \
+                mock.patch.object(enforcer.threading, "Thread",
+                                  lambda target, daemon: mock.Mock(start=lambda: started.append(target))):
+            self.e._wait_for_network()
+        self.assertEqual(started, [self.e._run])
+        self.assertTrue(self.e.available())
+
+
+class CrashRecovery(EnforcerCase):
+    """Notes on disk let the next start undo what a killed or crashed run left behind."""
+
+    def setUp(self):
+        super().setUp()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.e.state_path = os.path.join(self.tmp.name, "enforcer_state.json")
+
+    def fresh(self):
+        e = enforcer.Enforcer(US, dict, lambda: self.hosts, log=self.log.append, data_dir=self.tmp.name)
+        e.iface, e.gateway_ip, e.our_mac, e.backend, e.reason = "eth0", GATEWAY, OUR_MAC, "nft", ""
+        e._sock = FakeSocket()
+        return e
+
+    def test_steering_is_written_down_while_it_happens(self):
+        self.plan = {KID: {"off": False, "ips": set()}}
+        self.e._tick()
+        with open(self.e.state_path) as f:
+            notes = json.load(f)
+        self.assertEqual(notes["spoofed"], {KID: KID_MAC})
+        self.assertEqual(notes["sysctls"]["net.ipv4.ip_forward"], "0")
+
+    def test_the_next_start_hands_devices_back_and_restores_settings(self):
+        self.plan = {KID: {"off": False, "ips": set()}}
+        self.e._tick()                                    # ...and then the program is killed
+        e = self.fresh()
+        e._recover()
+        self.assertEqual({claims(f) for f in e._sock.frames}, {(KID_MAC, GATEWAY, GATEWAY_MAC)})
+        self.assertEqual(self.sysctl["net.ipv4.ip_forward"], "0")
+        self.assertFalse(os.path.exists(self.e.state_path))
+
+    def test_the_notes_are_removed_once_everything_is_restored(self):
+        self.plan = {KID: {"off": False, "ips": set()}}
+        self.e._tick()
+        self.e._teardown()
+        self.assertFalse(os.path.exists(self.e.state_path))
+
+    def test_a_stop_that_cannot_hand_devices_back_keeps_the_notes(self):
+        self.plan = {KID: {"off": False, "ips": set()}}
+        self.e._tick()
+        del self.hosts[GATEWAY]
+        self.e._teardown()
+        self.assertTrue(os.path.exists(self.e.state_path))
+        self.assertEqual(self.sysctl["net.ipv4.ip_forward"], "1")       # left on so the device keeps working
+
+
+class FirewallChecks(unittest.TestCase):
+    """Spotting another firewall that would drop the traffic we pass on."""
+
+    DOCKER = ("table ip filter {\n\tchain FORWARD {\n\t\ttype filter hook forward priority filter; policy drop;\n"
+              "\t\tcounter packets 0 bytes 0 jump DOCKER-USER\n\t}\n\tchain DOCKER-USER {\n\t}\n}\n")
+
+    def test_dockers_drop_policy_is_spotted(self):
+        self.assertEqual(enforcer.foreign_forward_drop(self.DOCKER, "eth0"), "filter")
+
+    def test_following_our_advice_clears_it(self):
+        fixed = self.DOCKER.replace("chain DOCKER-USER {\n",
+                                    'chain DOCKER-USER {\n\t\tiifname "eth0" oifname "eth0" counter packets 0 bytes 0 accept\n')
+        self.assertEqual(enforcer.foreign_forward_drop(fixed, "eth0"), "")
+
+    def test_a_chain_that_ends_by_rejecting_is_spotted(self):
+        firewalld = ("table inet firewalld {\n\tchain filter_FORWARD {\n"
+                     "\t\ttype filter hook forward priority filter + 10; policy accept;\n"
+                     "\t\tct state established,related accept\n\t\treject with icmpx admin-prohibited\n\t}\n}\n")
+        self.assertEqual(enforcer.foreign_forward_drop(firewalld, "eth0"), "firewalld")
+
+    def test_our_own_table_does_not_count(self):
+        ours = enforcer.nft_ruleset({KID: {"off": True, "ips": set()}}, US).replace("policy accept", "policy drop")
+        self.assertEqual(enforcer.foreign_forward_drop(ours, "eth0"), "")
+
+    def test_an_accept_in_dockers_table_does_not_clear_a_reject_in_firewallds_table(self):
+        found = enforcer.forward_blockers(DOCKER_FIXED + FIREWALLD_RULESET, "eth0")
+        self.assertEqual(found, [("inet", "firewalld", "filter_FORWARD", False)])
+
+    def test_an_accept_in_firewallds_table_does_not_clear_dockers_drop_policy(self):
+        found = enforcer.forward_blockers(DOCKER_RULESET + FIREWALLD_FIXED, "eth0")
+        self.assertEqual(found, [("ip", "filter", "FORWARD", True)])
+
+    def test_an_accept_in_every_blocking_table_clears_them_all(self):
+        self.assertEqual(enforcer.forward_blockers(DOCKER_FIXED + FIREWALLD_FIXED, "eth0"), [])
+
+    def test_an_accept_after_the_reject_does_not_clear_the_chain(self):
+        late = FIREWALLD_RULESET.replace("admin-prohibited\n", 'admin-prohibited\n\t\tiifname "eth0" oifname "eth0" accept\n')
+        self.assertEqual(enforcer.foreign_forward_drop(late, "eth0"), "firewalld")
+
+    def test_an_accept_in_a_chain_only_some_traffic_jumps_to_does_not_clear_it(self):
+        sometimes = ("table inet filter {\n\tchain forward {\n\t\ttype filter hook forward priority 0; policy drop;\n"
+                     '\t\tiifname "wlan0" jump mine\n\t}\n\tchain mine {\n'
+                     '\t\tiifname "eth0" oifname "eth0" accept\n\t}\n}\n')
+        self.assertEqual(enforcer.foreign_forward_drop(sometimes, "eth0"), "filter")
+
+    def test_a_catch_all_goto_inside_a_jumped_chain_does_not_hide_the_final_reject(self):
+        zones = ("table inet firewalld {\n\tchain filter_FORWARD {\n"
+                 "\t\ttype filter hook forward priority filter + 10; policy accept;\n"
+                 "\t\tjump filter_FORWARD_ZONES\n\t\treject with icmpx admin-prohibited\n\t}\n"
+                 '\tchain filter_FORWARD_ZONES {\n\t\tiifname "wlan1" goto filter_FWD_home\n'
+                 "\t\tgoto filter_FWD_public\n\t}\n\tchain filter_FWD_home {\n\t}\n"
+                 "\tchain filter_FWD_public {\n\t}\n}\n")
+        self.assertEqual(enforcer.forward_blockers(zones, "eth0"), [("inet", "firewalld", "filter_FORWARD", False)])
+
+    def test_a_goto_from_the_forward_chain_to_an_empty_chain_leaves_it_to_the_policy(self):
+        gone = ("table inet filter {\n\tchain forward {\n\t\ttype filter hook forward priority 0; policy accept;\n"
+                "\t\tgoto empty\n\t\treject\n\t}\n\tchain empty {\n\t}\n}\n")
+        self.assertEqual(enforcer.forward_blockers(gone, "eth0"), [])
+
+    def test_an_ipv6_only_table_does_not_block_steering(self):
+        v6 = ("table ip6 filter {\n\tchain FORWARD {\n\t\ttype filter hook forward priority filter; policy drop;\n"
+              "\t\tjump DOCKER-USER\n\t}\n\tchain DOCKER-USER {\n\t}\n}\n")
+        self.assertEqual(enforcer.forward_blockers(v6, "eth0"), [])
+
+    def test_a_bridge_table_does_not_block_steering(self):
+        bridge = ("table bridge filter {\n\tchain forward {\n"
+                  "\t\ttype filter hook forward priority 0; policy drop;\n\t}\n}\n")
+        self.assertEqual(enforcer.forward_blockers(bridge, "eth0"), [])
+
+    def test_a_set_listed_over_several_lines_does_not_confuse_the_check(self):
+        self.assertEqual(enforcer.forward_blockers(FIREWALLD_FIXED, "eth0"), [])
+        self.assertEqual(enforcer.foreign_forward_drop(FIREWALLD_RULESET, "eth0"), "firewalld")
+
+    def test_the_older_tools_drop_policy_is_spotted(self):
+        self.assertTrue(enforcer.iptables_forward_drop("-P INPUT ACCEPT\n-P FORWARD DROP\n", "eth0"))
+        self.assertFalse(enforcer.iptables_forward_drop("-P FORWARD DROP\n-A DOCKER-USER -i eth0 -o eth0 -j ACCEPT\n", "eth0"))
+        self.assertFalse(enforcer.iptables_forward_drop("-P FORWARD ACCEPT\n", "eth0"))
+
+
+class Helpers(unittest.TestCase):
+    """The small pure functions added for safety."""
+
+    def test_only_ordinary_devices_on_the_home_network_may_be_steered(self):
+        net = enforcer.ipaddress.IPv4Network("192.168.1.0/24")
+        self.assertEqual(enforcer.target_problem(KID, net, GATEWAY, US), "")
+        for bad in ("999.1.1.1", GATEWAY, US, "192.168.1.0", "192.168.1.255", "10.0.0.5", "127.0.0.1",
+                    "224.0.0.1", "169.254.1.1", "nonsense"):
+            self.assertNotEqual(enforcer.target_problem(bad, net, GATEWAY, US), "", bad)
+
+    def test_who_is_the_router_questions_are_recognised(self):
+        mac = enforcer.mac_to_bytes(KID_MAC)
+        req = (b"\xff" * 6 + mac + b"\x08\x06" + enforcer.struct.pack(">HHBBH", 1, 0x0800, 6, 4, 1)
+               + mac + socket.inet_aton(KID) + bytes(6) + socket.inet_aton(GATEWAY))
+        self.assertEqual(enforcer.parse_arp_request(req), (KID, KID_MAC, GATEWAY))
+        self.assertIsNone(enforcer.parse_arp_request(enforcer.build_arp_reply(GATEWAY, OUR_MAC, KID, KID_MAC)))
+        self.assertIsNone(enforcer.parse_arp_request(b"short"))
+
+    def test_kernel_settings_are_found_in_proc_even_for_interfaces_with_dots(self):
+        self.assertEqual(enforcer._proc_path("net.ipv4.ip_forward"), "/proc/sys/net/ipv4/ip_forward")
+        self.assertEqual(enforcer._proc_path("net.ipv4.conf.eth0.10.send_redirects"),
+                         "/proc/sys/net/ipv4/conf/eth0.10/send_redirects")
+
+    def test_the_home_network_is_read_from_the_routing_table(self):
+        with mock.patch.object(enforcer, "open", mock.mock_open(read_data=SystemFacts.ROUTES), create=True):
+            self.assertEqual(str(enforcer.local_subnet("eth0")), "192.168.1.0/24")
+            self.assertIsNone(enforcer.local_subnet("wlan0"))
 
 
 class Teardown(EnforcerCase):
@@ -208,6 +1003,21 @@ class Teardown(EnforcerCase):
         self.assertFalse(self.e.status()["active"])
         self.assertEqual(self.log[-1], "Enforcer stopped; network restored.")
 
+    def test_a_poke_runs_the_next_tick_at_once(self):
+        # So the kill switch bites straight away instead of up to two seconds later.
+        ticks = []
+        self.e._open_socket = lambda: self.sock
+        self.e._tick = lambda: ticks.append(1)
+        self.e._answer_questions = lambda: None
+        self.e.start()
+        self.addCleanup(self.e.stop)
+        time.sleep(0.2)
+        self.e.poke()
+        deadline = time.time() + 1
+        while not ticks and time.time() < deadline:
+            time.sleep(0.01)
+        self.assertTrue(ticks, "the poke did not cause a tick within a second")
+
     def test_stop_waits_until_the_network_has_been_restored(self):
         # stop() must not return while devices are still pointed at us, or the program
         # could exit first and leave the firewall table and kernel settings behind.
@@ -229,8 +1039,9 @@ class Teardown(EnforcerCase):
         self.e.backend = "iptables"
         self.e._teardown()
         cmds = [args for args, _ in self.commands]
-        self.assertEqual(cmds, [["iptables", "-D", "FORWARD", "-j", "QUIETNET"], ["iptables", "-F", "QUIETNET"],
-                                ["iptables", "-X", "QUIETNET"]])
+        w = ["iptables", "-w", "5"]
+        self.assertEqual(cmds[:3], [w + ["-D", "FORWARD", "-j", "QUIETNET"], w + ["-F", "QUIETNET"],
+                                    w + ["-X", "QUIETNET"]])
 
     def test_if_the_routers_hardware_address_is_unknown_it_still_cleans_up(self):
         del self.hosts[GATEWAY]
@@ -246,14 +1057,16 @@ class Availability(unittest.TestCase):
                 mock.patch.object(enforcer.os, "geteuid", lambda: 0 if root else 1000, create=True), \
                 mock.patch.object(enforcer, "interface_and_gateway", lambda: route), \
                 mock.patch.object(enforcer, "mac_of_interface", lambda iface: mac), \
+                mock.patch.object(enforcer, "local_subnet", lambda iface: None), \
                 mock.patch.object(enforcer.shutil, "which", lambda tool: "/usr/sbin/" + tool if tool in tools else None):
             return enforcer.Enforcer(US, dict, dict, log=lambda m: None)
 
     def test_ready_on_a_linux_box_with_admin_rights_and_a_firewall_tool(self):
         e = self.make()
         self.assertTrue(e.available())
-        self.assertEqual(e.status(), {"available": True, "reason": "", "active": False, "backend": "nft",
-                                      "gateway": GATEWAY})
+        self.assertEqual(e.status(), {"available": True, "reason": "", "problem": "", "problems": {},
+                                      "active": False, "backend": "nft", "gateway": GATEWAY, "dns_redirect": False,
+                                      "firewall": None, "ipv6_steering": {"offered": False}})
 
     def test_off_on_a_mac_with_a_plain_explanation(self):
         e = self.make(linux=False)
