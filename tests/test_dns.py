@@ -1475,9 +1475,21 @@ class LiveFilter(Base):
         cls.real_upstreams, cls.real_port = server.UPSTREAMS, server.S.dns_port
         server.UPSTREAMS = [("127.0.0.1", up_port)]
 
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:        # find a spare port for the filter
-            s.bind(("0.0.0.0", 0))
-            cls.port = s.getsockname()[1]
+        # Find a spare port for the filter. It opens the one number for UDP and for TCP, and a
+        # port that is spare for UDP is now and then taken for TCP (a few times in a hundred runs
+        # in a Linux container), which used to mean this whole class was skipped. So look until
+        # one is spare for both.
+        for _ in range(50):
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+                s.bind(("0.0.0.0", 0))
+                cls.port = s.getsockname()[1]
+            try:
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                    s.bind(("0.0.0.0", cls.port))
+                break
+            except OSError:
+                continue
         server.S.dns_error = None
         with mock.patch.object(server, "ipv6_watcher", lambda: None):     # never read the real machine's IPv6 setup
             server.start_dns(cls.port)
