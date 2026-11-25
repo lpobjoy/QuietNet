@@ -62,6 +62,21 @@ def spare_port(kind=socket.SOCK_STREAM):
         return s.getsockname()[1]
 
 
+def spare_dns_port():
+    """A port number that nothing is using for UDP or for TCP: the DNS filter opens both on
+    the one number, and a port that is spare for one is now and then taken for the other."""
+    for _ in range(50):
+        port = spare_port(socket.SOCK_DGRAM)
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                s.bind(("0.0.0.0", port))               # just as the filter opens it; nothing listens
+            return port
+        except OSError:
+            continue
+    return port
+
+
 def question(name):
     """A DNS question for the IPv4 address of `name`, as a device would send it."""
     labels = b"".join(bytes([len(part)]) + part.encode() for part in name.split("."))
@@ -130,7 +145,8 @@ class Shutdown(unittest.TestCase):
         moment later. Now and then something else on the computer has taken it in between
         (seen on a Mac that was short of spare ports, with several test runs going at once),
         and the program stops with "Address already in use". Such a start is tried once more,
-        on fresh ports."""
+        on fresh ports. So is one that needs its DNS filter (a start with `internet`) and found
+        the filter's port taken, which the program reports and carries on without."""
         for another_try in (True, False):
             proc = self.launch(internet, python_options=["-X", "importtime"] if ready == "loading" else [])
             try:
@@ -142,10 +158,27 @@ class Shutdown(unittest.TestCase):
                     self.wait_until_the_port_is_open(proc)
                 else:
                     self.wait_until_the_dashboard_answers(proc)
+                if internet:
+                    self.the_filter_must_have_started(proc)
                 return proc
             except PortTaken:
                 if not another_try:
                     raise
+
+    def the_filter_must_have_started(self, proc):
+        """Read what the program has printed so far, without waiting for more, and fail with
+        PortTaken if it says the DNS filter's port could not be opened. Everything the program
+        prints comes from its start-up, so by the time its dashboard answers it is all there
+        to be read. The program is ended first, since start() will start another."""
+        while select.select([proc.stdout], [], [], 0)[0]:
+            more = os.read(proc.stdout.fileno(), 4096)
+            if not more:
+                break
+            self.printed_so_far += more
+        if b"Could not start the filter on port" in self.printed_so_far:
+            proc.kill()
+            out, _ = proc.communicate()
+            raise PortTaken("QuietNet could not open its DNS filter's port:\n" + self.all_printed(out))
 
     def launch(self, internet=None, python_options=()):
         """Start the real program on spare ports with a throwaway data folder, which is removed
@@ -160,7 +193,7 @@ class Shutdown(unittest.TestCase):
         env = dict(os.environ, QUIETNET_DATA=self.data_folder, PYTHONUNBUFFERED="1")
         env.pop("QUIETNET_CLOUD", None)
         env.pop("QUIETNET_PAIR", None)
-        self.web_port, self.dns_port = spare_port(), spare_port(socket.SOCK_DGRAM)
+        self.web_port, self.dns_port = spare_port(), spare_dns_port()
         self.printed_so_far = b""
         program = [sys.executable] + list(python_options) + [os.path.join(ROOT, "server.py")]
         if internet:
@@ -392,6 +425,35 @@ class Shutdown(unittest.TestCase):
         self.assert_clean(code, out)
         self.assertEqual(len(asked_for), 4)                 # two ports for each of two starts
         self.assertNotEqual(self.web_port, other.server_address[1])
+
+    def test_a_start_that_needs_the_dns_filter_is_tried_once_more_when_the_filters_port_was_taken(self):
+        """See start(). The first port found for the filter is taken here, for TCP, by another
+        web server made by this test; the program says so and carries on without its filter,
+        which would leave a test that sends it lookups waiting for ever.
+
+        The other web server takes the port on every address of this computer, as the filter
+        does, because a Mac lets the filter open a port that is taken on one address only. It
+        is never set serving."""
+        other = HTTPServer(("0.0.0.0", 0), SomethingElse)
+        self.addCleanup(other.server_close)
+        taken = [other.server_address[1]]
+        ports = []
+
+        def taken_the_first_time():
+            """The held port for the first filter, and a truly spare one after that."""
+            ports.append(taken.pop() if taken else really_spare())
+            return ports[-1]
+        really_spare = spare_dns_port
+        internet = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.addCleanup(internet.close)
+        internet.bind(("127.0.0.1", 0))
+        with mock.patch.object(sys.modules[__name__], "spare_dns_port", taken_the_first_time):
+            proc = self.start(internet=internet.getsockname()[1])
+        proc.send_signal(signal.SIGTERM)
+        code, out = self.ended(proc)
+        self.assert_clean(code, out)
+        self.assertEqual(len(ports), 2)
+        self.assertNotIn("Could not start the filter", out)
 
     def test_lookups_still_in_hand_do_not_hold_up_the_end_of_the_program(self):
         """With the internet down, a lookup waits in the program for an answer that is not
