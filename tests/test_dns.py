@@ -2651,6 +2651,24 @@ class Limits(unittest.TestCase):
                 server.udp_server(sock, shares)
         self.assertEqual(shares.count, {})
 
+    def test_a_lookup_that_cannot_be_given_a_thread_gives_its_share_back_to_the_count_both_listeners_use(self):
+        """Python will not start a thread once the program is ending. The lookup is dropped, and
+        its share must go back to the count it was taken from: left there, it would be held
+        against the device on the IPv4 and the IPv6 listener alike."""
+        self.match_the_phone()
+        shares = server.Shares()
+        sock = mock.Mock(family=socket.AF_INET6)
+        sock.recvfrom.side_effect = [(query("www.bbc.co.uk"), (self.PHONE_V6, 5000, 0, 0)), KeyboardInterrupt()]
+
+        def refuse(fn, data, addr, source):
+            """Refuse the lookup as Python does when it will not start a thread."""
+            raise RuntimeError("can't create new thread at interpreter shutdown")
+        pool = mock.Mock(submit=refuse)
+        with mock.patch.object(server, "Workers", lambda most: pool):
+            with self.assertRaises(KeyboardInterrupt):
+                server.udp_server(sock, shares)
+        self.assertEqual(shares.count, {})
+
     def test_this_computers_own_addresses_count_against_one_share(self):
         self.addCleanup(setattr, server.S, "v6_own", server.S.v6_own)
         self.addCleanup(setattr, server.S, "local_ip", server.S.local_ip)
