@@ -199,7 +199,7 @@ Only the outgoing direction passes through the Pi. Replies travel from the route
 
 **Notes on disk.** Which devices are steered and which settings were changed are written to `enforcer_state.json` in the data folder as they happen. At start-up `_recover()` removes any leftover firewall table, adopts the leftovers as its own, and hands those devices back. If the enforcer can't start at all, it still removes the table; if no devices were steered it also restores the settings and removes the notes, but if devices were steered it leaves every setting as it is and keeps the notes, since they can't be handed back without the network. If it can't start only because the network isn't up yet, it keeps looking every 15 seconds.
 
-When the last device is released, the kernel settings are put back. On shutdown, `_teardown()` tells every device the router's real hardware address five times, from the Pi's own hardware address (switches and Wi-Fi ignore frames that claim to come from another machine). It then removes the firewall table and restores the settings. If devices couldn't be handed back, forwarding is left on and the notes kept for the next start. The program waits for this to finish before it exits, both on Ctrl-C and on `docker stop`.
+When the last device is released, the kernel settings are put back. On shutdown, `_teardown()` tells every device the router's real hardware address five times, from the Pi's own hardware address (switches and Wi-Fi ignore frames that claim to come from another machine). It then removes the firewall table and restores the settings. If devices couldn't be handed back, forwarding is left on and the notes kept for the next start. The program waits for this to finish before it exits, both on Ctrl-C and on `docker stop`, whether the request arrives while it is serving or while it is still starting up (see [Starting and stopping](#starting-and-stopping)).
 
 Limits: it steers and cuts IPv4 only. To make up for this, a device it is on gets no IPv6 addresses from QuietNet's DNS (step 7 of "What happens to one lookup"), so its new connections use IPv4; but a connection it already had over IPv6 is not cut, and may carry on for a short while until the app connects again (the device page says so when the network has IPv6, from `in_use` in the `ipv6` part of `/api/status`; known issue 5). When another firewall on the Pi stops all steering (`_forward_blocker()`), `status()["firewall"]` (`firewall_fix()`) gives the firewalls in the way and the commands that fix it, and the dashboard's home page shows them with the note that a command run by hand lasts until the next restart and, for Docker's firewall, that re-running the install command makes it permanent; it blocks by address, so an address a blocked service shares with a site the device is allowed is left to the DNS block (above), and one it shares with a site the device has not been given in the last six hours is dropped until that site is looked up; and it relies on the device using QuietNet for DNS, since that is how QuietNet learns which addresses belong to which name.
 
@@ -401,6 +401,27 @@ The dashboard's history questions (today's totals in `/api/status`, the device l
 
 `users` (email, password record, session number `session_gen`), `pis` (id, owner, name, token hash, pairing code and when it was issued, last seen, `install_id`, `agent`), `licences` (one per account: public id, state, plan, seats, end date, payment grace date, set-to-cancel flag, reason; columns for a licence key and Stripe ids are there but unused until later), `licence_log` (licence id, account, time, what happened: grants, changes, rescues, refusals), `throttle` (each limit's name and its recent times, as a JSON list), `meta` (the signing secret). `pis` has indexes on the token, the pairing code and the owner. The new columns and tables, the indexes, and the hashing of any plain-text tokens are all added at start-up to an existing database too. No addresses or household activity are stored for licences.
 
+## Starting and stopping
+
+`main()` in `server.py` reads the command line and hands over to `run()`, which is the whole life of the program:
+
+1. **Listen for a request to stop** (`StopRequest.listen()`), before anything is started. A request to stop is the signal that `docker stop` and a system shutdown send (SIGTERM), or Ctrl-C (SIGINT).
+2. **Start up** (`start_up()`), in this order: the database, the lists, the DNS filter and the listeners, the enforcer, the cloud link, and last the dashboard's port.
+3. **Serve the dashboard** (`StopRequest.serve()`) until a stop is asked for.
+4. **Clean up** (`clean_up()`): stop the enforcer, which waits until every device has been handed back to the router and the firewall rules and kernel settings are restored (see [The enforcer](#the-enforcer)); stop the cloud link; print "QuietNet stopped.". The exit code is 0.
+
+The clean-up runs however steps 2 and 3 end: a request to stop while serving, one during start-up, or an error (the dashboard's port being in use, say; the error is then shown after "QuietNet stopped." and the exit code is 1). It matters because the enforcer steers devices' traffic through this computer: a program that ended without it would leave them pointing at something that is gone until the next start.
+
+**How a request to stop is handled.** Python runs the handler for a signal in the main thread, in between two steps of whatever that thread was doing. So the handler (`StopRequest.note()`) must not raise an exception, which would come up at whatever line the main thread had reached (inside Python's web server it can be swallowed, and the request lost: known issue 12, fixed), and must not take a lock, which the main thread may be holding at that very moment. It does two things only: it sets a flag (`asked`) and writes one byte into a pipe. A helper thread, started when serving begins, waits for that byte and then ends the serving loop with the web server's own `shutdown()`, which has to be called from another thread than the one serving. The loop notices within half a second, and at once if it is busy with a connection.
+
+**A request during start-up** is remembered. `start_up()` looks at the flag before it starts the enforcer and again before it starts the cloud link (whose first pairing try can take 20 seconds), and starts nothing more once a stop has been asked for; a request that arrives after those two looks ends the serving as soon as it begins, because the byte is still in the pipe. Either way the clean-up then stops whatever was started. Each line of `clean_up()` is safe whether its thing was started, only made, or never reached.
+
+**During the clean-up** both signals are ignored outright (`StopRequest.ignore()`), so that asking twice cannot cut short the handing back of the network. Ignoring, not merely noting, also protects the commands the enforcer runs at that point: a Ctrl-C in a terminal goes to every program started from it, and a program started while a signal is ignored ignores it too. If Ctrl-C's signal was already being ignored when QuietNet started (a shell does that to a program it puts in the background), it stays ignored throughout.
+
+**What this cannot cover** is a request that arrives before `run()` has begun, while Python is still loading the program (about a tenth of a second on a Mac, perhaps a second or two on a Pi). Nothing has been started then, so nothing needs cleaning up; but see known issue 12 for what Docker does with such a request.
+
+**To add something that must be stopped:** start it in `start_up()` and give it one line in `clean_up()`.
+
 ## Background work
 
 `server.py` starts these threads:
@@ -408,6 +429,7 @@ The dashboard's history questions (today's totals in `/api/status`, the device l
 | Thread | Does |
 | --- | --- |
 | Web server | One thread per dashboard request |
+| Stop helper | Waits for a request to stop, then ends the web server's loop (`StopRequest`; see [Starting and stopping](#starting-and-stopping)) |
 | UDP listener | Receives lookups and hands each to a pool of 64 workers |
 | TCP server | One thread per TCP lookup |
 | Log writer | Saves recorded lookups once a second; prunes old history every 10 minutes |
