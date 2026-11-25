@@ -884,16 +884,17 @@ function viewHome(){
       ${avatar(d)}
       <span class="tile-main"><span class="name">${esc(deviceName(d))}</span>
         <span class="meta addr">${esc(d.ip)}${d.hint && d.name ? ' · ' + esc(d.hint) : ''}${d.mac ? ' · ' + esc(d.mac) : ''}</span>
-        ${suggestionLines(d, true)}</span>
+        ${suggestionLines(d, true)}${sameAsLine(d)}</span>
       <span class="tile-figs">${d.last
         ? `${num(d.n)} requests today · <b>${num(d.nb)} blocked</b> · active ${esc(ago(d.last))}`
         : '<span class="muted">Not using QuietNet yet</span>'}</span>
-      <span class="tile-badges">${d.off ? '<span class="badge danger">Internet off</span>' : ''}${d.enforced ? '<span class="badge accent">Live-enforced</span>' : ''}${d.paused ? '<span class="badge warn">Rules paused</span>' : ''}${d.other_dns ? '<span class="badge warn">Tried another DNS service</span>' : ''}${d.group ? `<span class="badge">${esc(groupName(d.group))}</span>` : ''}</span>
+      <span class="tile-badges">${d.off ? '<span class="badge danger">Internet off</span>' : ''}${d.enforced ? '<span class="badge accent">Live-enforced</span>' : ''}${d.paused ? '<span class="badge warn">Rules paused</span>' : ''}${d.other_dns ? '<span class="badge warn">Tried another DNS service</span>' : ''}${v6Bypass(d) ? '<span class="badge warn">Can bypass over IPv6</span>' : ''}${d.group ? `<span class="badge">${esc(groupName(d.group))}</span>` : ''}</span>
       ${ICON.go}
     </button>`).join('');
   const scanning = st.scan && st.scan.state === 'scanning';
   return `
   ${v6Warning(true)}
+  ${v6NeighbourNotice()}
   ${firewallNotice()}
   ${movedNotices(null)}
   ${deviceEvents()}
@@ -930,6 +931,103 @@ function otherDnsSwitch(st){
       Cloudflare's) to get round QuietNet. Turn this on to stop every device. A phone or computer set to use one of those
       services, rather than "automatic", will then have no internet at home until its setting is changed.</p></div>
     <label class="switch"><input type="checkbox" id="otherDnsSwitch" ${st.other_dns_all ? 'checked' : ''} aria-label="Stop every device using another DNS service"><span></span></label></div>`;
+}
+
+/* ---------- IPv6: saying honestly what QuietNet can't see ---------- */
+// d.v6_bypass comes from the Pi: true while the home network has IPv6, or while something in the
+// home names an IPv6 DNS server that is not QuietNet, for every device but the Pi itself, steered
+// or not ("Cut live connections" covers IPv4 only). Shown only for a device that uses QuietNet;
+// one that doesn't is already marked "Not using QuietNet yet".
+function v6Bypass(d){ return !!(d.v6_bypass && d.last); }
+// The notice says "IPv6 is on in your home" only when the Pi says so (in_use). A router with no
+// IPv6 internet can still name its own IPv6 DNS server; then the notice says that instead.
+function v6BypassNotice(d){
+  if(!v6Bypass(d)) return '';
+  const why = ((S.status || {}).ipv6 || {}).in_use
+    ? `IPv6 is on in your home, and your router gives every device its own IPv6 DNS server. So this device can look
+    names up, and connect, without QuietNet seeing or blocking it.`
+    : `Something in your home, most likely your router, tells every device to use an IPv6 DNS server that is not
+    QuietNet. So this device can look names up without QuietNet seeing or blocking them.`;
+  return `<div class="notice warn"><b>This device can bypass QuietNet over IPv6.</b> ${why}${d.enforced ? ' "Cut live connections" covers IPv4 only, so it does not close this.' : ''}
+    The sure fix is to switch IPv6 off on your router.
+    <button class="btn link" data-act="tab" data-tab="setup">Show me how</button></div>`;
+}
+// d.same_as is a hint from the Pi for a card filed under an IPv6 address it could not match to a
+// device: the number of the device whose hardware address that IPv6 address was built from. It is
+// only ever shown. No rule is applied from it, because any device can make itself such an address.
+function sameAsName(d){
+  const other = S.devices.find(x => x.ip === d.same_as);
+  return (other ? deviceName(other) + ' (' + d.same_as + ')' : d.same_as);
+}
+function sameAsLine(d){
+  return d.same_as ? `<span class="meta sugg">Probably the same device as ${esc(sameAsName(d))}</span>` : '';
+}
+function sameAsNotice(d){
+  if(!d.same_as) return '';
+  return `<div class="notice info">This is probably <b>${esc(sameAsName(d))}</b> asking over IPv6: this IPv6 address looks as
+    if it was built from that device's hardware address. QuietNet could not confirm it, and any device can make itself
+    such an address, so that device's rules are not applied here.
+    <button class="btn link" data-act="open" data-ip="${esc(d.same_as)}">Open it</button></div>`;
+}
+// Shown on the home page when the Pi can't read its list of IPv6 neighbours, which is how it tells
+// which device a lookup over IPv6 came from. Only while it is taking lookups over IPv6.
+function v6NeighbourNotice(){
+  const v6 = (S.status || {}).ipv6 || {};
+  if(v6.neighbours_ok !== false || !v6.taking_lookups) return '';
+  return `<div class="notice warn"><b>QuietNet can't tell which device a lookup over IPv6 came from.</b> It could not read
+    this computer's list of IPv6 neighbours. While any device has rules of its own, is in a group or has "Cut live
+    connections" on, lookups over IPv6 are refused, and devices fall back to their other DNS server. On a Raspberry Pi,
+    running the install command again puts the missing tool back.</div>`;
+}
+// The optional household setting "Give no device IPv6 addresses". st.no_ipv6_all is true or false;
+// off unless the owner turns it on, because it changes what every device is told. Through the relay
+// the Pi may be an older QuietNet without the switch (no st.no_ipv6_all): then it is not offered.
+function noIpv6Switch(st){
+  if(st.no_ipv6_all == null) return '';
+  return `<div class="row"><div class="grow"><h2>Give no device IPv6 addresses</h2>
+    <p class="meta">Off unless you turn it on. QuietNet then answers "none" whenever a device asks it for a name's IPv6
+      addresses, so apps connect over IPv4, where blocks and "Cut live connections" work. It only helps for lookups that
+      reach QuietNet, and a site that works over IPv6 only would stop working. Names of things in your own home are not
+      affected. Turn it off again at any time; devices pick that up within a couple of minutes.</p></div>
+    <label class="switch"><input type="checkbox" id="noIpv6Switch" ${st.no_ipv6_all ? 'checked' : ''} aria-label="Give no device IPv6 addresses"><span></span></label></div>`;
+}
+// What QuietNet knows about IPv6 on the home network, for "Set up a device". v6.hub_off is true only
+// after the Pi has listened for a full hour while able to hear the router, heard no router announce
+// IPv6, holds no public IPv6 address itself, and nothing in the home names an IPv6 DNS server other
+// than QuietNet; a Pi that is not listening, or was restarted, never shows it. The order matters:
+// "off" only on the Pi's word; then "on"; then a DNS server still being named (v6.router_dns_not_ours),
+// which means devices can bypass even with no IPv6 internet; then the "can't tell" cases; and only
+// then "Still checking". v6.can_hear is false when IPv6 is switched off on the Pi's own network
+// card (it then hears nothing, which is not the same as nothing being said) and null when the Pi
+// could not find out. Through the relay the Pi may be an older QuietNet that sends no listening_for
+// (that counts as "can't tell" too) or no can_hear (then the page says what it always did).
+function hubIpv6State(v6){
+  if(v6.hub_off) return `<div class="notice info"><b>IPv6 is off on your hub.</b> QuietNet has listened for over an hour,
+    heard no IPv6 announcement from your router, and has no public IPv6 address itself. Devices can't use IPv6 to get
+    round QuietNet.</div>`;
+  if(v6.in_use) return `<div class="notice warn"><b>IPv6 is on in your home.</b> Your router gives devices IPv6
+    addresses and, on a BT Smart Hub, its own IPv6 DNS server, which can't be changed. Devices that use it bypass
+    QuietNet, whatever DNS you set on them. They are marked "Can bypass over IPv6" on the Devices page.</div>`;
+  if((v6.router_dns_not_ours || []).length) return `<div class="notice warn"><b>Something in your home still names an IPv6
+    DNS server that is not QuietNet</b> (${v6.router_dns_not_ours.map(a => '<b>' + esc(a) + '</b>').join(', ')}). Devices
+    that use it send their lookups past QuietNet, so QuietNet can't say IPv6 is off. They are marked "Can bypass over IPv6"
+    on the Devices page. This is most likely your router: it can go on naming its own DNS server after it stops giving
+    out IPv6 internet addresses. On a BT Smart Hub that can happen while <b>ULA Enabled</b> is on, so if you have set
+    Allocation Mode to Off, turn ULA Enabled off as well. The notice goes within an hour of the server no longer being named.</div>`;
+  if(!v6.listening || v6.listening_for == null) return `<p class="meta">QuietNet can't tell from here whether IPv6 is on.
+    It can only listen for the router's IPv6 announcements when it runs on a Raspberry Pi.</p>`;
+  if(v6.can_hear === false) return `<div class="notice warn"><b>QuietNet can't tell whether IPv6 is on in your home.</b>
+    IPv6 is switched off on this computer's own network connection, so it can't hear your router's IPv6 announcements.
+    That is not the same as your router being silent: devices may still be using IPv6 to get round QuietNet, and
+    QuietNet can't mark them "Can bypass over IPv6" while it can't hear. To let it check, switch IPv6 back on for the
+    Raspberry Pi itself; it then needs a full hour of listening. Or look at the IPv6 page in your router's own settings.</div>`;
+  if(v6.can_hear === null) return `<p class="meta"><b>QuietNet can't tell yet whether IPv6 is on.</b> It has not been able to
+    check that this computer's own network connection can hear your router's IPv6 announcements. That check is made
+    every minute or so; the hour of listening starts once it passes.</p>`;
+  const left = Math.ceil((3600 - (v6.listening_for || 0)) / 60);
+  return `<p class="meta"><b>Still checking.</b> QuietNet has not heard your router announce IPv6. It only says "IPv6 is
+    off on your hub" after listening for a full hour without a break${left > 0 ? ': about ' + num(left) + ' min to go' : ''}.
+    Restarting QuietNet starts the hour again.</p>`;
 }
 
 /* ---------- Another firewall in the way ---------- */
@@ -1012,8 +1110,9 @@ function enforceCard(d){
     <p class="meta">Normally a block only stops new connections. Turn this on and blocks, bedtimes and the kill switch
       also stop things that are <b>already running</b> on this device (like a Disney+ video mid-stream). QuietNet steers this
       device through itself and drops only what's blocked for it. Takes a few seconds to bite.</p>
-    ${((S.status || {}).ipv6 || {}).in_use ? `<p class="small muted">This device's IPv6 connections can't be cut directly; QuietNet stops giving it
-      IPv6 addresses so it uses IPv4 instead. Connections it already had over IPv6 may carry on for a short while.</p>` : ''}
+    ${((S.status || {}).ipv6 || {}).in_use ? `<p class="small muted">This covers IPv4 only, and IPv6 is on in your home. QuietNet gives this
+      device no IPv6 addresses in its own answers, so most apps connect over IPv4. But lookups the device sends to the router's
+      own IPv6 DNS server, and anything it reaches over IPv6, are not seen or cut.</p>` : ''}
     ${d.enforced && (e.problem || (e.problems || {})[d.ip]) ? `<p class="small err-text"><b>Not working yet:</b> ${esc(e.problem || e.problems[d.ip])}</p>` : ''}
     ${sharedNote(d, e)}</div>
     <label class="switch"><input type="checkbox" id="enforceSwitch" ${d.enforced ? 'checked' : ''} aria-label="Cut live connections for this device"><span></span></label></div></div>`;
@@ -1113,6 +1212,8 @@ function viewDevice(){
   ${deviceWarning(d)}
   ${movedNotices(d.ip)}
   ${otherDnsNotice(d)}
+  ${sameAsNotice(d)}
+  ${v6BypassNotice(d)}
   ${controls('device:' + S.device, 'this device')}
   ${enforceCard(d)}
   <h2 class="list-head">What it has been talking to</h2>
@@ -1351,9 +1452,28 @@ function viewSetup(){
     : `<p class="meta"><b>IPv6:</b> QuietNet has no IPv6 address to give devices. If your router hands out IPv6 (a BT Smart Hub
       does as it comes), switch IPv6 off on it (on a BT Smart Hub: <b>Advanced settings</b> → <b>IPv6</b>), or accept that
       some lookups will skip QuietNet.</p>`;
+  const hubCard = `<div class="card"><h2>IPv6 on your router</h2>
+    ${hubIpv6State(v6)}
+    ${v6.hub_off ? '<p class="meta">Nothing more to do here. The steps are kept below in case you want to undo it.</p>'
+      : `<p>A BT Smart Hub hands out IPv6 as it comes, and tells every device to use the hub itself for IPv6 DNS. That can't be
+      changed on the hub, so the DNS number below is not enough on its own. Do one of these on the hub, once:</p>`}
+    ${step('Best: switch IPv6 off on the hub', ['On a phone or computer at home, open the <b>Hub Manager</b>: type <b>192.168.1.254</b> into a browser (the hub\'s usual number).',
+      'Choose <b>Advanced Settings</b> → <b>IPv6</b> → <b>Configuration</b>. It asks for the hub\'s admin password, which is on the hub\'s label or settings card.',
+      'Set <b>Allocation Mode</b> to <b>Off</b> and save. Not every Smart Hub offers this. If yours doesn\'t, switch ULA on instead (next section).',
+      '<b>Afterwards:</b> turn Wi-Fi off and on again on each device, or restart it. Until then a device keeps the hub\'s old IPv6 DNS server, and looking things up can be slow.',
+      'Check anything that may want IPv6: games consoles (party chat) and work laptops (a work VPN). Smart-home gear that uses Thread or Matter makes its own IPv6 and should carry on working.',
+      'Come back to this page in about an hour. It says <b>IPv6 is off on your hub</b> once QuietNet has listened for a full hour and heard no IPv6 announcement. It can take longer while this computer still holds its old IPv6 address; restarting the Pi clears that. If it still never says so, the hub is still handing out IPv6.',
+      'To undo it, set <b>Allocation Mode</b> back to what it was.'])}
+    ${step('If there is no Off: switch ULA on', ['In the same place (<b>Advanced Settings</b> → <b>IPv6</b> → <b>Configuration</b>), turn on <b>ULA Enabled</b> and save.',
+      '<b>Afterwards:</b> within a few minutes the IPv6 number below changes to one starting <b>fd</b>. It stays the same when BT changes your home\'s IPv6 range, so you only set it on each device once.',
+      'Set that number as the IPv6 DNS server on each device, using the steps below.',
+      'This narrows the gap but does not close it: the hub still gives devices its own IPv6 DNS server, and devices marked "Can bypass over IPv6" still can. The switch below helps a little more.',
+      'To undo it, turn <b>ULA Enabled</b> off again.'])}
+    ${noIpv6Switch(S.status || {})}</div>`;
   return `
   ${v6Warning(false)}
   ${cloudCard()}
+  ${hubCard}
   <div class="card"><h2>How to point a device at QuietNet</h2>
     <p>Every device has a setting called <b>DNS</b>. Change it to this number and QuietNet can see and filter that device:</p>
     <div class="bigcode">${ip}</div>
@@ -1379,7 +1499,7 @@ function viewSetup(){
     <p><b>Something stopped working?</b> Press <i>Pause advert blocking for 10 minutes</i>, next to the kill switch. If that fixes it, look at the device's list for something recently blocked and unblock it.</p>
     <p><b>What QuietNet can and can't see.</b> It sees <i>which addresses</i> a device contacts (like <i>ads.example.com</i>), not the pages, messages or passwords — those stay private. It can't remove adverts that come from the same address as the real content (YouTube adverts are the well-known example).</p>
     <p><b>Blocks, schedules and the kill switch take a couple of minutes to bite.</b> They stop a device finding addresses, so something already playing — a video, a game in progress — can carry on for a short while. If an app still works long after, look in the device's list for what it's using and block that too.</p>
-    <p><b>Devices are recognised by their number</b> (like 192.168.1.23). If your router gives a device a new number, its name, group and blocks won't follow it — "reserving" the number in your router avoids that.</p>
+    <p><b>Devices are recognised by their hardware address</b>, the label of their network card, where QuietNet can see it. If your router gives a device a new number (like 192.168.1.23), its name, group and blocks follow it within a minute or so. They can't follow a device that connects through a Wi-Fi range extender, or a phone that changes its private Wi-Fi address; QuietNet asks you about those on the Devices page. "Reserving" each device's number in your router still helps.</p>
     <p><b>The number above can change</b> if your router hands this computer a new one. If devices suddenly stop working, come back here and check it. Your router can usually "reserve" the number so it stays put.</p>
     <p class="meta">Everyone in the house should know this is running — it records which services each device talks to. History is kept for 30 days on this computer only.</p>
   </div>
@@ -1598,6 +1718,7 @@ document.addEventListener('change', async e => {
   if(e.target.name === 'qnTheme'){ setTheme(e.target.value); return; }   // a look only: nothing is sent anywhere
   if(e.target.id === 'junkSwitch'){ await api('/api/junk-switch', {on:e.target.checked}).catch(oops); refresh(); }
   if(e.target.id === 'otherDnsSwitch'){ await api('/api/other-dns-switch', {on:e.target.checked}).catch(oops); refresh(); }
+  if(e.target.id === 'noIpv6Switch'){ await api('/api/no-ipv6-switch', {on:e.target.checked}).catch(oops); refresh(); }
   if(e.target.id === 'enforceSwitch'){ await api('/api/enforce', {ip:S.device, on:e.target.checked}).catch(oops); refresh(true); }
   if(e.target.id === 'netSwitch'){ await api('/api/internet', {scope:e.target.dataset.scope, off:!e.target.checked}).catch(oops); refresh(true); }
   if(e.target.id === 'newGroupSel'){ await api('/api/new-device-group', {group:e.target.value ? +e.target.value : null}).catch(oops); e.target.blur(); refresh(true); }

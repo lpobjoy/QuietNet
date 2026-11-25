@@ -514,9 +514,12 @@ class DashboardContract(unittest.TestCase):
         cls.page = read("static", "index.html")
 
     def test_every_api_address_the_dashboard_calls_exists_on_the_server(self):
-        called = set(re.findall(r"""['"`](/api/[a-z-]+)""", self.page))
+        # Digits are allowed in a call's name (/api/no-ipv6-switch); without them here the name
+        # would be cut short at the digit and the check would compare the wrong thing.
+        called = set(re.findall(r"""['"`](/api/[a-z0-9-]+)""", self.page))
         self.assertGreater(len(called), 15)
-        handled = set(re.findall(r"""["'](/api/[a-z-]+)["']""", read("server.py")))
+        self.assertIn("/api/no-ipv6-switch", called)
+        handled = set(re.findall(r"""["'](/api/[a-z0-9-]+)["']""", read("server.py")))
         self.assertEqual(called - handled, set())
 
     def test_the_dashboard_marks_its_requests_for_the_relay(self):
@@ -594,15 +597,23 @@ class DashboardContract(unittest.TestCase):
     def test_the_enforcer_card_explains_ipv6_only_when_the_network_has_it(self):
         card = self.page[self.page.index("function enforceCard"):]
         card = card[:card.index("\nfunction ")]
-        self.assertIn("((S.status || {}).ipv6 || {}).in_use ? `<p class=\"small muted\">This device's IPv6 connections "
-                      "can't be cut directly; QuietNet stops giving it", card)
-        self.assertIn("IPv6 addresses so it uses IPv4 instead. Connections it already had over IPv6 may carry on "
-                      "for a short while.</p>` : ''", card)
+        self.assertIn("((S.status || {}).ipv6 || {}).in_use ? `<p class=\"small muted\">This covers IPv4 only, "
+                      "and IPv6 is on in your home.", card)
+        self.assertIn("are not seen or cut.</p>` : ''", card)
 
-    def test_the_enforcer_card_no_longer_says_it_works_on_ipv4_only(self):
+    def test_the_enforcer_card_says_plainly_what_still_gets_out_over_ipv6(self):
         card = self.page[self.page.index("function enforceCard"):]
         card = card[:card.index("\nfunction ")]
-        self.assertNotIn("It works on IPv4 only", card)
+        self.assertIn("But lookups the device sends to the router's\n      own IPv6 DNS server, and anything it reaches "
+                      "over IPv6, are not seen or cut.", card)
+        self.assertNotIn("so it uses IPv4 instead", card)             # the old wording promised too much
+
+    def test_the_enforcer_card_says_ipv4_only_just_once_and_only_when_the_network_has_ipv6(self):
+        card = self.page[self.page.index("function enforceCard"):]
+        card = card[:card.index("\nfunction ")]
+        self.assertEqual(card.count("IPv4 only"), 1)
+        self.assertIn(".in_use ? `<p class=\"small muted\">This covers IPv4 only", card)
+        self.assertNotIn("It works on IPv4 only", card)      # the old sentence, shown to every home
 
 
 class DashboardFirewallNotice(unittest.TestCase):
@@ -683,6 +694,175 @@ class DashboardIPv6Setup(unittest.TestCase):
     def test_the_router_dns_warning_is_on_the_home_page_and_the_setup_page(self):
         self.assertIn("${v6Warning(true)}", self.home)
         self.assertIn("${v6Warning(false)}", self.setup)
+
+
+class DashboardIPv6Honesty(unittest.TestCase):
+    """What the dashboard says about IPv6: the router steps, the "IPv6 is off on your hub"
+    confirmation, the optional switch, and which devices can bypass QuietNet. These checks read
+    the page's script; nothing is run in a browser."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.page = read("static", "index.html")
+        cls.setup = cls.page[cls.page.index("function viewSetup(){"):cls.page.index("/* ---------- drawing & refreshing")]
+        cls.home = cls.page[cls.page.index("function viewHome(){"):cls.page.index("// The household setting \"Stop every device")]
+        cls.device = cls.page[cls.page.index("function viewDevice(){"):]
+
+    def part(self, name):
+        """The script of one function on the page."""
+        start = self.page.index("function %s(" % name)
+        return self.page[start:self.page.index("\nfunction ", start + 1)]
+
+    def test_the_setup_page_says_how_to_switch_allocation_mode_off(self):
+        self.assertIn("step('Best: switch IPv6 off on the hub'", self.setup)
+        self.assertIn("<b>Advanced Settings</b> → <b>IPv6</b> → <b>Configuration</b>", self.setup)
+        self.assertIn("Set <b>Allocation Mode</b> to <b>Off</b> and save.", self.setup)
+
+    def test_the_setup_page_says_to_switch_ula_on_when_there_is_no_off(self):
+        self.assertIn("step('If there is no Off: switch ULA on'", self.setup)
+        self.assertIn("turn on <b>ULA Enabled</b> and save", self.setup)
+
+    def test_the_setup_page_says_what_to_do_after_switching_ipv6_off(self):
+        for must in ("<b>Afterwards:</b> turn Wi-Fi off and on again on each device, or restart it.",
+                     "games consoles (party chat) and work laptops (a work VPN)",
+                     "Come back to this page in about an hour. It says <b>IPv6 is off on your hub</b>"):
+            self.assertIn(must, self.setup)
+
+    def test_the_setup_page_says_what_to_do_after_switching_ula_on(self):
+        self.assertIn("<b>Afterwards:</b> within a few minutes the IPv6 number below changes to one starting <b>fd</b>", self.setup)
+        self.assertIn("Set that number as the IPv6 DNS server on each device", self.setup)
+
+    def test_the_setup_page_is_honest_that_ula_does_not_close_the_gap(self):
+        self.assertIn("This narrows the gap but does not close it", self.setup)
+
+    def test_both_router_changes_say_how_to_undo_them(self):
+        self.assertIn("To undo it, set <b>Allocation Mode</b> back to what it was.", self.setup)
+        self.assertIn("To undo it, turn <b>ULA Enabled</b> off again.", self.setup)
+
+    def test_the_ipv6_off_confirmation_shows_only_when_the_pi_says_so(self):
+        state = self.part("hubIpv6State")
+        self.assertIn("if(v6.hub_off) return `<div class=\"notice info\"><b>IPv6 is off on your hub.</b>", state)
+        self.assertEqual(self.page.count("<b>IPv6 is off on your hub.</b>"), 1)
+        self.assertIn("${hubIpv6State(v6)}", self.setup)
+
+    def test_while_ipv6_is_on_the_setup_page_says_devices_can_bypass(self):
+        self.assertIn("if(v6.in_use) return `<div class=\"notice warn\"><b>IPv6 is on in your home.</b>", self.part("hubIpv6State"))
+
+    def test_a_pi_that_is_not_listening_says_it_cannot_tell_rather_than_all_clear(self):
+        state = self.part("hubIpv6State")
+        self.assertIn("if(!v6.listening || v6.listening_for == null) return `<p class=\"meta\">QuietNet can't tell from here "
+                      "whether IPv6 is on.", state)
+        self.assertLess(state.index("if(!v6.listening"), state.index("Still checking"))
+
+    def test_the_setup_page_says_when_something_still_names_an_ipv6_dns_server_that_is_not_quietnet(self):
+        state = self.part("hubIpv6State")
+        self.assertIn("if((v6.router_dns_not_ours || []).length) return `<div class=\"notice warn\"><b>Something in your "
+                      "home still names an IPv6\n    DNS server that is not QuietNet</b>", state)
+        self.assertIn("so QuietNet can't say IPv6 is off", state)
+        self.assertIn("They are marked \"Can bypass over IPv6\"\n    on the Devices page.", state)
+
+    def test_the_named_ipv6_dns_servers_are_escaped_on_the_setup_page(self):
+        self.assertIn("${v6.router_dns_not_ours.map(a => '<b>' + esc(a) + '</b>').join(', ')}", self.part("hubIpv6State"))
+
+    def test_a_named_ipv6_dns_server_is_reported_after_off_and_on_and_before_still_checking(self):
+        state = self.part("hubIpv6State")
+        order = [state.index(mark) for mark in ("if(v6.hub_off)", "if(v6.in_use)", "if((v6.router_dns_not_ours || []).length)",
+                                                "if(!v6.listening", "Still checking")]
+        self.assertEqual(order, sorted(order))
+
+    def test_a_pi_with_its_own_ipv6_switched_off_says_it_cannot_tell_rather_than_still_checking(self):
+        state = self.part("hubIpv6State")
+        self.assertIn("if(v6.can_hear === false) return `<div class=\"notice warn\"><b>QuietNet can't tell whether IPv6 is on "
+                      "in your home.</b>\n    IPv6 is switched off on this computer's own network connection, so it can't hear "
+                      "your router's IPv6 announcements.", state)
+        self.assertIn("switch IPv6 back on for the\n    Raspberry Pi itself", state)
+        self.assertLess(state.index("if(v6.can_hear === false)"), state.index("Still checking"))
+
+    def test_a_pi_that_could_not_find_out_whether_it_can_hear_says_it_cannot_tell_yet(self):
+        state = self.part("hubIpv6State")
+        self.assertIn("if(v6.can_hear === null) return `<p class=\"meta\"><b>QuietNet can't tell yet whether IPv6 is on.</b>", state)
+        self.assertLess(state.index("if(v6.can_hear === null)"), state.index("Still checking"))
+
+    def test_an_older_pi_that_does_not_say_whether_it_can_hear_is_shown_what_it_always_was(self):
+        state = self.part("hubIpv6State")
+        self.assertNotIn("can_hear == ", state)                # a missing answer must not be read as "no" or "not known"
+        self.assertNotIn("!v6.can_hear", state)
+
+    def test_an_older_pi_reached_through_the_relay_is_not_offered_a_switch_it_does_not_have(self):
+        self.assertIn("if(st.no_ipv6_all == null) return '';", self.part("noIpv6Switch"))
+
+    def test_while_checking_the_page_says_how_long_is_left_and_escapes_the_number(self):
+        state = self.part("hubIpv6State")
+        self.assertIn("Math.ceil((3600 - (v6.listening_for || 0)) / 60)", state)
+        self.assertIn("num(left)", state)
+        self.assertIn("Restarting QuietNet starts the hour again.", state)
+
+    def test_the_no_ipv6_switch_is_on_the_setup_page_and_follows_the_status(self):
+        self.assertIn("${noIpv6Switch(S.status || {})}", self.setup)
+        self.assertIn("st.no_ipv6_all ? 'checked' : ''", self.part("noIpv6Switch"))
+        self.assertIn("api('/api/no-ipv6-switch', {on:e.target.checked})", self.page)
+
+    def test_the_no_ipv6_switch_says_it_is_off_by_default_and_what_it_can_break(self):
+        switch = self.part("noIpv6Switch")
+        for must in ("Off unless you turn it on.", "a site that works over IPv6 only would stop working",
+                     "Names of things in your own home are not\n      affected.", "Turn it off again at any time"):
+            self.assertIn(must, switch)
+
+    def test_the_bypass_badge_shows_only_for_a_device_the_pi_marks_and_that_uses_quietnet(self):
+        self.assertIn("function v6Bypass(d){ return !!(d.v6_bypass && d.last); }", self.page)
+        self.assertIn("${v6Bypass(d) ? '<span class=\"badge warn\">Can bypass over IPv6</span>' : ''}", self.home)
+
+    def test_the_device_page_says_the_device_can_bypass_quietnet_over_ipv6(self):
+        notice = self.part("v6BypassNotice")
+        self.assertIn("if(!v6Bypass(d)) return '';", notice)
+        self.assertIn("<b>This device can bypass QuietNet over IPv6.</b>", notice)
+        self.assertIn("The sure fix is to switch IPv6 off on your router.", notice)
+        self.assertIn("${v6BypassNotice(d)}", self.device)
+
+    def test_the_device_page_says_ipv6_is_on_in_your_home_only_when_the_pi_says_so(self):
+        notice = self.part("v6BypassNotice")
+        self.assertIn("((S.status || {}).ipv6 || {}).in_use\n    ? `IPv6 is on in your home, and your router gives every "
+                      "device its own IPv6 DNS server.", notice)
+        self.assertIn(": `Something in your home, most likely your router, tells every device to use an IPv6 DNS server "
+                      "that is not\n    QuietNet.", notice)
+        self.assertEqual(notice.count("IPv6 is on in your home"), 1)
+
+    def test_the_device_page_says_cut_live_connections_does_not_close_the_ipv6_gap(self):
+        self.assertIn("${d.enforced ? ' \"Cut live connections\" covers IPv4 only, so it does not close this.' : ''}",
+                      self.part("v6BypassNotice"))
+
+    def test_the_same_device_hint_is_escaped_and_says_no_rules_are_applied(self):
+        self.assertIn("Probably the same device as ${esc(sameAsName(d))}", self.part("sameAsLine"))
+        notice = self.part("sameAsNotice")
+        self.assertIn("<b>${esc(sameAsName(d))}</b>", notice)
+        self.assertIn('data-ip="${esc(d.same_as)}"', notice)
+        self.assertIn("so that device's rules are not applied here", notice)
+        self.assertIn("${sameAsNotice(d)}", self.device)
+
+    def test_the_home_page_says_when_ipv6_lookups_cannot_be_matched_to_devices(self):
+        notice = self.part("v6NeighbourNotice")
+        self.assertIn("if(v6.neighbours_ok !== false || !v6.taking_lookups) return '';", notice)
+        self.assertIn("<b>QuietNet can't tell which device a lookup over IPv6 came from.</b>", notice)
+        self.assertIn("${v6NeighbourNotice()}", self.home)
+
+    def test_the_router_card_is_put_on_the_setup_page(self):
+        shown = self.setup[self.setup.index("const hubCard = `"):]
+        self.assertEqual(shown.count("${hubCard}"), 1)
+        self.assertIn("${hubCard}", shown[shown.index("  return `"):])
+
+    def test_the_home_page_shows_the_same_device_hint_on_a_device(self):
+        self.assertIn("${sameAsLine(d)}", self.home)
+
+    def test_the_page_no_longer_says_rules_do_not_follow_a_device_to_a_new_number(self):
+        self.assertNotIn("won't follow it", self.page)
+        self.assertNotIn("Devices are recognised by their number", self.page)
+        self.assertIn("<b>Devices are recognised by their hardware address</b>", self.setup)
+        self.assertIn("its name, group and blocks follow it within a minute or so", self.setup)
+
+    def test_the_page_says_hardware_address_not_mac_to_people(self):
+        shown = re.sub(r"\$\{[^}]*\}", "", self.setup + self.part("v6BypassNotice") + self.part("sameAsNotice")
+                       + self.part("hubIpv6State") + self.part("noIpv6Switch") + self.part("v6NeighbourNotice"))
+        self.assertNotRegex(shown, r"\bMAC\b")
 
 
 class DashboardSharedAddresses(unittest.TestCase):

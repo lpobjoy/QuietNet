@@ -31,7 +31,7 @@ A home network filter. Devices point their DNS at it; it records what they look 
 python3 -m unittest discover tests
 ```
 
-It takes about a minute and needs nothing installed. It must end in `OK`. Run it as an ordinary user if you can: as an admin user on Linux, the shutdown tests that start the real program are skipped.
+It takes between one minute and a minute and a half, and needs nothing installed. It must end in `OK`. Run it as an ordinary user if you can: as an admin user on Linux, the shutdown tests that start the real program are skipped.
 
 ## Rules
 
@@ -64,6 +64,9 @@ Each of these is the only thing standing between a hostile web page, or a strang
 - **The order of checks in `decision()` is behaviour people rely on.** It is tabulated in `docs/ARCHITECTURE.md`; change the two together.
 - **The dashboard page is edited by the relay with a plain text replace** on the opening `head` and `body` tags. Keep exactly one of each, lower case, no attributes.
 - **The three looks (themes) must each stay complete.** The dashboard's style sheet and the relay's `RELAY_CSS` set every colour and size name for each look under `[data-theme="..."]`, with Calm as the root default (the font stacks `--font-body` and `--font-mono` are shared from the root on purpose). A new colour or size name goes into all three looks (and Calm's and Household's dark sets), the markup stays free of fixed colours and inline styles, and nothing is loaded from other websites: no font files, `@import` or outside addresses. Theme names are checked against `calm`, `household` and `control` wherever the `qn_theme` cookie is read.
+- **"IPv6 is off on your hub" is shown only on evidence** (`ipv6_dns_view()`, `hub_off`): a full hour of listening with no router heard, this computer's own IPv6 working on its home network card for that whole hour (`ipv6_on_card()`: with it switched off the listener runs but hears nothing), no public IPv6 address, no IPv6 DNS server but this computer being named by anyone (a router with no IPv6 internet can still name its own), and a recent look. A listener that never started, a restart, or anything unknown must never read as "off". Keep the steady timer (`time.monotonic()`); a Pi's clock jumps.
+- **An IPv6 address built from a hardware address is a hint, never proof** (`eui64_mac()`). Any device can make one. Only the neighbour table decides which device an address belongs to, and so whose rules apply.
+- **A lookup must never run tools or wait long.** A lookup from an unknown IPv6 address only sets a flag for the IPv6 watcher and waits a fraction of a second at most (`matched_ipv6_device()`), outside `decision()`.
 - **History queries must use an index.** `queries` can hold a month of a household's lookups. A test checks the query plans.
 - **`cloud/relay.py` is deployed without the other programs.** It cannot import them.
 - **Licence code stays on the relay and never answers 401.** It must never reach the Pi's blocking (`decision()`, the enforcer, the internet switches). A licence refusal is `402` or `403`, never `401`, which today's Pis take to mean "unpaired" and delete their token. Every licence decision reads `licence_state()`. Every refusal goes through `licence_gate()` (`pi_request`, `POST /pis/new`, `agent_pair`); the home page only reads `gate_on()` and `licence_state()` to decide what to show. The two rescue calls must keep working in every licence state.
