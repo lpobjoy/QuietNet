@@ -144,8 +144,17 @@ class RelayCase(unittest.TestCase):
             pi = Browser(self.port)
             _, text, _ = pi.get("/agent/poll", headers={"X-QuietNet-Token": token})
             seen.update(json.loads(text))
-            pi.post("/agent/respond", data={"id": seen.get("id"), "status": status, "body": body},
-                    headers={"X-QuietNet-Token": token, "X-QuietNet-Call": str(seen.get("id"))})
+            try:
+                pi.post("/agent/respond", data={"id": seen.get("id"), "status": status, "body": body},
+                        headers={"X-QuietNet-Token": token, "X-QuietNet-Call": str(seen.get("id"))})
+            except (OSError, http.client.HTTPException):
+                # The relay closes the connection, unread, on an answer it turns away (a large
+                # one it has no room for). If this pretend Pi is still sending, the send ends
+                # in "connection reset" or "broken pipe", or the relay's short refusal comes
+                # back cut off. The tests judge by what the browser was told, so that is not a
+                # failure here, and it must not print a traceback from this thread into the
+                # log of a run that passed.
+                pass
 
         t = threading.Thread(target=work, daemon=True)
         t.start()
