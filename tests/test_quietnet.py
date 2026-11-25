@@ -6,6 +6,7 @@ touches your real history or rules, and never sends anything to the network.
 import calendar
 import os
 import socket
+import sqlite3
 import struct
 import sys
 import tempfile
@@ -30,6 +31,38 @@ def at(day, hhmm):
     return base + day * 86400 + int(hhmm[:2]) * 3600 + int(hhmm[3:]) * 60
 
 
+def in_force_now(**more):
+    """What to give a schedule so that it is in force at this moment, at any time on any day.
+
+    Returns the "days", "start" and "end" of a window that opened at the start of the present hour
+    (by this computer's clock) and closes two hours after that, on every day of the week, with
+    anything in `more` added. Use it wherever a test needs a schedule that is on right now:
+
+        self.schedule(**in_force_now())
+        self.schedule(**in_force_now(scope="all", off=False, services=["tiktok"]))
+
+    Never write a fixed window such as "00:00" to "23:59" for this. A schedule's end is not inside
+    it, so that one is off for the last minute of every day, and a test relying on it fails when
+    it happens to run then. This window stays open for at least an hour after it is made: a
+    window that runs past midnight belongs to the evening it started, and every day is chosen, so
+    it holds late in the evening and across the turn of the day and of the week too."""
+    hour = time.localtime().tm_hour
+    window = {"days": [0, 1, 2, 3, 4, 5, 6], "start": "%02d:00" % hour, "end": "%02d:00" % ((hour + 2) % 24)}
+    window.update(more)
+    return window
+
+
+def not_in_force_now(**more):
+    """The opposite of in_force_now(): a window, on every day, that is closed at this moment.
+
+    It opens two hours after the start of the present hour and closes an hour after that, so it
+    stays closed for at least an hour after it is made, whatever the time of day."""
+    hour = time.localtime().tm_hour
+    window = {"days": [0, 1, 2, 3, 4, 5, 6], "start": "%02d:00" % ((hour + 2) % 24), "end": "%02d:00" % ((hour + 3) % 24)}
+    window.update(more)
+    return window
+
+
 def query(name, qtype=1):
     labels = b"".join(bytes([len(p)]) + p.encode() for p in name.split("."))
     return struct.pack(">HHHHHH", 0x4242, 0x0100, 1, 0, 0, 0) + labels + b"\0" + struct.pack(">HH", qtype, 1)
@@ -44,6 +77,33 @@ def fake_answer(data, ttl=86400):
 def is_blocked(name, client):
     resp = server.answer_query(query(name), client, fake_answer)
     return resp[-4:] == bytes(4)
+
+
+_open_the_database = server.init_db
+
+
+def init_db_closing_the_old_connection():
+    """server.init_db(), followed by closing the database connection it replaced.
+
+    QuietNet opens its database once, at start-up. The tests open it again and again: Base.setUp
+    does before every test, and so does every test that mimics a restart. Each time, the
+    connection in use until then was simply dropped. From Python 3.13 on, a connection dropped
+    without being closed draws a "ResourceWarning: unclosed database" line when Python tidies it
+    away, and a run printed hundreds of them, each quoting whatever line of code happened to be
+    running at that moment (which is how lines such as "raise AttributeError(name)", from
+    unittest/mock.py, came to appear in the output of a run that passed).
+
+    The old connection is closed while holding db_lock, so no other thread is part-way through
+    using it. Only a real connection is closed: a test may have put a stand-in in its place."""
+    old = server.db
+    _open_the_database()
+    if isinstance(old, sqlite3.Connection) and old is not server.db:
+        with server.db_lock:
+            old.close()
+
+
+# Every test file calls server.init_db() by that name, so replacing it here covers them all.
+server.init_db = init_db_closing_the_old_connection
 
 
 class Base(unittest.TestCase):
@@ -201,7 +261,7 @@ class KillSwitch(Base):
     def test_a_whole_house_bedtime_does_not_stop_this_computers_own_lookups(self):
         self.addCleanup(setattr, server.S, "local_ip", server.S.local_ip)
         server.S.local_ip = "192.168.1.60"
-        self.schedule(scope="all", start="00:00", end="23:59")
+        self.schedule(**in_force_now(scope="all"))
         self.assertTrue(is_blocked("www.bbc.co.uk", KID))
         self.assertFalse(is_blocked("www.bbc.co.uk", "127.0.0.1"))
 
@@ -258,33 +318,30 @@ class Schedules(Base):
         self.assertFalse(server.schedule_in_force(x, at(1, "00:30")))
 
     def test_bedtime_turns_internet_off_for_that_device_only(self):
-        self.schedule(start="00:00", end="23:59")                           # in force now
+        self.schedule(**in_force_now())
         self.assertTrue(is_blocked("www.bbc.co.uk", KID))
         self.assertFalse(is_blocked("www.bbc.co.uk", ADULT))
         self.assertEqual(server.decision("www.bbc.co.uk", KID)[1:], ("schedule", "Bedtime"))
         self.assertTrue(server.internet_off_for(KID))
 
     def test_service_schedule_blocks_only_those_services(self):
-        self.schedule(name="Homework", start="00:00", end="23:59", off=False, services=["youtube", "fortnite"])
+        self.schedule(**in_force_now(name="Homework", off=False, services=["youtube", "fortnite"]))
         self.assertTrue(is_blocked("www.youtube.com", KID))
         self.assertTrue(is_blocked("fortnite.com", KID))
         self.assertFalse(is_blocked("www.bbc.co.uk", KID))
         self.assertFalse(is_blocked("www.youtube.com", ADULT))
 
     def test_schedule_outside_its_hours_or_switched_off_does_nothing(self):
-        now = time.localtime()
-        later = "%02d:00" % ((now.tm_hour + 2) % 24)
-        later_end = "%02d:00" % ((now.tm_hour + 3) % 24)
-        self.schedule(start=later, end=later_end)
+        self.schedule(**not_in_force_now())
         self.assertFalse(is_blocked("www.bbc.co.uk", KID))
-        x = self.schedule(name="Always", start="00:00", end="23:59")
+        x = self.schedule(**in_force_now(name="Always"))
         self.assertTrue(is_blocked("www.bbc.co.uk", KID))
         server.sql("UPDATE schedules SET enabled=0 WHERE id=?", (x["id"],), commit=True)
         server.load_schedules()
         self.assertFalse(is_blocked("www.bbc.co.uk", KID))
 
     def test_whole_house_schedule_and_pause(self):
-        self.schedule(scope="all", start="00:00", end="23:59", off=False, services=["tiktok"])
+        self.schedule(**in_force_now(scope="all", off=False, services=["tiktok"]))
         server.S.paused_until = time.time() + 600
         self.assertTrue(is_blocked("www.tiktok.com", ADULT))
 
@@ -305,7 +362,7 @@ class Schedules(Base):
         self.assertEqual(server.S.schedules, [])
 
     def test_unblocking_during_a_bedtime_schedule_adds_no_permanent_allow(self):
-        self.schedule(scope="all", start="00:00", end="23:59", off=True)   # whole house off, in force now
+        self.schedule(**in_force_now(scope="all", off=True))               # whole house off
         server.block("news.example.com")
         server.unblock("news.example.com")
         self.assertEqual(server.S.allowed, set())                          # no stray whitelist left behind
@@ -427,8 +484,7 @@ class EnforcementPlan(Base):
         self.assertNotIn("142.250.1.1", server.enforcement_plan()[KID]["ips"])
 
     def test_an_all_internet_schedule_is_a_full_cut(self):
-        body = {"name": "Bedtime", "scope": "device:" + KID, "days": [0, 1, 2, 3, 4, 5, 6],
-                "start": "00:00", "end": "23:59", "off": True, "services": []}
+        body = in_force_now(name="Bedtime", scope="device:" + KID, off=True, services=[])
         self.assertIsNone(server.save_schedule(body))
         server.S.sched_cache = (0.0, [])
         self.live_cut()

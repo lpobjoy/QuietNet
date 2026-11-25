@@ -2316,11 +2316,22 @@ class ABigHistory(OlderHousehold):
         self.assertLess(worst, 30)
         self.assertEqual(steps, BIG_ROWS // server.FILL_BATCH + 1)
         self.assertEqual(server.sql("SELECT COUNT(*) FROM queries WHERE device IS NULL")[0][0], 0)
+        # The list counts the last day's lookups, and "the last day" is worked out from the clock
+        # as the list starts. The rows are little more than a second apart, so a count taken a few
+        # seconds later is of fewer rows. The clock is therefore read before the list is asked for
+        # and again after it has come back: the list's total must lie between the counts for those
+        # two moments, however long the machine took in between.
+        before = time.time()
         started = time.monotonic()
         listed = server.api_devices()
+        after = time.time()
         self.assertLess(time.monotonic() - started, 30)
-        self.assertAlmostEqual(sum(d["n"] for d in listed),
-                               server.sql("SELECT COUNT(*) FROM queries WHERE ts>?", (time.time() - 86400,))[0][0], delta=2)
+        in_the_day_before = "SELECT COUNT(*) FROM queries WHERE ts>?"
+        most = server.sql(in_the_day_before, (before - 86400,))[0][0]
+        least = server.sql(in_the_day_before, (after - 86400,))[0][0]
+        self.assertGreater(least, 0)
+        self.assertGreaterEqual(sum(d["n"] for d in listed), least)
+        self.assertLessEqual(sum(d["n"] for d in listed), most)
         self.assertEqual({d["kind"] for d in listed}, {"hw"})
 
 
