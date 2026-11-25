@@ -8,10 +8,10 @@ From the repository folder:
 python3 -m unittest discover tests
 ```
 
-Nothing needs installing. The run takes between one minute and a little over a minute and a half (as measured on 25 November: about 65 seconds on Linux with Python 3.13, 75 on a Mac with a current Python, 95 with the Python that Apple supplies) and ends with a line such as:
+Nothing needs installing. The run takes between one minute and a minute and a half (as measured on 25 November: about 65 seconds on Linux with Python 3.13, 80 on a Mac with a current Python, 90 with the Python that Apple supplies) and ends with a line such as:
 
 ```
-Ran 1596 tests in 93.1s
+Ran 1596 tests in 91.7s
 
 OK (skipped=2)
 ```
