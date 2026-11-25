@@ -982,7 +982,7 @@ class Trial(unittest.TestCase):
         self.assertEqual(self.lifetimes(), [600, 0, 0, 0])
 
     def test_the_wait_at_a_clean_stop_covers_a_check_under_way_and_the_goodbyes(self):
-        # main() calls AN.stop() with the wait it comes with; the thread is a daemon, so if the
+        # clean_up() calls AN.stop() with the wait it comes with; the thread is a daemon, so if the
         # wait ran out the program would end before the goodbyes left.
         wait = inspect.signature(announcer.Announcer.stop).parameters["wait"].default
         check = announcer.PROBE_TRIES * announcer.PROBE_WAIT            # a test question already under way
@@ -1733,33 +1733,53 @@ class InTheServer(Api):
             self.assertNotIn("announce_hold_reason", inspect.getsource(reader))
             self.assertNotIn("AN.", inspect.getsource(reader))
 
+    def lines_of(self, function):
+        """The lines of one of server.py's functions, without its docstring: what it does, with
+        nothing of what it says about itself."""
+        opening, docstring, lines = inspect.getsource(function).split('"""', 2)
+        self.assertTrue(opening.startswith("def ") and docstring)
+        return lines
+
     def test_a_clean_stop_asks_for_the_goodbye_first_and_waits_for_it_last(self):
-        text = inspect.getsource(server.main)
-        tidy_up = text[text.index("finally:"):]
+        # What happens when these lines run is checked in tests/test_start_stop.py (CleanUp).
+        tidy_up = self.lines_of(server.clean_up)
         self.assertLess(tidy_up.index("AN.ask_to_stop()"), tidy_up.index("ENF.stop()"))
         self.assertLess(tidy_up.index("ENF.stop()"), tidy_up.index("AN.stop()"))
         self.assertLess(tidy_up.index("AN.stop()"), tidy_up.index("QuietNet stopped."))
+        run = self.lines_of(server.run)
+        self.assertLess(run.index("finally:"), run.index("clean_up()"))     # however the program ends
 
     def test_the_program_starts_the_announcer_from_the_saved_choice(self):
-        text = inspect.getsource(server.main)
+        text = self.lines_of(server.start_up)
         self.assertIn("AN = make_announcer()", text)
         self.assertLess(text.index("start_dns(args.dns_port)"), text.index("AN.start()"))
 
     def test_the_announcer_starts_only_once_the_dashboard_is_open_and_a_stop_request_is_caught(self):
         # Started any earlier, a start-up that then failed would leave an announcement with no goodbye.
-        text = inspect.getsource(server.main)
+        text = self.lines_of(server.start_up)
         self.assertEqual(text.count("AN.start()"), 1)
         started = text.index("AN.start()")
         self.assertLess(text.index("ThreadingHTTPServer(("), started)
-        self.assertLess(text.index("signal.signal(signal.SIGTERM, _stop_requested)"), started)
-        self.assertLess(text.index("try:"), started)
-        self.assertLess(started, text.index("web.serve_forever()"))
-        self.assertLess(started, text.index("finally:"))
+        # Its start is the last thing start-up does, straight after a look at the stop request...
+        self.assertTrue(text[:started].rstrip().endswith("if not stop.asked:"))
+        self.assertEqual(text[started:].split(), ["AN.start()", "return", "web"])
+        # ...and start-up runs where a stop request is listened for and the clean-up always follows.
+        run = self.lines_of(server.run)
+        self.assertLess(run.index("stop.listen()"), run.index("try:"))
+        self.assertLess(run.index("try:"), run.index("start_up(args, stop)"))
+        self.assertLess(run.index("start_up(args, stop)"), run.index("stop.serve(web)"))
+        self.assertLess(run.index("stop.serve(web)"), run.index("finally:"))
+        for elsewhere in (server.run, server.main, server.clean_up):
+            self.assertNotIn("AN.start()", self.lines_of(elsewhere))
 
 
 class StartingUp(Base):
     """main() run for real, with everything that touches the network replaced by a stand-in: when
-    the announcer starts, and that a failure after it has started still ends in the goodbye."""
+    the announcer starts, and that a failure after it has started still ends in the goodbye.
+
+    A request to stop is made here the way the program's own handler makes it (StopRequest.note),
+    with no signal sent and the handling of signals in the test program left alone.
+    tests/test_start_stop.py sends real signals, and checks the order of the whole clean-up."""
 
     def setUp(self):
         super().setUp()
@@ -1780,9 +1800,11 @@ class StartingUp(Base):
                                       pause=lambda s: None, unavailable="", log=lambda line: None)
         self.addCleanup(self.an.stop, 2)
         self.web = mock.Mock()
+        self.stop = server.StopRequest()
+        self.addCleanup(self.end_the_stop_request)
         nothing = lambda *a, **kw: None     # noqa: E731
         stand_ins = [mock.patch.object(server, name, value) for name, value in (
-            ("AN", None), ("ENF", None), ("CA", None),             # main() sets these; put back afterwards
+            ("AN", None), ("ENF", None), ("CA", None), ("BROWSER", None),    # start_up() sets these; put back afterwards
             ("make_announcer", lambda: self.an), ("start_dns", nothing), ("find_local_ip", lambda: "192.168.1.2"),
             ("log_writer", nothing), ("router_advert_listener", nothing), ("address_watcher", nothing),
             # The device keeper never ends, and every 5 seconds reads this computer's real neighbour
@@ -1791,7 +1813,8 @@ class StartingUp(Base):
             ("ThreadingHTTPServer", mock.Mock(return_value=self.web)))]
         stand_ins += [mock.patch.object(server.enforcer, "Enforcer", mock.Mock()),
                       mock.patch.object(server.cloud_agent, "CloudAgent", mock.Mock()),
-                      mock.patch.object(server.signal, "signal", nothing),
+                      mock.patch.object(server.StopRequest, "listen", nothing),
+                      mock.patch.object(server.StopRequest, "ignore", nothing),
                       mock.patch.object(server.S, "local_ip", server.S.local_ip),
                       mock.patch.object(sys, "argv", ["server.py", "--no-browser", "--no-device-names"])]
         for p in stand_ins:
@@ -1801,7 +1824,19 @@ class StartingUp(Base):
     def run_main(self):
         """Run main() with what it prints thrown away."""
         with contextlib.redirect_stdout(io.StringIO()):
-            server.main()
+            server.main(self.stop)
+
+    def end_the_stop_request(self):
+        """After each test: if serving began, a helper thread of the StopRequest's is waiting on
+        its pipe for a request. Make one, wait until the helper has acted on it (it tells the
+        stand-in web server to finish), and only then close the pipe it was reading."""
+        if self.web.serve_forever.called:
+            self.stop.note()
+            deadline = time.monotonic() + 30
+            while not self.web.shutdown.called and time.monotonic() < deadline:
+                time.sleep(0.001)
+        for end in (self.stop._read, self.stop._write):
+            os.close(end)
 
     def test_a_start_up_that_fails_before_the_dashboard_opens_announces_nothing(self):
         server.ThreadingHTTPServer.side_effect = OSError("Address already in use")
@@ -1820,19 +1855,29 @@ class StartingUp(Base):
         self.assertIsNone(self.an._thread)
 
     def test_a_stop_request_after_the_announcer_has_started_ends_in_the_goodbye(self):
-        def serve_forever():
-            """Wait for the first announcement, then act as a stop request does."""
+        def serve_forever(poll_interval=None):
+            """Wait for the first announcement, then note a stop request as the program's handler
+            does, and come back as the real serving loop does once it has been told to finish."""
             deadline = time.time() + 5
             while not self.sent and time.time() < deadline:
                 time.sleep(0.01)
-            raise KeyboardInterrupt
+            self.stop.note()
 
         self.web.serve_forever.side_effect = serve_forever
         self.run_main()
         self.assertEqual(self.sent, [KNOWN_ANNOUNCEMENT] + [KNOWN_GOODBYE] * 3)
+        self.assertFalse(self.an._thread.is_alive())
+
+    def test_a_stop_request_noted_before_the_dashboard_opens_means_the_announcer_is_never_started(self):
+        # Devices must not be told to use a computer that is on its way out.
+        server.ThreadingHTTPServer.side_effect = lambda *a, **kw: self.stop.note() or self.web
+        self.run_main()
+        self.assertEqual(self.sent, [])
+        self.assertIsNone(self.an._thread)
+        self.web.serve_forever.assert_not_called()
 
     def test_a_dashboard_that_breaks_after_the_announcer_has_started_still_ends_in_the_goodbye(self):
-        def serve_forever():
+        def serve_forever(poll_interval=None):
             """Wait for the first announcement, then fail."""
             deadline = time.time() + 5
             while not self.sent and time.time() < deadline:
@@ -2027,7 +2072,7 @@ class WhatTheDocsSay(unittest.TestCase):
         self.assertNotIn("With two, the system chooses which one each reply leaves from", text)
 
     def test_there_are_manual_steps_for_the_routers_dhcpv6_flags_and_for_an_extender_seen_at_one_number(self):
-        self.assertRegex(self.testing, r"\n81\. \*\*The router's DHCPv6 flags\.\*\*")
+        self.assertRegex(self.testing, r"\n82\. \*\*The router's DHCPv6 flags\.\*\*")
         self.assertIn("**The one-number case.**", self.testing)
 
     def test_there_is_a_manual_step_for_a_device_that_was_never_pointed_at_quietnet(self):

@@ -2351,12 +2351,14 @@ class TheKeepersRounds(Devices):
 
 
 class StartUp(unittest.TestCase):
-    """main() itself, with a stand-in for every part it starts: no database, socket, thread,
-    firewall tool or web server is touched, only the order of the starts is noted."""
+    """start_up() itself, with a stand-in for every part it starts: no database, socket, thread,
+    firewall tool or web server is touched, only the order of the starts is noted. What a
+    request to stop does to start-up is checked in tests/test_start_stop.py."""
 
     def start_up(self):
-        """Run main() to the end with stand-ins. Returns (what was started, in order; the stand-in
-        for move_to_devices, to see whether start-up itself ran the move)."""
+        """Run start_up() to the end with stand-ins, and with no stop asked for. Returns (what was
+        started, in order; the stand-in for move_to_devices, to see whether start-up itself ran
+        the move)."""
         order = []
 
         class Thread:
@@ -2381,24 +2383,18 @@ class StartUp(unittest.TestCase):
                 """Note that this part was started."""
                 order.append(self.name)
 
-            def serve_forever(self):
-                """Note that the dashboard was reached, and come straight back."""
-                order.append(self.name)
-
             def available(self):
                 """The enforcer is never ready in this test."""
                 return False
 
-            def stop(self):
-                """Nothing to stop."""
-
-            def ask_to_stop(self):
-                """Nothing to stop."""
+        def open_the_port(*args, **kwargs):
+            """Stands in for making the dashboard's web server, which opens its port: note it."""
+            order.append("dashboard's port opened")
+            return Part("dashboard")
 
         threads = mock.Mock(wraps=threading)
         threads.Thread = Thread
         swaps = [
-            mock.patch.object(sys, "argv", ["server.py", "--no-browser", "--no-device-names"]),
             mock.patch.object(server, "init_db", lambda: order.append("init_db")),
             mock.patch.object(server, "load_lists", lambda: None),
             mock.patch.object(server, "find_local_ip", lambda: PI),
@@ -2406,20 +2402,21 @@ class StartUp(unittest.TestCase):
             mock.patch.object(server, "threading", threads),
             mock.patch.object(server.enforcer, "Enforcer", lambda *a, **k: Part("enforcer")),
             mock.patch.object(server.cloud_agent, "CloudAgent", lambda *a, **k: Part("cloud link")),
-            mock.patch.object(server, "ThreadingHTTPServer", lambda *a, **k: Part("dashboard")),
+            mock.patch.object(server, "ThreadingHTTPServer", open_the_port),
             # The real announcer would read its setting from the database and start a thread of its own.
             mock.patch.object(server, "make_announcer", lambda: Part("announcer")),
-            mock.patch.object(server.signal, "signal", lambda *a: None),
             mock.patch.object(server, "ENF", None), mock.patch.object(server, "CA", None),
-            mock.patch.object(server, "AN", None),
+            mock.patch.object(server, "BROWSER", None), mock.patch.object(server, "AN", None),
             mock.patch.object(server.S, "local_ip", PI),
             mock.patch("builtins.print"),
         ]
         for swap in swaps:
             swap.start()
             self.addCleanup(swap.stop)
+        args = mock.Mock(dns_port=0, web_port=0, no_browser=True, no_device_names=True)
         with mock.patch.object(server, "move_to_devices") as move:
-            server.main()
+            web = server.start_up(args, mock.Mock(asked=False))
+        self.assertEqual(web.name, "dashboard")               # start-up ran to its end
         return order, move
 
     def test_the_device_keeper_is_started_only_after_the_filter_and_the_enforcer(self):
@@ -2432,11 +2429,14 @@ class StartUp(unittest.TestCase):
         _, move = self.start_up()
         move.assert_not_called()
 
-    def test_the_trial_announcer_is_started_after_the_device_keeper_and_last_before_the_dashboard(self):
+    def test_the_trial_announcer_is_started_after_the_device_keeper_and_last_once_the_dashboards_port_is_open(self):
+        """start_up() hands the web server back for run() to serve, so the announcer's start is
+        the last thing it does. What a request to stop does to that start, and the goodbye at
+        the clean-up, are checked in tests/test_start_stop.py."""
         order, _ = self.start_up()
         self.assertEqual(order.count("announcer"), 1)
         self.assertGreater(order.index("announcer"), order.index("device_keeper"))
-        self.assertEqual(order[-2:], ["announcer", "dashboard"])
+        self.assertEqual(order[-2:], ["dashboard's port opened", "announcer"])
 
     def test_the_history_writer_is_started_at_start_up(self):
         order, _ = self.start_up()

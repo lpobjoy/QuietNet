@@ -241,7 +241,7 @@ def card_facts(card=None, inet6_path="/proc/net/if_inet6", folder="/sys/class/ne
     throws away an answer from an address it did not ask, and waits. That has never been tried
     on a real Pi with two home-only addresses, and the announcer's own test question, asked
     from this computer, could not notice it going wrong. So the trial holds back until manual
-    step 79 has been run; taking the hold out is the owner's decision. The facts are still
+    step 80 has been run; taking the hold out is the owner's decision. The facts are still
     given so that devices already told can be sent a goodbye."""
     if card is None:
         card = enforcer.interface_and_gateway()[0]
