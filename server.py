@@ -29,7 +29,6 @@ import threading
 import time
 import urllib.request
 import webbrowser
-from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
@@ -42,6 +41,7 @@ import names
 #   database             the SQLite connection, the tables, saved settings, the history writer
 #   rules                the lists, schedules and decision(): is this name blocked for this device, and why
 #   DNS                  reading questions, building answers, asking the real servers, the UDP/TCP listeners
+#                        and Workers, the team of background threads that answers lookups
 #   helpers              this computer's address, the neighbour table, device names (the work is in
 #                        names.py), the network scan, and the api_...() functions that build each
 #                        dashboard answer
@@ -1617,25 +1617,95 @@ def send_answer(sock, resp, addr, source):
     sock.sendto(resp, addr)
 
 
+class Workers:
+    """A team of background threads that run the jobs handed to them, first come first served:
+    at most `most` jobs at a time, and the rest wait their turn.
+
+    It does what Python's ThreadPoolExecutor did here until 25 November, with one difference
+    that matters when the program stops. Python waits, as a program ends, for every thread of
+    a ThreadPoolExecutor to finish the job it holds and every job still waiting, and that
+    cannot be switched off. With lookups in hand and the internet down, each one waiting five
+    seconds for an answer that is not coming, QuietNet went on running for up to 20 seconds
+    after it had printed "QuietNet stopped.", which is as long as Docker waits before it kills
+    a program. These are daemon threads, which Python does not wait for. A job cut off as the
+    program ends is a lookup whose device will simply ask again."""
+
+    def __init__(self, most):
+        """No thread is started until there is a job for it."""
+        self._jobs = queue.Queue()
+        self._most = most
+        self._threads = 0
+        self._spare = 0             # threads with nothing to do, less the jobs waiting for one
+        self._lock = threading.Lock()
+
+    def submit(self, job, *args):
+        """Hand over one job: job(*args) is run by a thread that is free, by a new one if none
+        is free and there are fewer than `most`, or else when one comes free.
+
+        Raises RuntimeError, with the job not taken, if a thread is needed and Python will not
+        start one: it refuses once the program is ending, and when the computer has no room
+        for another."""
+        with self._lock:
+            if self._spare < 1 and self._threads < self._most:
+                threading.Thread(target=self._work, daemon=True).start()
+                self._threads += 1
+                self._spare += 1
+            self._spare -= 1
+            self._jobs.put((job, args))
+
+    def finish(self):
+        """No more jobs will be handed over: let each thread end once those already handed
+        over are done. For a team made for one piece of work, such as a network scan."""
+        with self._lock:
+            for _ in range(self._threads):
+                self._jobs.put(None)
+
+    def _work(self):
+        """One thread of the team: run jobs as they come, until finish() says there are no more.
+        A job that fails is reported in a line and does not take the thread with it."""
+        while True:
+            todo = self._jobs.get()
+            if todo is None:
+                return
+            job, args = todo
+            try:
+                job(*args)
+            except Exception as e:
+                print("Background job problem:", e, flush=True)
+            with self._lock:
+                self._spare += 1
+
+
 def udp_server(sock):
-    """Receive lookups on the UDP socket for ever, handing each to a pool of 64 worker
+    """Receive lookups on the UDP socket for ever, handing each to a team of 64 worker
     threads so that one slow upstream answer does not hold up the rest. At most
     MAX_DNS_WAITING are in hand at once, and at most MAX_DNS_PER_DEVICE from any one device;
     beyond that, new lookups are dropped rather than queued without limit (a flood from one
     device, or the internet being down). The per-device share means one busy or broken device
     can't use up every slot and stop everyone else's lookups. Devices simply ask again.
     On the IPv6 socket, lookups from outside the home network are dropped unanswered.
-    On Linux, each answer leaves from the address its lookup was sent to (see ask_for_reply_address)."""
-    pool = ThreadPoolExecutor(max_workers=64)
+    On Linux, each answer leaves from the address its lookup was sent to (see ask_for_reply_address).
+    The workers are daemon threads, so lookups still in hand never hold up the program's end
+    (see Workers)."""
+    pool = Workers(64)
     with_address = ask_for_reply_address(sock)
     slots = threading.BoundedSemaphore(MAX_DNS_WAITING)
     on_ipv6 = sock.family == socket.AF_INET6
     in_hand = {}                    # device address -> lookups of its being answered now
     in_hand_lock = threading.Lock()
 
+    def give_back(who):
+        """Give back the slot one lookup held: the device's own, and one of the house's."""
+        with in_hand_lock:
+            left = in_hand.get(who, 1) - 1
+            if left > 0:
+                in_hand[who] = left
+            else:
+                in_hand.pop(who, None)
+        slots.release()
+
     def work(data, addr, source):
         """Answer one lookup and send the reply back to the device that asked, from `source`."""
-        who = device_address(addr[0])
         try:
             resp = answer_query(data, addr[0], forward_udp)
             if resp:
@@ -1643,13 +1713,7 @@ def udp_server(sock):
         except Exception as e:
             print("Lookup problem:", e)
         finally:
-            with in_hand_lock:
-                left = in_hand.get(who, 1) - 1
-                if left > 0:
-                    in_hand[who] = left
-                else:
-                    in_hand.pop(who, None)
-            slots.release()
+            give_back(device_address(addr[0]))
 
     while True:
         try:
@@ -1664,7 +1728,14 @@ def udp_server(sock):
             if mine >= MAX_DNS_PER_DEVICE or not slots.acquire(blocking=False):
                 continue
             in_hand[who] = mine + 1
-        pool.submit(work, data, addr, source)
+        try:
+            pool.submit(work, data, addr, source)
+        except RuntimeError:
+            # Python would not start a thread for it: the program is ending, or the computer has
+            # no room for one more. Either way this lookup is dropped, quietly, and the device
+            # asks again. Left alone, the error would end this listener with a traceback, which
+            # used to be printed after "QuietNet stopped." when a lookup arrived at that moment.
+            give_back(who)
 
 
 class TCPHandler(socketserver.BaseRequestHandler):
@@ -2863,27 +2934,35 @@ def scan_network():
             if addr in subnet and addr not in skip:
                 found[ip] = mac
         found.setdefault(S.local_ip, "")
-        pool = ThreadPoolExecutor(max_workers=32)
-        jobs = {ip: pool.submit(reverse_name, ip) for ip in found}
+        hosts, asked = {}, queue.Queue()
+
+        def name_of(ip):
+            """Ask the network for one device's name, and say when that is done, name or no name."""
+            try:
+                hosts[ip] = reverse_name(ip)
+            finally:
+                asked.put(ip)
+        pool = Workers(32)              # daemon threads: a slow name never holds up the program's end
+        for ip in found:
+            pool.submit(name_of, ip)
+        pool.finish()
         deadline = time.time() + 8
         # Wait for the names before taking db_lock: these are network waits of up to 8 seconds,
         # and the dashboard and the history writer would otherwise wait behind them.
-        hosts = {}
-        for ip, job in jobs.items():
-            try:
-                hosts[ip] = job.result(timeout=max(0.1, deadline - time.time()))
-            except Exception:
-                hosts[ip] = ""
+        try:
+            for _ in found:
+                asked.get(timeout=max(0.1, deadline - time.time()))
+        except queue.Empty:
+            pass                        # out of time: a device not yet answered for keeps the name it had
         now = time.time()
         with db_lock:
-            for ip in jobs:
-                host = hosts[ip]
+            for ip in found:
+                host = hosts.get(ip, "")
                 db.execute("""INSERT INTO seen(ip,mac,host,ts) VALUES(?,?,?,?) ON CONFLICT(ip) DO UPDATE SET
                               mac=excluded.mac, ts=excluded.ts,
                               host=CASE WHEN excluded.host='' THEN seen.host ELSE excluded.host END""",
                            (ip, found[ip], host, now))
             db.commit()
-        pool.shutdown(wait=False)
         NAMES_WANTED.set()          # ask the devices just found for their names now, not in two minutes
     except Exception as e:
         print("Scan problem:", e, flush=True)

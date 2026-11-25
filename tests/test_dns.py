@@ -620,7 +620,7 @@ class ReplyAddress(unittest.TestCase):
         with mock.patch.object(server, "IP_PKTINFO", 8), \
                 mock.patch.object(server, "answer_query", return_value=b"answer"), \
                 mock.patch.object(server, "send_answer", lambda s, resp, addr, source: sent.append((addr, source))), \
-                mock.patch.object(server, "ThreadPoolExecutor", lambda max_workers: pool):
+                mock.patch.object(server, "Workers", lambda most: pool):
             with self.assertRaises(KeyboardInterrupt):
                 server.udp_server(sock)
         self.assertEqual(sent, [(("192.168.1.23", 5000), self.PI)])
@@ -878,7 +878,7 @@ class LookupsOverIPv6(Base):
         sock.recvfrom.side_effect = [(query("www.bbc.co.uk"), ("2001:db8:9:9::1", 5000, 0, 0)), KeyboardInterrupt()]
         submitted = []
         pool = mock.Mock(submit=lambda fn, data, addr, source: submitted.append(addr))
-        with mock.patch.object(server, "ThreadPoolExecutor", lambda max_workers: pool):
+        with mock.patch.object(server, "Workers", lambda most: pool):
             with self.assertRaises(KeyboardInterrupt):
                 server.udp_server(sock)
         self.assertEqual(submitted, [])
@@ -889,7 +889,7 @@ class LookupsOverIPv6(Base):
         sock.recvfrom.side_effect = [(query("www.bbc.co.uk"), ("fe80::1", 5000, 0, 2)), KeyboardInterrupt()]
         submitted = []
         pool = mock.Mock(submit=lambda fn, data, addr, source: submitted.append(addr))
-        with mock.patch.object(server, "ThreadPoolExecutor", lambda max_workers: pool):
+        with mock.patch.object(server, "Workers", lambda most: pool):
             with self.assertRaises(KeyboardInterrupt):
                 server.udp_server(sock)
         self.assertEqual(len(submitted), 1)
@@ -1611,7 +1611,7 @@ class Limits(unittest.TestCase):
         submitted = []
         pool = mock.Mock(submit=lambda fn, data, addr, source: submitted.append(addr))
         with mock.patch.object(server, "MAX_DNS_WAITING", 2), \
-                mock.patch.object(server, "ThreadPoolExecutor", lambda max_workers: pool):
+                mock.patch.object(server, "Workers", lambda most: pool):
             with self.assertRaises(KeyboardInterrupt):
                 server.udp_server(sock)
         self.assertEqual(len(submitted), 2)                      # the rest were dropped, not queued
@@ -1624,7 +1624,7 @@ class Limits(unittest.TestCase):
         submitted = []
         pool = mock.Mock(submit=lambda fn, data, addr, source: submitted.append(addr[0]))
         with mock.patch.object(server, "MAX_DNS_PER_DEVICE", 2), \
-                mock.patch.object(server, "ThreadPoolExecutor", lambda max_workers: pool):
+                mock.patch.object(server, "Workers", lambda most: pool):
             with self.assertRaises(KeyboardInterrupt):
                 server.udp_server(sock)
         self.assertEqual(submitted, ["192.168.1.23", "192.168.1.23", "192.168.1.40"])
@@ -1642,10 +1642,142 @@ class Limits(unittest.TestCase):
         pool = mock.Mock(submit=run_now)
         with mock.patch.object(server, "MAX_DNS_PER_DEVICE", 1), \
                 mock.patch.object(server, "answer_query", return_value=None), \
-                mock.patch.object(server, "ThreadPoolExecutor", lambda max_workers: pool):
+                mock.patch.object(server, "Workers", lambda most: pool):
             with self.assertRaises(KeyboardInterrupt):
                 server.udp_server(sock)
         self.assertEqual(len(submitted), 4)
+
+    def test_a_lookup_that_cannot_be_given_a_thread_is_dropped_quietly_and_the_listener_carries_on(self):
+        """Python will not start a thread once the program is ending. A lookup that arrived at
+        that moment used to end the listener with a traceback, printed after "QuietNet
+        stopped.". Now it is dropped, its slot is given back, and nothing is printed."""
+        sock = mock.Mock()
+        incoming = [(query("n%d.example.com" % i), ("192.168.1.23", 5000 + i)) for i in range(3)]
+        sock.recvfrom.side_effect = incoming + [KeyboardInterrupt()]
+        tried = []
+
+        def refuse(fn, data, addr, source):
+            """Note the lookup, then refuse it as Python does when it will not start a thread."""
+            tried.append(addr)
+            raise RuntimeError("can't create new thread at interpreter shutdown")
+        pool = mock.Mock(submit=refuse)
+        with mock.patch.object(server, "MAX_DNS_PER_DEVICE", 1), mock.patch("builtins.print") as printed, \
+                mock.patch.object(server, "Workers", lambda most: pool):
+            with self.assertRaises(KeyboardInterrupt):
+                server.udp_server(sock)
+        # With one slot for the device, the second and third were only tried because the slot
+        # of the one before had been given back.
+        self.assertEqual(len(tried), 3)
+        printed.assert_not_called()
+
+
+class WorkerTeam(unittest.TestCase):
+    """Workers: the background threads that answer lookups and ask for names during a scan."""
+
+    def team(self, most):
+        """A team whose threads are let go when the test is over."""
+        team = server.Workers(most)
+        self.addCleanup(team.finish)
+        return team
+
+    def wait_until(self, true_now, what):
+        """Wait up to 30 seconds for true_now() to hold; fail, saying `what`, if it never does."""
+        deadline = time.monotonic() + 30
+        while not true_now():
+            if time.monotonic() > deadline:
+                self.fail("still waiting after 30 seconds for " + what)
+            time.sleep(0.001)
+
+    def test_a_job_is_run_with_what_it_was_given(self):
+        done = queue.Queue()
+        self.team(2).submit(lambda a, b: done.put((a, b)), "x", 3)
+        self.assertEqual(done.get(timeout=30), ("x", 3))
+
+    def test_its_threads_are_daemon_threads(self):
+        """Python does not wait for a daemon thread when the program ends. That is the whole
+        reason for this class: lookups in hand used to keep the program running for up to 20
+        seconds after "QuietNet stopped."."""
+        seen = queue.Queue()
+        self.team(2).submit(lambda: seen.put(threading.current_thread().daemon))
+        self.assertTrue(seen.get(timeout=30))
+
+    def test_no_more_jobs_run_at_once_than_the_team_has_threads(self):
+        go, lock, done = threading.Event(), threading.Lock(), queue.Queue()
+        running, most_at_once, threads = [], [], set()
+
+        def job(n):
+            """Note which thread runs this and how many jobs are running, then wait to be let go."""
+            with lock:
+                running.append(n)
+                most_at_once.append(len(running))
+                threads.add(threading.get_ident())
+            go.wait(30)
+            with lock:
+                running.remove(n)
+            done.put(n)
+        team = self.team(2)
+        for n in range(6):
+            team.submit(job, n)
+        self.wait_until(lambda: len(running) >= 2, "two jobs to be running")
+        go.set()
+        self.assertEqual(sorted(done.get(timeout=30) for _ in range(6)), list(range(6)))
+        self.assertEqual(max(most_at_once), 2)
+        self.assertEqual(len(threads), 2)
+
+    def test_a_thread_with_nothing_to_do_is_used_before_a_new_one_is_started(self):
+        threads = queue.Queue()
+        team = self.team(8)
+        team.submit(lambda: threads.put(threading.get_ident()))
+        first = threads.get(timeout=30)
+        self.wait_until(lambda: team._spare == 1, "the first thread to be free again")
+        team.submit(lambda: threads.put(threading.get_ident()))
+        self.assertEqual(threads.get(timeout=30), first)
+        self.assertEqual(team._threads, 1)      # and no second thread was started to sit idle
+
+    def test_finish_lets_the_threads_end_once_their_jobs_are_done(self):
+        go, threads, done = threading.Event(), queue.Queue(), queue.Queue()
+
+        def job(n):
+            """Say which thread this is, wait to be let go, then say the job is done."""
+            threads.put(threading.current_thread())
+            go.wait(30)
+            done.put(n)
+        team = server.Workers(2)
+        for n in range(4):
+            team.submit(job, n)
+        team.finish()
+        mine = [threads.get(timeout=30) for _ in range(2)]
+        go.set()
+        self.assertEqual(sorted(done.get(timeout=30) for _ in range(4)), [0, 1, 2, 3])
+        for thread in mine:
+            thread.join(30)
+            self.assertFalse(thread.is_alive())
+
+    def test_a_job_that_fails_is_reported_and_its_thread_carries_on(self):
+        done = queue.Queue()
+
+        def fail():
+            """A job with a fault in it."""
+            raise ValueError("a fault in the job")
+        team = self.team(1)
+        with mock.patch("builtins.print") as printed:
+            team.submit(fail)
+            team.submit(done.put, threading.get_ident)
+            self.assertIs(done.get(timeout=30), threading.get_ident)
+        self.assertIn("a fault in the job", " ".join(str(a) for a in printed.call_args[0]))
+
+    def test_a_job_that_cannot_be_given_a_thread_is_refused_and_not_kept(self):
+        """Python refuses to start a thread once the program is ending. The job must not be
+        left waiting for a thread that will never come, and the team must still work if the
+        refusal had another cause and passes."""
+        done = queue.Queue()
+        team = self.team(1)
+        with mock.patch.object(server.threading, "Thread", side_effect=RuntimeError("no more threads")):
+            with self.assertRaises(RuntimeError):
+                team.submit(done.put, "refused")
+        self.assertTrue(team._jobs.empty())
+        team.submit(done.put, "taken")
+        self.assertEqual(done.get(timeout=30), "taken")
 
 
 if __name__ == "__main__":
