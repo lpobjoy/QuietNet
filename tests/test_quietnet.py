@@ -3,8 +3,10 @@
 Uses only Python's standard library, and a throwaway data folder - it never
 touches your real history or rules, and never sends anything to the network.
 """
+import atexit
 import calendar
 import os
+import shutil
 import socket
 import sqlite3
 import struct
@@ -16,6 +18,7 @@ import unittest
 from unittest import mock
 
 os.environ["QUIETNET_DATA"] = tempfile.mkdtemp(prefix="quietnet-test-")
+atexit.register(shutil.rmtree, os.environ["QUIETNET_DATA"], True)       # removed when the run is over
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import server  # noqa: E402
 import enforcer  # noqa: E402
