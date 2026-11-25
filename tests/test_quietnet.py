@@ -6,6 +6,7 @@ touches your real history or rules, and never sends anything to the network.
 import calendar
 import os
 import socket
+import sqlite3
 import struct
 import sys
 import tempfile
@@ -75,6 +76,33 @@ def fake_answer(data, ttl=86400):
 def is_blocked(name, client):
     resp = server.answer_query(query(name), client, fake_answer)
     return resp[-4:] == bytes(4)
+
+
+_open_the_database = server.init_db
+
+
+def init_db_closing_the_old_connection():
+    """server.init_db(), followed by closing the database connection it replaced.
+
+    QuietNet opens its database once, at start-up. The tests open it again and again: Base.setUp
+    does before every test, and so does every test that mimics a restart. Each time, the
+    connection in use until then was simply dropped. From Python 3.13 on, a connection dropped
+    without being closed draws a "ResourceWarning: unclosed database" line when Python tidies it
+    away, and a run printed hundreds of them, each quoting whatever line of code happened to be
+    running at that moment (which is how lines such as "raise AttributeError(name)", from
+    unittest/mock.py, came to appear in the output of a run that passed).
+
+    The old connection is closed while holding db_lock, so no other thread is part-way through
+    using it. Only a real connection is closed: a test may have put a stand-in in its place."""
+    old = server.db
+    _open_the_database()
+    if isinstance(old, sqlite3.Connection) and old is not server.db:
+        with server.db_lock:
+            old.close()
+
+
+# Every test file calls server.init_db() by that name, so replacing it here covers them all.
+server.init_db = init_db_closing_the_old_connection
 
 
 class Base(unittest.TestCase):

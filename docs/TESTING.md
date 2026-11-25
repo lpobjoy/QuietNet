@@ -69,13 +69,14 @@ The existing files share a few helpers, all in `test_quietnet.py`:
 - `is_blocked(name, client)`: asks the filter and reports whether the answer was the block address.
 - `at(day, "HH:MM")`: a moment on a given weekday, for schedule tests.
 - `in_force_now()`: the days and times to give a schedule so that it is in force at this moment, whatever the time of day: `self.schedule(**in_force_now(scope="all"))`. `not_in_force_now()` is its opposite.
+- `server.init_db()`: call it to mimic a restart, as the program's own start-up does. In the tests it also closes the database connection it replaces (`test_quietnet.py` wraps it), so that a run is not filled with "unclosed database" warnings.
 
 Conventions: one behaviour per test; the test name states the behaviour in plain words; a comment explains any check whose reason is not obvious from the name.
 
 A test must pass at any time of day, on any day of the week, and on a slow machine:
 
 - **Never write a fixed window to mean "now".** A schedule from 00:00 to 23:59 is off for the last minute of every day (its end is not inside it), and six tests built on one failed when GitHub's machines ran them at 23:59. Use `in_force_now()`. A test about a particular window should pass the moment itself, with `at(day, "HH:MM")`, and not read the clock at all.
-- **Wait for the thing itself, not for a length of time.** Both web servers finish some of their work just after an answer has been sent: the relay gives back the room held for a large answer, and frees the connection's place; the dashboard's port takes connections a moment before the program is ready to be stopped. A test that checks such a thing straight after the answer arrives, or after a fixed `sleep`, fails now and then on a busy machine. Check again for a few seconds until it is so, then assert (see `answer_once_a_place_is_free` in `test_relay.py` and `wait_until_the_dashboard_answers` in `test_shutdown.py`).
+- **Wait for the thing itself, not for a length of time.** The relay finishes some of its work just after an answer has been sent: it gives back the room held for a large answer, and frees the connection's place. And the dashboard's port takes connections a moment before the program is ready to be stopped. A test that checks such a thing straight after the answer arrives, or after a fixed `sleep`, fails now and then on a busy machine. Check again for a few seconds until it is so, then assert (see `answer_once_a_place_is_free` in `test_relay.py` and `wait_until_the_dashboard_answers` in `test_shutdown.py`).
 
 ## Not covered
 

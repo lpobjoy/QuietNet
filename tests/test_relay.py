@@ -1239,6 +1239,7 @@ class PairingCodeExpiry(RelayCase):
             relay.init_db()
             self.assertEqual(relay.sql("SELECT id, token, paired, code_ts FROM pis"),
                              [("abc", relay.token_record("tok"), 1, 0)])
+            relay.db.close()                                  # as when the relay stops
             relay.init_db()                                   # starting a second time must not fail
             relay.db.close()
         finally:
@@ -1880,6 +1881,7 @@ class TokenStorage(RelayCase):
 
     def test_starting_again_does_not_hash_a_token_twice(self):
         self.start_on(self.old_database("a" * 48))
+        relay.db.close()                                      # as when the relay stops
         relay.init_db()
         self.assertEqual(relay.sql("SELECT token FROM pis", one=True)[0], relay.token_record("a" * 48))
 
