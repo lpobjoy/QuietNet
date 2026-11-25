@@ -423,7 +423,8 @@ class Shutdown(unittest.TestCase):
         proc.send_signal(signal.SIGTERM)
         code, out = self.ended(proc)
         self.assert_clean(code, out)
-        self.assertEqual(len(asked_for), 4)                 # two ports for each of two starts
+        # A dashboard port was found twice: once for each of two starts.
+        self.assertEqual(asked_for.count(socket.SOCK_STREAM), 2)
         self.assertNotEqual(self.web_port, other.server_address[1])
 
     def test_a_start_that_needs_the_dns_filter_is_tried_once_more_when_the_filters_port_was_taken(self):
