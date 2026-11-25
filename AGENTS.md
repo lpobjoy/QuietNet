@@ -31,7 +31,7 @@ A home network filter. Devices point their DNS at it; it records what they look 
 python3 -m unittest discover tests
 ```
 
-It takes between one minute and a minute and three quarters, and needs nothing installed (`QUIETNET_BIG_ROWS=20000` in front makes the one big-history test quick while you work). It must end in `OK`. Run it as an ordinary user if you can: as an admin user on Linux, two shutdown tests are skipped.
+It takes between one minute and a minute and three quarters, and needs nothing installed (`QUIETNET_BIG_ROWS=20000` in front makes the one big-history test quick while you work). It must end in `OK`. Run it as an ordinary user if you can: as an admin user on Linux, the shutdown tests that start the real program are skipped.
 
 ## Rules
 
@@ -72,6 +72,7 @@ Each of these is the only thing standing between a hostile web page, or a strang
 - **An older household's database is moved to the device tables after start-up, never in `init_db()`** (`move_to_devices()`, from the device keeper, once the filter and the enforcer are running). Building the index on a big history is slow, and a slow or failing start would leave the house without DNS. The move keeps a copy first, is one transaction, and on any error rolls back and leaves QuietNet running on the old tables (`S.devices_ready` stays false; every code path must still work then). It waits up to two minutes for this computer to know its own address, since it decides once which old history is this computer's and the router's. The copy holds the household's history, so it must not outlive it: `forget_old_copy()` deletes it at 30 days and whenever everyone's history is forgotten.
 - **`cloud/relay.py` is deployed without the other programs.** It cannot import them.
 - **Licence code stays on the relay and never answers 401.** It must never reach the Pi's blocking (`decision()`, the enforcer, the internet switches). A licence refusal is `402` or `403`, never `401`, which today's Pis take to mean "unpaired" and delete their token. Every licence decision reads `licence_state()`. Every refusal goes through `licence_gate()` (`pi_request`, `POST /pis/new`, `agent_pair`); the home page only reads `gate_on()` and `licence_state()` to decide what to show. The two rescue calls must keep working in every licence state.
+- **Whatever `start_up()` starts, `clean_up()` stops and the tests stand in for.** One line in each (`server.py`); every thread a daemon thread, because Python waits at exit for any other (lookups in hand once kept the program running for 20 seconds after "QuietNet stopped."); and a stand-in in `WholeLife.setUp` (`tests/test_start_stop.py`), or those tests start the real thing inside the test program. A request to stop is only ever noted, never raised as an exception. See "Starting and stopping" in `docs/ARCHITECTURE.md`.
 - **Python 3.9 must still work** for the programs: the macOS launcher prefers the Python that Apple supplies. Avoid newer syntax such as `match` or `X | Y` type hints at run time.
 - **A test must not depend on the time of day or on a sleep being long enough.** For a schedule that is in force now, use `in_force_now()` from `tests/test_quietnet.py`, never a fixed window such as 00:00 to 23:59. See "Writing more" in `docs/TESTING.md`.
 
