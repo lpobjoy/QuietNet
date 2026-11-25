@@ -332,7 +332,14 @@ class ThisComputersCard(unittest.TestCase):
 class StandInDns:
     """A DNS server on 127.0.0.1 (or on ::1 when asked) for the test question.
     `answer(question)` gives the reply to send back, or None to stay silent. Raises OSError if
-    the computer has no such address."""
+    the computer has no such address.
+
+    It answers from a thread of its own, and notes each question in `asked` only when that thread
+    gets round to it, which on a busy machine can be a moment after the question was sent. So a
+    test that expects an answer gives a long wait (the asker returns as soon as the answer is in),
+    and a test that counts questions which got no answer waits for them with questions_reach().
+    A question is always noted before its answer is sent, so once the asker has an answer the
+    question behind it is in `asked`."""
 
     def __init__(self, answer, family=socket.AF_INET, address="127.0.0.1"):
         self.answer = answer
@@ -360,6 +367,16 @@ class StandInDns:
             if reply:
                 self.sock.sendto(reply, who)
 
+    def questions_reach(self, count, within=5):
+        """Wait until this many questions have been noted, or `within` seconds have passed, and
+        say whether they were. When a question gets no answer the asker can be back before this
+        thread has noted it, so questions that went unanswered are never counted without this
+        wait first."""
+        deadline = time.monotonic() + within
+        while len(self.asked) < count and time.monotonic() < deadline:
+            time.sleep(0.01)
+        return len(self.asked) >= count
+
     def close(self):
         self.done.set()
         self.thread.join(2)
@@ -373,7 +390,11 @@ class TheTestQuestion(Base):
         return dns
 
     def ask(self, dns, **kw):
-        kw.setdefault("wait", 0.2)
+        """Ask the stand-in the test question. The wait is long unless the test gives its own:
+        the asker returns as soon as an answer arrives, so a long wait costs nothing where an
+        answer is expected, and a stand-in held up for a moment still gets its answer in. A test
+        that expects silence passes a short wait, since it has to sit the whole wait out."""
+        kw.setdefault("wait", 5)
         return announcer.dns_answers("127.0.0.1", port=dns.port, **kw)
 
     def test_quietnet_answering_counts_as_answering(self):
@@ -382,7 +403,7 @@ class TheTestQuestion(Base):
 
     def test_the_question_is_a_bare_twelve_byte_header_with_no_name_in_it(self):
         dns = self.stand_in(lambda q: q[:2] + b"\x80\x81" + bytes(8))
-        self.ask(dns)
+        self.assertTrue(self.ask(dns))
         self.assertEqual(len(dns.asked[0]), 12)
         self.assertEqual(dns.asked[0][2:], bytes(10))
 
@@ -405,25 +426,35 @@ class TheTestQuestion(Base):
     def test_the_question_is_asked_again_once_before_giving_up(self):
         dns = self.stand_in(lambda q: None)
         self.ask(dns, wait=0.05)
+        dns.questions_reach(announcer.PROBE_TRIES)
         self.assertEqual(len(dns.asked), announcer.PROBE_TRIES)
         self.assertEqual(announcer.PROBE_TRIES, 2)
 
     def test_an_answer_to_the_second_question_is_enough(self):
         seen = []
         dns = self.stand_in(lambda q: seen.append(q) or (q[:2] + b"\x80\x81" + bytes(8) if len(seen) > 1 else None))
-        self.assertTrue(self.ask(dns, wait=0.1))
+        # The first question has to go unanswered for its whole wait, so the wait is paid once:
+        # a second, which a stand-in held up for most of a second still answers within.
+        self.assertTrue(self.ask(dns, wait=1))
+        self.assertEqual(len(seen), 2)
+
+    def turned_away(self, answer):
+        """Ask a stand-in that gives this answer to every question, and check that the answer was
+        had each time and did not count. The wait is the long one: an answer that does not count
+        ends that go at once, so nothing is waited out, and on a machine that is held up the
+        answer is still looked at (with a short wait it would pass as silence, unjudged)."""
+        dns = self.stand_in(answer)
+        self.assertFalse(self.ask(dns))
+        self.assertEqual(len(dns.asked), announcer.PROBE_TRIES)
 
     def test_an_answer_carrying_the_wrong_number_does_not_count(self):
-        dns = self.stand_in(lambda q: bytes([q[0] ^ 0xFF, q[1]]) + b"\x80\x81" + bytes(8))
-        self.assertFalse(self.ask(dns, wait=0.05))
+        self.turned_away(lambda q: bytes([q[0] ^ 0xFF, q[1]]) + b"\x80\x81" + bytes(8))
 
     def test_the_question_sent_straight_back_does_not_count(self):
-        dns = self.stand_in(lambda q: q)
-        self.assertFalse(self.ask(dns, wait=0.05))
+        self.turned_away(lambda q: q)
 
     def test_a_cut_short_answer_does_not_count(self):
-        dns = self.stand_in(lambda q: q[:2] + b"\x80")
-        self.assertFalse(self.ask(dns, wait=0.05))
+        self.turned_away(lambda q: q[:2] + b"\x80")
 
     def test_nothing_listening_counts_as_not_answering(self):
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as spare:
@@ -448,7 +479,7 @@ class TheTestQuestion(Base):
         except OSError:
             self.skipTest("this computer has no IPv6 loopback address")
         self.addCleanup(dns.close)
-        self.assertTrue(announcer.dns_answers("::1", port=dns.port, wait=0.2))
+        self.assertTrue(announcer.dns_answers("::1", port=dns.port, wait=5))
         self.assertEqual(len(dns.asked), 1)
 
     def answering_sockets(self, made):
@@ -650,11 +681,16 @@ class Trial(unittest.TestCase):
 
     def test_the_status_says_what_is_being_announced(self):
         an = self.make(on=True)
+        before = time.time()
         an.step()
+        after = time.time()
         status = an.status()
         self.assertEqual((status["on"], status["state"], status["address"], status["reason"]), (True, "announcing", ADDR, ""))
         self.assertEqual((status["lifetime"], status["every"], status["available"]), (600, 200, True))
-        self.assertAlmostEqual(status["sent"], time.time(), delta=5)
+        # The time of day it went out: between the readings taken just before and just after, so
+        # the check does not depend on how long the machine took to get here.
+        self.assertGreaterEqual(status["sent"], before)
+        self.assertLessEqual(status["sent"], after)
 
     # -- only while QuietNet answers over IPv6 -----------------------------------
 
