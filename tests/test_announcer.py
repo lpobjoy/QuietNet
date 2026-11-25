@@ -14,6 +14,7 @@ import inspect
 import io
 import os
 import re
+import shutil
 import socket
 import sys
 import tempfile
@@ -230,6 +231,7 @@ class ThisComputersCard(unittest.TestCase):
 
     def setUp(self):
         self.folder = tempfile.mkdtemp(prefix="quietnet-announcer-test-")
+        self.addCleanup(shutil.rmtree, self.folder, True)
         self.inet6 = os.path.join(self.folder, "if_inet6")
         self.cards = os.path.join(self.folder, "net")
         self.write("fe80000000000000ba27ebfffe123456 03 40 20 80    wlan0\n")
