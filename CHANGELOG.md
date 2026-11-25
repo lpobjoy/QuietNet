@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+The relay moved to `quiet-net-relay.q3n.net` (25 November):
+- **Changed: the relay's sentences name `quiet-net-relay.q3n.net`**, where it is now reached, in place of `q3n.net`, which no longer leads to it: the seven that send people somewhere to renew, to sort out a payment, to contact the seller, to remove a Pi, or that say a Pi is not connected. The name is written once, as `RELAY_NAME` in `cloud/relay.py`, and a test fails if a sentence has it typed in.
+- A Pi paired while the relay was at `q3n.net` keeps that address and must be paired again: on the relay's page, name it under "Add a QuietNet", press "Create pairing code", and run the one line shown on the Pi. The Pi's old entry is replaced, and its rules and history are not affected.
+
 Names a device's own system needs (24 November). Found in a real household: a Samsung TV stopped opening apps after `samsungcloudsolution.net`, labelled "Possibly junk", was blocked from its page. Known issue 95:
 - **Fixed: an address a TV depends on was called "Possibly junk".** A short table, `NEEDED` in `server.py`, lists about 30 whole names that common household devices need for their own sign-in, app shop, online check, clock or updates. Such a row shows "Needed by Samsung TVs" in place of "Possibly junk"; a name on the advert list keeps "Advert / tracker"; sub-names keep their own labels. New `needed` in `GET /api/activity` and `GET /api/rules`. `samsungcloudsolution.net` is now labelled "Samsung TV".
 - **New: blocking such a name asks first.** `POST /api/block` answers `409` with who needs the name unless the request carries `"sure": true`; the dashboard asks ("Samsung TVs need this address for their own system to work. Blocking it may stop them opening apps, signing in or updating. Block it anyway?") and blocks only on a yes. This covers the Block button, a name typed on the Blocked list page, and the dashboard through the relay. Blocking a single sub-name does not ask. What is blocked once a block exists is unchanged.

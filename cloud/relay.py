@@ -965,7 +965,13 @@ def licence_for_pi(info, used, now):
 
 # -- wording (section 4.7 of the licensing design; the Pi's own sentences match these)
 
-PAIR_NEEDS_LICENCE = "Remote access needs a QuietNet licence. Your Pi is still filtering at home. Visit q3n.net to renew."
+# The name people are sent to in the sentences below: where this relay is reached. It is written
+# out, not read from the request, because these sentences also go to the Pi, which shows them at
+# home. If the relay moves to another name, change it here and nowhere else (a test checks that).
+RELAY_NAME = "quiet-net-relay.q3n.net"
+
+PAIR_NEEDS_LICENCE = ("Remote access needs a QuietNet licence. Your Pi is still filtering at home. "
+                      "Visit %s to renew." % RELAY_NAME)
 ADD_NEEDS_LICENCE = "Adding a Pi needs a current licence."
 SAME_IDENTITY = ("Another Pi with the same identity is online. This usually means the SD card was copied. "
                  "On this Pi, run the installer with --new-identity, then pair again.")
@@ -1038,13 +1044,13 @@ def licence_sentence(info):
     if state == "past_due":
         stop = (" on " + long_date(info["grace_until"])) if info["grace_until"] else ""
         return ("Your last payment didn't go through. Remote access will stop%s unless it's sorted at "
-                "q3n.net. Filtering at home is not affected." % stop)
+                "%s. Filtering at home is not affected." % (stop, RELAY_NAME))
     if state == "expired":
         return ("Remote access is paused because the licence %s. Your Pi is still filtering and blocking at "
-                "home as normal. Renew at q3n.net to turn remote access back on." % ended_on(info))
+                "home as normal. Renew at %s to turn remote access back on." % (ended_on(info), RELAY_NAME))
     if state == "revoked":
         return ("Remote access has been switched off for this licence. Your Pi is still filtering at home. "
-                "Contact the seller through q3n.net.")
+                "Contact the seller through %s." % RELAY_NAME)
     return "This account has no QuietNet licence yet. Remote access needs one; filtering at home doesn't."
 
 
@@ -1061,7 +1067,7 @@ def paused_lead(info):
     """The first lines of the paused page, saying why remote access is paused."""
     if info["state"] == "revoked":
         return ("Remote access has been switched off for this licence. Your Pi is still filtering and blocking "
-                "at home as normal. Contact the seller through q3n.net.")
+                "at home as normal. Contact the seller through %s." % RELAY_NAME)
     if info["state"] == "expired":
         return ("Your QuietNet licence %s. Your Pi is still filtering and blocking at home as normal. "
                 "Renewing turns remote access back on within a minute, with nothing to pair again." % ended_on(info))
@@ -1086,7 +1092,7 @@ RESCUE_DONE = {
     ("pause-hour", 2): "Done. Blocking is paused for an hour.",
     ("pause-hour", 1): "Done. Blocking is paused for an hour.",
 }
-RESCUE_OFFLINE = "Your Pi isn't connected to q3n.net right now, so this couldn't be sent. Is it switched on?"
+RESCUE_OFFLINE = "Your Pi isn't connected to %s right now, so this couldn't be sent. Is it switched on?" % RELAY_NAME
 RESCUE_PATH = re.compile(r"^/pi/([^/]+)/rescue$")
 
 
@@ -2231,7 +2237,7 @@ class Relay(BaseHTTPRequestHandler):
         if outcome == "same identity":
             return self.send_json({"error": SAME_IDENTITY}, 403)
         if outcome == "seats":
-            return self.send_json({"error": seats_full(info["seats"], "Remove one at q3n.net, then pair again."),
+            return self.send_json({"error": seats_full(info["seats"], "Remove one at %s, then pair again." % RELAY_NAME),
                                    "licence": info["state"]}, 403)
         if outcome == "used":
             return self.send_json({"error": "That pairing code is wrong, already used, or has expired."}, 400)
