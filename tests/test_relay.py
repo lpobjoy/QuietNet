@@ -6,9 +6,11 @@ Run with:  python3 -m unittest discover tests
 Standard library only. The relay is started on a spare port on this computer with
 a throwaway data folder, and a pretend Pi answers its calls. Nothing leaves this machine.
 """
+import atexit
 import http.client
 import json
 import re
+import shutil
 import socket
 import stat
 import os
@@ -22,6 +24,7 @@ from http.server import ThreadingHTTPServer
 from urllib.parse import urlencode
 
 os.environ["QUIETNET_RELAY_DATA"] = tempfile.mkdtemp(prefix="quietnet-relay-test-")
+atexit.register(shutil.rmtree, os.environ["QUIETNET_RELAY_DATA"], True)     # removed when the run is over
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "cloud"))
 import relay  # noqa: E402
@@ -1232,6 +1235,7 @@ class PairingCodeExpiry(RelayCase):
     def test_a_database_from_version_0_5_is_upgraded_in_place(self):
         import sqlite3
         folder = tempfile.mkdtemp(prefix="quietnet-relay-old-")
+        self.addCleanup(shutil.rmtree, folder, True)
         old = sqlite3.connect(os.path.join(folder, "relay.db"))
         old.executescript("""
             CREATE TABLE users(id INTEGER PRIMARY KEY, email TEXT UNIQUE, pw TEXT, created REAL);
@@ -1535,6 +1539,7 @@ class QuietNetsPerAccount(RelayCase):
     def test_an_existing_database_gains_the_lookup_indexes(self):
         import sqlite3
         folder = tempfile.mkdtemp(prefix="quietnet-relay-old-")
+        self.addCleanup(shutil.rmtree, folder, True)
         old = sqlite3.connect(os.path.join(folder, "relay.db"))
         old.executescript("""
             CREATE TABLE users(id INTEGER PRIMARY KEY, email TEXT UNIQUE, pw TEXT, created REAL);
@@ -1861,6 +1866,7 @@ class TokenStorage(RelayCase):
         """A relay.db from before tokens were hashed, holding one paired Pi with a plain-text token."""
         import sqlite3
         folder = tempfile.mkdtemp(prefix="quietnet-relay-old-")
+        self.addCleanup(shutil.rmtree, folder, True)
         old = sqlite3.connect(os.path.join(folder, "relay.db"))
         old.executescript("""
             CREATE TABLE users(id INTEGER PRIMARY KEY, email TEXT UNIQUE, pw TEXT, created REAL);
