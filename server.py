@@ -293,6 +293,7 @@ class State:
 S = State()
 ENF = None
 CA = None
+BROWSER = None      # the timer that opens the dashboard in a browser just after start-up, if one was set
 db = None
 db_lock = threading.RLock()
 # A second, read-only connection for the dashboard's questions about the history, with its own
@@ -3642,8 +3643,9 @@ class StopRequest:
     started by serve() waits for that byte and then stops the web server in the proper way, with
     its shutdown(), which has to be called from a thread other than the one that is serving.
 
-    The byte stays in the pipe until it is read. So a request that arrives before serving has
-    begun, when there is no helper thread yet, is not lost: serving ends as soon as it starts.
+    A request that arrives before serving has begun, when there is no helper thread yet, is not
+    lost either: serve() looks at the flag and does not serve at all, and should the request
+    come in the instant after that look, its byte is still in the pipe for the helper thread.
 
     A pipe written by the handler was chosen over Python's signal.set_wakeup_fd() because it
     keeps the whole of this in one class: set_wakeup_fd is a single setting for the whole
@@ -3677,16 +3679,25 @@ class StopRequest:
             except OSError:
                 pass                    # nothing useful can be done about it here; the flag is set
 
+    # How often, in seconds, the serving loop looks whether it has been told to finish while no
+    # connection arrives (after one, it looks at once). Python's own figure is half a second,
+    # which made a stop with the dashboard idle take up to half a second where it had taken a
+    # hundredth; a twentieth cannot be noticed, and the looks themselves cost next to nothing.
+    LOOK_EVERY = 0.05
+
     def serve(self, web):
         """Run the web server in this thread until a stop is asked for, then return. If one has
-        been asked for already, return as soon as the server has started."""
+        been asked for already, during start-up, do not serve at all."""
+        if self.asked:
+            return
         threading.Thread(target=self._shut_when_asked, args=(web,), daemon=True).start()
-        web.serve_forever()
+        web.serve_forever(poll_interval=self.LOOK_EVERY)
 
     def _shut_when_asked(self, web):
         """The helper thread: wait for the byte that note() writes, then tell the web server to
         finish. Being an ordinary thread, it may take the locks that shutdown() needs. The
-        serving loop looks for that request twice a second, and at once after each connection."""
+        serving loop acts on it at its next look: within LOOK_EVERY seconds, and at once after
+        a connection."""
         os.read(self._read, 1)
         web.shutdown()
 
@@ -3710,12 +3721,15 @@ def start_up(args, stop):
     and before the cloud link, the two things that need cleaning up or can take a while to start
     (the cloud link's first pairing try can take 20 seconds): once a stop has been asked for,
     nothing more is started and None is returned in place of the web server. A request that
-    arrives later than that is acted on as soon as serving begins. Either way run() goes on to
-    clean_up(), which stops whatever was started.
+    arrives later than that means there is no serving (see StopRequest.serve) and no browser
+    is opened. Either way run() goes on to clean_up(), which stops whatever was started.
 
     To start one more thing: start it here, look at `stop.asked` first if it is slow to start or
-    would be wrong to start on the way out, and give it its line in clean_up()."""
-    global ENF, CA
+    would be wrong to start on the way out, and give it its line in clean_up(). Then give it a
+    stand-in in WholeLife.setUp in tests/test_start_stop.py: those tests run this very function
+    inside the test program, and anything without a stand-in would be started there for real.
+    A test in that file fails until every name used here is accounted for."""
+    global ENF, CA, BROWSER
     init_db()
     load_lists()
     S.local_ip = find_local_ip()
@@ -3747,17 +3761,30 @@ def start_up(args, stop):
     print("  Dashboard:        %s" % url)
     print("  This computer is: %s  (type this into a device's DNS setting)" % S.local_ip)
     print("\nLeave this window open. Close it to stop QuietNet.\n")
-    if not args.no_browser:
-        threading.Timer(0.5, webbrowser.open, (url,)).start()
+    if not args.no_browser and not stop.asked:
+        BROWSER = open_browser_soon(url)
     return web
+
+
+def open_browser_soon(url, after=0.5):
+    """Open the dashboard in the person's browser `after` seconds from now: half a second, by
+    when the program will be serving it. Returns the timer, started, so that clean_up() can
+    call it off: a stop request in that half second must not open a browser on a dashboard
+    that has gone. A daemon thread, so that it can never hold up the program's end."""
+    timer = threading.Timer(after, webbrowser.open, (url,))
+    timer.daemon = True
+    timer.start()
+    return timer
 
 
 def clean_up():
     """Stop what start_up() started, and say that QuietNet has stopped.
 
-    To have one more thing stopped, add its line here. Each line must be safe whether its thing
-    was started, only made, or never reached (still None), because a stop request or an error
-    can end start-up at any point."""
+    To have one more thing stopped, add its line here (and see start_up() for its stand-in in
+    the tests). Each line must be safe whether its thing was started, only made, or never
+    reached (still None), because a stop request or an error can end start-up at any point."""
+    if BROWSER:
+        BROWSER.cancel()                # if it has not opened yet, it never will
     if ENF:
         ENF.stop()                      # waits until the network is restored
     if CA:

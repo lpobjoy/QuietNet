@@ -215,9 +215,41 @@ class Handler(SignalsPutBack):
         client.join(30)
         self.assertEqual(answers, [b"hello"])
 
-    def test_serving_ends_at_once_when_the_stop_was_asked_for_before_it_began(self):
+    def test_there_is_no_serving_at_all_when_the_stop_was_asked_for_before_it_began(self):
+        """Once the serving loop has begun it can take a moment to notice that it should finish,
+        so a request already noted must mean that it never begins."""
+        web = mock.Mock()
         self.note()
-        self.serve_with_a_time_limit(self.web_server())
+        self.stop.serve(web)
+        web.serve_forever.assert_not_called()
+
+    def test_serving_still_ends_when_the_request_comes_before_the_loop_has_begun(self):
+        """The instant between serve() finding nothing asked and the serving loop starting: the
+        request's byte waits in the pipe for the helper thread, which ends the loop."""
+        web = self.web_server()
+        begin = web.serve_forever
+
+        def asked_just_before_the_loop_begins(**how):
+            """Note a stop request, as the handler would, then start the real serving loop."""
+            self.note()
+            begin(**how)
+        web.serve_forever = asked_just_before_the_loop_begins
+        self.serve_with_a_time_limit(web)
+
+    def test_an_idle_dashboard_looks_for_the_request_to_finish_at_least_ten_times_a_second(self):
+        """Python's serving loop notices that it has been told to finish only when it next looks,
+        and left alone it looks twice a second: a stop with nobody using the dashboard then took
+        up to half a second, where before the fix it had taken a hundredth."""
+        web = mock.Mock()
+        self.stop.serve(web)
+        web.serve_forever.assert_called_once()
+        self.assertLessEqual(web.serve_forever.call_args[1]["poll_interval"], 0.1)
+        # Let the helper thread go before the pipe it is reading is closed.
+        self.note()
+        deadline = time.monotonic() + 30
+        while not web.shutdown.called and time.monotonic() < deadline:
+            time.sleep(0.001)
+        web.shutdown.assert_called_once_with()
 
 
 class StandIn:
@@ -246,52 +278,103 @@ class StandIn:
         self.diary.append(self.name + " stopped")
 
 
+class BrowserTimer:
+    """A stand-in for the timer that opens the dashboard in a browser half a second after
+    start-up: it opens nothing, and writes in the diary that it was set and that it was called
+    off."""
+
+    def __init__(self, url, diary):
+        """Note that the timer was set, and for which address."""
+        self.diary = diary
+        diary.append("browser set to open " + url)
+
+    def cancel(self):
+        """Note that the timer was called off."""
+        self.diary.append("browser called off")
+
+
+class Dashboard(ThreadingHTTPServer):
+    """The real dashboard web server, on a spare port, that writes in the diary when its
+    serving loop begins."""
+    daemon_threads = True
+
+    def serve_forever(self, poll_interval=0.5):
+        """Note that serving has begun, then serve as usual."""
+        self.diary.append("dashboard serving")
+        super().serve_forever(poll_interval)
+
+
+# The names start_up() and clean_up() use that start nothing by themselves: the program's
+# settings and what it holds in memory, the modules whose classes have stand-ins, and the methods
+# called on the stand-ins. Every other name those two functions use must have a stand-in in
+# WholeLife.setUp (see the test near the end of WholeLife).
+STARTS_NOTHING = {
+    "S", "local_ip", "dns_error", "dns_port", "DATA", "enforcement_plan", "neighbours", "learn_enforced_mac",
+    "web_port", "no_browser", "no_device_names", "asked", "print", "Web",
+    "threading", "Thread", "enforcer", "cloud_agent",
+    "start", "stop", "cancel", "available", "reason", "start_listeners",
+}
+
+
 class WholeLife(SignalsPutBack, Base):
     """run() with the real start_up() and clean_up(), and stand-ins for everything they start.
 
     `self.diary` lists what happened, in order. A test says what should happen while a stand-in
-    starts or stops, such as a stop request arriving, by filling `self.enforcer_does` or
-    `self.cloud_does`."""
+    starts or stops, or as the dashboard's port is opened, such as a stop request arriving, by
+    filling `self.enforcer_does`, `self.cloud_does`, `self.listeners_do` or `self.dashboard_does`.
+
+    Whatever start_up() starts needs a stand-in here, or these tests start the real thing
+    inside the test program. `self.stood_in` holds the names replaced; a test checks them
+    against the names start_up() and clean_up() use."""
 
     def setUp(self):
         """Put the stand-ins in place for the length of the test."""
         super().setUp()
         self.diary, self.enforcer_does, self.cloud_does, self.listeners_do = [], {}, {}, {}
-        self.webs, self.answers = [], []
+        self.dashboard_does = {}
+        self.webs, self.answers, self.stood_in = [], [], set()
         self.printed = io.StringIO()
-        for name in ("init_db", "load_lists", "log_writer", "router_advert_listener", "address_watcher"):
+        for name in ("init_db", "load_lists", "log_writer", "router_advert_listener", "address_watcher",
+                     "hint_refresher"):
             self.patch(server, name, nothing)
+        self.patch(server, "NAMER", mock.Mock())
         self.patch(server, "find_local_ip", lambda: "192.168.1.2")
         self.patch(server, "start_dns", lambda port: self.listeners_do.get("start", nothing)())
         self.patch(server.enforcer, "Enforcer", lambda *a, **k: StandIn("enforcer", self.diary, self.enforcer_does))
         self.patch(server.cloud_agent, "CloudAgent", lambda *a, **k: StandIn("cloud link", self.diary, self.cloud_does))
         self.patch(server, "ThreadingHTTPServer", self.make_web_server)
-        self.patch(server, "ENF", None)
-        self.patch(server, "CA", None)
+        self.patch(server, "open_browser_soon", lambda url: BrowserTimer(url, self.diary))
+        # What start_up() keeps for clean_up(): put back after each test, so that no test stops
+        # something an earlier test left behind.
+        for name in ("ENF", "CA", "BROWSER"):
+            self.patch(server, name, None)
 
     def patch(self, where, name, stand_in):
         """Replace where.name with the stand-in until the test is over."""
         patcher = mock.patch.object(where, name, stand_in)
         patcher.start()
         self.addCleanup(patcher.stop)
+        self.stood_in.add(name)
 
     def make_web_server(self, address, handler):
         """A real dashboard web server on a spare port, noted in the diary and kept in
         self.webs, so that a test can reach it and the time limit can end it."""
-        web = ThreadingHTTPServer(("127.0.0.1", 0), handler)
-        web.daemon_threads = True
+        web = Dashboard(("127.0.0.1", 0), handler)
+        web.diary = self.diary
         self.addCleanup(web.server_close)
         self.webs.append(web)
         self.diary.append("dashboard port opened")
+        self.dashboard_does.get("opened", nothing)()
         return web
 
-    def run_it(self, stop_once_serving=None):
+    def run_it(self, stop_once_serving=None, browser=False):
         """Run the whole life in this thread, and return the error that ended it, if one did.
 
         `stop_once_serving` is a signal to send once the dashboard has answered a request (the
-        diary then says "dashboard answered"). Should
-        run() still be going 30 seconds on, the dashboard is ended from outside and the test
-        fails, so that a fault here cannot hang the whole test run."""
+        diary then says "dashboard answered"). `browser` says whether the program is to open
+        the dashboard in a browser, as it does when started by hand. Should run() still be
+        going 30 seconds on, the dashboard is ended from outside and the test fails, so that a
+        fault here cannot hang the whole test run."""
         gave_up, helpers = [], []
 
         def give_up():
@@ -302,22 +385,35 @@ class WholeLife(SignalsPutBack, Base):
 
         def ask_then_stop():
             """Wait for the dashboard's answer, which shows it is serving, then send the signal
-            to this program. Python runs the handler in the main thread, which is serving."""
+            to this program. Python runs the handler in the main thread, which is serving.
+
+            If start-up never gets as far as a dashboard, give up after 30 seconds and send
+            nothing. And send nothing unless QuietNet is listening for the signal: left to
+            Python, it would end the whole test run. The dashboard is then ended from here, and
+            the diary says why."""
+            deadline = time.monotonic() + 30
             while not self.webs:
+                if time.monotonic() > deadline:
+                    return
                 time.sleep(0.001)
             conn = http.client.HTTPConnection("127.0.0.1", self.webs[0].server_address[1], timeout=30)
             conn.request("GET", "/api/services", headers={"Host": "localhost"})
             self.answers.append(conn.getresponse().status)
             conn.close()
             self.diary.append("dashboard answered")
-            signal.raise_signal(stop_once_serving)
+            handler = signal.getsignal(stop_once_serving)
+            if getattr(handler, "__func__", None) is server.StopRequest.note:
+                signal.raise_signal(stop_once_serving)
+            else:
+                self.diary.append("QuietNet was not listening for %s: %r was in place" % (stop_once_serving.name, handler))
+                self.webs[0].shutdown()
         limit = threading.Timer(30, give_up)
         limit.daemon = True
         limit.start()
         if stop_once_serving:
             helpers.append(threading.Thread(target=ask_then_stop, daemon=True))
             helpers[0].start()
-        args = mock.Mock(dns_port=0, web_port=0, no_browser=True, no_device_names=True)
+        args = mock.Mock(dns_port=0, web_port=0, no_browser=not browser, no_device_names=True)
         error = None
         try:
             with contextlib.redirect_stdout(self.printed):
@@ -334,8 +430,8 @@ class WholeLife(SignalsPutBack, Base):
     def test_an_ordinary_life_starts_everything_serves_and_stops_everything(self):
         self.assertIsNone(self.run_it(stop_once_serving=signal.SIGTERM))
         self.assertEqual(self.diary, ["enforcer made", "enforcer started", "cloud link made", "cloud link started",
-                                      "dashboard port opened", "dashboard answered", "enforcer stopped",
-                                      "cloud link stopped"])
+                                      "dashboard port opened", "dashboard serving", "dashboard answered",
+                                      "enforcer stopped", "cloud link stopped"])
         self.assertEqual(self.answers, [200])
         self.assertIn("QuietNet is running.", self.printed.getvalue())
         self.assertTrue(self.printed.getvalue().endswith("QuietNet stopped.\n"))
@@ -364,14 +460,43 @@ class WholeLife(SignalsPutBack, Base):
         self.assertIsNone(self.run_it())
         self.assertEqual(self.diary, ["enforcer made", "enforcer started", "enforcer stopped"])
 
-    def test_a_stop_request_while_the_cloud_link_starts_ends_serving_as_soon_as_it_begins(self):
-        """Too late for start-up to be cut short, so the request has to be remembered until the
-        dashboard is serving, and end it then."""
+    def test_a_stop_request_while_the_cloud_link_starts_means_the_dashboard_is_never_served(self):
+        """Too late for start-up to be cut short, so the request has to be remembered: the rest
+        of start-up is finished, there is no serving, and everything is stopped."""
         self.cloud_does["start"] = ask_to_stop
         self.assertIsNone(self.run_it())
         self.assertEqual(self.diary, ["enforcer made", "enforcer started", "cloud link made", "cloud link started",
                                       "dashboard port opened", "enforcer stopped", "cloud link stopped"])
         self.assertTrue(self.printed.getvalue().endswith("QuietNet stopped.\n"))
+
+    def test_a_stop_request_just_as_the_dashboards_port_opens_means_it_is_never_served(self):
+        """The last lines of start-up, after its last look at the request: the port is open
+        and the program is not yet serving. Before the fix, the request ended the program on
+        the spot here, with no clean-up."""
+        self.dashboard_does["opened"] = ask_to_stop
+        self.assertIsNone(self.run_it())
+        self.assertEqual(self.diary[-3:], ["dashboard port opened", "enforcer stopped", "cloud link stopped"])
+        self.assertTrue(self.printed.getvalue().endswith("QuietNet stopped.\n"))
+
+    def test_a_program_started_by_hand_sets_its_browser_to_open_and_the_clean_up_calls_it_off(self):
+        """The browser opens half a second after start-up. Calling it off does nothing once it
+        has opened; if the stop request came first, it stops a browser opening on a dashboard
+        that has gone."""
+        self.assertIsNone(self.run_it(stop_once_serving=signal.SIGTERM, browser=True))
+        self.assertEqual(self.diary[4:], ["dashboard port opened", "browser set to open http://localhost:0",
+                                          "dashboard serving", "dashboard answered", "browser called off",
+                                          "enforcer stopped", "cloud link stopped"])
+
+    def test_no_browser_is_set_to_open_when_the_program_was_told_not_to(self):
+        self.assertIsNone(self.run_it(stop_once_serving=signal.SIGTERM))
+        self.assertEqual([line for line in self.diary if "browser" in line], [])
+
+    def test_a_stop_request_while_the_cloud_link_starts_means_no_browser_is_opened(self):
+        """Before this was fixed the browser opened after "QuietNet stopped." had been printed."""
+        self.cloud_does["start"] = ask_to_stop
+        self.assertIsNone(self.run_it(browser=True))
+        self.assertEqual([line for line in self.diary if "browser" in line], [])
+        self.assertEqual(self.diary[-3:], ["dashboard port opened", "enforcer stopped", "cloud link stopped"])
 
     def test_a_start_up_that_fails_still_stops_what_it_had_started(self):
         """The dashboard's port being in use is the usual cause. The error still ends the
@@ -404,15 +529,34 @@ class WholeLife(SignalsPutBack, Base):
         self.assertEqual(self.diary[-2:], ["enforcer stopped", "cloud link stopped"])
         self.assertTrue(self.printed.getvalue().endswith("QuietNet stopped.\n"))
 
+    def test_a_signal_is_not_sent_to_the_test_program_unless_quietnet_is_listening_for_it(self):
+        """A guard on these tests themselves. Should run() ever stop listening, the test must
+        fail with a reason; a signal sent regardless would end the whole test run on the spot,
+        with no report at all."""
+        self.patch(server.StopRequest, "listen", nothing)
+        self.assertIsNone(self.run_it(stop_once_serving=signal.SIGTERM))
+        self.assertIn("QuietNet was not listening for SIGTERM", " ".join(self.diary))
+
+    def test_everything_start_up_and_clean_up_use_has_a_stand_in_here_or_starts_nothing(self):
+        """These tests run the real start_up() and clean_up() inside the test program. So the
+        next thing added to them (a thread, a listener, something that sends onto the home
+        network) would be started for real by every test above, with nothing to show for it,
+        unless it is given a stand-in in setUp. This fails until it has one, or until its name
+        is added to STARTS_NOTHING because it truly starts nothing."""
+        used = set(server.start_up.__code__.co_names) | set(server.clean_up.__code__.co_names)
+        self.assertEqual(used - self.stood_in - STARTS_NOTHING, set(),
+                         "start_up() or clean_up() in server.py uses these names, which WholeLife.setUp in "
+                         "tests/test_start_stop.py does not replace with a stand-in")
+
 
 class CleanUp(Base):
     """clean_up() alone, for the states start-up can be left in."""
 
-    def cleaned_up(self, enforcer, cloud):
-        """Run clean_up() with these two in place of the real ones; return what it printed."""
+    def cleaned_up(self, enforcer, cloud, browser=None):
+        """Run clean_up() with these in place of the real ones; return what it printed."""
         printed = io.StringIO()
         with mock.patch.object(server, "ENF", enforcer), mock.patch.object(server, "CA", cloud), \
-                contextlib.redirect_stdout(printed):
+                mock.patch.object(server, "BROWSER", browser), contextlib.redirect_stdout(printed):
             server.clean_up()
         return printed.getvalue()
 
@@ -434,6 +578,26 @@ class CleanUp(Base):
         """The real class again: made with a throwaway folder, it contacts nothing until started."""
         cloud = server.cloud_agent.CloudAgent(0, server.DATA, log=lambda m: None)
         self.assertIn("QuietNet stopped.", self.cleaned_up(None, cloud))
+
+    def test_a_browser_that_has_not_opened_yet_is_called_off(self):
+        browser = mock.Mock()
+        self.assertIn("QuietNet stopped.", self.cleaned_up(None, None, browser))
+        browser.cancel.assert_called_once_with()
+
+    def test_the_real_browser_timer_can_be_called_off_and_never_holds_up_the_end_of_the_program(self):
+        """The real timer, with a stand-in for the opening itself and an hour to run in place of
+        half a second, so that this test cannot be too slow for it: it is set for the address
+        given, is a daemon thread (which Python does not wait for at exit), and once called off
+        it ends without opening anything."""
+        opened = []
+        with mock.patch.object(server.webbrowser, "open", opened.append):
+            timer = server.open_browser_soon("http://localhost:1", after=3600)
+            self.assertEqual(self.cleaned_up(None, None, timer), "\nQuietNet stopped.\n")
+            timer.join(30)
+        self.assertFalse(timer.is_alive())
+        self.assertTrue(timer.daemon)
+        self.assertEqual(timer.args, ("http://localhost:1",))
+        self.assertEqual(opened, [])
 
     def test_the_enforcer_is_stopped_before_the_cloud_link(self):
         order = []
