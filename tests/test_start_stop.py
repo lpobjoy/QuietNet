@@ -377,7 +377,7 @@ class WholeLife(SignalsPutBack, Base):
         its file. Should run() still be
         going 30 seconds on, the dashboard is ended from outside and the test fails, so that a
         fault here cannot hang the whole test run."""
-        gave_up, helpers = [], []
+        gave_up, helpers, over = [], [], threading.Event()
 
         def give_up():
             """End the serving loop from outside and note that it had to be done."""
@@ -389,13 +389,13 @@ class WholeLife(SignalsPutBack, Base):
             """Wait for the dashboard's answer, which shows it is serving, then send the signal
             to this program. Python runs the handler in the main thread, which is serving.
 
-            If start-up never gets as far as a dashboard, give up after 30 seconds and send
-            nothing. And send nothing unless QuietNet is listening for the signal: left to
-            Python, it would end the whole test run. The dashboard is then ended from here, and
-            the diary says why."""
+            If start-up never gets as far as a dashboard, give up as soon as run() is over, or
+            after 30 seconds, and send nothing. And send nothing unless QuietNet is listening
+            for the signal: left to Python, it would end the whole test run. The dashboard is
+            then ended from here, and the diary says why."""
             deadline = time.monotonic() + 30
             while not self.webs:
-                if time.monotonic() > deadline:
+                if over.is_set() or time.monotonic() > deadline:
                     return
                 time.sleep(0.001)
             conn = http.client.HTTPConnection("127.0.0.1", self.webs[0].server_address[1], timeout=30)
@@ -424,8 +424,10 @@ class WholeLife(SignalsPutBack, Base):
             error = e
         finally:
             limit.cancel()
+            over.set()
         for helper in helpers:
             helper.join(30)
+            self.assertFalse(helper.is_alive(), "the tests' own helper thread was still going 30 seconds on")
         self.assertFalse(gave_up, "QuietNet was still running 30 seconds on. The diary: %r" % self.diary)
         return error
 
@@ -519,12 +521,15 @@ class WholeLife(SignalsPutBack, Base):
 
     def test_a_start_up_that_fails_still_stops_what_it_had_started(self):
         """The dashboard's port being in use is the usual cause. The error still ends the
-        program, but not before the enforcer has handed the network back."""
+        program, but not before the enforcer has handed the network back.
+
+        The tests' helper that waits for the dashboard is set going here as well, to show that
+        it gives up when there is never to be a dashboard: run_it() checks that it has ended."""
         def port_in_use(address, handler):
             """What Python's web server does when something else has the port."""
             raise OSError(48, "Address already in use")
         self.patch(server, "ThreadingHTTPServer", port_in_use)
-        error = self.run_it()
+        error = self.run_it(stop_once_serving=signal.SIGTERM)
         self.assertIsInstance(error, OSError)
         self.assertEqual(self.diary[-2:], ["enforcer stopped", "cloud link stopped"])
         self.assertTrue(self.printed.getvalue().endswith("QuietNet stopped.\n"))
