@@ -77,6 +77,17 @@ def one_round_of_the_writer():
     return prune
 
 
+def steady_clock_held_at_the_move():
+    """Hold QuietNet's steady clock at the moment the move finished, for the length of a "with".
+    The fill may call itself finished FILL_SETTLE seconds after the move. A test of what it does
+    before then says itself when that time has passed (by moving S.moved_steady back), so the
+    real seconds that go by while the test runs must not count: on a machine that stalls for
+    ten seconds between the move and the fill, the fill would finish without the waits the test
+    is about."""
+    moved = server.S.moved_steady
+    return mock.patch.object(server.time, "monotonic", lambda: moved)
+
+
 class Devices(Base):
     """Shared steps: a home with this computer at PI and the router at ROUTER."""
 
@@ -1120,7 +1131,9 @@ class DeviceList(Api):
         self.look({OLD_SPOT: fresh(TV)})
         self.lookup(OLD_SPOT, "old.example.com")
         path = "/api/activity?ip=%s&device=%s&hours=24&since=%%s" % (OLD_SPOT, server.S.hw_device[TV])
-        server.sql("INSERT INTO queries(ts,client,domain,blocked) VALUES(?,?,?,0)", (time.time() - 5, OTHER, "other.example.com"),
+        # Five seconds before the look that follows, by the clock the looks go by (self.now), not
+        # by the real one: a lookup made after the last look would have to wait for a later look.
+        server.sql("INSERT INTO queries(ts,client,domain,blocked) VALUES(?,?,?,0)", (self.now - 5, OTHER, "other.example.com"),
                    commit=True)
         first = self.get(path % "")[1]["marker"]
         self.look({OLD_SPOT: fresh(TV), OTHER: fresh(LAPTOP)})
@@ -1242,13 +1255,23 @@ class TheDashboardPage(unittest.TestCase):
         self.assertIn("${id ? '&device=' + encodeURIComponent(id) : ''}", self.page)
 
     def test_the_page_clears_history_by_the_devices_number_when_it_has_one(self):
-        self.assertIn("id ? {ip:S.device, device:id} : {ip:S.device}", self.page)
+        self.assertIn("await api('/api/clear-history', who).catch(oops)", self.page)
+        self.assertIn("const who = byDevice(S.device);", self.page)
+
+    def test_the_page_never_asks_to_clear_history_without_naming_a_device(self):
+        # A request that names neither a device nor an address clears everyone's history.
+        clear = self.page[self.page.index("async clear(){"):]
+        clear = clear[:clear.index("\n  },")]
+        self.assertIn("if(!who.ip && !who.device) return;", clear)
+        self.assertLess(clear.index("if(!who.ip && !who.device) return;"), clear.index("api('/api/clear-history'"))
 
     def test_the_page_only_takes_a_whole_number_as_a_devices_number(self):
-        self.assertIn("Number.isInteger(d.id) ? String(d.id) : ''", self.page)
+        self.assertIn("const keyOf = d => Number.isInteger(d.id) ? 'd' + d.id : 'a' + d.ip;", self.page)
+        self.assertIn("const deviceId = key => /^d\\d+$/.test(String(key)) ? String(key).slice(1) : '';", self.page)
 
-    def test_the_page_leaves_out_entries_with_no_address_of_their_own(self):
-        self.assertIn("api('/api/devices').then(x => S.devices = x.filter(d => d.ip))", self.page)
+    def test_the_page_lists_devices_with_no_address_of_their_own_too(self):
+        self.assertIn("api('/api/devices?all=1').then(x => { S.devices = x.filter(d => d.ip || Number.isInteger(d.id)); "
+                      "rekey(); })", self.page)
 
     def test_the_note_about_the_move_is_shown_on_the_home_page(self):
         home = self.page[self.page.index("function viewHome(){"):self.page.index("// The household setting \"Stop every device")]
@@ -1290,17 +1313,18 @@ class TheDashboardPage(unittest.TestCase):
         self.assertIn("if(!lines.length) return '';", self.notice)
 
     def test_the_page_names_a_device_by_its_number_as_well_as_its_address_when_it_changes_it(self):
-        self.assertIn("const byDevice = ip => { const id = deviceId(ip); return id ? {ip, device:id} : {ip}; };", self.page)
-        for call in ("api('/api/device-name', Object.assign(byDevice(ip), {name}))",
+        self.assertIn("const byDevice = key => { const ip = addrOf(key), id = deviceId(key), out = {}; "
+                      "if(ip) out.ip = ip; if(id) out.device = id; return out; };", self.page)
+        for call in ("api('/api/device-name', Object.assign(byDevice(key), {name}))",
                      "api('/api/device-group', Object.assign(byDevice(S.device), {group:",
                      "api('/api/enforce', Object.assign(byDevice(S.device), {on:e.target.checked}))"):
             self.assertIn(call, self.page)
 
     def test_the_page_keeps_a_devices_rules_under_its_number_when_it_has_one(self):
-        self.assertIn("return id ? 'dev:' + id : 'device:' + ip;", self.page)
+        self.assertIn("return id ? 'dev:' + id : 'device:' + addrOf(key);", self.page)
         self.assertIn("${controls(scopeOf(S.device), 'this device')}", self.page)
         # The controls are asked for only once the device list has arrived, so the number is the right one.
-        self.assertIn("jobs.push(devices.then(() => ctl(scopeOf(S.device))))", self.page)
+        self.assertIn("jobs.push(devices.then(() => S.device ? ctl(scopeOf(S.device)) : null))", self.page)
 
     def test_the_page_matches_a_schedule_to_a_device_by_its_number(self):
         self.assertIn("x.scope === scope || (x.device != null && scope === 'dev:' + x.device)", self.page)
@@ -1644,7 +1668,7 @@ class TheMove(OlderHousehold):
             waits.append(seconds)
             if waits.count(1) == 3:
                 server.S.moved_steady -= server.FILL_SETTLE
-        with mock.patch.object(server.time, "sleep", sleep):
+        with mock.patch.object(server.time, "sleep", sleep), steady_clock_held_at_the_move():
             server.fill_old_history()
         self.assertEqual(waits, [server.FILL_PAUSE, 1, 1, 1])
         self.assertEqual(server.get_setting("devices_fill", ""), "done")
@@ -2082,7 +2106,7 @@ class LookupsMadeJustBeforeTheMove(OlderHousehold):
                 del waiting[:]
                 self.assertEqual(server.sql("SELECT device FROM queries WHERE domain='late.example.com'"), [(None,)])
                 server.S.moved_steady -= server.FILL_SETTLE
-        with mock.patch.object(server.time, "sleep", sleep):
+        with mock.patch.object(server.time, "sleep", sleep), steady_clock_held_at_the_move():
             server.fill_old_history()
         self.assertEqual(waiting, [])
         self.assertEqual(server.sql("SELECT COUNT(*) FROM queries WHERE device IS NULL")[0][0], 0)
