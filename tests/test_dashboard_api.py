@@ -16,7 +16,7 @@ from http.server import ThreadingHTTPServer
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from test_quietnet import ADULT, KID, Base, is_blocked, query, server
+from test_quietnet import ADULT, KID, Base, in_force_now, is_blocked, query, server
 
 
 class Api(Base):
@@ -478,18 +478,18 @@ class ScheduleApi(Api):
         self.assertEqual(self.get("/api/schedules")[1], [])
 
     def test_a_saved_schedule_is_listed_with_whether_it_is_on_right_now(self):
-        every_day = dict(self.GOOD, days=[0, 1, 2, 3, 4, 5, 6])
-        self.ok("/api/schedule", every_day)
+        self.ok("/api/schedule", dict(self.GOOD, **in_force_now()))
         _, schedules = self.get("/api/schedules")
         self.assertEqual(len(schedules), 1)
         x = schedules[0]
         self.assertEqual((x["name"], x["scope"], x["services"], x["off"], x["enabled"]),
                          ("Homework", "all", ["youtube"], False, True))
-        self.assertEqual(x["active"], time.strftime("%H:%M") != "23:59")
+        self.assertTrue(x["active"])
 
     def test_switching_a_schedule_off_and_on(self):
-        self.ok("/api/schedule", dict(self.GOOD, days=[0, 1, 2, 3, 4, 5, 6], start="00:00", end="23:59"))
+        self.ok("/api/schedule", dict(self.GOOD, **in_force_now()))
         sid = self.get("/api/schedules")[1][0]["id"]
+        self.assertTrue(is_blocked("www.youtube.com", KID))
         self.ok("/api/schedule-enable", {"id": sid, "on": False})
         x = self.get("/api/schedules")[1][0]
         self.assertEqual((x["enabled"], x["active"]), (False, False))
