@@ -144,8 +144,17 @@ class RelayCase(unittest.TestCase):
             pi = Browser(self.port)
             _, text, _ = pi.get("/agent/poll", headers={"X-QuietNet-Token": token})
             seen.update(json.loads(text))
-            pi.post("/agent/respond", data={"id": seen.get("id"), "status": status, "body": body},
-                    headers={"X-QuietNet-Token": token, "X-QuietNet-Call": str(seen.get("id"))})
+            try:
+                pi.post("/agent/respond", data={"id": seen.get("id"), "status": status, "body": body},
+                        headers={"X-QuietNet-Token": token, "X-QuietNet-Call": str(seen.get("id"))})
+            except (OSError, http.client.HTTPException):
+                # The relay closes the connection, unread, on an answer it turns away (a large
+                # one it has no room for). If this pretend Pi is still sending, the send ends
+                # in "connection reset" or "broken pipe", or the relay's short refusal comes
+                # back cut off. The tests judge by what the browser was told, so that is not a
+                # failure here, and it must not print a traceback from this thread into the
+                # log of a run that passed.
+                pass
 
         t = threading.Thread(target=work, daemon=True)
         t.start()
@@ -1239,6 +1248,7 @@ class PairingCodeExpiry(RelayCase):
             relay.init_db()
             self.assertEqual(relay.sql("SELECT id, token, paired, code_ts FROM pis"),
                              [("abc", relay.token_record("tok"), 1, 0)])
+            relay.db.close()                                  # as when the relay stops
             relay.init_db()                                   # starting a second time must not fail
             relay.db.close()
         finally:
@@ -1605,6 +1615,19 @@ class ConnectionLimits(RelayCase):
         self.addCleanup(httpd.shutdown)
         return httpd
 
+    def answer_once_a_place_is_free(self, httpd):
+        """Ask a one-connection server for /healthz, asking again for up to five seconds while it
+        says it is busy, and return the answer's status.
+
+        The server frees a connection's place just after it has finished with the connection, so
+        a browser can have its whole answer a moment before that place is free again."""
+        deadline = time.time() + 5
+        while True:
+            status = Browser(httpd.server_address[1]).get("/healthz")[0]
+            if status != 503 or time.time() > deadline:
+                return status
+            time.sleep(0.05)
+
     def test_connections_beyond_the_cap_are_told_the_relay_is_busy(self):
         httpd = self.busy_server()
         with socket.create_connection(("127.0.0.1", httpd.server_address[1]), timeout=5):   # holds the only place
@@ -1624,8 +1647,7 @@ class ConnectionLimits(RelayCase):
     def test_a_place_is_freed_when_a_connection_ends(self):
         httpd = self.busy_server()
         self.assertEqual(Browser(httpd.server_address[1]).get("/healthz")[0], 200)
-        time.sleep(0.2)
-        self.assertEqual(Browser(httpd.server_address[1]).get("/healthz")[0], 200)
+        self.assertEqual(self.answer_once_a_place_is_free(httpd), 200)
 
     def test_waiting_pis_beyond_their_cap_are_told_to_try_again(self):
         pid, token = self.paired_pi(self.signed_in())
@@ -1680,8 +1702,7 @@ class ConnectionLimits(RelayCase):
             except OSError:
                 pass
             self.assertLess(time.time() - started, 4)
-        time.sleep(0.2)
-        self.assertEqual(Browser(httpd.server_address[1]).get("/healthz")[0], 200)     # its place was freed
+        self.assertEqual(self.answer_once_a_place_is_free(httpd), 200)                  # its place was freed
 
     def test_a_request_whose_headers_arrive_in_time_is_answered(self):
         self.limit("HEADER_SECONDS", 1)
@@ -1757,6 +1778,11 @@ class BigAnswersOverTheWire(RelayCase):
         t, _ = self.pretend_pi(token, body=self.BIG)
         self.assertEqual(b.get("/pi/%s/api/activity" % pid, headers=self.API)[0], 200)
         t.join(5)
+        # The relay gives the room back just after it has written the answer, so the browser can
+        # have the whole answer a moment before the room is back. Allow it that moment.
+        deadline = time.time() + 5
+        while relay.big_answers.used and time.time() < deadline:
+            time.sleep(0.01)
         self.assertEqual((relay.big_answers.used, relay.big_answers.held), (0, {}))
 
     def test_a_large_answer_with_no_room_is_refused_and_the_browser_told_at_once(self):
@@ -1864,6 +1890,7 @@ class TokenStorage(RelayCase):
 
     def test_starting_again_does_not_hash_a_token_twice(self):
         self.start_on(self.old_database("a" * 48))
+        relay.db.close()                                      # as when the relay stops
         relay.init_db()
         self.assertEqual(relay.sql("SELECT token FROM pis", one=True)[0], relay.token_record("a" * 48))
 
