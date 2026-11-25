@@ -71,6 +71,7 @@ Each of these is the only thing standing between a hostile web page, or a strang
 - **`cloud/relay.py` is deployed without the other programs.** It cannot import them.
 - **Licence code stays on the relay and never answers 401.** It must never reach the Pi's blocking (`decision()`, the enforcer, the internet switches). A licence refusal is `402` or `403`, never `401`, which today's Pis take to mean "unpaired" and delete their token. Every licence decision reads `licence_state()`. Every refusal goes through `licence_gate()` (`pi_request`, `POST /pis/new`, `agent_pair`); the home page only reads `gate_on()` and `licence_state()` to decide what to show. The two rescue calls must keep working in every licence state.
 - **Python 3.9 must still work** for the programs: the macOS launcher prefers the Python that Apple supplies. Avoid newer syntax such as `match` or `X | Y` type hints at run time.
+- **A test must not depend on the time of day or on a sleep being long enough.** For a schedule that is in force now, use `in_force_now()` from `tests/test_quietnet.py`, never a fixed window such as 00:00 to 23:59. See "Writing more" in `docs/TESTING.md`.
 
 ## Working method
 
