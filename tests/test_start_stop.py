@@ -11,6 +11,7 @@ after every test. tests/test_shutdown.py does the same from outside, with the wh
 """
 import contextlib
 import http.client
+import inspect
 import io
 import os
 import signal
@@ -322,7 +323,7 @@ class Threads:
 # called on the stand-ins. Every other name those two functions use must have a stand-in in
 # WholeLife.setUp (see the test near the end of WholeLife).
 STARTS_NOTHING = {
-    "S", "local_ip", "dns_error", "dns_port", "DATA", "enforcement_plan", "neighbours", "learn_enforced_mac",
+    "S", "local_ip", "dns_error", "dns_port", "DATA", "enforcement_plan", "plan_neighbours", "learn_enforced_mac",
     "web_port", "no_browser", "no_device_names", "asked", "print", "Web",
     "threading", "Thread", "enforcer", "cloud_agent",
     "start", "stop", "cancel", "available", "reason", "start_listeners",
@@ -346,6 +347,7 @@ class WholeLife(SignalsPutBack, Base):
         super().setUp()
         self.diary, self.enforcer_does, self.cloud_does, self.listeners_do = [], {}, {}, {}
         self.dashboard_does, self.keeper_does, self.keeper_threads = {}, {}, []
+        self.real_enforcer, self.enforcer_given = server.enforcer.Enforcer, []
         self.webs, self.answers, self.stood_in = [], [], set()
         self.printed = io.StringIO()
         for name in ("init_db", "load_lists", "log_writer", "router_advert_listener", "address_watcher",
@@ -357,7 +359,7 @@ class WholeLife(SignalsPutBack, Base):
         self.patch(server, "NAMER", mock.Mock())
         self.patch(server, "find_local_ip", lambda: "192.168.1.2")
         self.patch(server, "start_dns", lambda port: self.listeners_do.get("start", nothing)())
-        self.patch(server.enforcer, "Enforcer", lambda *a, **k: StandIn("enforcer", self.diary, self.enforcer_does))
+        self.patch(server.enforcer, "Enforcer", self.make_enforcer)
         self.patch(server.cloud_agent, "CloudAgent", lambda *a, **k: StandIn("cloud link", self.diary, self.cloud_does))
         self.patch(server, "ThreadingHTTPServer", self.make_web_server)
         self.patch(server, "open_browser_soon", lambda url: BrowserTimer(url, self.diary))
@@ -372,6 +374,12 @@ class WholeLife(SignalsPutBack, Base):
         patcher.start()
         self.addCleanup(patcher.stop)
         self.stood_in.add(name)
+
+    def make_enforcer(self, *args, **kwargs):
+        """Stands in for the enforcer's class: keeps what start_up() handed over, under the names
+        the real enforcer knows each thing by, and gives back a stand-in that starts nothing."""
+        self.enforcer_given.append(inspect.signature(self.real_enforcer).bind(*args, **kwargs).arguments)
+        return StandIn("enforcer", self.diary, self.enforcer_does)
 
     def device_keeper(self):
         """Stands in for the device keeper, the background job that moves an older household's
@@ -539,6 +547,17 @@ class WholeLife(SignalsPutBack, Base):
         self.enforcer_does["start"] = lambda: ask_to_stop(signal.SIGINT)
         self.assertIsNone(self.run_it())
         self.assertEqual(self.diary, ["enforcer made", "enforcer started", "enforcer stopped"])
+
+    def test_the_enforcer_is_given_the_neighbour_table_its_plan_has_just_read(self):
+        """Every two seconds the enforcer asks for its plan and then for the neighbour table. The
+        plan is made from a reading of that table (which device is at which address just now), so
+        the enforcer is handed plan_neighbours, which gives it that same reading while it is
+        fresh: the table is read once a tick, not twice. Handed the plain reader, `neighbours`,
+        the enforcer would run the system's tool a second time every tick."""
+        self.enforcer_does["start"] = ask_to_stop
+        self.assertIsNone(self.run_it())
+        self.assertEqual(len(self.enforcer_given), 1)
+        self.assertIs(self.enforcer_given[0]["neighbours"], server.plan_neighbours)
 
     def test_a_stop_request_while_the_cloud_link_starts_means_the_dashboard_is_never_served(self):
         """Too late for start-up to be cut short, so the request has to be remembered: the rest

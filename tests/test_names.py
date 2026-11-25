@@ -287,6 +287,62 @@ class Dhcp(unittest.TestCase):
         for junk in (b"", packet[:24], b"\x60" + packet[1:], b"\x4f" + packet[1:]):
             self.assertIsNone(names.dhcp_from_ip_packet(junk))
 
+    def test_a_request_says_which_address_the_device_is_taking(self):
+        packet = dhcp_packet(3, b"\x32\x04" + bytes([192, 168, 1, 71]))
+        self.assertEqual(names.dhcp_address(packet), ("aa:bb:cc:00:11:22", "192.168.1.71"))
+
+    def test_a_request_renewing_an_address_gives_the_address_the_device_already_holds(self):
+        packet = bytearray(dhcp_packet(3))
+        packet[12:16] = bytes([192, 168, 1, 54])                    # the 'client address' field
+        self.assertEqual(names.dhcp_address(bytes(packet)), ("aa:bb:cc:00:11:22", "192.168.1.54"))
+
+    def test_the_address_asked_for_wins_over_the_address_already_held(self):
+        packet = bytearray(dhcp_packet(3, b"\x32\x04" + bytes([192, 168, 1, 71])))
+        packet[12:16] = bytes([192, 168, 1, 54])
+        self.assertEqual(names.dhcp_address(bytes(packet))[1], "192.168.1.71")
+
+    def test_a_device_that_set_its_own_address_says_so_in_an_inform(self):
+        packet = bytearray(dhcp_packet(8))
+        packet[12:16] = bytes([192, 168, 1, 99])
+        self.assertEqual(names.dhcp_address(bytes(packet))[1], "192.168.1.99")
+
+    def test_a_discover_only_says_what_the_device_would_like_so_it_names_no_address(self):
+        self.assertIsNone(names.dhcp_address(dhcp_packet(1, b"\x32\x04" + bytes([192, 168, 1, 71]))))
+
+    def test_a_request_that_names_no_address_gives_none(self):
+        self.assertIsNone(names.dhcp_address(dhcp_packet(3)))
+        self.assertIsNone(names.dhcp_address(dhcp_packet(3, b"\x32\x04" + bytes(4))))
+        self.assertIsNone(names.dhcp_address(dhcp_packet(3, b"\x32\x03abc")))
+
+    def test_a_servers_answer_or_a_rubbish_packet_names_no_address(self):
+        wanted = b"\x32\x04" + bytes([192, 168, 1, 71])
+        for junk in (dhcp_packet(2, wanted, op=2), dhcp_packet(5, wanted), dhcp_packet(3, wanted)[:200], b"",
+                     dhcp_packet(3, wanted).replace(b"\x63\x82\x53\x63", b"\x00\x00\x00\x00")):
+            self.assertIsNone(names.dhcp_address(junk))
+
+    def test_an_address_asked_for_in_an_overloaded_field_is_read_too(self):
+        packet = bytearray(dhcp_packet(3, b"\x34\x01\x01"))       # more options are in the 'file' field
+        packet[108:114] = b"\x32\x04" + bytes([192, 168, 1, 71])
+        self.assertEqual(names.dhcp_address(bytes(packet))[1], "192.168.1.71")
+
+    def test_the_listener_passes_on_which_address_a_device_is_taking(self):
+        heard = []
+        namer = names.Namer(on_address=lambda mac, address: heard.append((mac, address)))
+        namer.hear_dhcp(dhcp_packet(3, b"\x32\x04" + bytes([192, 168, 1, 71])), "0.0.0.0")
+        namer.hear_dhcp(dhcp_packet(1, b"\x0c\x02tv"), "0.0.0.0")   # a discover: a name, but no address taken
+        self.assertEqual(heard, [("aa:bb:cc:00:11:22", "192.168.1.71")])
+
+    def test_a_request_that_gives_no_name_still_says_which_address_is_taken(self):
+        heard = []
+        namer = names.Namer(on_address=lambda mac, address: heard.append(address))
+        namer.hear_dhcp(dhcp_packet(3, b"\x32\x04" + bytes([192, 168, 1, 71])), "0.0.0.0")
+        self.assertEqual((heard, dict(namer.heard_dhcp)), (["192.168.1.71"], {}))
+
+    def test_the_listener_works_without_anyone_to_tell(self):
+        namer = names.Namer()
+        namer.hear_dhcp(dhcp_packet(3, b"\x0c\x02tv\x32\x04" + bytes([192, 168, 1, 71])), "0.0.0.0")
+        self.assertEqual(namer.heard_dhcp["aa:bb:cc:00:11:22"]["name"], "tv")
+
     def test_common_software_labels_are_put_in_plain_words(self):
         self.assertEqual(names.vendor_words("MSFT 5.0"), "Runs Windows")
         self.assertEqual(names.vendor_words("android-dhcp-13"), "Runs Android")

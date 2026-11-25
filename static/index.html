@@ -682,6 +682,16 @@ const num = n => Number(n || 0).toLocaleString();
 // The number the Pi knows a device by (d.id in the device list), for the card at this address; ''
 // when it has none: an address listed on its own, or an older Pi that lists by address.
 const deviceId = ip => { const d = S.devices.find(x => x.ip === ip); return d && Number.isInteger(d.id) ? String(d.id) : ''; };
+// How a change names the device on the card at this address: by the card's address, and by the
+// device's number as well where the Pi gave one (names, groups and rules are held against the
+// device, so the number is what the Pi goes by; the address is for an older Pi).
+const byDevice = ip => { const id = deviceId(ip); return id ? {ip, device:id} : {ip}; };
+// The scope a device's own rules are kept under: 'dev:12' where the Pi lists by device, else
+// 'device:<address>' (an older Pi, or an address no device is known for yet).
+const scopeOf = ip => { const id = deviceId(ip); return id ? 'dev:' + id : 'device:' + ip; };
+// Is this schedule for this scope? The Pi gives a device's schedule with the device's number
+// (x.device) and with its scope written the older way ('device:<address>').
+const forScope = (x, scope) => x.scope === scope || (x.device != null && scope === 'dev:' + x.device);
 
 // The three looks. The choice is a display preference kept in a cookie for a year; it is checked
 // against this list wherever it is read, and anything else means calm. It never reaches the server's API.
@@ -860,7 +870,7 @@ function controls(scope, what){
     <div class="grow"><h2>Internet for ${what} is ${isOff ? 'OFF' : 'on'}</h2>
     <p class="meta">${c.off_from && !c.off ? 'Switched off ' + esc(c.off_from) + '.' : (c.off ? 'Switch back on to let ' + what + ' use the internet again.' : 'Switch this off to stop ' + what + ' reaching anything at all.')}</p></div>
     <label class="switch"><input type="checkbox" id="netSwitch" data-scope="${esc(scope)}" ${c.off ? '' : 'checked'} aria-label="Internet for ${what}"><span></span></label></div>`;
-  const scheds = S.schedules.filter(x => x.scope === scope).map(x => `<div class="sched">
+  const scheds = S.schedules.filter(x => forScope(x, scope)).map(x => `<div class="sched">
     <span class="avatar sm moon" aria-hidden="true">${ICON.moon}</span>
     <div class="grow"><b>${esc(x.name)}</b>${x.active ? '<span class="badge danger">On right now</span>' : ''}${x.enabled ? '' : '<span class="badge">Not in use</span>'}
       <div class="meta">${esc(daysText(x.days))}, <span class="mono">${esc(x.start)}</span> to <span class="mono">${esc(x.end)}</span>${x.start > x.end ? ' next morning' : ''} · ${esc(whatText(x))}</div></div>
@@ -902,6 +912,7 @@ function viewHome(){
   ${devicesNotice()}
   ${movedNotices(null)}
   ${deviceEvents()}
+  ${moveReport()}
   <div class="card">
     <div class="row">
       <div class="grow"><h2>Block known adverts and trackers automatically</h2>
@@ -983,12 +994,34 @@ function v6NeighbourNotice(){
     connections" on, lookups over IPv6 are refused, and devices fall back to their other DNS server. On a Raspberry Pi,
     running the install command again puts the missing tool back.</div>`;
 }
-// What the Pi has to say about bringing an older household's history up to date (st.devices.notice):
-// too little free space, or a move that failed. Nothing was changed in either case. An older Pi
-// sends no st.devices, and then nothing is shown.
+// What the Pi has to say about bringing an older household's data up to date (st.devices):
+//  - notice: too little free space, or a move that failed. Nothing was changed in either case.
+//  - conflicts: rules the move set aside, because the same device had rules under two numbers and
+//    these were not the ones applying to it. They apply to no device until the owner chooses;
+//    nothing is dropped or applied without being asked. The text says which were which.
+//  - old_rules: an older QuietNet was run on this data afterwards and left names, groups or rules
+//    where this version no longer reads them. The owner is offered to bring them in.
+//  - report: what the move of rules did, in plain words, kept to read later.
+// An older Pi sends no st.devices, or none of the last three, and then nothing is shown for them.
 function devicesNotice(){
-  const note = ((S.status || {}).devices || {}).notice;
-  return note ? `<div class="notice warn">${esc(note)}</div>` : '';
+  const dv = (S.status || {}).devices || {};
+  const choose = (c, choice, label, cls) =>
+    `<button class="btn${cls}" data-act="conflict" data-id="${esc(c.id)}" data-choice="${choice}">${label}</button>`;
+  return (dv.notice ? `<div class="notice warn">${esc(dv.notice)}</div>` : '')
+    + (dv.old_rules ? `<div class="notice warn"><b>An older version of QuietNet has been run on your data</b>, and names,
+      groups or rules were set there for ${num(dv.old_rules)} number${dv.old_rules === 1 ? '' : 's'}. This version is not
+      using them. <button class="btn" data-act="oldrules">Bring them in</button></div>` : '')
+    + (dv.conflicts || []).map(c => `<div class="notice warn"><b>Rules that need your decision.</b> ${esc(c.text)}
+      Give them to the device and they are added to its own rules. Leave them with the number and they apply to
+      whichever other device has that number.
+      ${choose(c, 'give', 'Give them to the device', ' primary')}${choose(c, 'remove', 'Remove them', '')}${choose(c, 'keep', 'Leave them with the number', ' link')}</div>`).join('');
+}
+// What the move of names, groups and rules to the devices did, line by line, for the owner to read.
+function moveReport(){
+  const lines = ((S.status || {}).devices || {}).report || [];
+  if(!lines.length) return '';
+  return `<div class="card"><h2>What changed when your rules were moved to the devices</h2><ul class="list">${lines.map(line =>
+    `<li class="item"><div class="meta">${esc(line)}</div></li>`).join('')}</ul></div>`;
 }
 // The optional household setting "Give no device IPv6 addresses". st.no_ipv6_all is true or false;
 // off unless the owner turns it on, because it changes what every device is told. Through the relay
@@ -1057,31 +1090,53 @@ function firewallNotice(){
       : 'To make it permanent, add the same rule to that firewall\'s own saved settings.'}</div>`;
 }
 
-/* ---------- Devices that change address ---------- */
-// A device with rules went quiet just as a new private-address device appeared: it may be the same
-// phone or tablet with a new private Wi-Fi address. st.device_notices comes from refresh_devices on
-// the Pi. On the home page every notice is shown; on a device's page (ip given) only those about it.
-// n.same marks a device with a new private address at the very number the rules are kept under:
-// the rules still apply to it, and the owner says whether it is the same device.
+/* ---------- Devices that change address, or come back with a new hardware address ---------- */
+// Rules are held against the device, by its hardware address. A phone told to forget the network
+// comes back with a new private Wi-Fi address, so as a new device. st.device_notices are the Pi's
+// questions about that. On the home page every notice is shown; on a device's page (ip given) only
+// those about it. Each carries the two devices' numbers (n.from_device, n.to_device), which the
+// answer sends back; an older Pi sends only the addresses.
+// n.same: the newcomer already gets the other device's rules for now, and the owner says whether
+// it is the same device. n.held: those rules were kept under a number alone (QuietNet could not
+// tell which device had it), and a device it can tell apart now has that number. n.extender: the
+// number is now answered for by a Wi-Fi range extender, so the device there can't be told apart
+// or joined to another; the only answer is "no".
+// Otherwise it is only a suggestion: a device with rules went quiet just as a new one appeared.
 function movedNotices(ip){
   const list = ((S.status || {}).device_notices || []).filter(n => !ip || n.to === ip);
-  return list.map(n => n.same
+  const ids = n => n.to_device == null ? '' : ` data-todev="${esc(n.to_device)}" data-fromdev="${esc(n.from_device)}"`;
+  const open = n => ip ? '' : `<button class="btn link" data-act="open" data-ip="${esc(n.to)}">Open it</button>`;
+  return list.map(n => n.same && n.extender
+    ? `<div class="notice warn"><b>The device at ${esc(n.to)} now connects through a Wi-Fi range extender</b>, so QuietNet
+    can't tell which device it is. That was ${esc(n.name)}'s number, so the rules for ${esc(n.name)} still apply to it.
+    <button class="btn" data-act="notsame" data-ip="${esc(n.to)}"${ids(n)}>It's a different device</button>
+    ${open(n)}</div>`
+    : n.same && n.held
+    ? `<div class="notice warn"><b>Rules are kept under the number ${esc(n.to)}</b>, set before QuietNet could tell which
+    device has it. A device it can tell apart has that number now, and the rules apply to it for now. Are they for this device?
+    <button class="btn primary" data-act="moverules" data-from="${esc(n.from)}" data-to="${esc(n.to)}"${ids(n)}>Yes, they are this device's</button>
+    <button class="btn" data-act="notsame" data-ip="${esc(n.to)}"${ids(n)}>No, they are for another device</button>
+    ${open(n)}</div>`
+    : n.same
     ? `<div class="notice warn"><b>A device with a new private Wi-Fi address now has the number ${esc(n.to)}</b>,
     which ${esc(n.name)} had. It may be the same device, so its rules still apply. Is it ${esc(n.name)}?
-    <button class="btn primary" data-act="moverules" data-from="${esc(n.from)}" data-to="${esc(n.to)}">Yes, it's the same device</button>
-    <button class="btn" data-act="notsame" data-ip="${esc(n.to)}">No, it's a different device</button>
-    ${ip ? '' : `<button class="btn link" data-act="open" data-ip="${esc(n.to)}">Open it</button>`}</div>`
+    <button class="btn primary" data-act="moverules" data-from="${esc(n.from)}" data-to="${esc(n.to)}"${ids(n)}>Yes, it's the same device</button>
+    <button class="btn" data-act="notsame" data-ip="${esc(n.to)}"${ids(n)}>No, it's a different device</button>
+    ${open(n)}</div>`
     : `<div class="notice warn"><b>A device with rules (${esc(n.name)}) has gone quiet and a new device appeared</b>
     at ${esc(n.to)}. It may be the same one with a new private Wi-Fi address.
-    <button class="btn primary" data-act="moverules" data-from="${esc(n.from)}" data-to="${esc(n.to)}">Move the rules to this device</button>
-    ${ip ? '' : `<button class="btn link" data-act="open" data-ip="${esc(n.to)}">Open it</button>`}</div>`).join('');
+    <button class="btn primary" data-act="moverules" data-from="${esc(n.from)}" data-to="${esc(n.to)}"${ids(n)}>It's the same device</button>
+    ${open(n)}</div>`).join('');
 }
-// The warning on a device's page (rules paused, not moved, or behind a range extender). A paused
-// address offers "It's the same device", for a device that changed its hardware address.
+// The warning on a device's page (it may be another device with a new hardware address, it is
+// behind a range extender, or its hardware address is at two numbers). On a Pi that still keeps
+// rules under addresses (an older one, or one that has not yet brought its data up to date), a
+// paused address offers "It's the same device": the rules kept under the number then apply to
+// the device that has it now. Nothing is joined there, so it has its own question (samehere).
 function deviceWarning(d){
   if(!d.warning) return '';
   return `<div class="notice warn">${esc(d.warning)}${d.paused
-    ? ` <button class="btn" data-act="moverules" data-from="${esc(d.ip)}" data-to="${esc(d.ip)}">It's the same device</button>` : ''}</div>`;
+    ? ` <button class="btn" data-act="samehere" data-ip="${esc(d.ip)}">It's the same device</button>` : ''}</div>`;
 }
 // What QuietNet did by itself to devices' rules in the last week (moved, paused, new-device group).
 function deviceEvents(){
@@ -1225,7 +1280,7 @@ function viewDevice(){
   ${otherDnsNotice(d)}
   ${sameAsNotice(d)}
   ${v6BypassNotice(d)}
-  ${controls('device:' + S.device, 'this device')}
+  ${controls(scopeOf(S.device), 'this device')}
   ${enforceCard(d)}
   <h2 class="list-head">What it has been talking to</h2>
   <div class="controls">
@@ -1317,6 +1372,11 @@ function daysText(days){
 function scopeText(scope){
   if(scope === 'all') return 'Whole house';
   if(scope.startsWith('group:')) return groupName(+scope.slice(6)) + ' group';
+  if(scope.startsWith('dev:')){
+    // A device named by its number: one with no address of its own now has no card to name it by.
+    const known = S.devices.find(x => String(x.id) === scope.slice(4));
+    return known ? deviceName(known) + ' (' + known.ip + ')' : 'A device that is not on your network now';
+  }
   const d = S.devices.find(x => x.ip === scope.slice(7));
   return d ? deviceName(d) + ' (' + d.ip + ')' : scope.slice(7);
 }
@@ -1356,7 +1416,7 @@ function scheduleForm(){
     <label class="fld">Name<input type="text" id="sName" maxlength="40" placeholder="Bedtime" value="${esc(e.name)}"></label>
     <label class="fld">Who is it for?<select id="sScope">${opt('all', 'Whole house')}
       ${S.groups.length ? `<optgroup label="Groups">${S.groups.map(g => opt('group:' + g.id, g.name + ' group')).join('')}</optgroup>` : ''}
-      ${S.devices.length ? `<optgroup label="Devices">${S.devices.map(d => opt('device:' + d.ip, deviceName(d) + ' (' + d.ip + ')')).join('')}</optgroup>` : ''}</select></label>
+      ${S.devices.length ? `<optgroup label="Devices">${S.devices.map(d => opt(scopeOf(d.ip), deviceName(d) + ' (' + d.ip + ')')).join('')}</optgroup>` : ''}</select></label>
     <div class="fld">Which days?
       <div class="daychips">${DAYS.map((d, i) => `<button class="chip ${e.days.includes(i) ? 'on' : ''}" data-act="schedday" data-d="${i}" aria-pressed="${e.days.includes(i)}">${d}</button>`).join('')}</div>
       <div class="meta quick">Quick picks: ${Object.keys(DAYSETS).map(k => `<button class="btn link" data-act="scheddays" data-k="${esc(k)}">${esc(k)}</button>`).join('')}</div></div>
@@ -1554,13 +1614,19 @@ async function refresh(hard, tick){
     if(S.tab === 'schedules' || S.tab === 'rules' || (S.tab === 'home' && S.device) || (S.tab === 'groups' && S.group))
       jobs.push(api('/api/schedules').then(x => S.schedules = x));
     if(S.tab === 'setup') jobs.push(api('/api/cloud').then(x => S.cloud = x).catch(() => {}));
-    if(S.tab === 'home' || S.tab === 'groups' || S.tab === 'schedules')
+    let devices = Promise.resolve();
+    if(S.tab === 'home' || S.tab === 'groups' || S.tab === 'schedules'){
       // The Pi lists by device now. Every card here is still known by its address (d.ip). A
       // device with no address of its own (it has left, and its address went to another device)
-      // is only sent when asked for with ?all=1, and could not be shown here yet; its history is
-      // kept on the Pi under its number (d.id). The filter is a second guard on that.
-      jobs.push(api('/api/devices').then(x => S.devices = x.filter(d => d.ip)), api('/api/groups').then(x => S.groups = x));
-    if(S.tab === 'home' && S.device) jobs.push(ctl('device:' + S.device));
+      // is only sent when asked for with ?all=1, and could not be shown here yet; its history,
+      // name and rules are kept on the Pi under its number (d.id). The filter is a second guard on that.
+      devices = api('/api/devices').then(x => S.devices = x.filter(d => d.ip));
+      jobs.push(devices, api('/api/groups').then(x => S.groups = x));
+    }
+    // A device's rules are kept under its number, which the device list gives. So wait for the
+    // list first: a card that has only just been given a number (by naming it, say), or a new
+    // one (after two devices were joined), is then asked for by the right one.
+    if(S.tab === 'home' && S.device) jobs.push(devices.then(() => ctl(scopeOf(S.device))));
     if(S.tab === 'groups' && S.group) jobs.push(ctl('group:' + S.group));
     if(S.tab === 'rules') jobs.push(ctl('all'));
     if(S.tab === 'home' && S.device && !(tick && Date.now() - activityAt < ACTIVITY_EVERY)){
@@ -1623,6 +1689,7 @@ const actions = {
     const x = S.schedules.find(v => v.id === +d.id);
     if(!x) return;
     S.edit = JSON.parse(JSON.stringify(x));
+    if(x.device != null) S.edit.scope = 'dev:' + x.device;     // the form lists devices by their number
     S.tab = 'schedules'; S.device = null; S.group = null; S.svcOpen = false; refresh(true);
   },
   schedcancel(){ S.edit = null; refresh(true); },
@@ -1662,17 +1729,29 @@ const actions = {
   },
   // Put a device into the open group (data-in="1") or take it out (data-in="").
   async moverules(d){
-    const yes = await ask(d.from === d.to
-      ? {title:'Is this the same device?', ok:'Yes, the same device',
-         text:'The rules kept for ' + d.from + ' will belong to the device that has that number now, and apply to it.'}
-      : {title:'Move the rules to this device?', ok:'Move the rules',
-         text:'Its name, group, blocks, schedules and "cut live connections" move from ' + d.from + ' to ' + d.to + '. The history stays where it was.'});
+    const yes = await ask({title:'Is this the same device?', ok:'Yes, the same device',
+      text:'The two become one device from now on, with one name, one group, one set of blocks and schedules, one "cut live connections" switch and one history. If both are in a group, it keeps the group of the device the rules belong to, and "Recent changes to devices" says which group it left. No block, schedule or switch either had is dropped.'});
     if(!yes) return;
-    await api('/api/move-rules', {from:d.from, to:d.to}).catch(oops); refresh(true);
+    const body = {from:d.from, to:d.to};
+    if(d.todev){ body.to_device = d.todev; body.from_device = d.fromdev; }
+    await api('/api/move-rules', body).catch(oops); refresh(true);
   },
-  // "No, it's a different device": the rules are paused and kept for the device they belong to.
-  async notsame(d){ await api('/api/different-device', {ip:d.ip}).catch(oops); refresh(true); },
-  async member(d){ await api('/api/device-group', {ip:d.ip, group:d.in ? S.group : null}).catch(oops); refresh(true); },
+  // "It's the same device" on a card whose rules are paused (a Pi that keeps rules under
+  // addresses): the device that has the number now is the one the rules belong to.
+  async samehere(d){
+    const yes = await ask({title:'Is this the same device?', ok:'Yes, the same device',
+      text:'The rules kept under this number are paused because a different hardware address has it now. If it is the same device, they will apply to it again.'});
+    if(!yes) return;
+    await api('/api/move-rules', {from:d.ip, to:d.ip}).catch(oops); refresh(true);
+  },
+  // "No, it's a different device": the other device's rules stop applying to this one, and stay
+  // with the device they belong to.
+  async notsame(d){ await api('/api/different-device', d.todev ? {ip:d.ip, device:d.todev} : {ip:d.ip}).catch(oops); refresh(true); },
+  // The owner's choice for rules that the move to the devices set aside (st.devices.conflicts).
+  async conflict(d){ await api('/api/rule-conflict', {id:+d.id, choice:d.choice}).catch(oops); refresh(true); },
+  // Bring in names, groups and rules that an older QuietNet left where this version no longer reads them.
+  async oldrules(){ await api('/api/move-old-rules', {}).catch(oops); refresh(true); },
+  async member(d){ await api('/api/device-group', Object.assign(byDevice(d.ip), {group:d.in ? S.group : null})).catch(oops); refresh(true); },
   open(d){ S.device = d.ip; S.activity = []; S.activityKey = ''; S.open.clear(); S.search = ''; S.filter = 'all'; S.svcOpen = false; refresh(true); },
   back(){ S.device = null; refresh(true); },
   filter(d){ S.filter = d.f; render(); },
@@ -1699,12 +1778,12 @@ const actions = {
     const dev = S.devices.find(x => x.ip === ip) || {};
     const name = await ask({title:'Name this device', text:'For example "Living room TV" or "Sam\'s iPad".', input:dev.name || '', ok:'Save'});
     if(name === null) return;
-    await api('/api/device-name', {ip, name}).catch(oops); refresh(true);
+    await api('/api/device-name', Object.assign(byDevice(ip), {name})).catch(oops); refresh(true);
   },
   async usehint({ip}){
     const d = S.devices.find(x => x.ip === ip);
     if(!d || !d.hint) return;
-    await api('/api/device-name', {ip, name:d.hint}).catch(oops); refresh(true);
+    await api('/api/device-name', Object.assign(byDevice(ip), {name:d.hint})).catch(oops); refresh(true);
   },
   async clear(){
     const yes = await ask({title:'Forget this device\'s history?', ok:'Forget it', danger:true,
@@ -1737,10 +1816,10 @@ document.addEventListener('change', async e => {
   if(e.target.id === 'junkSwitch'){ await api('/api/junk-switch', {on:e.target.checked}).catch(oops); refresh(); }
   if(e.target.id === 'otherDnsSwitch'){ await api('/api/other-dns-switch', {on:e.target.checked}).catch(oops); refresh(); }
   if(e.target.id === 'noIpv6Switch'){ await api('/api/no-ipv6-switch', {on:e.target.checked}).catch(oops); refresh(); }
-  if(e.target.id === 'enforceSwitch'){ await api('/api/enforce', {ip:S.device, on:e.target.checked}).catch(oops); refresh(true); }
+  if(e.target.id === 'enforceSwitch'){ await api('/api/enforce', Object.assign(byDevice(S.device), {on:e.target.checked})).catch(oops); refresh(true); }
   if(e.target.id === 'netSwitch'){ await api('/api/internet', {scope:e.target.dataset.scope, off:!e.target.checked}).catch(oops); refresh(true); }
   if(e.target.id === 'newGroupSel'){ await api('/api/new-device-group', {group:e.target.value ? +e.target.value : null}).catch(oops); e.target.blur(); refresh(true); }
-  if(e.target.id === 'groupSel'){ await api('/api/device-group', {ip:S.device, group:e.target.value ? +e.target.value : null}).catch(oops); e.target.blur(); refresh(true); }
+  if(e.target.id === 'groupSel'){ await api('/api/device-group', Object.assign(byDevice(S.device), {group:e.target.value ? +e.target.value : null})).catch(oops); e.target.blur(); refresh(true); }
   if(e.target.classList.contains('schedOn')){ await api('/api/schedule-enable', {id:+e.target.dataset.id, on:e.target.checked}).catch(oops); refresh(true); }
   if(S.edit){
     if(e.target.id === 'sScope') S.edit.scope = e.target.value;
