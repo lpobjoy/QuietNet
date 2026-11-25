@@ -131,7 +131,7 @@ class AnsweringQueries(Base):
     def test_every_lookup_is_written_down_with_who_asked(self):
         server.answer_query(query("www.bbc.co.uk"), KID, fake_answer)
         server.answer_query(query("ads.doubleclick.net"), ADULT, fake_answer)
-        log = [(client, name, blocked) for ts, client, name, blocked in drain_log()]
+        log = [(client, name, blocked) for ts, client, name, blocked, *_ in drain_log()]
         self.assertEqual(log, [(KID, "www.bbc.co.uk", 0), (ADULT, "ads.doubleclick.net", 1)])
 
     def test_a_blocked_lookup_never_reaches_the_internet(self):
@@ -453,7 +453,7 @@ class NetworkDnsSignals(Base):
     def test_signal_lookups_are_written_down_as_blocked(self):
         self.ask("use-application-dns.net")
         self.ask("mask.icloud.com")
-        log = [(client, name, blocked) for ts, client, name, blocked in drain_log()]
+        log = [(client, name, blocked) for ts, client, name, blocked, *_ in drain_log()]
         self.assertEqual(log, [(KID, "use-application-dns.net", 1), (KID, "mask.icloud.com", 1)])
 
     def test_other_icloud_names_are_not_affected(self):
@@ -537,7 +537,7 @@ class OtherDnsServices(Base):
 
     def test_a_dns_service_lookup_is_written_down_as_blocked(self):
         self.ask("dns.google")
-        log = [(client, name, blocked) for ts, client, name, blocked in drain_log()]
+        log = [(client, name, blocked) for ts, client, name, blocked, *_ in drain_log()]
         self.assertEqual(log, [(KID, "dns.google", 1)])
 
     def test_a_dns_service_lookup_is_remembered_against_the_device(self):

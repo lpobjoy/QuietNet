@@ -25,8 +25,8 @@ A **scope** is `all`, `group:<id>` or `device:<ip>`.
 | --- | --- |
 | `GET /` | The dashboard page |
 | `GET /api/status` | See below |
-| `GET /api/devices` | List of devices, most recently active first |
-| `GET /api/activity?ip=<ip>&hours=<n>&since=<marker>` | What one device contacted, grouped by company. `hours` defaults to 24, limited to 0.1–720. `since` is optional: see below |
+| `GET /api/devices` | List of devices, one entry per device, most recently active first. With `?all=1` it also lists devices that have no address of their own now (`"ip": ""`: see below) |
+| `GET /api/activity?ip=<ip>&device=<number>&hours=<n>&since=<marker>` | What one device contacted, grouped by company. `device` is the device's number (`id` in `/api/devices`): the list is then the device's own history at every address it has had. Without it, or with a number QuietNet doesn't know, the list is what was recorded under the address `ip`, as before. `hours` defaults to 24, limited to 0.1–720. `since` is optional: see below |
 | `GET /api/rules` | `{"blocked": [...], "allowed": [...]}`, each item `{"d", "ts", "owner", "needed"}`. `needed` is who needs that name for their own system, such as `"Samsung TVs"`, or `""` (see "Names a device's own system needs" below) |
 | `GET /api/services` | The service catalogue: `[{"id", "name", "cat"}]` |
 | `GET /api/groups` | `[{"id", "name", "off", "members", "services"}]` |
@@ -55,9 +55,12 @@ A **scope** is `all`, `group:<id>` or `device:<ip>`.
   "device_notices": [{"from": "192.168.1.54", "name": "Wilf's iPad", "to": "192.168.1.71",
                       "mac": "da:11:22:33:44:03", "first": 1795000000.0, "same": false}],
   "device_events": [{"ts": 1795000000.0, "ip": "192.168.1.71",
-                     "text": "Wilf's iPad moved from 192.168.1.54 to 192.168.1.71; its rules moved with it."}]
+                     "text": "Wilf's iPad moved from 192.168.1.54 to 192.168.1.71; its rules moved with it."}],
+  "devices": {"state": "ready", "notice": "", "filling": false}
 }
 ```
+
+`devices` is about the device tables (one device is one hardware address; see ARCHITECTURE.md, "One device, many addresses"). `state` is `"ready"` when they are in use. On a household moved over from an older QuietNet it shows where that one-off move has got to: `"old"` (not tried yet; it runs shortly after start-up), `"moving"`, `"waiting"` (too little free space; tried again within the hour) or `"failed"` (tried again at the next start). In the last two nothing was changed, QuietNet runs on the old tables exactly as before, `/api/devices` lists by address, and `notice` is a plain-English sentence for the home page saying so (`""` otherwise; escape it before display). `filling` is `true` while older history is still being given its device, in the background, after a move. An older QuietNet sends no `devices`.
 
 `new_device_group` is the group a device seen for the first time is put in, or `null` for none (the default). `device_notices` lists devices with rules that have gone quiet just as a new device with a private Wi-Fi address appeared (`from` and `name`: the quiet one; `to`, `mac`, `first`: the new one and when it was first seen); the dashboard offers `POST /api/move-rules` for each. An entry with `same` true is a device with a private Wi-Fi address that appeared, since the rules' device was last seen, at the very address the rules are kept under (`from` and `to` are then that address): the rules still apply to it, and the dashboard asks whether it is the same device, offering `POST /api/move-rules` with that address twice ("yes") and `POST /api/different-device` ("no"). `other_dns_all` is whether every device is kept away from other DNS services, not just those the owner controls (see `POST /api/other-dns-switch`). `no_ipv6_all` is whether the optional "Give no device IPv6 addresses" switch is on (see `POST /api/no-ipv6-switch`; `false` unless the owner turned it on). `device_events` is up to ten notes from the last week of what QuietNet did to devices' rules by itself (moved them, paused them, put a new device in the group), newest first. Names, addresses and notes come from the household's network: escape them before display. See ARCHITECTURE.md, "When a device changes address".
 
@@ -76,12 +79,28 @@ A **scope** is `all`, `group:<id>` or `device:<ip>`.
 `/api/devices` item:
 
 ```json
-{"ip": "192.168.1.23", "name": "", "hint": "Sams iPad", "hint_source": "Bonjour", "hint_detail": "Model: iPad13,1",
- "mac": "11:22:33:44:55:66",
+{"id": 7, "kind": "hw", "ip": "192.168.1.23", "macs": ["11:22:33:44:55:66"], "mac": "11:22:33:44:55:66",
+ "addresses": [{"address": "192.168.1.23", "first": 1794000000.0, "last": 1795000000.0, "now": true},
+               {"address": "2a00:23c8:1:2:1111::1", "first": 1794990000.0, "last": 1795000000.0, "now": true}],
+ "name": "", "hint": "Sams iPad", "hint_source": "Bonjour", "hint_detail": "Model: iPad13,1",
  "this_computer": false, "last": 1795000000.0, "n": 412, "nb": 37, "on_network": 1795000000.0,
  "group": 1, "off": false, "enforced": false, "other_dns": 0, "paused": false, "warning": "",
  "v6_bypass": true, "same_as": ""}
 ```
+
+**One entry per device.** A device is one hardware address, whatever network address it has, so a TV that moved from `.65` to `.67` is one entry with the history of both, and when an address passes from one device to another each keeps its own history.
+
+- `id` is the device's number. It never changes while the device is remembered and is never given to another device. Pass it as `device` to `/api/activity` and `POST /api/clear-history`. It is `null` for an address listed on its own (below).
+- `kind` is `"hw"` (known by its hardware address), `"addr"` (known only by a network address: no hardware address is known for it, or it is behind a Wi-Fi range extender that shows several devices under one hardware address), `"pi"` (this computer) or `"hub"` (the home router).
+- `macs` is the device's hardware addresses; `mac` is the first, as before.
+- `addresses` is the addresses it has now or was confirmed at in the last day, IPv4 first, 32 at most. `first` and `last` are when it was first and last confirmed there (`null` where that isn't recorded) and `now` is whether it is there at this moment. A phone usually shows one IPv4 address and several IPv6 ones.
+- `ip` is the one address the entry is shown and controlled under: the IPv4 address the device has now; else the last one it had that no other device has been seen at since; else an IPv6 address. **It is `""` for a device that has left and whose address has since gone to another device.** Such a device keeps its history under its `id`, and is listed only with `?all=1`: a page from before the device tables (which an older relay may still serve) knows each card by its address and could not show or open it. The dashboard page does not show such devices yet.
+
+**Names, groups and rules are still kept under addresses**, so `name`, `group`, `off`, `enforced`, `paused` and `warning` are read from `ip`, and the calls that change them still take an address. An address that carries a name or rules of its own but is not the address its device is listed under (a TV's old address whose rules could not be moved, say) keeps an entry of its own, with `id` `null` and `kind` `"addr"`, so those rules can still be seen and removed. So does an address no device is known for. Every address that carries a name, a group, an internet switch, a blocked service, a schedule or "Cut live connections" is always listed, on its device's entry or its own, whether or not it has any history or a recorded owner (an address whose name was cleared, and that carries nothing else, is not listed for that alone). No two entries share an `ip`: when a device is listed under an address, what that address carries shows on that device's entry, whichever device the last scan found there.
+
+Listed are the devices with any history, those found by a scan, and those whose rules follow them or that a `device_notices` entry points at. Lookups made in the last few minutes that are not filed against a device yet count towards the device that has their address now.
+
+While `devices.state` in `/api/status` is not `"ready"` (an older household not moved over yet), the list is by address as it was: every entry has `id` `null`, `kind` `"addr"` and its one address in `addresses`.
 
 `v6_bypass` is the label "can bypass QuietNet over IPv6": `true` for every device except this computer while the home network has IPv6 (`ipv6.in_use` in `/api/status`) or while something on the home network names an IPv6 DNS server that is not this computer (`ipv6.router_dns_not_ours` is not empty), and `false` otherwise. It is `true` for a device with "Cut live connections" on as well, because steering covers IPv4 only. The dashboard shows it for devices that use QuietNet.
 
@@ -109,7 +128,9 @@ A **scope** is `all`, `group:<id>` or `device:<ip>`.
 {"unchanged": false, "marker": "3f9a0c1b2d4e5f6a7b8c9d0e", "groups": [ ...the same list... ]}
 ```
 
-Sending that `marker` back as `since` with the same `ip` and `hours` gets `{"unchanged": true, "marker": "<the same>"}`, without the list, when nothing has changed: no new lookup for the device, nothing leaving the time window or cleared, and no change to the rules, the pause, the advert switch, the schedules in force or the advert lists. A wrong or out-of-date marker simply gets the full answer with the current marker. The marker is 24 hex characters and should be treated as opaque: store it and send it back, never read anything into it. It only means something for the same `ip` and `hours`.
+Sending that `marker` back as `since` with the same `ip`, `device` and `hours` gets `{"unchanged": true, "marker": "<the same>"}`, without the list, when nothing has changed: no new lookup for the device, nothing leaving the time window or cleared, and no change to the rules, the pause, the advert switch, the schedules in force or the advert lists. A wrong or out-of-date marker simply gets the full answer with the current marker. The marker is 24 hex characters and should be treated as opaque: store it and send it back, never read anything into it. It only means something for the same `ip`, `device` and `hours`.
+
+**By device.** With `device=<number>` the list is everything filed against that device, at whatever address each lookup was made, plus the last few minutes' lookups from the addresses it has now that are still waiting to be filed. The block decisions shown (`b`, `why`, `svc`) are those for the address `ip`, since rules are still kept under addresses; with `device` and no `ip`, the device's own address is used.
 
 For QuietNet's own computer, `kill`, `off` and `schedule` never appear: it is exempt from them (see [How QuietNet works](ARCHITECTURE.md#the-order-rules-are-checked-in)).
 
@@ -117,7 +138,7 @@ For QuietNet's own computer, `kill`, `off` and `schedule` never appear: it is ex
 
 **Names a device's own system needs.** `server.py` keeps a short table, `NEEDED`, of whole names that a common household device needs for its own sign-in, app shop, "am I online?" check, clock or updates, each with who needs it (`samsungcloudsolution.net` is needed by "Samsung TVs"). It changes three things, and never what is blocked once a block exists:
 
-- **`needed` in `/api/activity` and `/api/rules`.** A group or name that is itself in the table carries who needs it; everything else carries `""`. A sub-name beneath a needed name carries `""` and keeps its own `v`. The dashboard shows "Needed by Samsung TVs" where it would have shown "Possibly junk", and keeps "Advert / tracker" for a name on the advert list. One `v` does change: a needed group in which every name seen is an advert sub-name (`logs.roku.com` under `roku.com`) is `suspect`, not `junk`, unless the whole name is itself on the advert list, so the row does not read "Advert / tracker" for a name the list does not block. Its sub-names keep `junk`.
+- **`needed` in `/api/activity` and `/api/rules`.** A group or name that is itself in the table carries who needs it; everything else carries `""`. `/api/activity` carries it the same way whether it was asked by address or with `device`. A sub-name beneath a needed name carries `""` and keeps its own `v`. The dashboard shows "Needed by Samsung TVs" where it would have shown "Possibly junk", and keeps "Advert / tracker" for a name on the advert list. One `v` does change: a needed group in which every name seen is an advert sub-name (`logs.roku.com` under `roku.com`) is `suspect`, not `junk`, unless the whole name is itself on the advert list, so the row does not read "Advert / tracker" for a name the list does not block. Its sub-names keep `junk`.
 - **`POST /api/block` asks first.** Blocking a name that is itself in the table, without `"sure": true`, changes nothing and answers `409`:
 
   ```json
@@ -165,7 +186,7 @@ For QuietNet's own computer, `kill`, `off` and `schedule` never appear: it is ex
 | `POST /api/cloud` | `{"relay", "code"}` or `{"action": "forget"}` | Pair with a relay, or unpair. A relay address starting `http://` is refused, with nothing sent, unless the host is `localhost`, `127.0.0.1` or `::1`: `400` with `{"error": "That relay address starts with http://, which would send this Pi's key unprotected. Use an address starting with https:// instead."}` |
 | `POST /api/scan` | `{}` | Starts a network scan in the background. Returns what it will cover: `{"ok": true, "network": "192.168.4.0/22", "addresses": 1022, "capped": false}` |
 | `POST /api/update-list` | `{}` | Starts the community list download in the background |
-| `POST /api/clear-history` | `{"ip"?}` | One device's history, or everyone's. Everyone's is cleared before the answer. One device's is cleared in the background, 5,000 rows at a time, and the answer comes at once, so its page may briefly show part of it while the clear runs |
+| `POST /api/clear-history` | `{"ip"?, "device"?}` | One device's history, or everyone's. With `device` (a device's number, `id` in `/api/devices`) everything filed against that device goes, at every address it has had, with any lookups still waiting to be filed from the addresses it has now; another device's history at the same address is left alone. With `ip` alone, what was recorded under that address goes, as before. With neither, everyone's. A `device` QuietNet doesn't know falls back to `ip`; with no `ip` either the answer is `400` and nothing is cleared. Everyone's is cleared before the answer, and with it the copy of the database kept from before the move to the device tables (`quietnet.db.before-devices`), which holds the history from that time; clearing one device's history leaves that copy alone until it is 30 days old. One device's is cleared in the background, 5,000 rows at a time, and the answer comes at once, so its page may briefly show part of it while the clear runs |
 
 Schedule body:
 

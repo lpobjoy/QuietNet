@@ -3,8 +3,8 @@ the order of start_up(), serving and clean_up() in run().
 
 Run with:  python3 -m unittest discover tests
 
-Everything here runs inside the test program, with stand-ins for the enforcer, the cloud link
-and the listeners, so nothing touches the network or its settings. A stop request is sent the
+Everything here runs inside the test program, with stand-ins for the enforcer, the cloud link,
+the device keeper and the listeners, so nothing touches the network or its settings. A stop request is sent the
 way `docker stop` and Ctrl-C send one, as a signal, but to the test program itself and only
 while QuietNet's own handling is in place; the handling that was there before is put back
 after every test. tests/test_shutdown.py does the same from outside, with the whole program.
@@ -304,6 +304,19 @@ class Dashboard(ThreadingHTTPServer):
         super().serve_forever(poll_interval)
 
 
+class Threads:
+    """Stands in for the `threading` module as server.py sees it: Python's own in everything
+    but the Thread class, which is the one given."""
+
+    def __init__(self, thread_class):
+        """Keep the class that server.py is to make its threads from."""
+        self.Thread = thread_class
+
+    def __getattr__(self, name):
+        """Anything else (locks, events, timers) is Python's own."""
+        return getattr(threading, name)
+
+
 # The names start_up() and clean_up() use that start nothing by themselves: the program's
 # settings and what it holds in memory, the modules whose classes have stand-ins, and the methods
 # called on the stand-ins. Every other name those two functions use must have a stand-in in
@@ -321,7 +334,8 @@ class WholeLife(SignalsPutBack, Base):
 
     `self.diary` lists what happened, in order. A test says what should happen while a stand-in
     starts or stops, or as the dashboard's port is opened, such as a stop request arriving, by
-    filling `self.enforcer_does`, `self.cloud_does`, `self.listeners_do` or `self.dashboard_does`.
+    filling `self.enforcer_does`, `self.cloud_does`, `self.listeners_do`, `self.keeper_does` or
+    `self.dashboard_does`.
 
     Whatever start_up() starts needs a stand-in here, or these tests start the real thing
     inside the test program. `self.stood_in` holds the names replaced; a test checks them
@@ -331,12 +345,15 @@ class WholeLife(SignalsPutBack, Base):
         """Put the stand-ins in place for the length of the test."""
         super().setUp()
         self.diary, self.enforcer_does, self.cloud_does, self.listeners_do = [], {}, {}, {}
-        self.dashboard_does = {}
+        self.dashboard_does, self.keeper_does, self.keeper_threads = {}, {}, []
         self.webs, self.answers, self.stood_in = [], [], set()
         self.printed = io.StringIO()
         for name in ("init_db", "load_lists", "log_writer", "router_advert_listener", "address_watcher",
                      "hint_refresher"):
             self.patch(server, name, nothing)
+        self.patch(server, "device_keeper", self.device_keeper)
+        self.patch(server, "threading", Threads(self.noting_thread()))
+        self.addCleanup(self.keeper_threads_ended)
         self.patch(server, "NAMER", mock.Mock())
         self.patch(server, "find_local_ip", lambda: "192.168.1.2")
         self.patch(server, "start_dns", lambda port: self.listeners_do.get("start", nothing)())
@@ -355,6 +372,47 @@ class WholeLife(SignalsPutBack, Base):
         patcher.start()
         self.addCleanup(patcher.stop)
         self.stood_in.add(name)
+
+    def device_keeper(self):
+        """Stands in for the device keeper, the background job that moves an older household's
+        data to the device tables and then keeps track of which device has which address. Run
+        in a thread of its own by start_up(), it does what the test asked for and comes back."""
+        self.keeper_does.get("run", nothing)()
+
+    def noting_thread(self):
+        """Python's Thread class with one thing added: when the thread that is to run the device
+        keeper's stand-in is started, the diary says so, there and then, and what the test asked
+        for at that moment is done (`self.keeper_does["start"]`, such as a stop request).
+
+        The stand-in itself could not write that line: it runs in the new thread, a moment
+        later, by when start_up() may be several steps further on. The start is noted in the
+        thread that starts it, which is the one start_up() runs in, so the diary's order is the
+        order of start_up()'s own lines. Every other thread is started exactly as usual. Only
+        server.py is given this class (see Threads): Python's own library must keep its own."""
+        test = self
+
+        class NotingThread(threading.Thread):
+            """threading.Thread, noting the start of the device keeper's thread in the diary."""
+
+            def __init__(self, *args, **kwargs):
+                """Remember what the thread is to run, however it was handed over."""
+                self.runs = kwargs.get("target", args[1] if len(args) > 1 else None)
+                super().__init__(*args, **kwargs)
+
+            def start(self):
+                """Note the device keeper's start, do what the test asked for, then start."""
+                if self.runs == test.device_keeper:
+                    test.diary.append("device keeper started")
+                    test.keeper_threads.append(self)
+                    test.keeper_does.get("start", nothing)()
+                super().start()
+        return NotingThread
+
+    def keeper_threads_ended(self):
+        """After each test: the threads that ran the device keeper's stand-in have ended."""
+        for thread in self.keeper_threads:
+            thread.join(30)
+            self.assertFalse(thread.is_alive(), "the device keeper's stand-in was still going 30 seconds on")
 
     def make_web_server(self, address, handler):
         """A real dashboard web server on a spare port, noted in the diary and kept in
@@ -433,7 +491,8 @@ class WholeLife(SignalsPutBack, Base):
 
     def test_an_ordinary_life_starts_everything_serves_and_stops_everything(self):
         self.assertIsNone(self.run_it(stop_once_serving=signal.SIGTERM))
-        self.assertEqual(self.diary, ["enforcer made", "enforcer started", "cloud link made", "cloud link started",
+        self.assertEqual(self.diary, ["enforcer made", "enforcer started", "device keeper started",
+                                      "cloud link made", "cloud link started",
                                       "dashboard port opened", "dashboard serving", "dashboard answered",
                                       "enforcer stopped", "cloud link stopped"])
         self.assertEqual(self.answers, [200])
@@ -486,8 +545,58 @@ class WholeLife(SignalsPutBack, Base):
         of start-up is finished, there is no serving, and everything is stopped."""
         self.cloud_does["start"] = ask_to_stop
         self.assertIsNone(self.run_it())
-        self.assertEqual(self.diary, ["enforcer made", "enforcer started", "cloud link made", "cloud link started",
+        self.assertEqual(self.diary, ["enforcer made", "enforcer started", "device keeper started",
+                                      "cloud link made", "cloud link started",
                                       "dashboard port opened", "enforcer stopped", "cloud link stopped"])
+        self.assertTrue(self.printed.getvalue().endswith("QuietNet stopped.\n"))
+
+    def test_the_device_keeper_is_started_once_the_enforcer_has_started_and_before_the_cloud_link(self):
+        """The keeper moves an older household's data to the device tables, which must wait until
+        the filter is answering and the enforcer steering (tests/test_devices.py checks the
+        filter's place in the order)."""
+        self.assertIsNone(self.run_it(stop_once_serving=signal.SIGTERM))
+        self.assertEqual(self.diary[:4], ["enforcer made", "enforcer started", "device keeper started",
+                                          "cloud link made"])
+
+    def test_a_stop_request_while_the_enforcer_starts_means_the_device_keeper_is_not_started(self):
+        """A move begun on the way out would be cut off moments later, and while it lasted it
+        would hold the database lock that the enforcer's last tick needs before it can hand the
+        network back."""
+        self.enforcer_does["start"] = ask_to_stop
+        self.assertIsNone(self.run_it())
+        self.assertNotIn("device keeper started", self.diary)
+        self.assertEqual(self.keeper_threads, [])
+
+    def test_a_stop_request_as_the_device_keeper_is_started_means_the_cloud_link_is_not(self):
+        """The request arrives after start-up's look for the device keeper and before its look
+        for the cloud link, whose first pairing try can take 20 seconds."""
+        self.keeper_does["start"] = ask_to_stop
+        self.assertIsNone(self.run_it())
+        self.assertEqual(self.diary, ["enforcer made", "enforcer started", "device keeper started", "enforcer stopped"])
+        self.assertTrue(self.printed.getvalue().endswith("QuietNet stopped.\n"))
+
+    def test_the_device_keeper_runs_in_a_daemon_thread(self):
+        """Python waits, as the program ends, for every thread that is not a daemon thread, and
+        the device keeper never ends by itself."""
+        self.assertIsNone(self.run_it(stop_once_serving=signal.SIGTERM))
+        self.assertEqual([thread.daemon for thread in self.keeper_threads], [True])
+
+    def test_the_program_stops_without_waiting_for_a_device_keeper_that_is_still_at_work(self):
+        """The clean-up has no line for the device keeper: it has nothing to put back, and a move
+        to the device tables cut short is undone by the database. Here it is still at work, as
+        the real one always is, when the stop is asked for and when the clean-up has finished."""
+        at_work, enough = threading.Event(), threading.Event()
+        self.addCleanup(enough.set)
+
+        def work():
+            """Say that the work has begun, then keep at it until the test is over."""
+            at_work.set()
+            enough.wait(30)
+        self.keeper_does["run"] = work
+        self.assertIsNone(self.run_it(stop_once_serving=signal.SIGTERM))
+        self.assertTrue(at_work.wait(30))
+        self.assertTrue(self.keeper_threads[0].is_alive())
+        self.assertEqual(self.diary[-3:], ["dashboard answered", "enforcer stopped", "cloud link stopped"])
         self.assertTrue(self.printed.getvalue().endswith("QuietNet stopped.\n"))
 
     def test_a_stop_request_just_as_the_dashboards_port_opens_means_it_is_never_served(self):
@@ -504,7 +613,7 @@ class WholeLife(SignalsPutBack, Base):
         has opened; if the stop request came first, it stops a browser opening on a dashboard
         that has gone."""
         self.assertIsNone(self.run_it(stop_once_serving=signal.SIGTERM, browser=True))
-        self.assertEqual(self.diary[4:], ["dashboard port opened", "browser set to open http://localhost:0",
+        self.assertEqual(self.diary[5:], ["dashboard port opened", "browser set to open http://localhost:0",
                                           "dashboard serving", "dashboard answered", "browser called off",
                                           "enforcer stopped", "cloud link stopped"])
 
