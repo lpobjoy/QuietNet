@@ -1411,7 +1411,12 @@ class DhcpSightings(Base, Setup):
             self.assertFalse(server.note_dhcp(mac, address), (mac, address))
 
     def test_only_so_many_words_are_taken_in_each_second(self):
-        taken = [server.note_dhcp(PHONE, "192.168.1.%d" % (100 + i)) for i in range(server.DHCP_MAX_PER_SECOND + 5)]
+        # The steady clock is held at its present reading, so every word falls in the same second
+        # however long the machine takes over them. Left running, a stall of a second part of the
+        # way through would begin a new second and let more in.
+        now = time.monotonic()
+        with mock.patch.object(server.time, "monotonic", lambda: now):
+            taken = [server.note_dhcp(PHONE, "192.168.1.%d" % (100 + i)) for i in range(server.DHCP_MAX_PER_SECOND + 5)]
         self.assertEqual(taken.count(True), server.DHCP_MAX_PER_SECOND)
 
     def test_only_so_many_words_are_remembered(self):
@@ -1600,7 +1605,12 @@ class WhereTheEnforcerSteers(Base, Setup):
         self.assertEqual(plan[NEW]["ips"], {"93.184.216.34"})
 
     def test_the_enforcer_is_given_the_table_the_plan_just_read(self):
-        with mock.patch.object(server, "neighbour_table", return_value={OLD: fresh(PHONE)}) as read:
+        # The plan's table is handed on only while it is under a second and a half old, so the
+        # steady clock is held at its present reading: the two calls then fall in the same moment
+        # however long the machine takes between them.
+        now = time.monotonic()
+        with mock.patch.object(server, "neighbour_table", return_value={OLD: fresh(PHONE)}) as read, \
+                mock.patch.object(server.time, "monotonic", lambda: now):
             server.enforcement_plan()
             self.assertEqual(server.plan_neighbours(), {OLD: PHONE})
         self.assertEqual(read.call_count, 1)
@@ -1749,7 +1759,12 @@ class WhereIPv6IsTakenAway(Base, Setup):
         self.assertEqual(plan["shared"], [EXTENDER])
 
     def test_the_table_the_ipv4_plan_read_is_used_and_not_read_again(self):
-        with mock.patch.object(server, "neighbour_table", return_value={OLD: fresh(PHONE)}) as read:
+        # plan6 goes by the plan's table only while it is no more than PLAN_TABLE_KEPT seconds old,
+        # so the steady clock is held at its present reading: the two calls then fall in the same
+        # moment however long the machine takes between them.
+        now = time.monotonic()
+        with mock.patch.object(server, "neighbour_table", return_value={OLD: fresh(PHONE)}) as read, \
+                mock.patch.object(server.time, "monotonic", lambda: now):
             server.enforcement_plan()
             self.assertEqual(server.plan6()["devices"], {OLD: {"mac": PHONE, "ll": LL}})
         self.assertEqual(read.call_count, 1)

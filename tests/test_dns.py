@@ -18,7 +18,7 @@ import unittest
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from test_quietnet import ADULT, KID, Base, fake_answer, query, server
+from test_quietnet import ADULT, KID, Base, fake_answer, in_force_now, query, server
 
 # The real check of whether this computer could hear the router over IPv6. Base swaps it for a
 # stand-in in every test, so that no test reads the real machine's network cards; the tests of the
@@ -294,8 +294,10 @@ class AnsweringQueries(Base):
         self.assertEqual(self.sent_to, [])
 
     def test_odd_names_are_not_passed_on_during_an_all_internet_schedule(self):
-        self.schedule(start="00:00", end="23:59")
-        self.ask(query("evil.home"))
+        server.S.router = "192.168.1.1"                             # or a home name is never passed on anyway
+        self.schedule(**in_force_now())
+        resp = self.ask(query("evil.home"))
+        self.assertEqual(resp[-4:], bytes(4))                       # the blocked answer
         self.assertEqual(self.sent_to, [])
 
     def test_odd_names_are_still_passed_on_when_the_internet_is_on(self):
@@ -1916,7 +1918,11 @@ class RouterAnnouncements(Base):
         server.S.ipv6_steer = True
         enf = mock.Mock()
         packet = (router_advert(self.LINK_ADDR, rdnss(600, self.HUB)), ("fe80::1%wlan0", 0, 0, 3))
-        with mock.patch.object(server, "ENF", enf):
+        # The steady clock is held at its present reading, so all three arrive in the same second
+        # however long the machine takes over them. Left running, a stall of a second between two
+        # of them would rightly wake the enforcer a second time.
+        now = time.monotonic()
+        with mock.patch.object(server, "ENF", enf), mock.patch.object(server.time, "monotonic", lambda: now):
             self.listen([packet, packet, packet])
         self.assertEqual(enf.poke.call_count, 1)
 

@@ -79,8 +79,18 @@ The existing files share a few helpers, all in `test_quietnet.py`:
 - `fake_answer(data)`: the reply a real upstream would give, with a one-day lifetime.
 - `is_blocked(name, client)`: asks the filter and reports whether the answer was the block address.
 - `at(day, "HH:MM")`: a moment on a given weekday, for schedule tests.
+- `in_force_now()`: the days and times to give a schedule so that it is in force at this moment, whatever the time of day: `self.schedule(**in_force_now(scope="all"))`. `not_in_force_now()` is its opposite.
+- `server.init_db()`: call it to mimic a restart, as the program's own start-up does. In the tests it also closes the database connection it replaces (`test_quietnet.py` wraps it), so that a run is not filled with "unclosed database" warnings.
 
 Conventions: one behaviour per test; the test name states the behaviour in plain words; a comment explains any check whose reason is not obvious from the name.
+
+A test must pass at any time of day, on any day of the week, and on a slow machine:
+
+- **Never write a fixed window to mean "now".** A schedule from 00:00 to 23:59 is off for the last minute of every day (its end is not inside it), and six tests built on one failed when GitHub's machines ran them at 23:59. Use `in_force_now()`. A test about a particular window should pass the moment itself, with `at(day, "HH:MM")`, and not read the clock at all.
+- **Wait for the thing itself, not for a length of time.** The relay finishes some of its work just after an answer has been sent: it gives back the room held for a large answer, and frees the connection's place. And the dashboard's port takes connections a moment before the program is ready to be stopped. A test that checks such a thing straight after the answer arrives, or after a fixed `sleep`, fails now and then on a busy machine. Check again for a few seconds until it is so, then assert (see `answer_once_a_place_is_free` in `test_relay.py` and `wait_until_the_dashboard_answers` in `test_shutdown.py`). One fixed pause is relied on all the same, in `test_shutdown.py`, between the dashboard's first answer and the request to stop: the program can lose a stop request that arrives while it is still taking that connection (known issue 12), and nothing outside the program shows when it has finished. When that fault is cured the pause can go.
+- **A stand-in thread must not die of an error the test expects.** Python prints a traceback for any error that ends a thread, and a traceback in the log of a run that passed sends people looking for a fault that is not there. The relay closes the connection on an answer it refuses, so `pretend_pi` in `test_relay.py` takes that as nothing wrong.
+- **Hold the clock still when the behaviour is "within a second".** Where QuietNet counts things per second, or keeps something for a second or two, a test that makes several calls and lets the clock run fails if the machine stalls between them. Hold the steady clock at one reading for the length of the check: `now = time.monotonic()`, then `mock.patch.object(server.time, "monotonic", lambda: now)` (see `test_only_so_many_words_are_taken_in_each_second` in `test_device_moves.py`). The same goes for a longer wait that a test ends by itself (`steady_clock_held_at_the_move()` in `test_devices.py`). And a test that times its looks from one reading of the clock (`self.now`) should time everything else from that reading too, not from a fresh `time.time()`.
+- **A test that starts the real program shows what it printed when it fails.** See `give_up` and `stopped_with` in `test_shutdown.py`.
 
 ## Not covered
 
