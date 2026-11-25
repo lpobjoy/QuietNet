@@ -17,7 +17,7 @@ import unittest
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from test_quietnet import ADULT, KID, Base, fake_answer, query, server
+from test_quietnet import ADULT, KID, Base, fake_answer, in_force_now, query, server
 
 
 def drain_log():
@@ -288,8 +288,10 @@ class AnsweringQueries(Base):
         self.assertEqual(self.sent_to, [])
 
     def test_odd_names_are_not_passed_on_during_an_all_internet_schedule(self):
-        self.schedule(start="00:00", end="23:59")
-        self.ask(query("evil.home"))
+        server.S.router = "192.168.1.1"                             # or a home name is never passed on anyway
+        self.schedule(**in_force_now())
+        resp = self.ask(query("evil.home"))
+        self.assertEqual(resp[-4:], bytes(4))                       # the blocked answer
         self.assertEqual(self.sent_to, [])
 
     def test_odd_names_are_still_passed_on_when_the_internet_is_on(self):
