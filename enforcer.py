@@ -243,6 +243,17 @@ def na_claim_problem(target_ip, target_mac, forbidden_macs):
     return ""
 
 
+def _plain_ipv6(text):
+    """One IPv6 address in its usual short spelling, so the same address written two ways compares
+    equal ('FE80:0::23' and 'fe80::23'). Text that is not an IPv6 address is handed back unchanged
+    (na_claim_problem then refuses it); nothing at all gives ''."""
+    text = str(text or "")
+    try:
+        return str(ipaddress.IPv6Address(text))
+    except ValueError:
+        return text
+
+
 def _ip6_dns_rules(ipv6):
     """The ip6 lines for the firewall's "redirect DNS" chain, given the `ipv6` dict passed to
     nft_ruleset, or [] when there is nothing to redirect. The dict holds `target` (this computer's
@@ -250,7 +261,12 @@ def _ip6_dns_rules(ipv6):
     `servers` (the router's IPv6 DNS addresses to catch) and `macs` (the hardware addresses of the
     steered devices; only traffic from these is touched). Every address, port and hardware address is
     checked, so a bad one raises ValueError rather than reach the firewall. The match is by hardware
-    address because a device has many IPv6 addresses and gets new ones often."""
+    address because a device has many IPv6 addresses and gets new ones often.
+
+    Only lookups addressed to the router's IPv6 DNS addresses are caught, as the design says. A lookup
+    a steered device sends to any other IPv6 DNS server (one built into the device, or typed in by
+    hand) is not matched: it is dropped with the rest of the device's IPv6 and gets no answer, while
+    its IPv4 lookups are still answered. Known issue 101 records this."""
     target = _checked_ipv6(ipv6["target"])
     port = ipv6.get("port")
     if isinstance(port, bool) or not isinstance(port, int) or not 0 < port < 65536:
@@ -624,15 +640,28 @@ class IPv6Steerer:
     those would otherwise let the device drift back. Which devices are steered is saved by hardware
     address, so a restart hands them back.
 
+    One hardware address with more than one link-local address is never claimed. Each device has one
+    such address, so two mean that several devices may share the hardware address (a Wi-Fi range
+    extender QuietNet has not recognised, or a laptop passing a virtual machine through its Wi-Fi),
+    and a claim to the wrong one would take IPv6 from a device the owner never chose. Every link-local
+    address heard from a hardware address is kept for an hour (note_frame, HEARD_KEPT), and counted
+    together with the one the plan gives and the one last claimed (steer).
+
     The Enforcer owns one of these and drives it; the sending is done through the Enforcer's own raw
     socket (`send`), and this class keeps no socket of its own except the one it listens on. Off
     unless the household turns it on: `set_target` is given `enabled` from a setting."""
 
-    def __init__(self, iface, our_mac, send, log=print, save=None, fixed_macs=()):
+    HEARD_KEPT = 3600            # seconds a link-local address heard from a hardware address is remembered
+    HEARD_PER_DEVICE = 4         # how many are remembered for one hardware address (two already mean "leave alone")
+    HEARD_DEVICES = 512          # how many hardware addresses anything is remembered for
+
+    def __init__(self, iface, our_mac, send, log=print, save=None, fixed_macs=(), clock=time.monotonic):
         """Hold what is needed to build and send claims. `send(frame)` puts one whole Ethernet frame
         on the wire; `save()` is called when the saved set of steered devices changes; `fixed_macs`
         are hardware addresses a claim is never sent to (this computer's and the router's are added
-        as they become known)."""
+        as they become known); `clock()` gives a steady time in seconds, by which heard addresses are
+        aged (the tests hand in their own, so none of them waits)."""
+        self.clock = clock
         self.iface = iface
         self.our_mac = our_mac
         self.send = send
@@ -648,7 +677,8 @@ class IPv6Steerer:
         self.redirect_ok = True       # set by the Enforcer: can the IPv6 DNS redirect be loaded (nft, no failed load)?
         self.devices = {}             # device IPv4 address -> {"mac": .., "ll": link-local address, "unclear": bool}
         self._steered = {}            # hardware address -> the link-local we last claimed the router at
-        self._heard = {}              # hardware address -> a link-local address heard from a frame on the wire
+        self._heard = {}              # hardware address -> {link-local address heard from it, or claimed: when (clock())}
+        self._heard_lock = threading.Lock()   # the listener thread adds to _heard while the tick reads it
         self._last_hub = {}           # the router's link-local and hardware addresses our claims were made against
         self._problems = {}           # device IPv4 address -> why it is not being steered
         self._stop = None             # set while listen() runs, so delayed reachability answers can bow out
@@ -678,7 +708,8 @@ class IPv6Steerer:
         this computer's hardware and IPv6 addresses known, the router's link-local and hardware
         addresses known, a port to answer on, a router DNS address to catch, and the firewall able to
         load the redirect? A claim is withheld unless its lookups can be answered, so a steered
-        device's IPv6 DNS is never left silent (design (c2): "DNS is answered")."""
+        device's lookups to the router's IPv6 DNS address are never left silent (design (c2): "DNS is
+        answered"). A lookup it sends to any other IPv6 DNS server is not caught (see _ip6_dns_rules)."""
         return bool(self.enabled and self.our_mac and self.hub.get("v6") and self.hub.get("mac")
                     and self.our_v6 and self.port and self.servers and self.redirect_ok)
 
@@ -704,7 +735,15 @@ class IPv6Steerer:
     def steer(self):
         """Send each chosen device a claim that the router's address is at this computer, and hand
         back any device that has left the plan. Returns {device IPv4 address: why not} for devices it
-        had to leave alone. Safe to call every tick; devices forget, so it is meant to repeat."""
+        had to leave alone. Safe to call every tick; devices forget, so it is meant to repeat.
+
+        A device is claimed at one link-local address only when that is the only one known for its
+        hardware address: the one the plan gives (from this computer's neighbour table), every one
+        heard from it in the last hour (heard_addresses) and the one last claimed, taken together.
+        With more than one it is left alone and said so, and if it was already claimed the address
+        claimed is sent the correction, since the other address may be another device behind the same
+        hardware address. So a claim never moves from one address to another: the old one is corrected
+        first, and the new one is claimed only once the old one is no longer known."""
         self._problems = {}
         if not self.ready():
             self.release_all()
@@ -726,10 +765,19 @@ class IPv6Steerer:
             if mac.lower() in self.shared:
                 self._problems[ip] = "This device is behind a range extender, so QuietNet leaves its IPv6 alone."
                 continue
+            heard = self.heard_addresses(mac)
+            planned = _plain_ipv6(dev.get("ll", ""))
+            claimed = _plain_ipv6(self._steered.get(mac, ""))
+            if len(set(heard) | {a for a in (planned, claimed) if a}) > 1:
+                # Not in `chosen`, so a claim already made is corrected and forgotten below.
+                self._problems[ip] = ("More than one device seems to share this device's hardware address "
+                                      "(it may be behind a range extender), so QuietNet leaves its IPv6 alone.")
+                continue
             chosen.add(mac)
-            # Prefer a freshly heard address, then the plan's, then the one we last claimed, so a chosen
-            # device whose neighbour-table entry drops out stays steered at its last known address.
-            ll = self._heard.get(mac.lower(), "") or str(dev.get("ll", "")) or self._steered.get(mac, "")
+            # The plan's address first; one heard on the wire only when the plan gave none; then the one
+            # last claimed, so a chosen device whose neighbour-table entry drops out stays steered at its
+            # last known address. All of them are the same address here, or there would be two.
+            ll = planned or (heard[0] if heard else "") or claimed
             if not ll:
                 self._problems[ip] = ("QuietNet has not yet learned this device's IPv6 link-local address, "
                                       "so its IPv6 is not taken away yet.")
@@ -744,6 +792,7 @@ class IPv6Steerer:
                 self.log("Could not take IPv6 from %s: %s" % (ip, e))
                 continue
             wanted[mac] = ll
+            self._remember(mac, ll)       # a claimed address counts as known for an hour after its last claim
         changed = False
         for mac in list(self._steered):
             if mac not in chosen:         # no longer chosen (or now shared/unclear): hand it back
@@ -787,13 +836,49 @@ class IPv6Steerer:
         self._last_hub = {}
         self.save()
 
+    def _remember(self, mac, ll):
+        """Note that this link-local address belongs to this hardware address as of now: heard from
+        it on the wire, or just claimed. At most HEARD_PER_DEVICE are kept for one hardware address
+        (the one noted longest ago makes way) and HEARD_DEVICES hardware addresses in all (the one
+        that has gone longest without a note makes way)."""
+        mac = str(mac).lower()
+        with self._heard_lock:
+            known = self._heard.pop(mac, {})          # put back last, so the dictionary stays in order of latest note
+            known[ll] = self.clock()
+            while len(known) > self.HEARD_PER_DEVICE:
+                del known[min(known, key=known.get)]
+            self._heard[mac] = known
+            while len(self._heard) > self.HEARD_DEVICES:
+                del self._heard[next(iter(self._heard))]
+
+    def heard_addresses(self, mac, now=None):
+        """The link-local addresses known for this hardware address from the last HEARD_KEPT seconds:
+        those heard from it on the wire (note_frame) and any claimed (steer), most recently noted
+        first. Older ones are forgotten here. More than one means several devices may share the
+        hardware address, and steer() then leaves it alone."""
+        mac = str(mac).lower()
+        now = self.clock() if now is None else now
+        with self._heard_lock:
+            known = self._heard.get(mac)
+            if not known:
+                return []
+            for ll in [a for a, when in known.items() if now - when >= self.HEARD_KEPT]:
+                del known[ll]
+            if not known:
+                del self._heard[mac]
+                return []
+            return sorted(known, key=known.get, reverse=True)
+
     def note_frame(self, frame):
         """Learn a device's link-local IPv6 address from a frame heard on the wire, so a device that
         has never spoken IPv6 to the Pi can still be steered. The Ethernet source hardware address is
         matched with the IPv6 source address, and kept only when the source is a link-local address and
         the hardware address is one single device's (not a group, not all zeros) and not a forbidden
-        one. A forged pair is harmless: a claim still goes only to that frame's own hardware address,
-        which a device ignores if the claimed address is not its own."""
+        one. Every such address is kept, with the time, for HEARD_KEPT seconds after it was last heard
+        (heard_addresses): a second one from the same hardware address is the sign of several devices
+        behind it, and steer() then leaves that hardware address alone. A forged pair can therefore
+        only get a device left alone, or a claim sent to that frame's own hardware address, which a
+        device ignores if the claimed address is not its own."""
         if len(frame) < 54 or frame[12:14] != b"\x86\xdd":
             return
         src_mac = frame[6:12].hex(":")
@@ -808,12 +893,7 @@ class IPv6Steerer:
             return
         if src_mac.lower() in self._forbidden():
             return
-        if self._heard.get(src_mac.lower()) == str(src):
-            return
-        self._heard[src_mac.lower()] = str(src)
-        if len(self._heard) > 512:                      # drop the oldest to keep this bounded
-            for old in list(self._heard)[:len(self._heard) - 512]:
-                del self._heard[old]
+        self._remember(src_mac, str(src))
 
     def handle_solicitation(self, frame):
         """Answer one device's check that the router is still reachable, for a device we are steering.

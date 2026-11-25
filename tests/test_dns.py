@@ -1116,9 +1116,19 @@ class LookupsOverIPv6(Base):
     def test_a_hardware_address_not_yet_known_as_a_range_extender_is_still_counted_as_one_device(self):
         self.behind_an_extender()
         server.S.shared_macs = set()                 # seen at several numbers, but not often enough yet
+        several = ("fe80::a", "2001:db8::b", "2001:db8::c")      # nothing over IPv6 says it is shared
+        self.view({ip: (self.EXTENDER, "fresh") for ip in self.BEHIND_V4},
+                  {addr: (self.EXTENDER, "fresh") for addr in several})
+        self.assertEqual({server.share_key(addr) for addr in several}, {self.BEHIND_V4[0]})
+
+    def test_several_link_local_addresses_under_one_hardware_address_each_count_against_a_share_of_their_own(self):
+        # Each device has one link-local address, so these may be several devices (an extender not
+        # yet known as one): unmatched, each counts by itself, as behind a known extender.
+        self.behind_an_extender()
+        server.S.shared_macs = set()
         self.view({ip: (self.EXTENDER, "fresh") for ip in self.BEHIND_V4},
                   {addr: (self.EXTENDER, "fresh") for addr in self.BEHIND_V6})
-        self.assertEqual({server.share_key(addr) for addr in self.BEHIND_V6}, {self.BEHIND_V4[0]})
+        self.assertEqual([server.share_key(addr) for addr in self.BEHIND_V6], list(self.BEHIND_V6))
 
     def test_an_ipv6_address_behind_a_range_extender_keeps_the_rules_it_had_before(self):
         # Only whose share is counted changes here: which rules apply is the next part of the work.
@@ -1581,6 +1591,20 @@ class AddressesBuiltFromAHardwareAddress(Base):
         self.assertEqual(server.S.v6_by_mac[self.KID_MAC]["ll"], "")
         self.assertEqual(sorted(server.S.v6_by_mac[self.KID_MAC]["lls"]), ["fe80::aa", "fe80::bb"])
 
+    def test_ipv6_addresses_of_a_hardware_address_with_two_link_local_addresses_are_matched_to_no_ipv4_device(self):
+        # Several devices may be behind it: none of its addresses is judged as, or filed under, the one known device.
+        self.view({KID: (self.KID_MAC, "fresh"), ADULT: ("aa:bb:cc:dd:ee:02", "fresh")},
+                  {"fe80::aa": (self.KID_MAC, "fresh"), "fe80::bb": (self.KID_MAC, "stale"),
+                   "2001:db8::aa": (self.KID_MAC, "fresh"), "fe80::cc": ("aa:bb:cc:dd:ee:02", "fresh")})
+        self.assertEqual(server.S.v6_devices, {"fe80::cc": ADULT})
+
+    def test_a_lookup_from_such_an_address_is_refused_while_a_device_has_rules_of_its_own(self):
+        self.view({KID: (self.KID_MAC, "fresh")},
+                  {"fe80::aa": (self.KID_MAC, "fresh"), "fe80::bb": (self.KID_MAC, "fresh")})
+        server.set_internet_off("device:" + KID, True)
+        resp = server.answer_query(query("www.bbc.co.uk"), "fe80::bb", fake_answer)
+        self.assertEqual(resp[3] & 15, 5)                              # refused, not blocked as the child's phone
+
     def test_a_range_extenders_addresses_are_left_out_of_the_view_by_hardware_address(self):
         server.S.shared_macs = {self.KID_MAC}
         self.view({KID: (self.KID_MAC, "fresh")}, {"fe80::aa": (self.KID_MAC, "fresh")})
@@ -1805,7 +1829,45 @@ class RouterAnnouncements(Base):
     def test_an_announcement_without_a_hardware_address_keeps_the_one_that_router_gave_before(self):
         server.note_router_dns([], 1000.0, sender="fe80::1", mac=self.HUB_MAC)
         server.note_router_dns([], 1010.0, sender="fe80::1", mac="")
-        self.assertEqual(server.S.routers_v6["fe80::1"], {"mac": self.HUB_MAC, "heard": 1010.0})
+        kept = server.S.routers_v6["fe80::1"]
+        self.assertEqual((kept["mac"], kept["heard"]), (self.HUB_MAC, 1010.0))
+
+    def flagged(self, flags):
+        """A router announcement whose flags byte (the M and O flags are its top two bits) is this."""
+        data = bytearray(router_advert(self.LINK_ADDR, rdnss(600, self.HUB)))
+        data[5] = flags
+        return bytes(data)
+
+    def test_an_announcement_with_neither_dhcpv6_flag_is_read_as_setting_neither(self):
+        found = server.read_router_advert(self.flagged(0))
+        self.assertEqual((found["managed"], found["other"]), (False, False))
+
+    def test_the_addresses_from_a_dhcpv6_server_flag_is_read_by_itself(self):
+        found = server.read_router_advert(self.flagged(0x80))
+        self.assertEqual((found["managed"], found["other"]), (True, False))
+
+    def test_the_other_settings_from_a_dhcpv6_server_flag_is_read_by_itself(self):
+        found = server.read_router_advert(self.flagged(0x40))
+        self.assertEqual((found["managed"], found["other"]), (False, True))
+
+    def test_the_other_bits_of_the_flags_byte_are_not_taken_for_dhcpv6_flags(self):
+        found = server.read_router_advert(self.flagged(0x3f))       # the router preference and spare bits
+        self.assertEqual((found["managed"], found["other"]), (False, False))
+
+    def test_the_listener_keeps_a_real_routers_dhcpv6_flags(self):
+        self.listen([(self.flagged(0x80), ("fe80::1%wlan0", 0, 0, 3))])
+        kept = server.S.routers_v6["fe80::1"]
+        self.assertEqual((kept["managed"], kept["other"]), (True, False))
+
+    def test_the_status_shows_each_routers_dhcpv6_flags(self):
+        self.listen([(self.flagged(0x40), ("fe80::1%wlan0", 0, 0, 3))])
+        router = server.ipv6_dns_view()["routers"][0]
+        self.assertEqual((router["managed"], router["other"]), (False, True))
+
+    def test_a_routers_latest_announcement_decides_its_dhcpv6_flags(self):
+        self.listen([(self.flagged(0xc0), ("fe80::1%wlan0", 0, 0, 3)), (self.flagged(0), ("fe80::1%wlan0", 0, 0, 3))])
+        kept = server.S.routers_v6["fe80::1"]
+        self.assertEqual((kept["managed"], kept["other"]), (False, False))
 
     def test_a_router_is_forgotten_an_hour_after_it_was_last_heard(self):
         server.note_router_dns([], 1000.0, sender="fe80::1", mac=self.HUB_MAC)

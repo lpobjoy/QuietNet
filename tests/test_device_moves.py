@@ -1720,6 +1720,12 @@ class WhereIPv6IsTakenAway(Base, Setup):
         server.S.v6_by_mac = {PHONE: v6_view(LL, LL_TOO)}
         self.assertEqual(self.named({OLD: fresh(PHONE)}), {OLD: {"mac": PHONE, "ll": "", "unclear": True}})
 
+    def test_a_hardware_address_the_ipv6_look_noted_as_unclear_is_marked_unclear(self):
+        # The same note that leaves its IPv6 addresses matched to no device (several_link_local).
+        server.S.v6_by_mac = {PHONE: v6_view(LL)}
+        server.S.v6_unclear = frozenset({PHONE})
+        self.assertEqual(self.named({OLD: fresh(PHONE)}), {OLD: {"mac": PHONE, "ll": "", "unclear": True}})
+
     def test_a_hardware_address_at_two_live_addresses_at_once_is_marked_unclear(self):
         # It may be a range extender not yet known to be one: its IPv6 addresses are matched to no
         # device (note_ipv6_addresses), and its IPv6 is left alone.
