@@ -615,6 +615,25 @@ class DashboardContract(unittest.TestCase):
         self.assertIn(".in_use ? `<p class=\"small muted\">This covers IPv4 only", card)
         self.assertNotIn("It works on IPv4 only", card)      # the old sentence, shown to every home
 
+    def test_the_enforcer_card_shows_the_escaped_ipv6_steering_problem(self):
+        card = self.page[self.page.index("function enforceCard"):]
+        card = card[:card.index("\nfunction ")]
+        self.assertIn("(e.ipv6_steering || {}).problems || {})[d.ip]", card)
+        self.assertIn("esc(e.ipv6_steering.problems[d.ip])", card)
+
+    def test_the_ipv6_steering_switch_is_not_offered_when_the_status_says_so(self):
+        card = self.page[self.page.index("function ipv6SteerSwitch"):]
+        card = card[:card.index("\nfunction ")]
+        self.assertIn("v6.offered !== true", card)
+        self.assertIn("Not available on this computer", card)
+
+    def test_the_ipv6_steering_switch_says_when_it_is_waiting_for_the_hub(self):
+        card = self.page[self.page.index("function ipv6SteerSwitch"):]
+        card = card[:card.index("\nfunction ")]
+        self.assertIn("Waiting to hear the hub announce IPv6", card)
+        self.assertIn("esc(v6.problem)", card)
+        self.assertIn("num(v6.steered)", card)
+
 
 class DashboardFirewallNotice(unittest.TestCase):
     """The home page's notice when another firewall on the Pi stops "Cut live connections" for

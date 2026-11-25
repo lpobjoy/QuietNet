@@ -1628,6 +1628,177 @@ class WhereTheEnforcerSteers(Base, Setup):
                                                       "fe80::1": fresh(PHONE)}), {})
 
 
+LL, LL_TOO = "fe80::aa", "fe80::bb"   # link-local IPv6 addresses, as the IPv6 neighbour table lists them
+
+
+def v6_view(*addresses):
+    """One hardware address's entry in S.v6_by_mac, as refresh_ipv6_view makes it."""
+    local = [a for a in addresses if a.startswith("fe80:")]
+    return {"ll": local[0] if len(local) == 1 else "", "lls": local, "addrs": list(addresses)}
+
+
+class WhereIPv6IsTakenAway(Base, Setup):
+    """Which devices plan6() names for IPv6 steering (option c2). As for IPv4: only a device with
+    "Cut live connections" on that the live neighbour table lists, at the address its rules are
+    held at and with its own hardware address. Never from the record of who used an address. A
+    device behind a range extender, known only by its number, or whose hardware address is not
+    settled on one device, is passed on so that the steerer reports it and leaves it alone."""
+
+    def setUp(self):
+        super().setUp()
+        self.start_clean()
+        self.look({OLD: fresh(PHONE)})
+        self.phone = self.give_rules(PHONE)
+        server.set_live_cut(self.phone, True)
+        server.S.ipv6_steer = True
+        self.addCleanup(setattr, server.S, "ipv6_steer", False)
+        server.S.v6_by_mac = {PHONE: v6_view(LL, V6_A)}
+
+    def plan6(self, table):
+        """plan6() with this (stand-in) neighbour table as the live one, and none read before."""
+        full = {PI: fresh(PI_MAC), ROUTER: fresh(ROUTER_MAC)}
+        full.update(table)
+        server.S.plan_table = (0.0, None)
+        with mock.patch.object(server, "neighbour_table", return_value=full):
+            return server.plan6()
+
+    def named(self, table):
+        """The devices plan6() names with this live neighbour table."""
+        return self.plan6(table)["devices"]
+
+    def test_a_device_with_the_cut_on_is_named_at_the_address_the_live_table_lists_it_at(self):
+        self.assertEqual(self.named({OLD: fresh(PHONE)}), {OLD: {"mac": PHONE, "ll": LL}})
+
+    def test_a_device_without_cut_live_connections_is_not_named(self):
+        server.set_live_cut(self.phone, False)
+        self.assertEqual(self.named({OLD: fresh(PHONE)}), {})
+
+    def test_a_device_whose_entry_has_gone_stale_is_still_named(self):
+        # As for IPv4: a steered device's entry is stale most of the time.
+        self.look({OLD: stale(PHONE)}, later=60)
+        self.assertEqual(self.named({OLD: stale(PHONE)}), {OLD: {"mac": PHONE, "ll": LL}})
+
+    def test_a_device_the_live_table_does_not_list_is_not_named(self):
+        # The record says the phone used this address; the live table says nothing. No steering.
+        self.assertEqual(server.S.addr_use[OLD][0], self.phone)
+        self.assertEqual(self.named({}), {})
+
+    def test_a_record_left_by_a_restart_names_nobody(self):
+        server.init_db()
+        server.S.ipv6_steer = True
+        server.S.v6_by_mac = {PHONE: v6_view(LL, V6_A)}
+        self.assertEqual(self.named({OLD: fresh(PHONE)}), {})      # not until a look has confirmed it there
+
+    def test_a_different_device_now_at_the_address_is_not_named(self):
+        server.S.v6_by_mac[LAPTOP] = v6_view(LL_TOO)
+        self.assertEqual(self.named({OLD: fresh(LAPTOP)}), {})     # even before the next look
+        self.look({OLD: fresh(LAPTOP)}, later=60)
+        self.assertEqual(self.named({OLD: fresh(LAPTOP)}), {})
+
+    def test_the_device_is_named_at_its_new_address_once_it_moves(self):
+        self.look({NEW: fresh(PHONE)}, later=60)
+        self.assertEqual(self.named({NEW: fresh(PHONE)}), {NEW: {"mac": PHONE, "ll": LL}})
+
+    def test_a_device_with_two_hardware_addresses_is_named_at_each(self):
+        self.look({OLD: fresh(PHONE), NEW: fresh(LAPTOP)}, later=60)        # its Wi-Fi and its cable, joined by the owner
+        server.merge_devices(self.phone, self.number(LAPTOP))
+        table = {OLD: fresh(PHONE), NEW: fresh(LAPTOP)}
+        self.look(table, later=120)
+        server.S.v6_by_mac[LAPTOP] = v6_view(LL_TOO)
+        self.assertEqual(self.named(table), {OLD: {"mac": PHONE, "ll": LL}, NEW: {"mac": LAPTOP, "ll": LL_TOO}})
+
+    def test_a_device_held_to_another_devices_rules_is_named_by_its_own_hardware_address(self):
+        self.look({OLD: fresh(PRIVATE)}, later=60)                  # a new private address at the phone's number
+        server.S.v6_by_mac = {PRIVATE: v6_view(LL_TOO)}
+        self.assertEqual(self.named({OLD: fresh(PRIVATE)}), {OLD: {"mac": PRIVATE, "ll": LL_TOO}})
+
+    def test_a_device_with_no_known_link_local_address_is_passed_with_an_empty_one(self):
+        server.S.v6_by_mac = {}
+        self.assertEqual(self.named({OLD: fresh(PHONE)}), {OLD: {"mac": PHONE, "ll": ""}})
+
+    def test_a_hardware_address_with_two_link_local_addresses_is_marked_unclear(self):
+        server.S.v6_by_mac = {PHONE: v6_view(LL, LL_TOO)}
+        self.assertEqual(self.named({OLD: fresh(PHONE)}), {OLD: {"mac": PHONE, "ll": "", "unclear": True}})
+
+    def test_a_hardware_address_at_two_live_addresses_at_once_is_marked_unclear(self):
+        # It may be a range extender not yet known to be one: its IPv6 addresses are matched to no
+        # device (note_ipv6_addresses), and its IPv6 is left alone.
+        table = {OLD: fresh(PHONE), NEW: fresh(PHONE)}
+        self.look(table, later=60)
+        self.assertEqual(server.S.hw_unsettled, {PHONE})
+        self.assertEqual(self.named(table), {OLD: {"mac": PHONE, "ll": "", "unclear": True}})
+
+    def behind_an_extender(self):
+        """Turn the cut on for the number OLD, which a range extender answers for. Returns the table."""
+        table = {OLD: fresh(EXTENDER), NEW: fresh(EXTENDER)}
+        for minute in range(1, 1 + server.SHARED_AFTER):
+            self.look(table, later=60 * minute)
+        self.assertEqual(server.S.shared_macs, {EXTENDER})
+        server.set_live_cut(server.S.addr_only[OLD], True, EXTENDER)
+        server.S.v6_by_mac = {EXTENDER: v6_view(LL_TOO)}            # even if the view somehow listed one
+        return table
+
+    def test_a_device_behind_a_range_extender_is_passed_with_no_link_local_address(self):
+        table = self.behind_an_extender()
+        plan = self.plan6(table)
+        self.assertEqual(plan["devices"], {OLD: {"mac": EXTENDER, "ll": ""}})
+        self.assertIn(EXTENDER, plan["shared"])
+
+    def test_a_device_known_only_by_its_number_is_never_given_a_link_local_address(self):
+        # Even if the hardware address answering there stopped counting as a range extender's.
+        table = self.behind_an_extender()
+        with mock.patch.object(server.S, "shared_macs", set()):
+            plan = self.plan6({OLD: fresh(EXTENDER)})
+        self.assertEqual(plan["devices"], {OLD: {"mac": EXTENDER, "ll": ""}})
+        self.assertEqual(plan["shared"], [EXTENDER])
+
+    def test_the_table_the_ipv4_plan_read_is_used_and_not_read_again(self):
+        # plan6 goes by the plan's table only while it is no more than PLAN_TABLE_KEPT seconds old,
+        # so the steady clock is held at its present reading: the two calls then fall in the same
+        # moment however long the machine takes between them.
+        now = time.monotonic()
+        with mock.patch.object(server, "neighbour_table", return_value={OLD: fresh(PHONE)}) as read, \
+                mock.patch.object(server.time, "monotonic", lambda: now):
+            server.enforcement_plan()
+            self.assertEqual(server.plan6()["devices"], {OLD: {"mac": PHONE, "ll": LL}})
+        self.assertEqual(read.call_count, 1)
+
+    def test_the_neighbour_table_is_read_afresh_when_the_ipv4_plans_is_too_old(self):
+        server.S.plan_table = (time.monotonic() - server.PLAN_TABLE_KEPT - 1, {OLD: fresh(PHONE)})
+        with mock.patch.object(server, "neighbour_table", return_value={}) as read:
+            self.assertEqual(server.plan6()["devices"], {})
+        self.assertEqual(read.call_count, 1)
+
+    def test_the_neighbour_table_is_read_before_the_database_lock_is_taken(self):
+        # Reading it runs a system tool; the history writer and every rule change wait on that lock.
+        free = []
+
+        def read():
+            def try_lock():
+                got = server.db_lock.acquire(blocking=False)
+                free.append(got)
+                if got:
+                    server.db_lock.release()
+            t = threading.Thread(target=try_lock)
+            t.start()
+            t.join()
+            return {OLD: fresh(PHONE)}
+        server.S.plan_table = (0.0, None)
+        with mock.patch.object(server, "neighbour_table", side_effect=read):
+            server.plan6()
+        self.assertEqual(free, [True])
+
+    def test_with_no_device_to_steer_the_neighbour_table_is_not_read(self):
+        server.set_live_cut(self.phone, False)
+        server.S.plan_table = (0.0, None)
+        with mock.patch.object(server, "neighbour_table", side_effect=AssertionError("read")):
+            self.assertEqual(server.plan6()["devices"], {})
+
+    def test_while_the_setting_is_off_no_device_is_named(self):
+        server.S.ipv6_steer = False
+        self.assertEqual(self.named({OLD: fresh(PHONE)}), {})
+
+
 class DecisionStaysFast(Base, Setup):
     def setUp(self):
         super().setUp()
@@ -1880,6 +2051,29 @@ class TheOlderDatabase(OlderHousehold):
         server.set_live_cut(self.SPOT, True, self.ITS_TV)
         self.look({self.SPOT: self.ANOTHER})
         self.assertEqual(server.enforcement_plan(), {})
+
+    def taking_ipv6_away(self):
+        """Switch on "Take IPv6 away from steered devices", with the TV's link-local address known."""
+        server.S.ipv6_steer = True
+        self.addCleanup(setattr, server.S, "ipv6_steer", False)
+        server.S.v6_by_mac = {self.ITS_TV: {"ll": "fe80::aa", "lls": ["fe80::aa"], "addrs": ["fe80::aa"]}}
+
+    def test_ipv6_is_taken_from_the_address_the_cut_is_kept_under_without_reading_the_neighbour_table(self):
+        server.set_live_cut(self.SPOT, True, self.ITS_TV)
+        self.taking_ipv6_away()
+        with mock.patch.object(server, "neighbour_table", side_effect=AssertionError("read")):
+            self.assertEqual(server.plan6()["devices"], {self.SPOT: {"mac": self.ITS_TV, "ll": "fe80::aa"}})
+
+    def test_a_paused_address_is_not_named_for_ipv6_steering(self):
+        server.set_live_cut(self.SPOT, True, self.ITS_TV)
+        self.taking_ipv6_away()
+        self.look({self.SPOT: self.ANOTHER})
+        self.assertEqual(server.plan6()["devices"], {})
+
+    def test_an_address_with_no_hardware_address_noted_is_not_named_for_ipv6_steering(self):
+        server.set_live_cut(self.SPOT, True, "")
+        self.taking_ipv6_away()
+        self.assertEqual(server.plan6()["devices"], {})
 
     def test_an_address_nobody_is_at_keeps_its_rules(self):
         self.look({})

@@ -4,7 +4,9 @@ the order of start_up(), serving and clean_up() in run().
 Run with:  python3 -m unittest discover tests
 
 Everything here runs inside the test program, with stand-ins for the enforcer, the cloud link,
-the device keeper and the listeners, so nothing touches the network or its settings. A stop request is sent the
+the device keeper and the listeners, so nothing touches the network or its settings. (Where a
+test of the clean-up uses the real enforcer, everything the enforcer would touch has a stand-in:
+see CleanUp.enforcer_steering_a_phone.) A stop request is sent the
 way `docker stop` and Ctrl-C send one, as a signal, but to the test program itself and only
 while QuietNet's own handling is in place; the handling that was there before is put back
 after every test. tests/test_shutdown.py does the same from outside, with the whole program.
@@ -14,8 +16,10 @@ import http.client
 import inspect
 import io
 import os
+import shutil
 import signal
 import sys
+import tempfile
 import threading
 import time
 import unittest
@@ -26,6 +30,12 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from test_quietnet import Base, server
 
 STOP_SIGNALS = (signal.SIGTERM, signal.SIGINT)
+# A made-up home network for the test of the clean-up with the real enforcer: the router, this
+# computer and one phone, each with its hardware address, and the router's and the phone's own
+# IPv6 addresses on the home network (the "link-local" ones, which is what IPv6 steering claims).
+HUB, HUB_V6, HUB_MAC = "192.168.1.254", "fe80::1", "98:99:99:99:99:99"
+PI, PI_MAC = "192.168.1.60", "aa:aa:aa:aa:aa:aa"
+PHONE, PHONE_V6, PHONE_MAC = "192.168.1.23", "fe80::23", "10:22:33:44:55:66"
 
 
 def nothing(*args, **kwargs):
@@ -324,6 +334,7 @@ class Threads:
 # WholeLife.setUp (see the test near the end of WholeLife).
 STARTS_NOTHING = {
     "S", "local_ip", "dns_error", "dns_port", "DATA", "enforcement_plan", "plan_neighbours", "learn_enforced_mac",
+    "plan6",                # handed to the enforcer, never called here: the enforcer asks it each tick
     "web_port", "no_browser", "no_device_names", "asked", "print", "Web",
     "threading", "Thread", "enforcer", "cloud_agent",
     "start", "stop", "cancel", "available", "reason", "start_listeners",
@@ -559,6 +570,17 @@ class WholeLife(SignalsPutBack, Base):
         self.assertEqual(len(self.enforcer_given), 1)
         self.assertIs(self.enforcer_given[0]["neighbours"], server.plan_neighbours)
 
+    def test_the_enforcer_is_given_the_plan_for_taking_ipv6_away_from_steered_devices(self):
+        """The enforcer takes IPv6 away from the devices it steers only when it is handed plan6,
+        which it asks each tick what that steering should do (nothing, while the household has
+        the setting off) and once more as it stops, to hand those devices back. Made without
+        it, the enforcer leaves IPv6 steering out altogether: the setting on the dashboard would
+        then do nothing, and nothing would say so."""
+        self.enforcer_does["start"] = ask_to_stop
+        self.assertIsNone(self.run_it())
+        self.assertEqual(len(self.enforcer_given), 1)
+        self.assertIs(self.enforcer_given[0].get("plan6"), server.plan6)
+
     def test_a_stop_request_while_the_cloud_link_starts_means_the_dashboard_is_never_served(self):
         """Too late for start-up to be cut short, so the request has to be remembered: the rest
         of start-up is finished, there is no serving, and everything is stopped."""
@@ -712,6 +734,13 @@ class CleanUp(Base):
             server.clean_up()
         return printed.getvalue()
 
+    def patched(self, where, name, stand_in):
+        """Replace where.name with the stand-in until the test is over, and return the stand-in."""
+        patcher = mock.patch.object(where, name, stand_in)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return stand_in
+
     def test_with_nothing_started_it_only_says_that_quietnet_has_stopped(self):
         self.assertEqual(self.cleaned_up(None, None), "\nQuietNet stopped.\n")
 
@@ -725,6 +754,86 @@ class CleanUp(Base):
         here; it never runs a command or opens a socket unless it is started."""
         enforcer = server.enforcer.Enforcer("127.0.0.1", dict, dict, log=lambda m: None)
         self.assertIn("QuietNet stopped.", self.cleaned_up(enforcer, None))
+
+    def test_an_enforcer_made_to_steer_ipv6_too_but_never_started_is_stopped_without_asking_for_a_plan(self):
+        """The same moment, for the enforcer as start_up() makes it, with a plan for IPv6
+        steering: stopping one that never started must ask for no plan (the real one takes
+        the database lock) and send nothing."""
+        plan6 = mock.Mock(return_value={})
+        enforcer = server.enforcer.Enforcer("127.0.0.1", dict, dict, log=lambda m: None, plan6=plan6)
+        enforcer._v6.send = mock.Mock()
+        self.assertIn("QuietNet stopped.", self.cleaned_up(enforcer, None))
+        plan6.assert_not_called()
+        enforcer._v6.send.assert_not_called()
+
+    def enforcer_steering_a_phone(self):
+        """The real enforcer, started, steering one phone over IPv4 and holding its IPv6 as well
+        (the optional setting on), with a stand-in for everything it would touch: the commands
+        it would run are only noted, kernel settings are neither read nor changed, its listeners
+        open nothing, and the frames it would send go into a list. Returns the enforcer, the
+        list of frames and the list of what it logged."""
+        made, frames, log = server.enforcer, [], []
+        self.patched(made.subprocess, "run", lambda args, **kw: mock.Mock(returncode=0, stdout="", stderr=""))
+        self.patched(made, "shutil", mock.Mock(which=lambda tool: "/sbin/nft" if tool == "nft" else None))
+        self.patched(made, "interface_and_gateway", lambda: ("wlan0", HUB))
+        self.patched(made, "local_subnet", lambda card: made.ipaddress.IPv4Network("192.168.1.0/24"))
+        self.patched(made, "mac_of_interface", lambda card: PI_MAC)
+        self.patched(made, "sysctl_get", lambda key: "1" if "forward" in key and "ipv6" not in key else "0")
+        self.patched(made, "sysctl_set", lambda key, value: True)
+        folder = tempfile.mkdtemp(prefix="quietnet-test-")
+        self.addCleanup(shutil.rmtree, folder, True)
+        plan6 = {"enabled": True, "hub": {"v6": HUB_V6, "mac": HUB_MAC}, "our_v6": "fd00::9", "port": 53,
+                 "servers": [HUB_V6], "shared": [], "devices": {PHONE: {"mac": PHONE_MAC, "ll": PHONE_V6}}}
+        enforcer = made.Enforcer(PI, lambda: {PHONE: {"off": True, "ips": set(), "mac": PHONE_MAC}},
+                                 lambda: {PHONE: PHONE_MAC, HUB: HUB_MAC}, log=log.append, data_dir=folder,
+                                 dns_port=53, plan6=lambda: plan6)
+        enforcer.reason = ""                        # as on a Pi: away from Linux it would say it cannot run
+        wire = mock.Mock()
+        wire.send.side_effect = frames.append
+        wire.recv.side_effect = OSError("nothing is heard on a stand-in")
+        enforcer._open_socket = lambda: wire
+        enforcer._v6.listen = lambda stop: None
+        enforcer.start()
+        self.addCleanup(enforcer.stop)
+        # IPv4 steering takes the phone on one tick and the IPv6 claim follows on the next; a
+        # poke runs a tick at once. Up to 30 seconds, ending the moment the phone is held.
+        deadline = time.monotonic() + 30
+        while not enforcer._v6.active() and time.monotonic() < deadline:
+            enforcer.poke()
+            time.sleep(0.01)
+        self.assertTrue(enforcer._v6.active(), "the enforcer did not take the phone's IPv6 within 30 seconds")
+        return enforcer, frames, log
+
+    def test_the_clean_up_says_quietnet_has_stopped_only_after_a_steered_devices_ipv6_is_handed_back(self):
+        """With "Take IPv6 away from steered devices" on, stopping the enforcer does one thing
+        more than handing the device back over IPv4: it tells the device the router's real
+        hardware address for the router's IPv6 address as well. The clean-up waits for both,
+        because the program ends right after its last line."""
+        enforcer, frames, log = self.enforcer_steering_a_phone()
+        ipv6_back = server.enforcer.neighbour_advertisement(HUB_V6, HUB_MAC, PHONE_V6, PHONE_MAC, eth_src=PI_MAC,
+                                                            solicited=False, override=True)
+        ipv4_back = server.enforcer.build_arp_reply(HUB, HUB_MAC, PHONE, PHONE_MAC, eth_src=PI_MAC)
+        self.assertNotIn(ipv6_back, frames)
+        self.assertNotIn(ipv4_back, frames)
+        seen = {}
+
+        class Noting(io.StringIO):
+            """Notes which frames had gone out by the time the clean-up's last line was printed."""
+
+            def write(self, text):
+                """Keep the text, and what had been sent when "QuietNet stopped." came."""
+                if "QuietNet stopped." in text:
+                    seen["frames"], seen["log"] = list(frames), list(log)
+                return super().write(text)
+
+        with mock.patch.object(server, "ENF", enforcer), mock.patch.object(server, "CA", None), \
+                mock.patch.object(server, "BROWSER", None), contextlib.redirect_stdout(Noting()):
+            server.clean_up()
+        self.assertIn(ipv6_back, seen["frames"])
+        self.assertIn(ipv4_back, seen["frames"])
+        self.assertLess(seen["frames"].index(ipv6_back), seen["frames"].index(ipv4_back))
+        self.assertEqual(seen["log"][-1], "Enforcer stopped; network restored.")
+        self.assertFalse(enforcer._v6.active())
 
     def test_a_cloud_link_that_was_made_but_never_started_can_be_stopped(self):
         """The real class again: made with a throwaway folder, it contacts nothing until started."""

@@ -120,7 +120,7 @@ class Base(unittest.TestCase):
                       "group_member", "live_cut", "device_follow", "rule_conflict"):
             server.sql("DELETE FROM %s" % table, commit=True)
         server.sql("DELETE FROM settings WHERE key IN ('macs_seeded', 'rules_move_report')", commit=True)
-        server.sql("DELETE FROM settings WHERE key IN ('other_dns_all', 'no_ipv6_all')", commit=True)
+        server.sql("DELETE FROM settings WHERE key IN ('other_dns_all', 'no_ipv6_all', 'ipv6_steer')", commit=True)
         server.init_db()
         server.S.junk_on, server.S.paused_until = True, 0
         server.S.enforced, server.S.resolved = set(), {}
@@ -132,6 +132,8 @@ class Base(unittest.TestCase):
         server.S.v6_table = {}
         # Nothing heard from the router about IPv6, and no IPv6 address to give devices.
         server.S.v6_dns, server.S.router_v6_dns, server.S.ra_heard = "", {}, None
+        server.S.v6_by_mac = {}
+        server.S.plan_table = (0.0, None)   # no neighbour table left over from another test's plan
         server.S.router_prefixes = {}
         # The announcement listener and the IPv6 watcher are not running, and have never looked.
         server.S.ra_listening, server.S.ra_since, server.S.ra_heard_at, server.S.routers_v6 = False, None, None, {}
