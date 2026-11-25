@@ -77,6 +77,17 @@ def one_round_of_the_writer():
     return prune
 
 
+def steady_clock_held_at_the_move():
+    """Hold QuietNet's steady clock at the moment the move finished, for the length of a "with".
+    The fill may call itself finished FILL_SETTLE seconds after the move. A test of what it does
+    before then says itself when that time has passed (by moving S.moved_steady back), so the
+    real seconds that go by while the test runs must not count: on a machine that stalls for
+    ten seconds between the move and the fill, the fill would finish without the waits the test
+    is about."""
+    moved = server.S.moved_steady
+    return mock.patch.object(server.time, "monotonic", lambda: moved)
+
+
 class Devices(Base):
     """Shared steps: a home with this computer at PI and the router at ROUTER."""
 
@@ -1120,7 +1131,9 @@ class DeviceList(Api):
         self.look({OLD_SPOT: fresh(TV)})
         self.lookup(OLD_SPOT, "old.example.com")
         path = "/api/activity?ip=%s&device=%s&hours=24&since=%%s" % (OLD_SPOT, server.S.hw_device[TV])
-        server.sql("INSERT INTO queries(ts,client,domain,blocked) VALUES(?,?,?,0)", (time.time() - 5, OTHER, "other.example.com"),
+        # Five seconds before the look that follows, by the clock the looks go by (self.now), not
+        # by the real one: a lookup made after the last look would have to wait for a later look.
+        server.sql("INSERT INTO queries(ts,client,domain,blocked) VALUES(?,?,?,0)", (self.now - 5, OTHER, "other.example.com"),
                    commit=True)
         first = self.get(path % "")[1]["marker"]
         self.look({OLD_SPOT: fresh(TV), OTHER: fresh(LAPTOP)})
@@ -1654,7 +1667,7 @@ class TheMove(OlderHousehold):
             waits.append(seconds)
             if waits.count(1) == 3:
                 server.S.moved_steady -= server.FILL_SETTLE
-        with mock.patch.object(server.time, "sleep", sleep):
+        with mock.patch.object(server.time, "sleep", sleep), steady_clock_held_at_the_move():
             server.fill_old_history()
         self.assertEqual(waits, [server.FILL_PAUSE, 1, 1, 1])
         self.assertEqual(server.get_setting("devices_fill", ""), "done")
@@ -2092,7 +2105,7 @@ class LookupsMadeJustBeforeTheMove(OlderHousehold):
                 del waiting[:]
                 self.assertEqual(server.sql("SELECT device FROM queries WHERE domain='late.example.com'"), [(None,)])
                 server.S.moved_steady -= server.FILL_SETTLE
-        with mock.patch.object(server.time, "sleep", sleep):
+        with mock.patch.object(server.time, "sleep", sleep), steady_clock_held_at_the_move():
             server.fill_old_history()
         self.assertEqual(waiting, [])
         self.assertEqual(server.sql("SELECT COUNT(*) FROM queries WHERE device IS NULL")[0][0], 0)
