@@ -128,6 +128,12 @@ Since 24 November the enforcer steers a device wherever the Pi's neighbour table
 - **A device that has really left stays in the plan while its stale entry stays in the table,** as it did before the device tables. Nothing is sent to anyone else.
 - **A device behind a Wi-Fi range extender that hides its hardware address is steered only while its entry is fresh.** One hardware address answers for several devices there, so a stale entry says nothing about which device has the number. Its "Cut live connections" can therefore lapse between its lookups: handed back to the router about half a minute after its last lookup, and steered again at the next one or at the next name round (two minutes), so a bedtime that starts in between cuts its open connections late. Its lookups are blocked throughout. Keeping such an entry fresh (a question to the device from the Pi every few seconds) would close this; it is not done, because it has not been tried against a real extender.
 
+### 103. The relay's Railway settings moved out of the repository (24 November)
+
+Railway warned that `railway.json` stops being read on 1 December 2026. Its replacement, `.railway/railway.ts`, needs Railway's npm package in the repository (the Python and Go versions need a pip package or a Go module), which QuietNet's standard-library-only rule does not allow. `railway.json` is gone; the relay's build and health check are set on the Railway service instead, and written down in `cloud/README.md`, "The service's settings". The file used to set only the Dockerfile path and the restart policy; the health check on `/healthz` is new.
+
+**Still to check on Railway:** before the first deploy without `railway.json`, that `RAILWAY_DOCKERFILE_PATH=cloud/Dockerfile` and the healthcheck path `/healthz` are set on the service. Then, after that deploy, the four checks in `cloud/README.md`, "Checking a deploy": the build log shows the Dockerfile's steps, the deploy log shows the health check passing on `/healthz`, `/healthz` answers `{"ok": true}`, and the start-up lines are as before. Nothing in the repository can check the settings on Railway themselves.
+
 ## Open: design decisions for the owner
 
 ### 5. IPv6: the enforcer, and devices known by two addresses

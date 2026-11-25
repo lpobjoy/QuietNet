@@ -1,6 +1,9 @@
 # The QuietNet relay (host this on Railway or any Docker host).
 # Build context must be the repository root so it can include the dashboard.
 # Uses only the Python standard library - nothing is installed.
+# On Railway the service's variable RAILWAY_DOCKERFILE_PATH=cloud/Dockerfile points here, and its
+# health check path is /healthz. These live in the service's settings, not in a railway.json:
+# see "The service's settings" in cloud/README.md.
 FROM python:3.13-slim
 WORKDIR /app
 COPY cloud/relay.py ./relay.py

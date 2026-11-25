@@ -9,8 +9,19 @@ It uses only the Python standard library.
 
 1. Push this repository to GitHub (already done if you're reading it there).
 2. In Railway: **New Project → Deploy from GitHub repo**, pick this repo.
-3. Railway reads `railway.json` and builds `cloud/Dockerfile`. No settings needed —
-   it provides the public HTTPS address and the `PORT`.
+3. Set these in the service on Railway (see "The service's settings" below for why they are not in
+   the repository):
+   - Variable `RAILWAY_DOCKERFILE_PATH` = `cloud/Dockerfile`. Railway then builds the relay's
+     container from that file, with the repository's top folder as the build context, which the
+     file needs.
+     The service's Settings, under Build, then show the builder as "Dockerfile, Automatically
+     Detected" and the Dockerfile path as set by that variable. There is nothing to choose there.
+   - **Healthcheck path** `/healthz` (the service's Settings, under Deploy). A new deploy only takes
+     over once the relay answers there.
+   - **Restart policy** On Failure, which is Railway's default.
+   - Leave the start command empty: the Dockerfile's last line starts the relay.
+
+   Railway provides the public HTTPS address and the `PORT`.
 4. Add a **Volume** mounted at `/data` so accounts survive redeploys.
 5. Sign-up needs no setting: by default (`QUIETNET_SIGNUP=first`) only the first account can be created, which should be yours, so create it straight after deploying. The values are `first` (the default), `open` (anyone who finds the address can make an account; they still cannot see your Pi) and `closed`. Any other value, such as a misspelling, switches sign-up off and the relay's log warns about it. The log says at start-up which setting is in force.
 
@@ -20,6 +31,64 @@ It uses only the Python standard library.
    pairs it in one go. For a Pi already running QuietNet, enter the code (and the Railway URL) on
    the Pi's own QuietNet page under **Remote access**. The code works once and for 15 minutes;
    reload the page for a new one. One account can hold up to 10 QuietNets and pair up to 20 a day.
+
+## The service's settings
+
+The repository has no `railway.json`. Railway stops reading those files on 1 December 2026. Its
+replacement, a `.railway/railway.ts` file, needs Railway's npm package installed in the
+repository. Its Python and Go versions need a pip package or a Go module, and QuietNet uses no
+outside packages. That file is also never read when the relay is deployed: the Railway command line
+copies it into the service's settings when someone runs `railway config apply`. So the settings
+live in the service on Railway itself, and this page is where they are written down:
+
+| Setting | Value | Where on Railway |
+| --- | --- | --- |
+| How to build | With Docker, from `cloud/Dockerfile` | Variable `RAILWAY_DOCKERFILE_PATH=cloud/Dockerfile`. Settings, Build then shows "Dockerfile, Automatically Detected" |
+| Build context | The repository's top folder | Railway's default. `railway up` uploads from where it is run |
+| Start command | None. The Dockerfile's `CMD ["python3", "relay.py"]` starts the relay | Settings, Deploy: leave the start command empty |
+| Health check | `/healthz`, which answers `{"ok": true}` | Settings, Deploy: healthcheck path |
+| Restart policy | On Failure | Settings, Deploy (Railway's default) |
+| Storage | A volume mounted at `/data` | The service's Volumes |
+
+If you change one of these on Railway, change this table too.
+
+**Moving a relay that was set up with `railway.json`.** Do these in order, before the copy of the
+repository you deploy from loses `railway.json`. While the file is there it overrides the service's
+settings, so setting the same values now changes nothing:
+
+1. Set `RAILWAY_DOCKERFILE_PATH=cloud/Dockerfile` on the service. From the folder linked to the
+   project, `railway variable set RAILWAY_DOCKERFILE_PATH=cloud/Dockerfile --skip-deploys` does it
+   without starting a deploy. On the website, the variable waits until you press Deploy.
+2. In the service's Settings, under Build: check the builder says "Dockerfile, Automatically
+   Detected". Under Deploy: press **+ Healthcheck Path** and set the healthcheck path to `/healthz`
+   (an unset path shows only that button), check the restart policy is On Failure and that there is
+   no start command (the page offers **+ Start Command**). If Railway then offers to apply or deploy
+   the change, do so: that redeploys what is running now, `railway.json` and all, which is safe.
+   Once saved, `railway config pull --json` (which only reads) lists `healthcheckPath` under
+   `deploy`. It lists the builder as `RAILPACK` whatever the page says; the page is the one to go by.
+3. Optional: `railway config migrate status`, from the linked folder, lists any service that still
+   has a config file path set. If this one does, clear it in the service's Settings (the config file
+   path field); after 1 December Railway ignores it anyway. `railway config migrate cutover` also
+   clears it and changes nothing else, but it is meant for moving to `.railway/railway.ts`, so
+   there is no need for it here.
+4. Deploy from a copy of the repository without `railway.json`, then check the deploy as below.
+
+If a deploy builds the wrong thing, put `railway.json` back (it still works until 1 December) and
+redeploy while you look into it.
+
+**Checking a deploy.** After every deploy that follows a change to these settings:
+
+1. **It built from `cloud/Dockerfile`.** Run `railway logs --build` from the linked folder, or open
+   the build log on Railway. It should show the Dockerfile's steps: `FROM python:3.13-slim`, then
+   `COPY cloud/relay.py ./relay.py` and `COPY static ./static`. If the log talks about Railpack or
+   Nixpacks, or installing packages, Railway did not find the variable: check
+   `RAILWAY_DOCKERFILE_PATH` and redeploy. The "Config as Code is deprecated" warning should be gone.
+2. **The health check ran on `/healthz`.** The deploy log should show the health check starting on
+   path `/healthz` and succeeding before the deploy goes live. If it shows no health check at all,
+   the healthcheck path is not set.
+3. **The relay answers.** `curl -s https://<your relay>/healthz` prints `{"ok": true}`.
+4. **It started as before.** `railway logs --deployment` shows the start-up lines, among them
+   "Running as user 65534, group 65534, not root." and the licence gate line. Sign in and open a Pi.
 
 ## Keeping the relay in step with the Pi
 
@@ -87,6 +156,12 @@ The limits on guessing are saved in the relay's database, so a restart or redepl
 ## Running as an ordinary user
 
 The container starts as root, because Railway's volume is owned by root. Before it opens its database or answers anything, the relay hands `/data` to the `nobody` user and stops being root; the log says "Running as user 65534, group 65534, not root." To use another user, set `QUIETNET_RUN_AS=uid:gid` (`0:0` keeps root). If the volume doesn't allow a change of owner, the relay carries on as root and the log warns about it. If the host refuses the change of user itself, the relay stops with a message saying so rather than carry on half-changed. Only `/data` itself and `relay.db` (with its `-wal`, `-shm` and `-journal` files) are handed over, and links are never followed.
+
+## Other hosts
+
+Any host that can build a Dockerfile works. Build from the repository's top folder with
+`docker build -f cloud/Dockerfile .`, keep `/data` on lasting storage, and point the host's health
+check, if it has one, at `/healthz`.
 
 ## Run locally (for development)
 

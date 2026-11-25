@@ -136,10 +136,24 @@ class Containers(unittest.TestCase):
         lines = [l for l in read("cloud", "Dockerfile").splitlines() if l.strip().upper().startswith("USER")]
         self.assertEqual(lines, [])
 
-    def test_railway_is_pointed_at_the_relay_container(self):
-        cfg = json.loads(read("railway.json"))
-        self.assertEqual(cfg["build"]["dockerfilePath"], "cloud/Dockerfile")
-        self.assertTrue(os.path.exists(os.path.join(ROOT, cfg["build"]["dockerfilePath"])))
+    def test_the_repository_has_no_railway_config_file(self):
+        # Railway stops reading these on 1 December 2026, and while one is there it overrides the
+        # service's settings, which are where the relay's build and health check now live.
+        for name in ("railway.json", "railway.toml"):
+            self.assertFalse(os.path.exists(os.path.join(ROOT, name)), name)
+
+    def test_the_relay_notes_point_railway_at_the_relay_container(self):
+        # The build setting lives on Railway; cloud/README.md is its only record, so it must name
+        # a Dockerfile that exists.
+        found = re.search(r"RAILWAY_DOCKERFILE_PATH=(\S+?)`", read("cloud", "README.md"))
+        self.assertIsNotNone(found)
+        self.assertEqual(found.group(1), "cloud/Dockerfile")
+        self.assertTrue(os.path.exists(os.path.join(ROOT, found.group(1))))
+
+    def test_the_relay_notes_give_the_health_check_path_the_relay_answers(self):
+        # Railway's health check is set by hand from cloud/README.md; the relay must answer there.
+        self.assertIn("healthcheck path to `/healthz`", read("cloud", "README.md"))
+        self.assertIn('if p == "/healthz":', read("cloud", "relay.py"))
 
     def test_compose_gives_the_pi_what_the_enforcer_and_dns_need(self):
         compose = read("docker-compose.yml")
