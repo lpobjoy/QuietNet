@@ -1856,7 +1856,11 @@ class RouterAnnouncements(Base):
         server.S.ipv6_steer = True
         enf = mock.Mock()
         packet = (router_advert(self.LINK_ADDR, rdnss(600, self.HUB)), ("fe80::1%wlan0", 0, 0, 3))
-        with mock.patch.object(server, "ENF", enf):
+        # The steady clock is held at its present reading, so all three arrive in the same second
+        # however long the machine takes over them. Left running, a stall of a second between two
+        # of them would rightly wake the enforcer a second time.
+        now = time.monotonic()
+        with mock.patch.object(server, "ENF", enf), mock.patch.object(server.time, "monotonic", lambda: now):
             self.listen([packet, packet, packet])
         self.assertEqual(enf.poke.call_count, 1)
 

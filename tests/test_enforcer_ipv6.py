@@ -511,7 +511,9 @@ class EnforcerDrives(unittest.TestCase):
         self.e._v6.listen = lambda stop: started.append(stop)
         self.e.start()
         self.addCleanup(self.e.stop)
-        for _ in range(100):
+        # The enforcer's own thread starts the listener, so wait for it: up to ten seconds, ending
+        # the moment it has, so the long limit costs nothing unless the machine is held up.
+        for _ in range(500):
             if started:
                 break
             time.sleep(0.02)
@@ -526,7 +528,9 @@ class EnforcerDrives(unittest.TestCase):
         self.e.start()
         self.addCleanup(self.e.stop)
         self.e.poke()
-        for _ in range(100):
+        # The tick runs on the enforcer's own thread, so wait for it: up to ten seconds, ending the
+        # moment it has run.
+        for _ in range(500):
             if ticks:
                 break
             time.sleep(0.02)

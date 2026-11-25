@@ -1753,7 +1753,12 @@ class WhereIPv6IsTakenAway(Base, Setup):
         self.assertEqual(plan["shared"], [EXTENDER])
 
     def test_the_table_the_ipv4_plan_read_is_used_and_not_read_again(self):
-        with mock.patch.object(server, "neighbour_table", return_value={OLD: fresh(PHONE)}) as read:
+        # plan6 goes by the plan's table only while it is no more than PLAN_TABLE_KEPT seconds old,
+        # so the steady clock is held at its present reading: the two calls then fall in the same
+        # moment however long the machine takes between them.
+        now = time.monotonic()
+        with mock.patch.object(server, "neighbour_table", return_value={OLD: fresh(PHONE)}) as read, \
+                mock.patch.object(server.time, "monotonic", lambda: now):
             server.enforcement_plan()
             self.assertEqual(server.plan6()["devices"], {OLD: {"mac": PHONE, "ll": LL}})
         self.assertEqual(read.call_count, 1)
